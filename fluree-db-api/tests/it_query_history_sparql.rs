@@ -753,3 +753,105 @@ async fn history_group_by_count_jsonld_over_indexed_range() {
         "rows: {rows:#?}"
     );
 }
+
+/// Explicit named history retains only the selected member. Upserts
+/// retract the old value; after reindex/reopen those retractions still exist.
+#[tokio::test]
+async fn named_graph_history_survives_reindex_and_restart() {
+    use fluree_db_api::ReindexOptions;
+    let tmp = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .unwrap();
+    let ledger_id = "history-named:main";
+    let l0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let r1 = fluree
+        .insert(
+            l0,
+            &json!({
+                "@graph": "urn:test:history:a", "@id": "http://example.org/alice",
+                "http://example.org/name": "Alice"
+            }),
+        )
+        .await
+        .unwrap();
+    let r2 = fluree
+        .upsert(
+            r1.ledger,
+            &json!({
+                "@graph": "urn:test:history:a", "@id": "http://example.org/alice",
+                "http://example.org/name": "Alicia"
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .insert(
+            r2.ledger,
+            &json!({
+                "@graph": "urn:test:history:b", "@id": "http://example.org/alice",
+                "http://example.org/name": "Other graph"
+            }),
+        )
+        .await
+        .unwrap();
+    let q = format!(
+        r"PREFIX ex: <http://example.org/>
+        PREFIX f: <https://ns.flur.ee/db#>
+        SELECT ?name ?t ?op FROM <{ledger_id}@t:1> TO <{ledger_id}@t:latest>
+        FROM NAMED <{ledger_id}#urn:test:history:a>
+        WHERE {{ GRAPH <{ledger_id}#urn:test:history:a> {{
+          << ex:alice ex:name ?name >> f:t ?t ; f:op ?op .
+        }} }} ORDER BY ?t ?op"
+    );
+    for indexed in [false, true] {
+        if indexed {
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .unwrap();
+        }
+        let rows = run_sparql(&fluree, &q).await;
+        let got: Vec<_> = rows.as_array().unwrap().iter().map(row_name_t_op).collect();
+        assert_eq!(
+            got,
+            EXPECTED
+                .iter()
+                .map(|(n, t, o)| (n.to_string(), *t, *o))
+                .collect::<Vec<_>>()
+        );
+        let early = run_sparql(&fluree, &q.replace("@t:latest", "@t:1")).await;
+        assert_eq!(early.as_array().unwrap().len(), 1);
+        let enumerated = run_sparql(
+            &fluree,
+            &q.replace("SELECT ?name", "SELECT ?g ?name").replace(
+                &format!("GRAPH <{ledger_id}#urn:test:history:a>"),
+                "GRAPH ?g",
+            ),
+        )
+        .await;
+        assert_eq!(enumerated.as_array().unwrap().len(), 3);
+        let implicit = q.replace(&format!("FROM NAMED <{ledger_id}#urn:test:history:a>"), "");
+        assert!(run_sparql(&fluree, &implicit)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+    drop(fluree);
+    let reopened = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .unwrap();
+    let rows = run_sparql(&reopened, &q).await;
+    assert_eq!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(row_name_t_op)
+            .collect::<Vec<_>>(),
+        EXPECTED
+            .iter()
+            .map(|(n, t, o)| (n.to_string(), *t, *o))
+            .collect::<Vec<_>>()
+    );
+}
