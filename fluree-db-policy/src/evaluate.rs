@@ -146,6 +146,9 @@ pub struct PolicyContext {
     /// `GraphId` is ledger-local and `Sid` namespaces are per-ledger, so an
     /// entry borrowed from another ledger collides rather than misses.
     class_cache: ClassCache,
+    /// Compiled native f:GraphConfig overrides from the same committed snapshot.
+    /// These are execution contexts, not ledger records or caller bindings.
+    graph_overrides: Arc<std::collections::HashMap<String, PolicyContext>>,
 }
 
 impl PolicyContext {
@@ -159,14 +162,28 @@ impl PolicyContext {
             identity: grounded_identity,
             reasoned: false,
             class_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            graph_overrides: Arc::new(std::collections::HashMap::new()),
         }
     }
 
     /// This context, for a query that reads reasoned facts. It shares the
     /// class cache, which keys entries by the state they read.
     pub fn for_reasoned_query(&self) -> Self {
+        // A native graph override judges the facts of its graph, reasoned
+        // ones included, so it selects by reasoned classes too.
+        let graph_overrides = if self.graph_overrides.is_empty() {
+            Arc::clone(&self.graph_overrides)
+        } else {
+            Arc::new(
+                self.graph_overrides
+                    .iter()
+                    .map(|(graph, context)| (graph.clone(), context.for_reasoned_query()))
+                    .collect(),
+            )
+        };
         Self {
             reasoned: true,
+            graph_overrides,
             ..self.clone()
         }
     }
@@ -178,6 +195,42 @@ impl PolicyContext {
         } else {
             self.wrapper.view()
         }
+    }
+
+    /// Attach effective contexts compiled from native graph configuration.
+    pub fn with_graph_overrides(
+        mut self,
+        overrides: std::collections::HashMap<String, PolicyContext>,
+    ) -> Self {
+        self.graph_overrides = Arc::new(overrides);
+        self
+    }
+
+    /// Select by the actual destination, never a value supplied in the request.
+    pub fn for_graph(&self, graph: Option<&str>) -> &Self {
+        let key = graph.unwrap_or(fluree_vocab::config_iris::DEFAULT_GRAPH);
+        self.graph_overrides
+            .get(key)
+            .or_else(|| {
+                graph.filter(|g| g.ends_with("#txn-meta")).and_then(|_| {
+                    self.graph_overrides
+                        .get(fluree_vocab::config_iris::TXN_META_GRAPH)
+                })
+            })
+            .unwrap_or(self)
+    }
+
+    pub fn contexts(&self) -> impl Iterator<Item = &Self> {
+        std::iter::once(self).chain(self.graph_overrides.values())
+    }
+
+    pub fn has_graph_overrides(&self) -> bool {
+        !self.graph_overrides.is_empty()
+    }
+
+    /// A root ledger default cannot bypass a restrictive graph override.
+    pub fn is_root(&self) -> bool {
+        self.contexts().all(|p| p.wrapper.is_root())
     }
 
     /// Get the policy wrapper
@@ -193,6 +246,28 @@ impl PolicyContext {
     /// depends on something else: an `f:query` restriction runs a query of
     /// its own, which can call `NOW()` or `RAND()`.
     pub fn hash_view_policy<H: std::hash::Hasher>(&self, h: &mut H) -> bool {
+        use std::hash::Hash;
+        if !self.hash_own_view_policy(h) {
+            return false;
+        }
+        // Native graph overrides judge the facts of their graphs: two
+        // contexts that agree on the ledger default but not on an override
+        // must not share a cached result.
+        let mut overrides: Vec<_> = self.graph_overrides.iter().collect();
+        overrides.sort_by(|a, b| a.0.cmp(b.0));
+        overrides.len().hash(h);
+        for (graph, context) in overrides {
+            graph.hash(h);
+            if !context.hash_view_policy(h) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`Self::hash_view_policy`] for this context's own wrapper and identity,
+    /// without its graph overrides.
+    fn hash_own_view_policy<H: std::hash::Hasher>(&self, h: &mut H) -> bool {
         use std::hash::Hash;
         let wrapper = &self.wrapper;
         wrapper.is_root().hash(h);
@@ -1236,6 +1311,53 @@ mod tests {
             for_classes: HashSet::new(),
             class_check_needed: false,
         }
+    }
+
+    /// Contexts that agree on the ledger default but not on a native graph
+    /// override key a query-result cache apart, and an override makes a
+    /// context with a root ledger default non-root.
+    #[test]
+    fn view_policy_hash_covers_graph_overrides() {
+        use std::collections::HashMap;
+        use std::hash::Hasher;
+        let key = |context: &PolicyContext| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            assert!(context.hash_view_policy(&mut h));
+            h.finish()
+        };
+        let identity = Some(make_sid(100, "alice"));
+        let root = || PolicyContext::new(PolicyWrapper::root(), identity.clone());
+        let deny = crate::build_policy_set(
+            vec![make_deny_restriction("deny-ssn", make_sid(100, "ssn"))],
+            None,
+            PolicyAction::View,
+            None,
+        );
+        let restricted = PolicyContext::new(
+            PolicyWrapper::new(deny, PolicySet::default(), false, true, HashMap::new()),
+            identity.clone(),
+        );
+        let graph = "http://example.org/restricted".to_string();
+        let plain = root();
+        let overridden =
+            root().with_graph_overrides(HashMap::from([(graph.clone(), restricted.clone())]));
+        let root_override = root().with_graph_overrides(HashMap::from([(graph.clone(), root())]));
+        assert!(plain.is_root());
+        assert!(!overridden.is_root());
+        assert_ne!(key(&plain), key(&overridden));
+        assert_ne!(key(&overridden), key(&root_override));
+        assert_eq!(
+            key(&overridden),
+            key(&root().with_graph_overrides(HashMap::from([(graph, restricted)])))
+        );
+        // A reasoning query's context keeps judging the override's graph.
+        let reasoned = overridden.for_reasoned_query();
+        assert!(!reasoned.is_root());
+        assert!(
+            reasoned
+                .for_graph(Some("http://example.org/restricted"))
+                .reasoned
+        );
     }
 
     fn make_deny_restriction(id: &str, property: Sid) -> PolicyRestriction {

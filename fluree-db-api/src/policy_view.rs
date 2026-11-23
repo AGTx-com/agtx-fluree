@@ -432,13 +432,111 @@ pub async fn build_transact_policy_context(
     to_t: i64,
     opts: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>> {
+    let ledger_id = snapshot.ledger_id.clone();
+    let mut resolution = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
+    build_graph_policy_contexts(
+        fluree,
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        &mut resolution,
+    )
+    .await
+}
+
+/// Share one governance snapshot across every native graph selection and the caller's read view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_graph_policy_contexts(
+    fluree: &crate::Fluree,
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &GovernanceOptions,
+    resolution: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> Result<Option<PolicyContext>> {
     fluree_db_transact::check_index_loaded(snapshot)?;
     let raw_config =
         resolve_ledger_config_cached(fluree, snapshot, overlay, novelty_for_stats, to_t).await?;
-    let resolved = raw_config
-        .as_deref()
+    // The fallback for unconfigured named graphs is the ledger group, NOT
+    // f:defaultGraph's override. Resolve explicit destinations separately.
+    let ledger_only = raw_config.as_deref().map(|c| {
+        let mut c = c.clone();
+        c.graph_overrides.clear();
+        c
+    });
+    let resolved = ledger_only
+        .as_ref()
         .map(|c| crate::config_resolver::resolve_effective_config(c, None));
+    let base = build_transact_graph_policy_context(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        resolved.as_ref(),
+        resolution,
+    )
+    .await?;
+    let Some(config) = raw_config
+        .as_deref()
+        .filter(|c| !c.graph_overrides.is_empty())
+    else {
+        return Ok(base);
+    };
+    let mut contexts = std::collections::HashMap::new();
+    let mut compiled: Vec<(
+        Option<fluree_db_core::ledger_config::PolicyDefaults>,
+        Option<fluree_db_core::ledger_config::ReasoningDefaults>,
+        PolicyContext,
+    )> = Vec::new();
+    for graph in &config.graph_overrides {
+        let target = &graph.target_graph;
+        if contexts.contains_key(target) {
+            continue;
+        }
+        let iri = (target != fluree_vocab::config_iris::DEFAULT_GRAPH).then_some(target.as_str());
+        let resolved = crate::config_resolver::resolve_effective_config(config, iri);
+        // Exact destinations sharing effective defaults also share their compiled rules.
+        // Scope remains the actual fact's graph in the evaluator, never part of this request-local memo.
+        if let Some((_, _, context)) = compiled.iter().find(|(policy, reasoning, _)| {
+            *policy == resolved.policy && *reasoning == resolved.reasoning
+        }) {
+            contexts.insert(target.clone(), context.clone());
+            continue;
+        }
+        let context = build_transact_graph_policy_context(
+            snapshot,
+            overlay,
+            novelty_for_stats,
+            to_t,
+            opts,
+            Some(&resolved),
+            resolution,
+        )
+        .await?
+        .unwrap_or_else(|| PolicyContext::new(fluree_db_policy::PolicyWrapper::root(), None));
+        compiled.push((resolved.policy, resolved.reasoning, context.clone()));
+        contexts.insert(target.clone(), context);
+    }
+    Ok(Some(
+        base.unwrap_or_else(|| PolicyContext::new(fluree_db_policy::PolicyWrapper::root(), None))
+            .with_graph_overrides(contexts),
+    ))
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn build_transact_graph_policy_context(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &GovernanceOptions,
+    resolved: Option<&fluree_db_core::ledger_config::ResolvedConfig>,
+    resolution: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> Result<Option<PolicyContext>> {
     let effective_opts = match &resolved {
         Some(r) => crate::config_resolver::merge_policy_opts(r, opts),
         None => opts.clone(),
@@ -453,34 +551,25 @@ pub async fn build_transact_policy_context(
     // f:onProperty expansion sees the model ledger's hierarchy. Resolved only
     // where a policy context is built from it: a write that runs without
     // policy never depends on the model ledger being there.
-    let cross_ledger_schema = || async {
-        match resolved
-            .as_ref()
-            .and_then(|r| r.reasoning.as_ref())
-            .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
-        {
-            Some(reasoning) => {
-                let ledger_id = snapshot.ledger_id.clone();
-                let mut schema_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
-                crate::cross_ledger::resolve_schema_closure_bundle(
-                    reasoning,
-                    snapshot,
-                    &mut schema_ctx,
-                )
+    let needs_policy =
+        source.is_some_and(|s| s.ledger.is_some()) || effective_opts.has_any_policy_inputs();
+    let cross_ledger_schema = match resolved
+        .and_then(|r| r.reasoning.as_ref())
+        .filter(|r| needs_policy && r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+    {
+        Some(reasoning) => {
+            crate::cross_ledger::resolve_schema_closure_bundle(reasoning, snapshot, resolution)
                 .await
                 .map_err(|e| {
                     crate::error::ApiError::config(format!(
                         "cross-ledger f:schemaSource resolution failed: {e}"
                     ))
-                })
-            }
-            None => Ok(None),
+                })?
         }
+        None => None,
     };
 
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
-        let ledger_id = snapshot.ledger_id.clone();
-        let mut ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, fluree);
         let config_policy_class = resolved
             .as_ref()
             .and_then(|r| r.policy.as_ref())
@@ -490,7 +579,7 @@ pub async fn build_transact_policy_context(
             &effective_opts,
             config_policy_class,
             source,
-            &mut ctx,
+            resolution,
             false,
         )
         .await?;
@@ -506,7 +595,7 @@ pub async fn build_transact_policy_context(
             // in D's default graph — the probe searches [0] only.
             &[0],
             restrictions,
-            cross_ledger_schema().await?,
+            cross_ledger_schema,
         )
         .await?;
         return Ok(Some(policy_ctx));
@@ -530,7 +619,7 @@ pub async fn build_transact_policy_context(
         to_t,
         &effective_opts,
         &policy_graphs,
-        cross_ledger_schema().await?,
+        cross_ledger_schema,
     )
     .await?;
     Ok(Some(policy_ctx))
