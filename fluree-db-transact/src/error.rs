@@ -70,6 +70,10 @@ pub enum TransactError {
     #[error("Commit conflict: expected t={expected_t}, head_t={head_t}")]
     CommitConflict { expected_t: i64, head_t: i64 },
 
+    /// Caller-supplied guards are terminal: retrying the same signed payload cannot repair them.
+    #[error("Transaction precondition failed: {0}")]
+    PreconditionFailed(String),
+
     /// Commit ID mismatch during commit (head CID does not match expected)
     #[error("Commit ID mismatch: expected {expected}, found {found}")]
     CommitIdMismatch { expected: String, found: String },

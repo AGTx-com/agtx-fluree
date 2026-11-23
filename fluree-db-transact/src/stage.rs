@@ -801,6 +801,14 @@ pub async fn stage_with_graph_delta(
     );
     async move {
         tracing::info!("starting transaction staging");
+        if let Some(expected_t) = txn.opts.expected_t {
+            if expected_t != ledger.t() {
+                return Err(TransactError::PreconditionFailed(format!(
+                    "expected t={expected_t}, head_t={}",
+                    ledger.t()
+                )));
+            }
+        }
 
         // 1. Check backpressure - reject early if novelty is at max
         if let Some(config) = options.index_config {
@@ -1269,6 +1277,11 @@ pub async fn stage_with_graph_delta(
             }
         }
 
+        if txn.opts.require_change.unwrap_or(false) && flakes.is_empty() {
+            return Err(TransactError::PreconditionFailed(
+                "Guarded transaction produced no changes".into(),
+            ));
+        }
         let total_flakes = flakes.len();
         let assertions = flakes.iter().filter(|f| f.op).count();
         let retractions = total_flakes - assertions;
