@@ -1186,8 +1186,15 @@ pub async fn stage_with_graph_delta(
                     };
                 let policy_span = tracing::debug_span!("policy_enforce");
                 async {
-                    enforce_modify_policies(&all, policy, &ledger, options.tracker, &reverse_graph)
-                        .await
+                    enforce_modify_policies(
+                        &all,
+                        policy,
+                        &ledger,
+                        options.tracker,
+                        &reverse_graph,
+                        ns_registry.delta(),
+                    )
+                    .await
                 }
                 .instrument(policy_span)
                 .await?;
@@ -2189,6 +2196,7 @@ async fn stage_graph_mgmt(
                     &ledger,
                     options.tracker,
                     &reverse_graph,
+                        ns_registry.delta(),
                 )
                 .await?;
             }
@@ -2622,8 +2630,15 @@ pub async fn stage_flakes(
         if let Some(policy) = options.policy_ctx {
             if !policy.wrapper().is_root() {
                 tracing::debug!("enforcing modify policies on pre-built flakes");
-                enforce_modify_policies(&flakes, policy, &ledger, options.tracker, &reverse_graph)
-                    .await?;
+                enforce_modify_policies(
+                    &flakes,
+                    policy,
+                    &ledger,
+                    options.tracker,
+                    &reverse_graph,
+                    &HashMap::new(),
+                )
+                .await?;
             }
         }
 
@@ -2806,7 +2821,16 @@ async fn enforce_modify_policies(
     ledger: &LedgerState,
     tracker: Option<&Tracker>,
     reverse_graph: &HashMap<Sid, GraphId>,
+    namespace_delta: &HashMap<u16, String>,
 ) -> Result<()> {
+    // Decode newly minted IRIs using the transaction's namespace table, but
+    // read only committed facts. Namespace knowledge is not post-state authority.
+    let mut policy_ledger = ledger.clone();
+    if !namespace_delta.is_empty() {
+        std::sync::Arc::make_mut(&mut policy_ledger.snapshot)
+            .apply_envelope_deltas(namespace_delta, std::iter::empty::<&str>())?;
+    }
+    let ledger = &policy_ledger;
     let owner_checks = list_owner_checks(ledger, staged, reverse_graph).await?;
     let flakes: std::borrow::Cow<'_, [Flake]> = if owner_checks.is_empty() {
         std::borrow::Cow::Borrowed(staged)
@@ -2893,7 +2917,32 @@ async fn enforce_modify_policies(
     // StagedLedger overlay (the same view SHACL validates against) provides
     // it. Built only when such a condition is loaded.
     let staged_view = if policy.wrapper().has_post_state_conditions() {
-        let mut view = StagedLedger::new(ledger.clone(), staged.to_vec(), reverse_graph)?;
+        // Post-state GRAPH queries must discover graphs first introduced by
+        // this staged write, not just the committed registry. Extend only the
+        // isolated post-state snapshot; pre-state authority/config selection
+        // still uses the original committed graph registry above.
+        let mut post_ledger = ledger.clone();
+        let graph_iris = reverse_graph
+            .keys()
+            .map(|sid| {
+                ledger.snapshot.decode_sid(sid).ok_or_else(|| {
+                    TransactError::FlakeGeneration(format!(
+                        "Cannot decode staged policy graph: {sid:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        std::sync::Arc::make_mut(&mut post_ledger.snapshot)
+            .apply_envelope_deltas(&HashMap::new(), graph_iris.iter().map(String::as_str))?;
+        for (sid, expected) in reverse_graph {
+            let iri = ledger.snapshot.decode_sid(sid).expect("decoded above");
+            if post_ledger.snapshot.graph_registry.assigned_graph_id(&iri) != Some(*expected) {
+                return Err(TransactError::FlakeGeneration(
+                    "Staged policy graph routing differs from transaction routing".into(),
+                ));
+            }
+        }
+        let mut view = StagedLedger::new(post_ledger, staged.to_vec(), reverse_graph)?;
         crate::staged_dicts::attach_staged_dicts(&mut view)?;
         Some(view)
     } else {
