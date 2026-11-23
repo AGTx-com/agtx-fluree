@@ -550,6 +550,21 @@ impl QueryPolicyExecutor<'_> {
         // Native metadata is explicitly addressable in this trusted root context only.
         // Ordinary query contexts never enable it, and graph enumeration stays unchanged.
         let mut ctx = ctx.with_policy_commit_metadata();
+        // Named-graph scans return encoded values. The parent policy context must
+        // carry the same dictionaries as an ordinary query so expressions outside
+        // GRAPH (e.g. CONCAT/BIND, STR or comparisons) can decode those values.
+        ctx.binary_store = ExecutionContext::extract_binary_store(snapshot);
+        ctx.dict_novelty = ExecutionContext::extract_dict_novelty(snapshot);
+        ctx.runtime_small_dicts = ExecutionContext::extract_runtime_small_dicts(snapshot);
+        ctx.namespace_codes_fallback = ctx
+            .binary_store
+            .as_ref()
+            .map(|_| snapshot.shared_namespaces());
+        // Policies cross named graphs, including newly staged/unindexed graphs and
+        // the native metadata view. Carry dictionaries for decoding without opting
+        // into batched binary joins that assume the active graph has index leaves.
+        // The per-row path merges the overlay and preserves explicit graph scope.
+        ctx.eager_materialization = true;
 
         // Build the where clause operators (VALUES is now part of the patterns).
         //
