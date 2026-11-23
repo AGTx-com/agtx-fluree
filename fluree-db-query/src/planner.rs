@@ -6187,6 +6187,37 @@ mod tests {
     }
 
     #[test]
+    fn graph_scoped_pushdown_preserves_exists_context() {
+        let subject = VarId(0);
+        let value = VarId(1);
+        let result = VarId(2);
+        let exists = Expression::Exists {
+            patterns: vec![Pattern::Triple(make_pattern(subject, "classification", value))],
+            negated: false,
+        };
+        for deferred in [
+            Pattern::Filter(exists.clone()),
+            Pattern::Bind { var: result, expr: exists.clone() },
+            Pattern::Exists(vec![Pattern::Triple(make_pattern(subject, "classification", value))]),
+        ] {
+            let patterns = vec![
+                Pattern::Graph {
+                    name: GraphName::Iri(Arc::from("http://example.org/roles")),
+                    patterns: vec![Pattern::Triple(make_pattern(subject, "role", value))],
+                },
+                deferred,
+            ];
+            let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+            let graph = reordered.iter().find_map(|p| match p {
+                Pattern::Graph { patterns, .. } => Some(patterns),
+                _ => None,
+            }).unwrap();
+            assert_eq!(graph.len(), 1, "a subquery must retain its original active graph");
+            assert_eq!(reordered.len(), 2);
+        }
+    }
+
+    #[test]
     fn test_filter_pushed_into_graph() {
         let s = VarId(0);
         let age = VarId(1);
