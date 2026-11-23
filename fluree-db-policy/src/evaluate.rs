@@ -706,13 +706,14 @@ impl PolicyContext {
                     PolicyValue::Allow => tracker.policy_allowed(&restriction.id),
                     PolicyValue::Deny => unreachable!(), // handled in the deny pass
                     PolicyValue::Query(q) => {
-                        let bindings = build_policy_values_clause(
+                        let mut bindings = build_policy_values_clause(
                             flake.subject,
                             flake.object,
                             flake.op,
                             &self.identity,
                             self.wrapper.policy_values(),
                         );
+                        bind_predicate(&mut bindings, flake.property);
                         if executor.evaluate_policy_query(q, &bindings).await? {
                             tracker.policy_allowed(&restriction.id);
                         } else {
@@ -752,7 +753,7 @@ impl PolicyContext {
                 PolicyValue::Deny => unreachable!(), // Already handled above
                 PolicyValue::Query(q) => {
                     // Build bindings for special variables + wrapper's policy_values
-                    let bindings = build_policy_values_clause(
+                    let mut bindings = build_policy_values_clause(
                         flake.subject,
                         flake.object,
                         flake.op,
@@ -760,6 +761,7 @@ impl PolicyContext {
                         self.wrapper.policy_values(),
                     );
                     // Await the async query evaluation
+                    bind_predicate(&mut bindings, flake.property);
                     if executor.evaluate_policy_query(q, &bindings).await? {
                         tracker.policy_allowed(&restriction.id);
                         return Ok(true);
@@ -815,6 +817,7 @@ impl PolicyContext {
         self.combine_applicable_async_detailed(
             policy_set,
             applicable_entries,
+            flake.property,
             flake.subject,
             flake.object,
             flake.op,
@@ -873,6 +876,7 @@ impl PolicyContext {
         self.combine_applicable_async_detailed(
             policy_set,
             applicable_entries,
+            property,
             subject,
             object,
             write.op,
@@ -891,6 +895,7 @@ impl PolicyContext {
         &'a self,
         policy_set: &'a PolicySet,
         applicable_entries: Vec<FlakePolicyEntry>,
+        property: &Sid,
         subject: &Sid,
         object: &FlakeValue,
         op: bool,
@@ -948,13 +953,14 @@ impl PolicyContext {
                 let restriction = &policy_set.restrictions[entry.idx];
                 tracker.policy_executed(&restriction.id);
                 if let PolicyValue::Query(q) = &restriction.value {
-                    let bindings = build_policy_values_clause(
+                    let mut bindings = build_policy_values_clause(
                         subject,
                         object,
                         op,
                         &self.identity,
                         self.wrapper.policy_values(),
                     );
+                    bind_predicate(&mut bindings, property);
                     if executor.evaluate_policy_query(q, &bindings).await? {
                         tracker.policy_allowed(&restriction.id);
                     } else {
@@ -1002,7 +1008,7 @@ impl PolicyContext {
                 PolicyValue::Deny => unreachable!(), // Already handled above
                 PolicyValue::Query(q) => {
                     // Build bindings for special variables + wrapper's policy_values
-                    let bindings = build_policy_values_clause(
+                    let mut bindings = build_policy_values_clause(
                         subject,
                         object,
                         op,
@@ -1010,6 +1016,7 @@ impl PolicyContext {
                         self.wrapper.policy_values(),
                     );
                     // Await the async query evaluation
+                    bind_predicate(&mut bindings, property);
                     if executor.evaluate_policy_query(q, &bindings).await? {
                         tracker.policy_allowed(&restriction.id);
                         return Ok(PolicyDecision::Allowed {
@@ -1247,6 +1254,14 @@ fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
     }
 }
 
+/// Bind `?$predicate`, the property of the fact being judged, beside the
+/// other built-ins from [`build_policy_values_clause`]. Any caller-supplied
+/// value of that name is dropped first, so a request cannot choose it.
+fn bind_predicate(bindings: &mut std::collections::HashMap<String, FlakeValue>, property: &Sid) {
+    bindings.retain(|name, _| name.trim_start_matches('?').trim_start_matches('$') != "predicate");
+    bindings.insert("?$predicate".to_string(), FlakeValue::Ref(property.clone()));
+}
+
 /// Build values clause for policy query execution.
 ///
 /// ALWAYS includes ?$identity binding to ensure it's ground.
@@ -1420,6 +1435,61 @@ mod tests {
             std::collections::HashMap::new(),
         );
         PolicyContext::new(wrapper, None)
+    }
+
+    /// Grants only when the query sees the checked fact's property as
+    /// `?$predicate`, and no other spelling of that name.
+    struct PredicateExecutor(Sid);
+
+    impl crate::query_eval::PolicyQueryExecutor for PredicateExecutor {
+        fn evaluate_policy_query<'a>(
+            &'a self,
+            _query: &'a crate::types::PolicyQuery,
+            bindings: &'a std::collections::HashMap<String, FlakeValue>,
+        ) -> crate::query_eval::PolicyQueryFut<'a> {
+            let sees_property =
+                bindings.get("?$predicate") == Some(&FlakeValue::Ref(self.0.clone()));
+            let others = bindings
+                .keys()
+                .filter(|name| name.trim_start_matches('?').trim_start_matches('$') == "predicate")
+                .count();
+            Box::pin(async move { Ok(sees_property && others == 1) })
+        }
+    }
+
+    /// A policy query sees the property of the fact it judges as
+    /// `?$predicate`, on reads and writes alike, and a caller cannot supply it.
+    #[tokio::test]
+    async fn query_policies_see_the_fact_property_as_predicate() {
+        let prop = make_sid(100, "name");
+        let mut set = PolicySet::new();
+        set.restrictions
+            .push(make_query_restriction("p", prop.clone(), "q"));
+        set.by_property
+            .entry(prop.clone())
+            .or_default()
+            .push(PropertyPolicyEntry {
+                idx: 0,
+                class_check_needed: false,
+            });
+        let forged =
+            std::collections::HashMap::from([("?predicate".to_string(), make_sid(100, "forged"))]);
+        let ctx = PolicyContext::new(
+            PolicyWrapper::new(set.clone(), set, false, false, forged),
+            None,
+        );
+        let tracker = Tracker::disabled();
+        let subject = make_sid(100, "alice");
+        let value = FlakeValue::String("Alice".into());
+        let executor = PredicateExecutor(prop.clone());
+        assert!(ctx
+            .allow_view_flake_async(&subject, &prop, &value, &[], &executor, &tracker)
+            .await
+            .unwrap());
+        assert!(ctx
+            .allow_modify_flake_async(&subject, &prop, &value, &[], &executor, &tracker)
+            .await
+            .unwrap());
     }
 
     /// Two targeted f:query policies on the same target: the outcome must be

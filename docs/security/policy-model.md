@@ -74,7 +74,7 @@ For the JSON-LD form, `f:query` is a string containing a JSON-encoded query whos
 "f:query": "{\"ask\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"hr\"}}"
 ```
 
-A condition carrying both `ask` and `where` is ambiguous and fails closed (deny). The engine runs the pattern as a subquery for each candidate flake, with two pre-bound variables:
+A condition carrying both `ask` and `where` is ambiguous and fails closed (deny). The engine runs the pattern as a subquery for each candidate flake, with pre-bound variables:
 
 | Variable | Binding |
 |----------|---------|
@@ -82,10 +82,11 @@ A condition carrying both `ask` and `where` is ambiguous and fails closed (deny)
 | `?$identity` | The IRI of the requesting identity (resolved from `opts.identity`, `policy_values["?$identity"]`, or the verified bearer-token subject). |
 | `?$value` | The object of the flake being authorized — an IRI ref or a literal. Lets a condition constrain the value being written ("stage may only be set to `qualified`"). |
 | `?$op` | `"assert"` or `"retract"` (reads always bind `"assert"`). A value gate typically exempts retractions — a value change retracts the old value, whose `?$value` would otherwise fail the constraint: `FILTER($op = "retract" || $value = "qualified")`. |
+| `?$predicate` | The property of the flake being authorized. Lets one condition that targets several properties compare like with like: `$this $predicate ?old` reads the same property's current value. A request cannot supply it. |
 
 Anything else binds via the embedded WHERE just like a normal Fluree query.
-In SPARQL these bind as `$this` / `$identity` / `$value` / `$op`; in Cypher
-they are supplied as the parameters `$this` / `$identity` / `$value` / `$op`.
+In SPARQL these bind as `$this` / `$identity` / `$value` / `$op` / `$predicate`; in Cypher
+they are supplied as the parameters `$this` / `$identity` / `$value` / `$op` / `$predicate`.
 
 Because RDF can't carry structured JSON values natively, stored policies must JSON-encode the query (`serde_json::to_string`). For inline policies passed via `opts.policy`, you can also use the JSON-LD typed-literal form `{"@type": "@json", "@value": {...}}` to avoid manually escaping.
 
