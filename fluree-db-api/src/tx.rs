@@ -1449,9 +1449,23 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // A graph participates, so resolve what validating it needs: the
     // cross-ledger ontology (SHACL targeting for either pass) and, for the
     // stored pass, a cross-ledger shapes source with its model ledger.
-    let cross_ledger_schema = match resolve_ctx.as_deref_mut() {
-        Some(resolver) => resolve_cross_ledger_schema_for_tx(base, config, resolver).await?,
-        None => None,
+    let local_reasoning = config
+        .and_then(|c| c.reasoning.as_ref())
+        .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_none()));
+    let cross_ledger_schema = if let Some(reasoning) = local_reasoning {
+        crate::ontology_imports::resolve_local_schema_flakes(
+            &base.snapshot,
+            base.novelty.as_ref(),
+            base.t(),
+            reasoning,
+        )
+        .await
+        .map_err(|e| fluree_db_transact::TransactError::Parse(e.to_string()))?
+    } else {
+        match resolve_ctx.as_deref_mut() {
+            Some(resolver) => resolve_cross_ledger_schema_for_tx(base, config, resolver).await?,
+            None => None,
+        }
     };
     let shapes_model = match (&stored_policy, resolve_ctx) {
         (Some(_), Some(resolver)) => open_cross_ledger_shapes_model(config, resolver).await?,

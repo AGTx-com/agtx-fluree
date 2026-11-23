@@ -1207,6 +1207,20 @@ impl Fluree {
                 .as_ref()
                 .and_then(|c| c.reasoning.as_ref())
             {
+                Some(reasoning)
+                    if reasoning
+                        .schema_source
+                        .as_ref()
+                        .is_some_and(|s| s.ledger.is_none()) =>
+                {
+                    crate::ontology_imports::resolve_local_schema_flakes(
+                        &view.snapshot,
+                        view.overlay.as_ref(),
+                        view.t,
+                        reasoning,
+                    )
+                    .await?
+                }
                 Some(reasoning) => crate::cross_ledger::resolve_schema_closure_bundle(
                     reasoning,
                     &view.snapshot,
@@ -1259,8 +1273,22 @@ impl Fluree {
             .resolved_config
             .as_ref()
             .and_then(|c| c.reasoning.as_ref())
-            .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+            .filter(|r| r.schema_source.is_some())
         {
+            Some(reasoning)
+                if reasoning
+                    .schema_source
+                    .as_ref()
+                    .is_some_and(|s| s.ledger.is_none()) =>
+            {
+                crate::ontology_imports::resolve_local_schema_flakes(
+                    &view.snapshot,
+                    view.overlay.as_ref(),
+                    view.t,
+                    reasoning,
+                )
+                .await?
+            }
             Some(reasoning) => {
                 let ledger_id_owned = view.snapshot.ledger_id.clone();
                 let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_heads(

@@ -555,8 +555,17 @@ async fn build_transact_graph_policy_context(
         source.is_some_and(|s| s.ledger.is_some()) || effective_opts.has_any_policy_inputs();
     let cross_ledger_schema = match resolved
         .and_then(|r| r.reasoning.as_ref())
-        .filter(|r| needs_policy && r.schema_source.as_ref().is_some_and(|s| s.ledger.is_some()))
+        .filter(|r| needs_policy && r.schema_source.is_some())
     {
+        Some(reasoning)
+            if reasoning
+                .schema_source
+                .as_ref()
+                .is_some_and(|s| s.ledger.is_none()) =>
+        {
+            crate::ontology_imports::resolve_local_schema_flakes(snapshot, overlay, to_t, reasoning)
+                .await?
+        }
         Some(reasoning) => {
             crate::cross_ledger::resolve_schema_closure_bundle(reasoning, snapshot, resolution)
                 .await

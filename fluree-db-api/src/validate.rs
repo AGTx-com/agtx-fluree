@@ -549,14 +549,28 @@ async fn validate_view_inner(
     let shapes = ShapeCompiler::compile_from_dbs(&shape_dbs)
         .await
         .map_err(TransactError::from)?;
-    // Hierarchy comes from the ledger's shared cache (novelty-aware) even
-    // when shapes compile from a detached inline bundle — subclass expansion
-    // must reflect the data, including unindexed schema commits.
-    let hierarchy = view
-        .schema_hierarchy_cache
-        .current(snapshot, novelty, to_t, view.novelty.schema_epoch)
-        .await
-        .map_err(TransactError::from)?;
+    // Match transaction enforcement when a local ontology graph is selected.
+    let reasoning = config
+        .as_ref()
+        .and_then(|c| c.reasoning.as_ref())
+        .filter(|r| r.schema_source.as_ref().is_some_and(|s| s.ledger.is_none()));
+    let hierarchy = if let Some(reasoning) = reasoning {
+        let bundle = crate::ontology_imports::resolve_local_schema_flakes(
+            snapshot, novelty, to_t, reasoning,
+        )
+        .await?;
+        let composed = fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+            novelty,
+            bundle.expect("configured local schema source"),
+        );
+        fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, &composed, to_t)
+            .await
+            .map_err(TransactError::from)?
+    } else {
+        fluree_db_core::compute_schema_hierarchy_with_overlay(snapshot, novelty, to_t)
+            .await
+            .map_err(TransactError::from)?
+    };
     let cache = ShaclCache::new(
         ShaclCacheKey::new(ledger_id, to_t as u64),
         shapes,

@@ -2025,24 +2025,13 @@ impl Fluree {
             ));
         }
 
-        let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
+        crate::ontology_imports::resolve_local_schema_flakes(
             db_ref.snapshot,
             db_ref.overlay,
             db_ref.t,
             reasoning,
         )
-        .await?
-        else {
-            return Ok(None);
-        };
-
-        let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
-            db_ref.snapshot,
-            db_ref.overlay,
-            &bundle,
-        )
-        .await?;
-        Ok(Some(flakes))
+        .await
     }
 
     /// Execute against a GraphDb with policy awareness.
