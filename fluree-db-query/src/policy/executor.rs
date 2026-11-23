@@ -572,14 +572,19 @@ impl QueryPolicyExecutor<'_> {
                 message: e.to_string(),
             })?;
 
-        let has_results = match operator.next_batch(&ctx).await {
-            Ok(Some(batch)) => !batch.is_empty(),
-            Ok(None) => false,
-            Err(e) => {
-                operator.close();
-                return Err(fluree_db_policy::PolicyError::QueryExecution {
-                    message: e.to_string(),
-                });
+        // A graph/union branch may yield an empty batch before a later branch matches.
+        // ASK is true if any batch has a solution, not only if the first batch does.
+        let has_results = loop {
+            match operator.next_batch(&ctx).await {
+                Ok(Some(batch)) if !batch.is_empty() => break true,
+                Ok(Some(_)) => continue,
+                Ok(None) => break false,
+                Err(e) => {
+                    operator.close();
+                    return Err(fluree_db_policy::PolicyError::QueryExecution {
+                        message: e.to_string(),
+                    });
+                }
             }
         };
 
