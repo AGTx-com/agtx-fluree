@@ -41,6 +41,7 @@ pub(crate) const CONFIG_EDGES: &[&str] = &[
     config_iris::SHAPES_SOURCE,
     config_iris::ADDITIONAL_DATA_SOURCE,
     config_iris::POLICY_SOURCE,
+    config_iris::IDENTITY_SOURCE,
     config_iris::SCHEMA_SOURCE,
     config_iris::RULES_SOURCE,
     config_iris::CONSTRAINTS_SOURCE,
@@ -64,6 +65,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::QUERY_DEFAULTS,
     config_iris::DEFAULT_ALLOW,
     config_iris::POLICY_SOURCE,
+    config_iris::IDENTITY_SOURCE,
     config_iris::SHACL_ENABLED,
     config_iris::SHAPES_SOURCE,
     config_iris::VALIDATION_MODE,
@@ -339,7 +341,7 @@ mod tests {
                 f:transactDefaults <urn:c:transact> ; f:fullTextDefaults <urn:c:ft> ;
                 f:servingDefaults <urn:c:serving> ; f:queryDefaults <urn:c:query> ;
                 f:graphOverrides <urn:c:g1> .
-              <urn:c:policy> f:defaultAllow false ; f:policySource <urn:c:ref> ;
+              <urn:c:policy> f:defaultAllow false ; f:policySource <urn:c:ref> ; f:identitySource <urn:c:ref> ;
                 f:policyClass ex:Reader ; f:overrideControl <urn:c:oc> .
               <urn:c:oc> f:controlMode f:IdentityRestricted ; f:allowedIdentities <did:key:z6Mk> .
               <urn:c:ref> a f:GraphRef ; f:graphSource <urn:c:src> ;

@@ -1287,6 +1287,10 @@ impl MergeableGroup for PolicyDefaults {
         PolicyDefaults {
             default_allow: self.default_allow.or(base.default_allow),
             policy_source: self.policy_source.clone().or(base.policy_source.clone()),
+            identity_source: self
+                .identity_source
+                .clone()
+                .or(base.identity_source.clone()),
             policy_class: self.policy_class.clone().or(base.policy_class.clone()),
             override_control: base.override_control.effective_min(&self.override_control),
         }
@@ -1809,6 +1813,14 @@ async fn read_policy_fields(
         config_iris::POLICY_SOURCE,
     )
     .await?;
+    let identity_source = read_graph_source_ref(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::IDENTITY_SOURCE,
+    )
+    .await?;
     let policy_class = read_iri_list_field(
         snapshot,
         overlay,
@@ -1822,6 +1834,7 @@ async fn read_policy_fields(
     Ok(PolicyDefaults {
         default_allow,
         policy_source,
+        identity_source,
         policy_class,
         override_control,
     })

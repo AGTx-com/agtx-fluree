@@ -1235,18 +1235,29 @@ impl Fluree {
                 None => None,
             };
 
-            let policy_ctx =
-                crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
-                    &view.snapshot,
-                    view.overlay.as_ref(),
-                    view.novelty_for_stats(),
-                    view.t,
-                    &effective_opts,
-                    &[0], // identity-mode uses [0]; unused under cross-ledger
-                    restrictions,
-                    cross_ledger_schema,
-                )
-                .await?;
+            let identity_source = view
+                .resolved_config
+                .as_ref()
+                .and_then(|c| c.policy.as_ref())
+                .and_then(|p| p.identity_source.as_ref());
+            let identity_graphs = crate::policy_builder::resolve_identity_source_g_ids(
+                identity_source,
+                &view.snapshot,
+                view.t,
+                &[0],
+            )?;
+            let policy_ctx = crate::policy_builder::build_policy_context_with_sources(
+                &view.snapshot,
+                view.overlay.as_ref(),
+                view.novelty_for_stats(),
+                view.t,
+                &effective_opts,
+                &[0],
+                &identity_graphs,
+                Some(restrictions),
+                cross_ledger_schema,
+            )
+            .await?;
             // Carry the per-ledger head-t captures forward onto
             // the returned view so any later `query()` in this same
             // logical request sees the same M version policy did.
@@ -1311,13 +1322,26 @@ impl Fluree {
             None => None,
         };
 
-        let policy_ctx = crate::policy_builder::build_policy_context_from_opts_with_schema(
+        let identity_source = view
+            .resolved_config
+            .as_ref()
+            .and_then(|c| c.policy.as_ref())
+            .and_then(|p| p.identity_source.as_ref());
+        let identity_graphs = crate::policy_builder::resolve_identity_source_g_ids(
+            identity_source,
+            &view.snapshot,
+            view.t,
+            &policy_graphs,
+        )?;
+        let policy_ctx = crate::policy_builder::build_policy_context_with_sources(
             &view.snapshot,
             view.overlay.as_ref(),
             view.novelty_for_stats(),
             view.t,
             &effective_opts,
             &policy_graphs,
+            &identity_graphs,
+            None,
             cross_ledger_schema,
         )
         .await?;

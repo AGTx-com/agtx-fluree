@@ -2283,6 +2283,9 @@ pub mod config_iris {
     /// `f:policySource` — GraphRef pointing to policy rules graph
     pub const POLICY_SOURCE: &str = "https://ns.flur.ee/db#policySource";
 
+    /// `f:identitySource` — local GraphRef for identity binding, not policy assignments
+    pub const IDENTITY_SOURCE: &str = "https://ns.flur.ee/db#identitySource";
+
     // Note: f:policyClass is already defined in policy_iris::POLICY_CLASS
 
     // ---- SHACL fields ----

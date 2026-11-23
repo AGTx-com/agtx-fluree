@@ -88,6 +88,8 @@ pub struct PolicyDefaults {
     pub default_allow: Option<bool>,
     /// `f:policySource` — reference to graph containing policy rules.
     pub policy_source: Option<GraphSourceRef>,
+    /// `f:identitySource` — optional local graph for identity binding only.
+    pub identity_source: Option<GraphSourceRef>,
     /// `f:policyClass` — default policy classes to apply.
     pub policy_class: Option<Vec<String>>,
     /// Override control for this setting group.
@@ -274,6 +276,7 @@ impl PolicyDefaults {
     pub fn is_empty(&self) -> bool {
         self.default_allow.is_none()
             && self.policy_source.is_none()
+            && self.identity_source.is_none()
             && self.policy_class.is_none()
             && self.override_control.is_default()
     }
