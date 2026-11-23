@@ -711,7 +711,12 @@ impl DefaultGraphSourceOperator {
     /// against the live execution context so no plan-time vouch is
     /// needed. See `annotation_edge_probe` for why each matters.
     fn annotation_probe_gates_pass(&self, ctx: &ExecutionContext<'_>) -> bool {
-        ctx.active_snapshot.annotation_index.is_some()
+        // The arena lanes below construct default-graph EdgeKeys (g: None).
+        // A policy or named GraphDb view can use this wrapper with a nonzero
+        // active graph even without a dataset. Keep that case on the ordinary
+        // graph-aware chain, including after indexing drains the overlay.
+        ctx.binary_g_id == 0
+            && ctx.active_snapshot.annotation_index.is_some()
             && ctx.active_snapshot.content_store.is_some()
             && !self.planning.is_history()
             && ctx.overlay().is_effectively_empty()
