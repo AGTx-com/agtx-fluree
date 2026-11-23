@@ -30,8 +30,27 @@ macro_rules! build_dataset_view_from_spec {
             let to_t = time_resolve::resolve_time_spec(&ledger, &range.to).await?;
 
             let view = GraphDb::from_ledger_state(&ledger);
-            let view = ($history_transform)(view).await?;
-            Ok(DataSetDb::single(view).with_history_range(from_t, to_t))
+            let default = ($history_transform)(view.clone()).await?;
+            let mut dataset = DataSetDb::single(default).with_history_range(from_t, to_t);
+            // A range keeps the ordinary explicit-dataset boundary. Named members
+            // must select graphs of this ledger, without a second temporal pin.
+            // Never enumerate other user or reserved graphs implicitly.
+            for source in &spec.named_graphs {
+                let address = source.address().ok_or_else(|| {
+                    ApiError::invalid_query(
+                        "History named members must explicitly name the range ledger and graph",
+                    )
+                })?;
+                if address.id() != &range.ledger || source.time_spec().is_some() {
+                    return Err(ApiError::invalid_query(
+                        "History named members must use the range ledger and its time bounds",
+                    ));
+                }
+                let named = Self::apply_graph_selector(view.clone(), address.graph())?;
+                let named = ($apply_policy)(named, source).await?;
+                dataset = dataset.with_named(source.name(), named);
+            }
+            Ok(dataset)
         } else {
             let mut dataset_db = DataSetDb::new();
             let mut members = Vec::with_capacity(spec.default_graphs.len());
