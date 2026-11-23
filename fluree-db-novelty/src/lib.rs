@@ -1393,6 +1393,55 @@ impl Novelty {
         Ok(())
     }
 
+    /// Rebase graph slots when an installed index assigns different numeric IDs.
+    /// Flakes and annotation attachments retain their graph SIDs; only the
+    /// segment routing and per-graph fact-state index use these numeric IDs.
+    pub fn remap_graph_ids(&mut self, mapping: &HashMap<GraphId, GraphId>) -> Result<()> {
+        let mut destinations = HashSet::new();
+        let mut changed = false;
+        for (old, segments) in self.graphs.iter().enumerate() {
+            if segments.is_none() {
+                continue;
+            }
+            let old = old as GraphId;
+            let new = mapping.get(&old).copied().ok_or_else(|| {
+                NoveltyError::InvalidGraph(format!("missing graph remapping for {old}"))
+            })?;
+            if !destinations.insert(new) {
+                return Err(NoveltyError::InvalidGraph(format!(
+                    "duplicate graph remapping to {new}"
+                )));
+            }
+            changed |= old != new;
+        }
+        if !changed {
+            return Ok(());
+        }
+
+        let length = destinations.iter().max().map_or(0, |id| *id as usize + 1);
+        let mut remapped = vec![None; length];
+        for (old, segments) in std::mem::take(&mut self.graphs).into_iter().enumerate() {
+            if segments.is_some() {
+                remapped[mapping[&(old as GraphId)] as usize] = segments;
+            }
+        }
+        self.graphs = remapped;
+        let mut facts = NoveltyFactState::new();
+        for (graph, segments) in self.graphs.iter().enumerate() {
+            if let Some(segments) = segments {
+                for segment in segments {
+                    for flake in &segment.flakes {
+                        facts.record(graph as GraphId, flake);
+                    }
+                }
+            }
+        }
+        self.fact_state = facts;
+        self.epoch += 1;
+        self.refresh_content_version();
+        Ok(())
+    }
+
     /// Clear flakes with t <= cutoff_t (after an index merge publishes them).
     ///
     /// Segments entirely at/below the cutoff are dropped wholesale; segments
