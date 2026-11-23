@@ -208,6 +208,65 @@ pub(crate) fn apply_commit_lifecycles(
     floors
 }
 
+/// Carries what commits after an index point still need into the newly installed snapshot: namespace codes and
+/// graph IRIs they introduced, and their novelty re-routed to the new snapshot's graph IDs. Index graph IDs are
+/// allocated independently from the live registry, so the surviving tail is routed by graph IRI.
+fn carry_post_index_entries(
+    old: &LedgerSnapshot,
+    new: &mut LedgerSnapshot,
+    novelty: &mut Novelty,
+) -> Result<()> {
+    // Collect old graph IRIs before moving old
+    let old_graph_iris: Vec<String> = old
+        .graph_registry
+        .iter_entries()
+        .map(|(_, iri)| iri.to_string())
+        .collect();
+
+    // Merge namespace codes: old entries not in new → carried forward.
+    // The new root's table is what the old one was at the index
+    // point, and codes are only ever added, so the old table is a
+    // superset and the entries to carry are exactly the extras.
+    // Nothing to do when the sizes agree; otherwise only the old
+    // entries above the new table's highest code can be missing —
+    // which keeps this proportional to the post-index commits, not
+    // to a ledger's tens of thousands of namespaces.
+    let old_codes = old.namespaces();
+    if old_codes.len() != new.namespaces().len() {
+        let new_max = new.namespaces().keys().copied().max().unwrap_or(0);
+        for (code, prefix) in old_codes {
+            if *code > new_max && !new.namespaces().contains_key(code) {
+                new.insert_namespace_code(*code, prefix.clone())?;
+            }
+        }
+        // A table that still disagrees carries codes below the
+        // new maximum; take the slow path once rather than lose them.
+        if new.namespaces().len() != old_codes.len() {
+            for (code, prefix) in old_codes {
+                if !new.namespaces().contains_key(code) {
+                    new.insert_namespace_code(*code, prefix.clone())?;
+                }
+            }
+        }
+    }
+
+    // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
+    new.graph_registry.apply_delta(&old_graph_iris);
+
+    // Index graph IDs are allocated independently from the live registry.
+    // Route the surviving tail by graph IRI before publishing that registry.
+    let mut graph_mapping = std::collections::HashMap::from([(0, 0)]);
+    for (old_id, iri) in old.graph_registry.iter_entries() {
+        let new_id = new
+            .graph_registry
+            .assigned_graph_id(iri)
+            .expect("old graph IRIs were merged above");
+        graph_mapping.insert(old_id, new_id);
+    }
+    novelty.remap_graph_ids(&graph_mapping)?;
+    Ok(())
+}
+
 /// Carry the drops `old`, a registry at the head, knows into `new`, the
 /// snapshot of an index root behind that head: the root knows the drops
 /// through its own `t`, the head those after it too. Matched by IRI, since a
@@ -763,6 +822,13 @@ impl LedgerState {
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
 
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        if has_remaining_novelty {
+            carry_post_index_entries(&self.snapshot, &mut new_snapshot, &mut new_novelty)?;
+        }
+
         // Reset dict_novelty with new watermarks from the index root
         let mut new_dict_novelty = DictNovelty::with_watermarks(
             new_snapshot.subject_watermarks.clone(),
@@ -770,9 +836,6 @@ impl LedgerState {
         );
         // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
         // so overlay translation can resolve newly-introduced subject/string IDs.
-        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
-        // holds dead flakes, but `size` tracks only active bytes.
-        let has_remaining_novelty = new_novelty.size > 0;
         if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
                 new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
@@ -852,48 +915,7 @@ impl LedgerState {
         // novelty flakes still reference for encoding/decoding and graph routing.
         let mut merged_snapshot = new_snapshot;
         if has_remaining_novelty {
-            // Collect old graph IRIs before moving self.snapshot
-            let old_graph_iris: Vec<String> = self
-                .snapshot
-                .graph_registry
-                .iter_entries()
-                .map(|(_, iri)| iri.to_string())
-                .collect();
-
-            // Merge namespace codes: old entries not in new → carried forward.
-            // The new root's table is what the old one was at the index
-            // point, and codes are only ever added, so the old table is a
-            // superset and the entries to carry are exactly the extras.
-            // Nothing to do when the sizes agree; otherwise only the old
-            // entries above the new table's highest code can be missing —
-            // which keeps this proportional to the post-index commits, not
-            // to a ledger's tens of thousands of namespaces.
-            let old_codes = self.snapshot.namespaces();
-            if old_codes.len() != merged_snapshot.namespaces().len() {
-                let new_max = merged_snapshot
-                    .namespaces()
-                    .keys()
-                    .copied()
-                    .max()
-                    .unwrap_or(0);
-                for (code, prefix) in old_codes {
-                    if *code > new_max && !merged_snapshot.namespaces().contains_key(code) {
-                        merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
-                    }
-                }
-                // A table that still disagrees carries codes below the
-                // new maximum; take the slow path once rather than lose them.
-                if merged_snapshot.namespaces().len() != old_codes.len() {
-                    for (code, prefix) in old_codes {
-                        if !merged_snapshot.namespaces().contains_key(code) {
-                            merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
-                        }
-                    }
-                }
-            }
-
-            // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
-            merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
+            carry_post_index_entries(&self.snapshot, &mut merged_snapshot, &mut new_novelty)?;
         }
         carry_graph_drops(&self.snapshot.graph_registry, &mut merged_snapshot);
         // The old snapshot goes first: its range provider holds the
@@ -2178,6 +2200,108 @@ mod tests {
             has_graph_after,
             "graph IRI from post-index commit should be preserved in registry"
         );
+    }
+
+    #[test]
+    fn index_install_remaps_surviving_named_graph_assertions_and_retractions() {
+        use fluree_db_core::{GraphRegistry, IndexType, OverlayProvider};
+
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot
+            .insert_namespace_code(200, "urn:test:".to_string())
+            .unwrap();
+        snapshot
+            .graph_registry
+            .apply_delta(&["urn:test:core", "urn:test:workspace"]);
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+        let core = Sid::new(200, "core");
+        let workspace = Sid::new(200, "workspace");
+        let mut old_policy = make_flake(10, 1, 100, 1);
+        old_policy.g = Some(core.clone());
+        let mut retraction = old_policy.clone();
+        retraction.t = 2;
+        retraction.op = false;
+        let mut new_policy = make_flake(10, 1, 200, 2);
+        new_policy.g = Some(core);
+        let mut other = make_flake(11, 1, 300, 2);
+        other.g = Some(workspace);
+        let routing = state.snapshot.build_reverse_graph().unwrap();
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(vec![old_policy], 1, &routing)
+            .unwrap();
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(
+                vec![retraction.clone(), new_policy.clone(), other.clone()],
+                2,
+                &routing,
+            )
+            .unwrap();
+        let previous_view = state.novelty.clone();
+        let old_core_id = state
+            .snapshot
+            .graph_registry
+            .assigned_graph_id("urn:test:core")
+            .unwrap();
+        let old_workspace_id = state
+            .snapshot
+            .graph_registry
+            .assigned_graph_id("urn:test:workspace")
+            .unwrap();
+        let mut indexed = (*state.snapshot).clone();
+        indexed.t = 1;
+        let entries: Vec<_> = state
+            .snapshot
+            .graph_registry
+            .iter_entries()
+            .map(|(id, iri)| {
+                (
+                    if id == old_core_id {
+                        old_workspace_id
+                    } else if id == old_workspace_id {
+                        old_core_id
+                    } else {
+                        id
+                    },
+                    iri,
+                )
+            })
+            .collect();
+        indexed.graph_registry = GraphRegistry::seed_from_entries(&entries).unwrap();
+        state.apply_loaded_db(indexed, None).unwrap();
+
+        let core_tail: Vec<_> = state
+            .novelty
+            .range_flakes(old_workspace_id, IndexType::Spot, None, None, true)
+            .cloned()
+            .collect();
+        assert_eq!(core_tail.len(), 2);
+        assert!(core_tail.contains(&retraction));
+        assert!(core_tail.contains(&new_policy));
+        let workspace_tail: Vec<_> = state
+            .novelty
+            .range_flakes(old_core_id, IndexType::Spot, None, None, true)
+            .cloned()
+            .collect();
+        assert_eq!(workspace_tail, vec![other]);
+        assert_eq!(
+            previous_view
+                .range_flakes(old_core_id, IndexType::Spot, None, None, true)
+                .count(),
+            3
+        );
+        assert_ne!(
+            previous_view.content_version(),
+            state.novelty.content_version()
+        );
+
+        // Dedup must consult the remapped fact-state, not the old numeric slot.
+        let before = state.novelty.len();
+        new_policy.t = 3;
+        let routing = state.snapshot.build_reverse_graph().unwrap();
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(vec![new_policy], 3, &routing)
+            .unwrap();
+        assert_eq!(state.novelty.len(), before);
     }
 
     #[test]
