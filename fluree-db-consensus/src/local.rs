@@ -94,7 +94,7 @@ impl Committer for LocalCommitter {
             ledger_id,
             body,
             txn_opts,
-            commit_opts,
+            mut commit_opts,
             tracking,
             governance,
         } = request;
@@ -106,6 +106,13 @@ impl Committer for LocalCommitter {
             .get_or_load(&ledger_id)
             .await
             .map_err(execution_failure)?;
+
+        // CommitOpts::clone cannot carry an upload task. Retain its durable ID
+        // before cloning for attempts, including signed HTTP envelopes.
+        commit_opts
+            .resolve_raw_txn()
+            .await
+            .map_err(|e| execution_failure(e.into()))?;
 
         // Bounded reconcile-and-retry around stage + commit. See
         // [`is_retryable_txn_conflict`] for the conflict variants that

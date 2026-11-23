@@ -127,10 +127,9 @@ pub(crate) struct BuildState {
 /// **Clone behavior:** `CommitOpts` implements `Clone` manually and **omits**
 /// the `raw_txn_upload` field (the clone receives `None`). A `PendingRawTxnUpload`
 /// owns a Tokio `JoinHandle` plus a Drop-guard release task, so cloning it would
-/// either duplicate the release or split ownership — neither is sound. In every
-/// current call path the `commit_opts_base.clone()` pattern happens **before**
-/// `with_raw_txn_spawned`, so the pending upload is only attached on the final,
-/// un-cloned `CommitOpts` that flows into `commit()`.
+/// either duplicate the release or split ownership — neither is sound. Before
+/// cloning options with an attached envelope, call [`Self::resolve_raw_txn`]
+/// to preserve its durable content ID through staging and commit retries.
 #[derive(Default)]
 pub struct CommitOpts {
     /// Authenticated/impersonated identity acting on the transaction.
@@ -283,6 +282,18 @@ impl CommitOpts {
     ) -> Self {
         self.raw_txn_upload = Some(PendingRawTxnUpload::spawn(content_store, txn));
         self
+    }
+
+    /// Make the original envelope safe to carry through option clones.
+    /// A resolved ID is authoritative; never replace it with a parsed body.
+    /// Upload failure prevents the transaction from proceeding without provenance.
+    pub async fn resolve_raw_txn(&mut self) -> Result<()> {
+        if let Some(pending) = self.raw_txn_upload.take() {
+            if self.raw_txn_id.is_none() {
+                self.raw_txn_id = Some(pending.finish().await?);
+            }
+        }
+        Ok(())
     }
 
     /// Set the signing key for commit signatures

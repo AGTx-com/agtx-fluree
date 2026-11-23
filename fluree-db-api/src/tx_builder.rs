@@ -1327,7 +1327,7 @@ impl Fluree {
         txn_payload: JsonValue,
         store_raw_txn: bool,
     ) -> CommitOpts {
-        if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
+        if commit_opts.raw_txn_upload.is_none() && commit_opts.raw_txn_id.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger_id);
             commit_opts.with_raw_txn_spawned(content_store, txn_payload)
         } else {
@@ -2393,7 +2393,10 @@ impl Fluree {
             None => OpPlan::from_op(core.operation.take().unwrap())?, // safe: validate checks
         };
         let txn_opts = core.txn_opts;
-        let commit_opts_base = core.commit_opts;
+        let mut commit_opts_base = core.commit_opts;
+        // Optimistic staging clones these options for every attempt. Preserve
+        // an attached original envelope instead of dropping its upload handle.
+        commit_opts_base.resolve_raw_txn().await?;
         let tracker_ref = tracker.is_enabled().then_some(&tracker);
 
         const MAX_RETRIES: usize = 16;
