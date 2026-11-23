@@ -7487,6 +7487,37 @@ mod tests {
     }
 
     #[test]
+    fn graph_variable_filters_and_binds_stay_outside_graph() {
+        let graph = VarId(0);
+        let subject = VarId(1);
+        let value = VarId(2);
+        let text = VarId(3);
+        let patterns = vec![
+            Pattern::Graph {
+                name: GraphName::Var(graph),
+                patterns: vec![Pattern::Triple(make_pattern(subject, "value", value))],
+            },
+            Pattern::Bind {
+                var: text,
+                expr: Expression::Call {
+                    func: Function::Str,
+                    args: vec![Expression::Var(graph)],
+                },
+            },
+            Pattern::Filter(Expression::eq(
+                Expression::Var(graph),
+                Expression::Var(value),
+            )),
+        ];
+        let reordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert_eq!(count_patterns(&reordered, is_bind), 1);
+        assert_eq!(count_patterns(&reordered, is_filter), 1);
+        let graph_at = reordered.iter().position(|p| matches!(p, Pattern::Graph { .. })).unwrap();
+        assert!(reordered.iter().position(is_bind).unwrap() > graph_at);
+        assert!(reordered.iter().position(is_filter).unwrap() > graph_at);
+    }
+
+    #[test]
     fn test_filter_pushed_into_graph() {
         let s = VarId(0);
         let age = VarId(1);
