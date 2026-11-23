@@ -25,7 +25,7 @@
 use super::{parse_garbage_record, CleanGarbageConfig, CleanGarbageResult, SharedBlobPolicy};
 use super::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
 use crate::error::Result;
-use fluree_db_binary_index::IndexRoot;
+use fluree_db_binary_index::{ChainCasIds, IndexRoot};
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::ContentId;
 use futures::stream::StreamExt;
@@ -85,7 +85,7 @@ struct NodePartition {
     resurrected: usize,
 }
 
-/// Every CAS id directly referenced by a root this pass leaves in the chain
+/// Every CAS id reachable from a root this pass leaves in the chain
 /// — `index_chain[..first_released]`, newest-first. That is more than the
 /// retention count: versions the age guard is still holding survive the pass
 /// too, and a query that started against one of them can still read it.
@@ -98,18 +98,22 @@ struct NodePartition {
 /// receives one new entry per build is re-hashed and its old CID garbaged
 /// every build, and the half a later split keeps is byte-identical to one of
 /// those earlier states, reviving a CID an already-consumed manifest named.
-/// Checked directly against `all_cas_ids()` rather than expanded, since a
-/// resurrected CID this pass must not delete is exactly one still directly
-/// reachable from a surviving root — nothing behind a named-graph or
-/// annotation branch manifest changes that.
-fn retained_refs(
+/// Named graphs hit it too: a touched leaf whose history is unchanged gets a
+/// new leaf CID but the same sidecar CID, which the build names as garbage
+/// while the new root still routes to it through the graph's branch
+/// manifest. So the set expands named-graph and annotation branches, as the
+/// full-rebuild garbage diff does. Expansion is strict: a manifest that cannot
+/// be read fails the pass rather than leave a live CID unprotected.
+async fn retained_refs(
+    store: &dyn ContentStore,
     index_chain: &[IndexChainEntry],
     first_released: usize,
-) -> std::collections::HashSet<ContentId> {
-    index_chain[..first_released.min(index_chain.len())]
-        .iter()
-        .flat_map(|entry| entry.root.all_cas_ids())
-        .collect()
+) -> Result<HashSet<ContentId>> {
+    let mut retained = ChainCasIds::new();
+    for entry in &index_chain[..first_released.min(index_chain.len())] {
+        retained.add_root(store, &entry.root).await?;
+    }
+    Ok(retained.into_ids())
 }
 
 /// Split manifest items into what this pass releases and what it leaves.
@@ -579,7 +583,7 @@ pub async fn plan_garbage(
     let retained = if planned.is_empty() {
         HashSet::new()
     } else {
-        retained_refs(&index_chain, chain_len - planned.len())
+        retained_refs(store, &index_chain, chain_len - planned.len()).await?
     };
     Ok(GarbagePlan {
         snapshot_head: current_root_id.clone(),
@@ -641,7 +645,7 @@ impl GarbagePlan {
         } = self;
 
         // 3. Release the nodes the manifests named, protecting anything a
-        // retained root still references directly (see `retained_refs`).
+        // retained root still references (see `retained_refs`).
         let partition = partition_nodes(&named, shared_blobs, &retained);
         let release_started = std::time::Instant::now();
         let node_failures = release_batched(store, &partition.release, "garbage node").await;
@@ -735,13 +739,16 @@ impl GarbagePlan {
             return Ok(published_since);
         }
         let mut walk = PrevIndexChainWalk::new(store, head, self.cache_dir.as_deref());
+        let mut published = ChainCasIds::new();
         while let Some(entry) = walk.next_entry().await? {
             if entry.root_id == self.snapshot_head {
                 break;
             }
-            self.retained.extend(entry.root.all_cas_ids());
+            // Expanded for the reason given on `retained_refs`.
+            published.add_root(store, &entry.root).await?;
             published_since += 1;
         }
+        self.retained.extend(published.into_ids());
         Ok(published_since)
     }
 }
@@ -1560,6 +1567,194 @@ mod tests {
             store.has(&revived).await.unwrap(),
             "the head published after the plan references this CID; it must survive"
         );
+        assert!(!store.has(&cid1).await.unwrap());
+    }
+
+    /// Write a named-graph branch manifest routing one leaf, with `sidecar` as
+    /// that leaf's history sidecar, and return the manifest's CID.
+    async fn write_named_graph_branch(
+        storage: &MemoryStorage,
+        leaf: &ContentId,
+        sidecar: &ContentId,
+    ) -> ContentId {
+        use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
+        use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+        let key = RunRecordV2::new(
+            1,
+            fluree_db_core::SubjectId(1),
+            1,
+            fluree_db_core::o_type::OType::XSD_STRING,
+            0,
+            LIST_INDEX_NONE,
+            1,
+        );
+        let manifest = fluree_db_binary_index::format::branch::build_branch_bytes(
+            fluree_db_binary_index::RunSortOrder::Spot,
+            1,
+            &[fluree_db_binary_index::LeafEntry {
+                first_key: key,
+                last_key: key,
+                row_count: 1,
+                leaf_cid: leaf.clone(),
+                sidecar_cid: Some(sidecar.clone()),
+            }],
+        );
+        let (cid, addr) = cid_and_addr(ContentKind::IndexBranch, &manifest);
+        storage.write_bytes(&addr, &manifest).await.unwrap();
+        cid
+    }
+
+    /// A named graph's leaf rewritten with its history unchanged keeps the
+    /// same sidecar CID, so the build names the sidecar as garbage while the
+    /// new root still routes to it through the named graph's branch. Retained
+    /// roots reach named-graph sidecars only through branch manifests, so the
+    /// retained set must expand them, or GC deletes a live history sidecar.
+    #[tokio::test]
+    async fn a_named_graph_sidecar_still_live_on_a_retained_root_is_not_released() {
+        let storage = MemoryStorage::new();
+        let dict = ContentId::new(ContentKind::IndexLeaf, b"dummy");
+        let (sidecar, sidecar_addr) = cid_and_addr(ContentKind::HistorySidecar, b"history");
+        let (leaf1, leaf1_addr) = cid_and_addr(ContentKind::IndexLeaf, b"leaf at t=1");
+        let (leaf2, leaf2_addr) = cid_and_addr(ContentKind::IndexLeaf, b"leaf at t=2");
+        let branch1 = write_named_graph_branch(&storage, &leaf1, &sidecar).await;
+        let branch2 = write_named_graph_branch(&storage, &leaf2, &sidecar).await;
+        let old_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let prev = |t: i64, id: &ContentId| Some(BinaryPrevIndexRef { t, id: id.clone() });
+
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+        let fir6 = crate::gc::test_support::fir6_with_named_graph_for;
+        let root1 = fir6(LEDGER, 1, None, None, dict.clone(), Some(branch1.clone()));
+        let root2 = fir6(
+            LEDGER,
+            2,
+            prev(1, &cid1),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+            dict.clone(),
+            Some(branch2.clone()),
+        );
+        let root3 = fir6(LEDGER, 3, prev(2, &cid2), None, dict, Some(branch2));
+        // t=2 rewrote the leaf; its history sidecar came out byte-identical.
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{leaf1}", "{sidecar}", "{branch1}"], "created_at_ms": {old_ts}}}"#
+        );
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&garb_addr2, garbage2.as_bytes()),
+            (&sidecar_addr, b"history".as_slice()),
+            (&leaf1_addr, b"leaf at t=1".as_slice()),
+            (&leaf2_addr, b"leaf at t=2".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        // max_old_indexes=1 -> keep_count=2 -> retained {t=3, t=2}; t=1 goes.
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let store = test_store(&storage);
+        let result = clean_garbage(&store, &cid3, config).await.unwrap();
+
+        assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
+        assert_eq!(result.resurrected, 1, "the sidecar is named and still live");
+        assert!(
+            store.has(&sidecar).await.unwrap(),
+            "roots t=2 and t=3 route to this sidecar; it must survive"
+        );
+        assert!(!store.has(&leaf1).await.unwrap(), "the replaced leaf goes");
+        assert!(
+            !store.has(&branch1).await.unwrap(),
+            "the replaced branch goes"
+        );
+        assert!(store.has(&leaf2).await.unwrap());
+        assert!(!store.has(&cid1).await.unwrap());
+    }
+
+    /// The same, for a root published after the pass planned: the walk from
+    /// the head back to the snapshot must expand named-graph branches too.
+    #[tokio::test]
+    async fn a_named_graph_sidecar_revived_after_the_plan_is_not_released() {
+        let storage = MemoryStorage::new();
+        let dict = ContentId::new(ContentKind::IndexLeaf, b"dummy");
+        let (sidecar, sidecar_addr) = cid_and_addr(ContentKind::HistorySidecar, b"history");
+        let (other, other_addr) = cid_and_addr(ContentKind::HistorySidecar, b"other history");
+        let (leaf1, leaf1_addr) = cid_and_addr(ContentKind::IndexLeaf, b"leaf at t=1");
+        let (leaf2, leaf2_addr) = cid_and_addr(ContentKind::IndexLeaf, b"leaf at t=2");
+        let (leaf4, leaf4_addr) = cid_and_addr(ContentKind::IndexLeaf, b"leaf at t=4");
+        let branch1 = write_named_graph_branch(&storage, &leaf1, &sidecar).await;
+        let branch2 = write_named_graph_branch(&storage, &leaf2, &other).await;
+        let branch4 = write_named_graph_branch(&storage, &leaf4, &sidecar).await;
+        let old_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let prev = |t: i64, id: &ContentId| Some(BinaryPrevIndexRef { t, id: id.clone() });
+
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let (cid4, addr4) = cid_and_addr(ContentKind::IndexRoot, b"root4");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+        let fir6 = crate::gc::test_support::fir6_with_named_graph_for;
+        let root1 = fir6(LEDGER, 1, None, None, dict.clone(), Some(branch1.clone()));
+        let root2 = fir6(
+            LEDGER,
+            2,
+            prev(1, &cid1),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+            dict.clone(),
+            Some(branch2.clone()),
+        );
+        let root3 = fir6(LEDGER, 3, prev(2, &cid2), None, dict.clone(), Some(branch2));
+        // Published after the plan: the graph's history returns to its t=1 bytes.
+        let root4 = fir6(LEDGER, 4, prev(3, &cid3), None, dict, Some(branch4));
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{leaf1}", "{sidecar}", "{branch1}"], "created_at_ms": {old_ts}}}"#
+        );
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&garb_addr2, garbage2.as_bytes()),
+            (&sidecar_addr, b"history".as_slice()),
+            (&other_addr, b"other history".as_slice()),
+            (&leaf1_addr, b"leaf at t=1".as_slice()),
+            (&leaf2_addr, b"leaf at t=2".as_slice()),
+            (&leaf4_addr, b"leaf at t=4".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let store = test_store(&storage);
+        let plan = plan_garbage(&store, &cid3, &config).await.unwrap();
+        assert!(!plan.is_empty(), "t=1 is past retention");
+
+        storage.write_bytes(&addr4, &root4).await.unwrap();
+
+        let release_all = SharedBlobPolicy::Release {
+            referenced_elsewhere: std::collections::HashSet::new(),
+        };
+        let result = plan.release(&store, &cid4, &release_all).await.unwrap();
+
+        assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
+        assert_eq!(result.resurrected, 1);
+        assert!(
+            store.has(&sidecar).await.unwrap(),
+            "the head published after the plan routes to this sidecar; it must survive"
+        );
+        assert!(!store.has(&leaf1).await.unwrap());
         assert!(!store.has(&cid1).await.unwrap());
     }
 
