@@ -4463,9 +4463,10 @@ async fn validate_staged_nodes(
     //
     // Ref-objects of assert flakes are pulled in as focus nodes too, so
     // `sh:targetObjectsOf` shapes targeting a newly-referenced node get
-    // evaluated on the write path. Retractions do NOT expand the focus set
-    // via their object — removing an inbound edge doesn't introduce
-    // validation work at the target.
+    // evaluated on the write path. Annotation attachment retractions also
+    // affect the base edge's endpoints: the base edge can remain asserted
+    // after its annotation is detached or its last body property is removed.
+    // Other retractions do not expand the focus set via their object.
     //
     // Predicate-target applicability (`sh:targetSubjectsOf` / `ObjectsOf`)
     // is resolved inside `ShaclEngine::validate_node` by querying the
@@ -4488,12 +4489,49 @@ async fn validate_staged_nodes(
         // graph. This is the only way a node that wasn't otherwise touched
         // by the transaction gets pulled in to be validated against
         // `sh:targetObjectsOf` shapes targeting the newly-introduced edge.
-        if flake.op {
+        if flake.op
+            || fluree_db_core::is_reifies_subject(&flake.p)
+            || fluree_db_core::is_reifies_object(&flake.p)
+        {
             if let fluree_db_core::FlakeValue::Ref(obj) = &flake.o {
                 subjects_by_graph
                     .entry(g_id)
                     .or_default()
                     .insert(obj.clone());
+            }
+        }
+    }
+
+    // Any body edit can change an edge constraint, even when the final body
+    // field or rdf:type disappears. Resolve endpoints in both pre- and post-state:
+    // post-state alone cannot find an attachment that was just detached.
+    let touched = subjects_by_graph.clone();
+    for (g_id, subjects) in touched {
+        for subject in subjects {
+            for db in [
+                view.base().as_graph_db_ref(g_id),
+                view.as_graph_db_ref(g_id),
+            ] {
+                for name in [
+                    fluree_vocab::db::REIFIES_SUBJECT,
+                    fluree_vocab::db::REIFIES_OBJECT,
+                ] {
+                    let endpoints = db
+                        .range(
+                            fluree_db_core::IndexType::Spot,
+                            fluree_db_core::RangeTest::Eq,
+                            fluree_db_core::RangeMatch::subject_predicate(
+                                subject.clone(),
+                                Sid::new(fluree_vocab::namespaces::FLUREE_DB, name),
+                            ),
+                        )
+                        .await?;
+                    for endpoint in endpoints {
+                        if let fluree_db_core::FlakeValue::Ref(node) = endpoint.o {
+                            subjects_by_graph.entry(g_id).or_default().insert(node);
+                        }
+                    }
+                }
             }
         }
     }

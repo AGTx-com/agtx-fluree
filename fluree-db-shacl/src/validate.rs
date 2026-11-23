@@ -20,7 +20,7 @@ use fluree_db_core::{
     FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch, RangeTest,
     SchemaHierarchy, Sid,
 };
-use fluree_vocab::namespaces::{BLANK_NODE, RDF};
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, RDF};
 use fluree_vocab::rdf_names;
 use fluree_vocab::shacl as sh_vocab;
 use parking_lot::Mutex;
@@ -38,6 +38,17 @@ use std::sync::Arc;
 /// value can legitimately resolve differently when referenced from a different
 /// data graph.
 type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
+
+/// `rdf:reifies` is virtual; its subjects are the graph-local attachment subjects.
+/// Probe the stored subject component instead of a nonexistent physical predicate.
+fn subjects_of_storage_predicate(predicate: Sid) -> Sid {
+    if predicate == Sid::new(RDF, "reifies") {
+        Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT)
+    } else {
+        predicate
+    }
+}
+
 
 /// `(focus node, shape id)` pairs currently being validated on the call stack.
 ///
@@ -402,7 +413,7 @@ impl ShaclEngine {
                     .range(
                         IndexType::Spot,
                         RangeTest::Eq,
-                        RangeMatch::subject_predicate(focus_node.clone(), probe),
+                        RangeMatch::subject_predicate(focus_node.clone(), subjects_of_storage_predicate(probe)),
                     )
                     .await?;
                 if !flakes.is_empty() {
@@ -814,7 +825,7 @@ async fn get_focus_nodes(
                 // Subjects of the predicate — or of any RDFS subproperty.
                 for pred in crate::path::with_subproperties(predicate, hierarchy) {
                     let flakes = db
-                        .range(IndexType::Psot, RangeTest::Eq, RangeMatch::predicate(pred))
+                        .range(IndexType::Psot, RangeTest::Eq, RangeMatch::predicate(subjects_of_storage_predicate(pred)))
                         .await?;
                     for flake in flakes {
                         focus_nodes.push(flake.s.clone());

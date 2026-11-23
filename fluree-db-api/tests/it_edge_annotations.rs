@@ -7051,3 +7051,122 @@ async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
         );
     }
 }
+
+#[cfg(feature = "shacl")]
+async fn assert_shacl_rechecks_detached_membership(delete: JsonValue) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:shacl-detach";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+            GRAPH <urn:shapes> {{
+                ex:Shape a sh:NodeShape ; sh:targetSubjectsOf ex:memberOf ;
+                    sh:sparql ex:Constraint .
+                ex:Constraint sh:message "Membership requires an annotation" ;
+                    sh:select """SELECT $this WHERE {{
+                        $this <http://example.org/memberOf> ?workspace .
+                        FILTER NOT EXISTS {{
+                            ?annotation <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>
+                                <<( $this <http://example.org/memberOf> ?workspace )>> .
+                        }}
+                    }}""" .
+            }}
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                ex:Config a f:LedgerConfig ; f:shaclDefaults ex:Validation .
+                ex:Validation f:shaclEnabled true ; f:shapesSource ex:Source .
+                ex:Source a f:GraphRef ; f:graphSource ex:Selector .
+                ex:Selector f:graphSelector <urn:shapes> .
+            }}
+            "#
+        ))
+        .execute()
+        .await
+        .expect("seed shapes and enforcement");
+    let result = fluree
+        .insert(
+            result.ledger,
+            &json!({
+                "@context": ctx(), "@graph": "urn:organization:a", "@id": "ex:alice",
+                "ex:memberOf": {"@id": "ex:workspace", "@annotation": {
+                    "@id": "ex:membership", "ex:role": "editor"
+                }}
+            }),
+        )
+        .await
+        .expect("valid annotated membership");
+    let error = fluree
+        .update(result.ledger, &json!({"@context": ctx(), "delete": delete}))
+        .await
+        .expect_err("detaching the only annotation must revalidate the surviving base edge");
+    assert!(error.to_string().contains("SHACL"), "{error}");
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_rechecks_base_subject_on_explicit_annotation_detach() {
+    assert_shacl_rechecks_detached_membership(json!({
+        "@graph": "urn:organization:a", "@id": "ex:alice",
+        "ex:memberOf": {"@id": "ex:workspace", "@annotation": {"@id": "ex:membership"}}
+    }))
+    .await;
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_rechecks_base_subject_on_last_annotation_body_retraction() {
+    assert_shacl_rechecks_detached_membership(json!({
+        "@graph": "urn:organization:a", "@id": "ex:membership", "ex:role": "editor"
+    }))
+    .await;
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_reifies_subject_target_checks_type_removal_in_its_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:shacl-reifier-type";
+    let result = fluree.stage_owned(genesis_ledger(&fluree, ledger_id))
+        .upsert_turtle(&format!(r#"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:shapes> {{
+                ex:Shape a sh:NodeShape ; sh:targetSubjectsOf rdf:reifies ;
+                    sh:class ex:MembershipTerms .
+            }}
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                ex:Config a f:LedgerConfig ; f:shaclDefaults ex:Validation .
+                ex:Validation f:shaclEnabled true ; f:shapesSource ex:Source .
+                ex:Source a f:GraphRef ; f:graphSource ex:Selector .
+                ex:Selector f:graphSelector <urn:shapes> .
+            }}
+        "#)).execute().await.expect("seed reifier-target shape");
+    let result = fluree.insert(result.ledger, &json!({
+        "@context": ctx(), "@graph": "urn:organization:a", "@id": "ex:alice",
+        "ex:memberOf": {"@id": "ex:workspace", "@annotation": {
+            "@id": "ex:membership", "@type": "ex:MembershipTerms", "ex:unknownMetadata": "kept"
+        }}
+    })).await.expect("typed reifier is valid");
+    // The same subject in another graph is not an attachment there.
+    let result = fluree.insert(result.ledger, &json!({
+        "@context": ctx(), "@graph": "urn:organization:b", "@id": "ex:membership",
+        "ex:unknownMetadata": "other graph"
+    })).await.expect("reifier target does not leak across graphs");
+    let result = fluree.update(result.ledger, &json!({
+        "@context": ctx(),
+        "delete": {"@graph": "urn:organization:a", "@id": "ex:membership", "ex:unknownMetadata": "kept"},
+        "insert": {"@graph": "urn:organization:a", "@id": "ex:membership", "ex:unknownMetadata": "changed"}
+    })).await.expect("metadata updates preserve required type");
+    let error = fluree.update(result.ledger, &json!({
+        "@context": ctx(), "delete": {
+            "@graph": "urn:organization:a", "@id": "ex:membership", "@type": "ex:MembershipTerms"
+        }
+    })).await.expect_err("removing type with remaining unknown metadata must fail");
+    assert!(error.to_string().contains("SHACL"), "{error}");
+}
