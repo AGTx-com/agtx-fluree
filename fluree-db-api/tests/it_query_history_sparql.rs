@@ -753,3 +753,103 @@ async fn history_group_by_count_jsonld_over_indexed_range() {
         "rows: {rows:#?}"
     );
 }
+
+// ===========================================================================
+// Regression: re-sending an unchanged fact is not a history event.
+//
+// Index-served history is transition-grade: a re-assert of a present fact
+// changes no state. The answer must not depend on where the re-sent copy
+// lives: only in novelty over an index holding the original, absorbed by an
+// incremental build (which replaces the row and records the replacement as a
+// same-`t` sidecar pair), or folded into a full rebuild.
+// ===========================================================================
+
+/// `<< ex:s ex:link ?o >> f:t ?t ; f:op ?op` over `[from, latest]`.
+async fn link_history(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    from: i64,
+) -> Vec<(i64, bool)> {
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?t ?op
+FROM <{ledger_id}@t:{from}>
+TO <{ledger_id}@t:latest>
+WHERE {{ << ex:s ex:link ?o >> f:t ?t ; f:op ?op . }}
+ORDER BY ?t ?op"
+    );
+    let rows = run_sparql(fluree, &sparql).await;
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["?t"]["@value"].as_i64().expect("?t"),
+                row["?op"]["@value"].as_bool().expect("?op"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn history_of_a_resent_fact_is_one_assert_in_every_index_state() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .without_indexing()
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-sparql-resend:main";
+    let fact = json!({"@context": ctx(), "@id": "ex:s", "ex:link": {"@id": "ex:b"}});
+
+    let l0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let first = fluree.insert(l0, &fact).await.expect("insert");
+    let first_t = first.receipt.t;
+    drop(first);
+    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    assert_eq!(
+        link_history(&fluree, ledger_id, 1).await,
+        vec![(first_t, true)]
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let resend = fluree.insert(ledger, &fact).await.expect("re-send");
+    let resend_t = resend.receipt.t;
+    assert_eq!(resend_t, first_t + 1, "the re-send is its own commit");
+    drop(resend);
+
+    let mut observed = Vec::new();
+    observed.push((
+        "re-sent copy in novelty",
+        link_history(&fluree, ledger_id, 1).await,
+        link_history(&fluree, ledger_id, resend_t).await,
+    ));
+
+    crate::support::build_incrementally_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    observed.push((
+        "after an incremental build",
+        link_history(&fluree, ledger_id, 1).await,
+        link_history(&fluree, ledger_id, resend_t).await,
+    ));
+
+    crate::support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.disconnect_ledger(ledger_id).await;
+    observed.push((
+        "after a full rebuild",
+        link_history(&fluree, ledger_id, 1).await,
+        link_history(&fluree, ledger_id, resend_t).await,
+    ));
+
+    let wrong: Vec<_> = observed
+        .iter()
+        .filter(|(_, whole, from_resend)| {
+            whole != &vec![(first_t, true)] || !from_resend.is_empty()
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "first t={first_t}, re-send t={resend_t}: {wrong:#?}"
+    );
+}

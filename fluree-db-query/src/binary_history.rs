@@ -14,6 +14,13 @@
 //! 3. **Overlay / novelty flakes** in `(index_t, to_t]` — carry their
 //!    own `flake.op`.
 //!
+//! The merge is then made transition-grade (`transition_grade_events`):
+//! a persisted same-`t` retract/assert pair of one fact (an incremental
+//! build's "row replaced while present") and overlay ops that repeat the
+//! fact's current state (a re-sent fact the index already holds) change no
+//! state and are dropped, so the answer does not depend on which index
+//! state served it.
+//!
 //! The merged flake list is handed to the existing
 //! `flakes_to_bindings` pipeline via `prime_history_flakes`, which
 //! preserves the per-flake `op` on the emitted `Binding::Lit` (the
@@ -53,6 +60,11 @@
 //! - **Novelty pass:** 1 micro-fuel per matched novelty flake, charged
 //!   during the walk. A captured `FuelExceededError` short-circuits the
 //!   walk on the next callback invocation.
+//! - **Transition fold:** linear in the collected events (hash grouping by
+//!   fact identity), plus one `NoOverlay` equality range read of the
+//!   persisted index per distinct overlay fact whose first op is an assert,
+//!   charged through the tracker like any range read. No read without a
+//!   store.
 //! - **Per-flake emit:** 1 micro-fuel per flake is charged downstream in
 //!   `flakes_to_bindings` when `next_batch` drains the collected vec.
 //!
@@ -75,14 +87,17 @@
 //!   queries (`?s ?p ?o` across a wide range) can benefit from a
 //!   leaflet-at-a-time streaming cursor — also tracked as a follow-up.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, ColumnProjection, RunSortOrder};
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::same_t::op_order;
 use fluree_db_core::{
     flake_matches_range_eq, Flake, FlakeMeta, FlakeValue, GraphId, IndexType, NoOverlay,
-    ObjectBounds, OverlayProvider, RangeMatch, Sid,
+    ObjectBounds, OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 
 use crate::binary_scan::{BinaryScanOperator, EmitMask};
@@ -381,6 +396,10 @@ impl BinaryHistoryScanOperator {
         flakes.retain(|f| object_matches(f));
 
         // ---- Novelty events in (index_t, to_t] ----
+        //
+        // Ops before `from_t` are collected too: they decide whether a later
+        // op changes state (`transition_grade_events`), and are not emitted.
+        let mut novelty: Vec<Flake> = Vec::new();
         if to_t > index_t {
             let subject_predicate = RangeMatch {
                 s: s_sid.clone(),
@@ -401,8 +420,9 @@ impl BinaryHistoryScanOperator {
             // crowded novelty slice would charge for every flake touched
             // even when our pattern only matches a sliver. `for_each_overlay_flake`'s
             // callback cannot return a Result, so we capture any
-            // `FuelExceededError` and surface it after the walk.
-            let mut novelty: Vec<Flake> = Vec::new();
+            // `FuelExceededError` and surface it after the walk. Ops before
+            // `from_t` are retained for the presence fold, so they are
+            // charged like every other retained flake.
             let mut fuel_err: Option<fluree_db_core::FuelExceededError> = None;
             overlay.for_each_overlay_flake(
                 g_id,
@@ -415,7 +435,7 @@ impl BinaryHistoryScanOperator {
                     if fuel_err.is_some() {
                         return;
                     }
-                    if f.t <= index_t || f.t > to_t || f.t < from_t {
+                    if f.t <= index_t || f.t > to_t {
                         return;
                     }
                     if !flake_matches_range_eq(f, &subject_predicate) || !object_matches(f) {
@@ -434,8 +454,17 @@ impl BinaryHistoryScanOperator {
             if let Some(e) = fuel_err {
                 return Err(e.into());
             }
-            flakes.extend(novelty);
         }
+
+        // ---- Transition-grade normalisation ----
+        let base_present = base_present_facts(
+            ctx,
+            store_opt.is_some(),
+            index_t,
+            overlay_facts_to_probe(&novelty),
+        )
+        .await?;
+        let flakes = transition_grade_events(flakes, novelty, from_t, |f| base_present.contains(f));
 
         // ---- Policy enforcement ----
         let flakes =
@@ -561,6 +590,138 @@ fn clamp_t_u32(t: i64) -> u32 {
     }
 }
 
+/// Make one history scan's merged events transition-grade.
+///
+/// Index-served history reports the state changes a fact went through (see
+/// `fluree_db_binary_index::format::transitions`). Two event shapes reach
+/// this reader that change no state, and are dropped:
+///
+/// - **Replacement pairs** among the persisted events. An incremental build
+///   that replaces a present row records the replacement as a retract in the
+///   sidecar at the new row's `t`, while the row carries the assert. The
+///   indexer writes no other same-`t` pair for one fact (it folds a commit's
+///   pair to its transition), so a persisted retract and assert of one fact
+///   identity at one `t` mean "row replaced while present".
+/// - **No-op overlay ops.** Novelty drops a re-assert only of a fact it
+///   holds itself, so a re-sent fact the index holds arrives as an assert.
+///   Overlay ops are folded per fact identity in `t` order from the fact's
+///   presence at `index_t`; ops at one `t` resolve by the same-`t` rule (the
+///   assertion holds), and a `t` whose op repeats the current state is no
+///   event. The presence at `index_t` is `base_present` when the fact's
+///   first overlay op is an assert ([`overlay_facts_to_probe`] names those
+///   facts). A fact whose first overlay op is a retract was present, since a
+///   staged retraction names a stored fact.
+///
+/// `persisted` holds the in-range sidecar and base-row events. `overlay`
+/// holds every matching overlay op in `(index_t, to_t]`, including those
+/// before `from_t`: they decide presence, but are not returned. Survivors
+/// keep their collection order.
+fn transition_grade_events(
+    persisted: Vec<Flake>,
+    overlay: Vec<Flake>,
+    from_t: i64,
+    base_present: impl Fn(&Flake) -> bool,
+) -> Vec<Flake> {
+    // Flake equality and hashing are fact identity (`t` and `op` excluded).
+    let mut ops_at: HashMap<(&Flake, i64), (bool, bool)> = HashMap::new();
+    for f in &persisted {
+        let (asserts, retracts) = ops_at.entry((f, f.t)).or_default();
+        *asserts |= f.op;
+        *retracts |= !f.op;
+    }
+    let keep: Vec<bool> = persisted
+        .iter()
+        .map(|f| ops_at[&(f, f.t)] != (true, true))
+        .collect();
+    let mut out: Vec<Flake> = persisted
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(f, keep)| keep.then_some(f))
+        .collect();
+
+    let mut by_fact: HashMap<&Flake, Vec<usize>> = HashMap::new();
+    for (i, f) in overlay.iter().enumerate() {
+        by_fact.entry(f).or_default().push(i);
+    }
+    let mut keep = vec![false; overlay.len()];
+    for ops in by_fact.values_mut() {
+        ops.sort_by_key(|&i| op_order(overlay[i].t, overlay[i].op));
+        let mut present: Option<bool> = None;
+        for at_t in ops.chunk_by(|&a, &b| overlay[a].t == overlay[b].t) {
+            // Sorted retract-first, so the op that holds at this `t` is last.
+            let held = *at_t.last().expect("chunks are non-empty");
+            let asserts = overlay[held].op;
+            let before = *present.get_or_insert_with(|| !asserts || base_present(&overlay[held]));
+            if asserts != before {
+                keep[held] = true;
+            }
+            present = Some(asserts);
+        }
+    }
+    out.extend(
+        overlay
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(f, keep)| (keep && f.t >= from_t).then_some(f)),
+    );
+    out
+}
+
+/// The overlay facts [`transition_grade_events`] asks `base_present` about:
+/// one per fact identity whose earliest overlay `t` holds an assert.
+fn overlay_facts_to_probe(overlay: &[Flake]) -> Vec<&Flake> {
+    let mut first: HashMap<&Flake, (i64, bool)> = HashMap::new();
+    for f in overlay {
+        let (t, asserts) = first.entry(f).or_insert((f.t, f.op));
+        if f.t < *t {
+            (*t, *asserts) = (f.t, f.op);
+        } else if f.t == *t {
+            *asserts |= f.op;
+        }
+    }
+    first
+        .into_iter()
+        .filter_map(|(f, (_, asserts))| asserts.then_some(f))
+        .collect()
+}
+
+/// The facts among `probe` that the persisted index holds as of `index_t`,
+/// ignoring the overlay: one `NoOverlay` equality range read per fact,
+/// bound on subject, predicate and object (the read staging uses for stored
+/// facts), whose rows are compared by fact identity. Nothing is
+/// base-present without a store (`index_t = -1`).
+async fn base_present_facts(
+    ctx: &ExecutionContext<'_>,
+    has_store: bool,
+    index_t: i64,
+    probe: Vec<&Flake>,
+) -> Result<HashSet<Flake>> {
+    let mut present = HashSet::new();
+    if !has_store || ctx.active_snapshot.range_provider.is_none() {
+        return Ok(present);
+    }
+    for fact in probe {
+        let rows = range_with_overlay_tracked(
+            ctx.active_snapshot,
+            ctx.binary_g_id,
+            &NoOverlay,
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                o: Some(fact.o.clone()),
+                ..RangeMatch::subject_predicate(fact.s.clone(), fact.p.clone())
+            },
+            RangeOptions::new().with_to_t(index_t),
+            Some(&ctx.tracker),
+        )
+        .await?;
+        if rows.iter().any(|row| row == fact) {
+            present.insert(fact.clone());
+        }
+    }
+    Ok(present)
+}
+
 /// Decode a single history event (from sidecar or base column) into
 /// a `Flake` with explicit `op`.
 ///
@@ -617,4 +778,162 @@ fn decode_event_to_flake(
         op,
         m: meta,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `<urn:x:s> <urn:x:p> <urn:x:{o}>` at `t`, asserted (`op`) or retracted.
+    fn ev(o: &str, t: i64, op: bool) -> Flake {
+        Flake::new(
+            Sid::new(1, "s"),
+            Sid::new(1, "p"),
+            FlakeValue::Ref(Sid::new(1, o)),
+            Sid::new(2, "id"),
+            t,
+            op,
+            None,
+        )
+    }
+
+    fn ops(flakes: &[Flake]) -> Vec<(String, i64, bool)> {
+        let mut out: Vec<_> = flakes
+            .iter()
+            .map(|f| match &f.o {
+                FlakeValue::Ref(o) => (o.name.to_string(), f.t, f.op),
+                other => panic!("unexpected object {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn row(o: &str, t: i64, op: bool) -> (String, i64, bool) {
+        (o.to_string(), t, op)
+    }
+
+    const NOTHING_INDEXED: fn(&Flake) -> bool = |_| false;
+    const ALL_INDEXED: fn(&Flake) -> bool = |_| true;
+
+    /// R1: after an incremental build replaced a present row, the sidecar
+    /// holds the migrated assert and a synthesized same-`t` retract, and the
+    /// base row carries the replacement's assert at that `t`. The pair is
+    /// "row replaced while present", not a state change.
+    #[test]
+    fn history_drops_a_persisted_replacement_pair() {
+        let persisted = vec![ev("b", 3, true), ev("b", 4, false), ev("b", 4, true)];
+        let out = transition_grade_events(persisted, Vec::new(), 0, NOTHING_INDEXED);
+        assert_eq!(ops(&out), vec![row("b", 3, true)]);
+    }
+
+    /// R1 from the replacement's `t`: only the pair is in range, and it is
+    /// no event at all.
+    #[test]
+    fn history_drops_a_replacement_pair_at_the_range_start() {
+        let persisted = vec![ev("b", 4, false), ev("b", 4, true)];
+        let out = transition_grade_events(persisted, Vec::new(), 4, NOTHING_INDEXED);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// R2: a novelty assert of a fact the persisted index holds is a no-op.
+    #[test]
+    fn history_drops_a_novelty_reassert_of_an_indexed_fact() {
+        let persisted = vec![ev("b", 3, true)];
+        let overlay = vec![ev("b", 4, true)];
+        let probe = overlay_facts_to_probe(&overlay);
+        assert_eq!(
+            ops(&probe.into_iter().cloned().collect::<Vec<_>>()),
+            vec![row("b", 4, true)]
+        );
+        let out = transition_grade_events(persisted, overlay, 0, ALL_INDEXED);
+        assert_eq!(ops(&out), vec![row("b", 3, true)]);
+    }
+
+    /// R2 from the re-send's `t`: the original assert is out of range and the
+    /// re-send is a no-op, so nothing is reported.
+    #[test]
+    fn history_drops_a_novelty_reassert_at_the_range_start() {
+        let overlay = vec![ev("b", 4, true)];
+        let out = transition_grade_events(Vec::new(), overlay, 4, ALL_INDEXED);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A real retract in novelty followed by a later assert are two state
+    /// changes, even though the fact is in the persisted index.
+    #[test]
+    fn history_keeps_a_novelty_retract_then_reassert() {
+        let persisted = vec![ev("b", 3, true)];
+        let overlay = vec![ev("b", 5, false), ev("b", 6, true)];
+        let probe = overlay_facts_to_probe(&overlay);
+        assert!(probe.is_empty(), "a retract-first fact needs no probe");
+        let out = transition_grade_events(persisted, overlay, 0, ALL_INDEXED);
+        assert_eq!(
+            ops(&out),
+            vec![row("b", 3, true), row("b", 5, false), row("b", 6, true)]
+        );
+    }
+
+    /// An update retracts one value and asserts another at one `t`: two
+    /// identities, both events stay, in either lane.
+    #[test]
+    fn history_keeps_an_update_at_one_t() {
+        let persisted = vec![ev("a", 1, true), ev("a", 2, false), ev("b", 2, true)];
+        let out = transition_grade_events(persisted, Vec::new(), 0, NOTHING_INDEXED);
+        assert_eq!(
+            ops(&out),
+            vec![row("a", 1, true), row("a", 2, false), row("b", 2, true)]
+        );
+
+        let persisted = vec![ev("a", 1, true)];
+        let overlay = vec![ev("a", 2, false), ev("b", 2, true)];
+        let only_a = |f: &Flake| f.o == FlakeValue::Ref(Sid::new(1, "a"));
+        let out = transition_grade_events(persisted, overlay, 0, only_a);
+        assert_eq!(
+            ops(&out),
+            vec![row("a", 1, true), row("a", 2, false), row("b", 2, true)]
+        );
+    }
+
+    /// A fact retracted in the index (sidecar events only, no base row) and
+    /// asserted again in novelty keeps that assert.
+    #[test]
+    fn history_keeps_a_novelty_assert_of_a_fact_retracted_in_the_index() {
+        let persisted = vec![ev("b", 1, true), ev("b", 2, false)];
+        let overlay = vec![ev("b", 5, true)];
+        let out = transition_grade_events(persisted, overlay, 0, NOTHING_INDEXED);
+        assert_eq!(
+            ops(&out),
+            vec![row("b", 1, true), row("b", 2, false), row("b", 5, true)]
+        );
+    }
+
+    /// A brand-new fact in novelty keeps its assert, with or without a store
+    /// (`index_t = -1` answers every probe "absent").
+    #[test]
+    fn history_keeps_a_new_novelty_fact() {
+        let overlay = vec![ev("b", 5, true)];
+        let out = transition_grade_events(Vec::new(), overlay, 0, NOTHING_INDEXED);
+        assert_eq!(ops(&out), vec![row("b", 5, true)]);
+    }
+
+    /// A novelty retract and re-assert of an indexed fact at one `t` changes
+    /// nothing; of an absent fact, the assert is the one state change.
+    #[test]
+    fn history_resolves_a_novelty_same_t_pair_by_prior_presence() {
+        let overlay = vec![ev("b", 5, false), ev("b", 5, true)];
+        let out = transition_grade_events(Vec::new(), overlay.clone(), 0, ALL_INDEXED);
+        assert!(out.is_empty(), "{out:?}");
+        let out = transition_grade_events(Vec::new(), overlay, 0, NOTHING_INDEXED);
+        assert_eq!(ops(&out), vec![row("b", 5, true)]);
+    }
+
+    /// Novelty events before `from_t` still decide presence, and stay out of
+    /// the answer.
+    #[test]
+    fn history_folds_novelty_before_the_range_start() {
+        let overlay = vec![ev("b", 5, false), ev("b", 6, true), ev("b", 7, true)];
+        let out = transition_grade_events(Vec::new(), overlay, 6, ALL_INDEXED);
+        assert_eq!(ops(&out), vec![row("b", 6, true)]);
+    }
 }
