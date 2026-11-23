@@ -389,18 +389,21 @@ pub async fn apply_policy_filter(
     // path, so a cross-ledger `f:policySource` fails closed here (the
     // resolver rejects `f:ledger`) rather than silently falling back to the
     // default graph.
-    let policy_graphs =
+    let (policy_graphs, identity_graphs) =
         crate::policy_view::resolve_policy_graphs_from_config(snapshot, overlay, to_t)
             .await
             .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;
 
-    let policy_ctx = policy_builder::build_policy_context_from_opts(
+    let policy_ctx = policy_builder::build_policy_context_with_sources(
         snapshot,
         overlay,
         None,
         to_t,
         &opts,
         &policy_graphs,
+        &identity_graphs,
+        None,
+        None,
     )
     .await
     .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;

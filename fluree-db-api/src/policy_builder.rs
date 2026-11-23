@@ -55,30 +55,55 @@ pub fn resolve_policy_source_g_ids(
     snapshot: &LedgerSnapshot,
     to_t: i64,
 ) -> Result<Vec<fluree_db_core::GraphId>> {
+    resolve_local_source_g_ids(source, snapshot, to_t, "policySource")
+}
+
+/// Identity binding is opt-in and local to this ledger; absent config preserves
+/// the caller's existing scope. It never changes policy assignment lookup.
+/// Like `f:policySource`, an explicit `f:identitySource` must name a graph that
+/// exists as of `to_t` and that no later drop took.
+pub(crate) fn resolve_identity_source_g_ids(
+    source: Option<&fluree_db_core::ledger_config::GraphSourceRef>,
+    snapshot: &LedgerSnapshot,
+    to_t: i64,
+    fallback: &[fluree_db_core::GraphId],
+) -> Result<Vec<fluree_db_core::GraphId>> {
+    match source {
+        Some(source) => resolve_local_source_g_ids(Some(source), snapshot, to_t, "identitySource"),
+        None => Ok(fallback.to_vec()),
+    }
+}
+
+fn resolve_local_source_g_ids(
+    source: Option<&fluree_db_core::ledger_config::GraphSourceRef>,
+    snapshot: &LedgerSnapshot,
+    to_t: i64,
+    field: &str,
+) -> Result<Vec<fluree_db_core::GraphId>> {
     let source = match source {
         None => return Ok(DEFAULT_POLICY_GRAPHS.to_vec()),
         Some(s) => s,
     };
 
     if source.ledger.is_some() {
-        return Err(ApiError::query(
-            "f:policySource with a cross-ledger f:ledger reference is not yet supported",
-        ));
+        return Err(ApiError::query(format!(
+            "f:{field} with a cross-ledger f:ledger reference is not yet supported"
+        )));
     }
     if source.at_t.is_some() {
-        return Err(ApiError::query(
-            "f:policySource with f:atT (temporal pinning) is not yet supported",
-        ));
+        return Err(ApiError::query(format!(
+            "f:{field} with f:atT (temporal pinning) is not yet supported"
+        )));
     }
     if source.trust_policy.is_some() {
-        return Err(ApiError::query(
-            "f:policySource with f:trustPolicy is not yet supported",
-        ));
+        return Err(ApiError::query(format!(
+            "f:{field} with f:trustPolicy is not yet supported"
+        )));
     }
     if source.rollback_guard.is_some() {
-        return Err(ApiError::query(
-            "f:policySource with f:rollbackGuard is not yet supported",
-        ));
+        return Err(ApiError::query(format!(
+            "f:{field} with f:rollbackGuard is not yet supported"
+        )));
     }
 
     let g_id = match source.graph_selector.as_deref() {
@@ -86,14 +111,14 @@ pub fn resolve_policy_source_g_ids(
         Some(iri) => snapshot
             .graph_registry
             .existing_graph_id(iri, to_t)
-            .map_err(|floor| dropped_source("f:policySource", iri, floor, to_t))?,
+            .map_err(|floor| dropped_source(&format!("f:{field}"), iri, floor, to_t))?,
         None => Some(0u16),
     };
 
     match g_id {
         Some(id) => Ok(vec![id]),
         None => Err(ApiError::query(format!(
-            "f:policySource graph '{}' not found in this ledger's graph registry",
+            "f:{field} graph '{}' not found in this ledger's graph registry",
             source.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
     }
@@ -166,12 +191,13 @@ pub async fn build_policy_context_from_opts(
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
 ) -> Result<PolicyContext> {
-    build_policy_context_from_opts_inner(
+    build_policy_context_with_sources(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         opts,
+        policy_graphs,
         policy_graphs,
         None,
         None,
@@ -216,12 +242,13 @@ pub async fn build_policy_context_from_opts_with_schema(
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
-    build_policy_context_from_opts_inner(
+    build_policy_context_with_sources(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         opts,
+        policy_graphs,
         policy_graphs,
         None,
         cross_ledger_schema,
@@ -240,12 +267,13 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
     cross_ledger_restrictions: Vec<PolicyRestriction>,
     cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
-    build_policy_context_from_opts_inner(
+    build_policy_context_with_sources(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         opts,
+        policy_graphs,
         policy_graphs,
         Some(cross_ledger_restrictions),
         cross_ledger_schema,
@@ -254,13 +282,14 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_policy_context_from_opts_inner(
+pub(crate) async fn build_policy_context_with_sources(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     novelty_for_stats: Option<&Novelty>,
     to_t: i64,
     opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
+    identity_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
     cross_ledger_schema: Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 ) -> Result<PolicyContext> {
@@ -275,6 +304,11 @@ async fn build_policy_context_from_opts_inner(
     // `policy_graphs`; an inline policy alone reads none of them.
     if opts.identity.is_some() || (!has_cross_ledger_source && opts.policy_class.is_some()) {
         refuse_dropped_policy_graphs(snapshot, policy_graphs, to_t)?;
+    }
+    // A configured `f:identitySource` binds `?$identity` from its own graphs:
+    // refuse them on the same terms when a later drop took what they held.
+    if opts.identity.is_some() && identity_graphs != policy_graphs {
+        refuse_dropped_policy_graphs(snapshot, identity_graphs, to_t)?;
     }
 
     struct PolicyStatsLookup<'a> {
@@ -338,9 +372,14 @@ async fn build_policy_context_from_opts_inner(
         // `PolicyRestriction` carries strings + hash sets) from paying a
         // per-request copy.
         let identity_sid = if let Some(identity_iri) = &opts.identity {
-            let resolved =
-                resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
-                    .await?;
+            let resolved = resolve_identity_binding_sid(
+                snapshot,
+                overlay,
+                to_t,
+                identity_iri,
+                identity_graphs,
+            )
+            .await?;
             if let Some(sid) = &resolved {
                 policy_values.insert("?$identity".to_string(), sid.clone());
             }
@@ -378,7 +417,7 @@ async fn build_policy_context_from_opts_inner(
         // and forward them alongside the authenticated identity depend on
         // the classes being honored.
         let identity_sid =
-            resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
+            resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, identity_graphs)
                 .await?;
         if let Some(sid) = &identity_sid {
             policy_values.insert("?$identity".to_string(), sid.clone());
@@ -666,8 +705,8 @@ async fn resolve_identity_binding_sid(
 ///
 /// Shared by identity binding under cross-ledger policy
 /// ([`resolve_identity_binding_sid`]) and same-ledger identity-mode's
-/// found-no-policies check ([`load_policies_by_identity`]) so the two agree on
-/// what "the identity exists" means (same index, same graph set).
+/// found-no-policies check ([`load_policies_by_identity`]). Callers supply the
+/// graph scope: configured identity binding may differ from assignment lookup.
 async fn subject_exists_in_graphs(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -1792,6 +1831,53 @@ mod tests {
     use super::*;
     use fluree_db_core::{Flake, GraphId, OverlayProvider};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn identity_source_rejects_unsupported_graph_refs() {
+        use fluree_db_core::ledger_config::{
+            GraphSourceRef, RollbackGuard, TrustMode, TrustPolicy,
+        };
+        let snapshot = LedgerSnapshot::genesis("identity-source:main");
+        let local = GraphSourceRef {
+            ledger: None,
+            graph_selector: Some(config_iris::DEFAULT_GRAPH.into()),
+            at_t: None,
+            trust_policy: None,
+            rollback_guard: None,
+        };
+        assert_eq!(
+            resolve_identity_source_g_ids(None, &snapshot, 0, &[2]).unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_identity_source_g_ids(Some(&local), &snapshot, 0, &[2]).unwrap(),
+            vec![0]
+        );
+        for source in [
+            GraphSourceRef {
+                ledger: Some("other:main".into()),
+                ..local.clone()
+            },
+            GraphSourceRef {
+                at_t: Some(1),
+                ..local.clone()
+            },
+            GraphSourceRef {
+                trust_policy: Some(TrustPolicy {
+                    trust_mode: TrustMode::Trusted,
+                }),
+                ..local.clone()
+            },
+            GraphSourceRef {
+                rollback_guard: Some(RollbackGuard { min_t: Some(1) }),
+                ..local.clone()
+            },
+        ] {
+            let error =
+                resolve_identity_source_g_ids(Some(&source), &snapshot, 0, &[0]).unwrap_err();
+            assert!(error.to_string().contains("identitySource"), "{error}");
+        }
+    }
 
     struct CountingOverlay {
         novelty: Novelty,

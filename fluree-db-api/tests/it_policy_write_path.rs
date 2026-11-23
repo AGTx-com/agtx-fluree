@@ -883,3 +883,247 @@ async fn default_only_configuration_governs_embedded_reads_and_writes() {
         assert_eq!(result.is_ok(), allowed, "opts: {opts}, result: {result:?}");
     }
 }
+
+/// A named policy source selects rules, not the storage location of the
+/// requesting identity. Binding an identity must not load its local grants.
+#[tokio::test]
+async fn named_policy_source_binds_identity_from_configured_graph() {
+    check_identity_source(Some("urn:provisioning"), "urn:core", false).await;
+}
+
+#[tokio::test]
+async fn unset_identity_source_preserves_policy_graph_scope() {
+    check_identity_source(None, "urn:core", false).await;
+}
+
+#[tokio::test]
+async fn identity_source_can_explicitly_select_default_graph() {
+    check_identity_source(
+        Some(fluree_vocab::config_iris::DEFAULT_GRAPH),
+        "urn:core",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unset_identity_source_preserves_explicit_config_graph_scope() {
+    check_identity_source(
+        None,
+        "urn:fluree:policy/external-identity:main#config",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_identity_source_fails_closed() {
+    check_identity_source(Some("urn:missing-graph"), "urn:core", false).await;
+}
+
+#[tokio::test]
+async fn cross_ledger_policies_use_configured_local_identity_source() {
+    check_identity_source(Some("urn:provisioning"), "urn:core", true).await;
+}
+
+async fn check_identity_source(source: Option<&str>, policy_graph: &str, cross_ledger: bool) {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "policy/identity-model:main";
+    if cross_ledger {
+        fluree
+            .stage_owned(genesis_ledger(&fluree, model_id))
+            .upsert_turtle(
+                r#"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/ns/> .
+            GRAPH <urn:core> {
+                ex:allow a ex:CorePolicy ; f:action f:view, f:modify ; f:onProperty ex:name ;
+                    f:query "ASK { FILTER($identity = <http://example.org/ns/member>) }"^^f:sparql .
+            }
+        "#,
+            )
+            .execute()
+            .await
+            .expect("seed remote policies without identity records");
+    }
+    let model_config = if cross_ledger {
+        format!("<urn:cfg:source> <https://ns.flur.ee/db#ledger> <{model_id}> .")
+    } else {
+        String::new()
+    };
+    let ledger_id = "policy/external-identity:main";
+    let config_iri = config_graph_iri(ledger_id);
+    let identity_config = source
+        .map(|graph| {
+            format!(
+                r#"
+        <urn:cfg:policy> f:identitySource <urn:cfg:identity-ref> .
+        <urn:cfg:identity-ref> a f:GraphRef ; f:graphSource <urn:cfg:identity-source> .
+        <urn:cfg:identity-source> f:graphSelector <{graph}> .
+    "#
+            )
+        })
+        .unwrap_or_default();
+    let mut ledger = fluree
+        .stage_owned(genesis_ledger(&fluree, ledger_id))
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            ex:defaultUser ex:name "Default user" .
+            GRAPH <urn:provisioning> {{
+                ex:member ex:name "Member" ; f:policyClass ex:UntrustedPolicy .
+                ex:denied ex:name "Denied" .
+                ex:objectOnly ex:reference ex:missing .
+                ex:untrusted a ex:UntrustedPolicy ; f:action f:view, f:modify ; f:allow true .
+            }}
+            GRAPH <{policy_graph}> {{
+                ex:coreUser ex:name "Core user" .
+                ex:allow a ex:CorePolicy ; f:action f:view, f:modify ;
+                    f:onProperty ex:name ;
+                    f:query "PREFIX ex: <http://example.org/ns/> ASK {{ FILTER($identity IN (ex:member, ex:defaultUser, ex:missing, ex:systemOnly, ex:coreUser)) }}"^^f:sparql .
+            }}
+            GRAPH <{config_iri}> {{
+                ex:systemOnly ex:name "Not a data identity" .
+                <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false ;
+                    f:policyClass ex:CorePolicy ; f:overrideControl f:OverrideNone ;
+                    f:policySource <urn:cfg:ref> .
+                <urn:cfg:ref> a f:GraphRef ; f:graphSource <urn:cfg:source> .
+                <urn:cfg:source> f:graphSelector <{policy_graph}> .
+                {identity_config}
+                {model_config}
+            }}
+            "#
+        ))
+        .execute()
+        .await
+        .expect("seed separate core and identity graphs")
+        .ledger;
+
+    if source == Some("urn:missing-graph") {
+        let error = build_transact_policy_context(
+            &fluree,
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &GovernanceOptions::default(),
+        )
+        .await
+        .expect_err("unknown identity source must fail closed even without identity opts");
+        assert!(error.to_string().contains("identitySource"), "{error}");
+        let error = fluree.query_from().jsonld(&json!({
+            "from": ledger_id, "select": ["?name"],
+            "where": {"@id": "http://example.org/ns/defaultUser", "http://example.org/ns/name": "?name"}
+        })).execute_formatted().await.expect_err("invalid identity source must also fail reads closed");
+        assert!(error.to_string().contains("identitySource"), "{error}");
+        return;
+    }
+    let selected = source.unwrap_or(policy_graph);
+    for (identity, allowed) in [
+        ("member", selected == "urn:provisioning"),
+        (
+            "defaultUser",
+            selected == fluree_vocab::config_iris::DEFAULT_GRAPH,
+        ),
+        ("coreUser", selected == policy_graph),
+        ("denied", false),
+        ("missing", false),
+        ("systemOnly", selected == config_iri),
+    ] {
+        let opts = GovernanceOptions {
+            identity: Some(format!("http://example.org/ns/{identity}")),
+            ..Default::default()
+        };
+        let ctx = build_transact_policy_context(
+            &fluree,
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &opts,
+        )
+        .await
+        .expect("build policy context")
+        .expect("configured policy must be enforced");
+
+        // The member's assignment to an allow-all policy in provisioning must
+        // not expand the rules selected from the core graph.
+        let ungranted = fluree
+            .insert_turtle_with_opts(
+                ledger.clone(),
+                "<urn:new> <http://example.org/ns/secret> \"Secret\" .",
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &test_index_config(),
+                Some(&ctx),
+            )
+            .await;
+        assert!(
+            matches!(
+                ungranted,
+                Err(fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::PolicyViolation(_)
+                ))
+            ),
+            "unselected grants must not authorize {identity}: {ungranted:?}"
+        );
+
+        // Use a new subject so every case exercises policy enforcement on a delta.
+        let result = fluree
+            .insert_turtle_with_opts(
+                ledger.clone(),
+                &format!(r#"<urn:new:{identity}> <http://example.org/ns/name> "New" ."#),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &test_index_config(),
+                Some(&ctx),
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "identity {identity}: {:?}",
+            result.as_ref().err()
+        );
+
+        if !allowed {
+            assert!(
+                matches!(
+                    result,
+                    Err(fluree_db_api::ApiError::Transact(
+                        fluree_db_transact::TransactError::PolicyViolation(_)
+                    ))
+                ),
+                "expected policy denial: {result:?}"
+            );
+        }
+        if let Ok(committed) = result {
+            ledger = committed.ledger;
+        }
+
+        let rows = fluree
+            .query_from()
+            .jsonld(&json!({
+                "from": ledger_id,
+                "select": ["?name"],
+                "where": {"@id": "http://example.org/ns/defaultUser", "http://example.org/ns/name": "?name"},
+                "opts": {"identity": format!("http://example.org/ns/{identity}")}
+            }))
+            .execute_formatted()
+            .await
+            .expect("query with named policy source");
+        assert_eq!(
+            rows,
+            if allowed {
+                json!([["Default user"]])
+            } else {
+                json!([])
+            },
+            "identity {identity}"
+        );
+    }
+}

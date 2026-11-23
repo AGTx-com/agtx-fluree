@@ -151,17 +151,20 @@ pub async fn wrap_policy_view<'a>(
     ledger: &'a LedgerState,
     opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>> {
-    let policy_graphs =
+    let (policy_graphs, identity_graphs) =
         resolve_policy_graphs_from_config(&ledger.snapshot, ledger.novelty.as_ref(), ledger.t())
             .await?;
 
-    let policy_ctx = policy_builder::build_policy_context_from_opts(
+    let policy_ctx = policy_builder::build_policy_context_with_sources(
         &ledger.snapshot,
         ledger.novelty.as_ref(),
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         opts,
         &policy_graphs,
+        &identity_graphs,
+        None,
+        None,
     )
     .await?;
 
@@ -178,18 +181,21 @@ pub async fn wrap_policy_view_historical<'a>(
     view: &'a HistoricalLedgerView,
     opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>> {
-    let policy_graphs =
+    let (policy_graphs, identity_graphs) =
         resolve_policy_graphs_from_config(&view.snapshot, view, view.to_t()).await?;
 
     // Extract novelty from the view for stats computation (needed for f:onClass)
     let novelty_for_stats: Option<&Novelty> = view.overlay().map(std::convert::AsRef::as_ref);
-    let policy_ctx = policy_builder::build_policy_context_from_opts(
+    let policy_ctx = policy_builder::build_policy_context_with_sources(
         &view.snapshot,
         view,
         novelty_for_stats,
         view.to_t(),
         opts,
         &policy_graphs,
+        &identity_graphs,
+        None,
+        None,
     )
     .await?;
 
@@ -225,15 +231,19 @@ pub async fn build_policy_context(
     to_t: i64,
     opts: &GovernanceOptions,
 ) -> Result<PolicyContext> {
-    let policy_graphs = resolve_policy_graphs_from_config(snapshot, overlay, to_t).await?;
+    let (policy_graphs, identity_graphs) =
+        resolve_policy_graphs_from_config(snapshot, overlay, to_t).await?;
 
-    policy_builder::build_policy_context_from_opts(
+    policy_builder::build_policy_context_with_sources(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         opts,
         &policy_graphs,
+        &identity_graphs,
+        None,
+        None,
     )
     .await
 }
@@ -578,6 +588,11 @@ async fn build_transact_graph_policy_context(
         None => None,
     };
 
+    let identity_source = resolved
+        .as_ref()
+        .and_then(|r| r.policy.as_ref())
+        .and_then(|p| p.identity_source.as_ref());
+
     if let Some(source) = source.filter(|s| s.ledger.is_some()) {
         let config_policy_class = resolved
             .as_ref()
@@ -592,18 +607,17 @@ async fn build_transact_graph_policy_context(
             false,
         )
         .await?;
-        let policy_ctx = policy_builder::build_policy_context_from_opts_with_cross_ledger(
+        let identity_graphs =
+            policy_builder::resolve_identity_source_g_ids(identity_source, snapshot, to_t, &[0])?;
+        let policy_ctx = policy_builder::build_policy_context_with_sources(
             snapshot,
             overlay,
             novelty_for_stats,
             to_t,
             &effective_opts,
-            // Graph set for the identity subject-existence probe that binds
-            // ?$identity (rule selection is the cross-ledger wire, not these
-            // graphs). Under cross-ledger policy, identity records must live
-            // in D's default graph — the probe searches [0] only.
             &[0],
-            restrictions,
+            &identity_graphs,
+            Some(restrictions),
             cross_ledger_schema,
         )
         .await?;
@@ -616,18 +630,26 @@ async fn build_transact_graph_policy_context(
     // invalid config `f:policySource` silently run as root on writes while reads
     // fail closed — the read/write divergence this path exists to eliminate.
     let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot, to_t)?;
+    let identity_graphs = policy_builder::resolve_identity_source_g_ids(
+        identity_source,
+        snapshot,
+        to_t,
+        &policy_graphs,
+    )?;
 
     if !effective_opts.has_any_policy_inputs() {
         return Ok(None);
     }
 
-    let policy_ctx = policy_builder::build_policy_context_from_opts_with_schema(
+    let policy_ctx = policy_builder::build_policy_context_with_sources(
         snapshot,
         overlay,
         novelty_for_stats,
         to_t,
         &effective_opts,
         &policy_graphs,
+        &identity_graphs,
+        None,
         cross_ledger_schema,
     )
     .await?;
@@ -736,25 +758,26 @@ pub async fn wrap_identity_policy_view<'a>(
     wrap_policy_view(ledger, &opts).await
 }
 
-/// Read the config graph and resolve `f:policySource` to graph IDs.
+/// Read config once and resolve policy-rule and identity-binding graph IDs.
 ///
 /// Fails closed: if a config exists but cannot be loaded, or if a configured
 /// `f:policySource` cannot be resolved (unknown graph selector, unsupported
 /// cross-ledger / temporal / trust fields), the error is propagated instead
 /// of silently falling back to the default graph.
 ///
-/// Returns `[0]` (default graph) only when no config has been written to the
+/// Returns `([0], [0])` (default graph) when no config has been written to the
 /// ledger yet (`Ok(None)`) or no `f:policySource` is configured — in both
-/// cases the caller's policy rules, if any, live in the default graph.
+/// cases the caller's policy rules, if any, live in the default graph. An explicit
+/// identitySource replaces only the second graph set; otherwise it follows the first.
 pub(crate) async fn resolve_policy_graphs_from_config(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
-) -> Result<Vec<fluree_db_core::GraphId>> {
+) -> Result<(Vec<fluree_db_core::GraphId>, Vec<fluree_db_core::GraphId>)> {
     let config = match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await
     {
         Ok(Some(c)) => c,
-        Ok(None) => return Ok(vec![0]),
+        Ok(None) => return Ok((vec![0], vec![0])),
         Err(e) => return Err(crate::error::ApiError::ConfigUnavailable(e.to_string())),
     };
     let resolved = crate::config_resolver::resolve_effective_config(&config, None);
@@ -762,5 +785,16 @@ pub(crate) async fn resolve_policy_graphs_from_config(
         .policy
         .as_ref()
         .and_then(|p| p.policy_source.as_ref());
-    policy_builder::resolve_policy_source_g_ids(source, snapshot, to_t)
+    let policy_graphs = policy_builder::resolve_policy_source_g_ids(source, snapshot, to_t)?;
+    let identity_source = resolved
+        .policy
+        .as_ref()
+        .and_then(|p| p.identity_source.as_ref());
+    let identity_graphs = policy_builder::resolve_identity_source_g_ids(
+        identity_source,
+        snapshot,
+        to_t,
+        &policy_graphs,
+    )?;
+    Ok((policy_graphs, identity_graphs))
 }

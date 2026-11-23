@@ -39,6 +39,7 @@ Controls default policy enforcement behavior.
 |-------|------|---------|-------------|
 | `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Applies to requests with and without policy inputs |
 | `f:policySource` | `f:GraphRef` | (none) | Graph containing policy rules (`f:Allow`, `f:Modify`, etc.) |
+| `f:identitySource` | `f:GraphRef` | (none) | Local graph for identity binding when policy classes select rules; no effect on identity-mode policy assignments |
 | `f:policyClass` | IRI or list | (none) | Default policy classes to apply |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating (see [Override control](override-control.md)) |
 
@@ -72,7 +73,20 @@ GRAPH <urn:fluree:mydb:main#config> {
 
 ### Example: policies in a named graph
 
-Storing policy rules in a dedicated named graph keeps them out of the default data graph. The identity's `f:policyClass` triples must also be in the policy graph.
+Storing policy rules in a dedicated named graph keeps them out of the default data graph. The identity's `f:policyClass` assignments are still looked up in the policy graph when identity-mode selects the rules.
+
+When a policy class is selected by the request or effective configuration, `f:identitySource` can separately select the local graph used to bind `?$identity`. The same setting applies to identity binding under cross-ledger policies, but always refers to the data ledger. It does not import policy assignments or rules from the identity graph. When unset, existing behavior is preserved: the policy graph is searched for same-ledger policies, and the data ledger's default graph for cross-ledger policies.
+
+`f:identitySource` uses `f:GraphRef`, is not request-overridable, and supports one local graph (including `f:defaultGraph`). Unknown graphs and cross-ledger, temporal, trust, or rollback options fail closed. The graph must exist before enabling the setting. This is a fork extension, not an upstream Fluree setting.
+
+```turtle
+@prefix f: <https://ns.flur.ee/db#> .
+
+<urn:cfg:policy> f:identitySource [
+    a f:GraphRef ;
+    f:graphSource [ f:graphSelector <urn:provisioning> ]
+] .
+```
 
 ```trig
 @prefix f: <https://ns.flur.ee/db#> .
