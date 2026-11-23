@@ -564,6 +564,9 @@ fn resolve_flake_graph_id(flake: &Flake, reverse_graph: &HashMap<Sid, GraphId>) 
 /// reducing the number of function parameters and making call sites cleaner.
 #[derive(Default, Clone)]
 pub struct StageOptions<'a> {
+    /// Immutable trusted host configuration; never accepted in request options.
+    pub transaction_metadata_bindings: Option<&'a crate::TransactionMetadataBindings>,
+
     /// Index configuration for backpressure checks.
     /// If provided, staging will fail with `NoveltyAtMax` when novelty is at capacity.
     pub index_config: Option<&'a IndexConfig>,
@@ -697,6 +700,55 @@ pub async fn stage(
     Ok((view, ns_registry))
 }
 
+/// Bind singleton IRI provenance from the parsed transaction. Never select an arbitrary value
+/// from multi-valued metadata. Supplied bindings must be one IRI; absence remains optional.
+fn transaction_policy(
+    policy: &PolicyContext,
+    txn: &Txn,
+    registry: &NamespaceRegistry,
+    bindings: Option<&crate::TransactionMetadataBindings>,
+) -> Result<PolicyContext> {
+    let mut values = policy.wrapper.policy_values().clone();
+    values.retain(|name, _| !crate::metadata_bindings::reserved_transaction_variable(name));
+    for (variable, predicate) in bindings.into_iter().flat_map(|bindings| bindings.iter()) {
+        let matching: Vec<_> = txn
+            .txn_meta
+            .iter()
+            .filter(|entry| {
+                registry
+                    .get_prefix(entry.predicate_ns)
+                    .is_some_and(|prefix| format!("{prefix}{}", entry.predicate_name) == *predicate)
+            })
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        let [entry] = matching.as_slice() else {
+            return Err(TransactError::Parse(format!(
+                "Configured transaction metadata {predicate} must contain exactly one IRI"
+            )));
+        };
+        let fluree_db_core::TxnMetaValue::Ref { ns, name } = &entry.value else {
+            return Err(TransactError::Parse(format!(
+                "Configured transaction metadata {predicate} must contain exactly one IRI"
+            )));
+        };
+        values.insert(format!("?{variable}"), Sid::new(*ns, name.as_str()));
+    }
+    let wrapper = fluree_db_policy::PolicyWrapper::new(
+        policy.wrapper.view().clone(),
+        policy.wrapper.modify().clone(),
+        policy.wrapper.is_root(),
+        policy.wrapper.default_allow(),
+        values,
+    );
+    Ok(PolicyContext::new(wrapper, Some(policy.identity.clone())).with_graph_overrides(
+        policy.graph_overrides().map(|(graph, context)| {
+            Ok((graph.clone(), transaction_policy(context, txn, registry, bindings)?))
+        }).collect::<Result<_>>()?
+    ))
+}
+
 /// [`stage`], also returning the named graphs the transaction writes, keyed
 /// by ledger graph id. Graphs not yet registered carry the id the commit will
 /// give them. The map covers the `Txn`'s `write_graphs`, every graph a
@@ -713,6 +765,22 @@ pub async fn stage_with_graph_delta(
     NamespaceRegistry,
     rustc_hash::FxHashMap<u16, String>,
 )> {
+    // Transaction provenance is part of the authenticated/signed body, not a caller policy override.
+    // Reserved bindings always replace request policy-values, including when a field is absent; malformed supplied fields are rejected.
+    // Policies must still authorize the authenticated writer: these are its claims, not human signatures.
+    let transaction_policy = options.policy_ctx.map(|policy| {
+        transaction_policy(
+            policy,
+            &txn,
+            &ns_registry,
+            options.transaction_metadata_bindings,
+        )
+    }).transpose()?;
+    let options = StageOptions {
+        policy_ctx: transaction_policy.as_ref(),
+        ..options
+    };
+
     // Staging reads the ledger's index (WHERE, upsert, graph management), so
     // refuse before the first read if this process has not loaded it.
     crate::check_index_loaded(&ledger.snapshot)?;
@@ -2564,6 +2632,20 @@ pub async fn stage_flakes(
     flakes: Vec<Flake>,
     options: StageOptions<'_>,
 ) -> Result<StagedLedger> {
+    // Pre-built flakes carry no authenticated transaction metadata. Never accept reserved context
+    // supplied through policy-values on bulk/import/push routes.
+    let transaction_policy = options.policy_ctx.map(|policy| {
+        transaction_policy(
+            policy,
+            &Txn::insert(),
+            &NamespaceRegistry::new(),
+            options.transaction_metadata_bindings,
+        )
+    }).transpose()?;
+    let options = StageOptions {
+        policy_ctx: transaction_policy.as_ref(),
+        ..options
+    };
     let span = tracing::debug_span!("stage_flakes", flake_count = flakes.len());
     async move {
         // Policy and SHACL read the ledger's index; see `stage_with_graph_delta`.
@@ -4614,6 +4696,101 @@ mod tests {
     use fluree_db_core::{FlakeValue, LedgerSnapshot, MemoryStorage, Sid};
     use fluree_db_novelty::Novelty;
     use fluree_db_query::parse::{UnresolvedTerm, UnresolvedTriplePattern};
+
+    #[test]
+    fn transaction_provenance_overrides_supplied_values_and_rejects_malformed_bindings() {
+        use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
+        use fluree_db_policy::{PolicySet, PolicyWrapper};
+        let mut registry = NamespaceRegistry::new();
+        let ex = registry.get_or_allocate("urn:example:");
+        let actor = Sid::new(ex, "alice");
+        let writer = Sid::new(ex, "writer");
+        let mut supplied = HashMap::from([
+            ("?txnRemoved".into(), Sid::new(ex, "forged")),
+            ("?unrelated".into(), Sid::new(ex, "preserved")),
+        ]);
+        for variable in ["txnInitiator", "txnReviewer"] {
+            for prefix in ["", "?", "$", "?$"] {
+                supplied.insert(format!("{prefix}{variable}"), Sid::new(ex, "mallory"));
+            }
+        }
+        let policy = PolicyContext::new(
+            PolicyWrapper::new(
+                PolicySet::default(),
+                PolicySet::default(),
+                false,
+                false,
+                supplied,
+            ),
+            Some(writer.clone()),
+        );
+        let policy = policy.clone().with_graph_overrides(HashMap::from([
+            ("urn:example:graph".into(), policy),
+        ]));
+        let bindings = crate::TransactionMetadataBindings::new(std::collections::BTreeMap::from([
+            ("txnInitiator".into(), "urn:example:metadata:actor".into()),
+            ("txnReviewer".into(), "urn:example:metadata:reviewer".into()),
+        ]))
+        .unwrap();
+        for (namespace, name, variable, other) in [
+            (
+                "urn:example:metadata:",
+                "actor",
+                "?txnInitiator",
+                "?txnReviewer",
+            ),
+            (
+                "urn:example:metadata:",
+                "reviewer",
+                "?txnReviewer",
+                "?txnInitiator",
+            ),
+        ] {
+            let ns = registry.get_or_allocate(namespace);
+            let mut txn = Txn::insert();
+            let entry = TxnMetaEntry::new(
+                ns,
+                name,
+                TxnMetaValue::Ref {
+                    ns: ex,
+                    name: "alice".into(),
+                },
+            );
+            txn.txn_meta.push(entry.clone());
+            let scoped = transaction_policy(&policy, &txn, &registry, Some(&bindings)).unwrap();
+            assert_eq!(scoped.identity, writer);
+            assert_eq!(scoped.wrapper.policy_values().get(variable), Some(&actor));
+            assert!(!scoped.wrapper.policy_values().contains_key(other));
+            assert_eq!(scoped.wrapper.policy_values().len(), 2);
+            assert!(scoped.has_graph_overrides());
+            let graph_policy = scoped.for_graph(Some("urn:example:graph"));
+            assert_eq!(graph_policy.identity, writer);
+            assert_eq!(graph_policy.wrapper.policy_values().get(variable), Some(&actor));
+            assert_eq!(graph_policy.wrapper.policy_values().len(), 2);
+            txn.txn_meta.push(entry);
+            assert!(transaction_policy(&policy, &txn, &registry, Some(&bindings)).is_err());
+            txn.txn_meta[0].value = TxnMetaValue::String("urn:example:alice".into());
+            txn.txn_meta.truncate(1);
+            assert!(transaction_policy(&policy, &txn, &registry, Some(&bindings)).is_err());
+        }
+        // The removed generic predicate is not an authorization alias for either owned term.
+        let mut legacy = Txn::insert();
+        let prov = registry.get_or_allocate("http://www.w3.org/ns/prov#");
+        legacy.txn_meta.push(TxnMetaEntry::new(
+            prov,
+            "wasAssociatedWith",
+            TxnMetaValue::Ref {
+                ns: ex,
+                name: "alice".into(),
+            },
+        ));
+        for txn in [Txn::insert(), legacy] {
+            let scoped = transaction_policy(&policy, &txn, &registry, Some(&bindings)).unwrap();
+            assert_eq!(scoped.wrapper.policy_values().len(), 1);
+            assert!(scoped.wrapper.policy_values().contains_key("?unrelated"));
+        }
+        assert_eq!(policy.wrapper.policy_values().len(), 10);
+    }
 
     /// Helper to create an UnresolvedPattern::Triple for WHERE clauses in tests
     fn where_triple(s: UnresolvedTerm, p: &str, o: UnresolvedTerm) -> UnresolvedPattern {

@@ -55,6 +55,7 @@ pub struct ProfileConfig {
 /// contain values the user wants to set.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ServerFileConfig {
+    pub transaction_metadata_bindings: Option<fluree_db_api::TransactionMetadataBindings>,
     pub listen_addr: Option<String>,
     pub storage_path: Option<String>,
     pub connection_config: Option<String>,
@@ -385,6 +386,11 @@ pub fn deep_merge(base: &mut ServerFileConfig, overlay: &ServerFileConfig) {
     let overlay_json = serde_json::to_value(overlay).expect("ServerFileConfig is serializable");
 
     merge_json_values(&mut base_json, &overlay_json);
+    // Authorization mappings are replaced as a unit, never inherited entry by entry.
+    if overlay.transaction_metadata_bindings.is_some() {
+        base_json["transaction_metadata_bindings"] =
+            overlay_json["transaction_metadata_bindings"].clone();
+    }
 
     *base = serde_json::from_value(base_json).expect("merged value is valid ServerFileConfig");
 }
@@ -1128,6 +1134,9 @@ fn merge_config_file(
     }
 
     apply_to_server_config(&server_section, config, matches);
+    config.transaction_metadata_bindings = server_section
+        .transaction_metadata_bindings
+        .unwrap_or_default();
 
     Ok(())
 }
@@ -1135,6 +1144,47 @@ fn merge_config_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_bindings_replace_profile_map_and_reject_intrinsics() {
+        let mut base: ServerFileConfig = toml::from_str(
+            r#"
+            [transaction_metadata_bindings]
+            txnActor = "urn:example:actor"
+            sampleTarget = "urn:example:subject"
+        "#,
+        )
+        .unwrap();
+        let overlay: ServerFileConfig = toml::from_str(
+            r#"
+            [transaction_metadata_bindings]
+            txnActor = "urn:example:replacement"
+        "#,
+        )
+        .unwrap();
+        deep_merge(&mut base, &overlay);
+        let entries: Vec<_> = base
+            .transaction_metadata_bindings
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "urn:example:replacement");
+        assert!(toml::from_str::<ServerFileConfig>(
+            r#"
+            [transaction_metadata_bindings]
+            txnMetadataGraph = "urn:example:forged"
+        "#
+        )
+        .is_err());
+        let empty: ServerFileConfig = toml::from_str("[transaction_metadata_bindings]").unwrap();
+        deep_merge(&mut base, &empty);
+        assert_eq!(
+            base.transaction_metadata_bindings.unwrap().iter().count(),
+            0
+        );
+    }
 
     #[test]
     fn policy_authorities_load_from_toml_and_cli_overrides_the_whole_list() {
