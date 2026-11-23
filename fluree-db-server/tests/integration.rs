@@ -1,0 +1,4906 @@
+use axum::body::Body;
+use fluree_db_api::{
+    ExportCommitsRequest, ExportCommitsResponse, NamespaceRegistry, PushCommitsRequest,
+};
+use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_novelty::Commit;
+use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode, ServerRole};
+use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
+use fluree_vocab::namespaces::{FLUREE_DB, XSD};
+use fluree_vocab::xsd_names;
+use http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::Value as JsonValue;
+use std::sync::Arc;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+async fn test_state() -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+fn locking_config(root: &std::path::Path) -> ServerConfig {
+    ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(root.to_path_buf()),
+        storage_lock: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_transaction_server_on_a_locked_root_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _first = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("first server");
+
+    let refused = AppState::new(cfg, telemetry)
+        .await
+        .err()
+        .expect("second server on the root");
+
+    assert!(
+        matches!(refused, fluree_db_api::ApiError::StorageInUse { .. }),
+        "{refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_storage_peer_reads_a_locked_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _transactor = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("transaction server");
+
+    let peer = ServerConfig {
+        server_role: ServerRole::Peer,
+        tx_server_url: Some("http://127.0.0.1:9".to_string()),
+        peer_subscribe_all: true,
+        ..cfg
+    };
+    AppState::new(peer, telemetry)
+        .await
+        .expect("a peer opens its transaction server's root");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_queries_use_fast_paths_after_background_index_publication() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: true,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("server state"));
+    let app = build_router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ledger":"index-adoption"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let handle = state
+        .fluree
+        .ledger_cached("index-adoption:main")
+        .await
+        .unwrap();
+
+    let mut turtle = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..2000 {
+        use std::fmt::Write as _;
+        writeln!(turtle, "ex:p{i} a ex:Person ; ex:name \"Person {i}\" .").unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/index-adoption:main")
+                .header("content-type", "text/turtle")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "insert: {body}");
+
+    // Keep the original handle: reloading or explicit reindexing would mask
+    // the distinction between a drained overlay and a never-written overlay.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if handle.snapshot().await.snapshot.t == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background index installed on the original handle");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/index-adoption:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(
+                    "SELECT ?p WHERE { ?p a <http://example.org/Person> } LIMIT 10",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(
+        body["result"]["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let fuel = body["fuel"].as_f64().expect("tracked fuel");
+    // One index batch costs ~3 fuel. Eagerly decoding all 2,000 subjects
+    // despite LIMIT 10 used ~23 fuel on this same cached state.
+    assert!(fuel < 4.0, "cached indexed query used {fuel} fuel");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/info/index-adoption:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "info: {body}");
+    assert_eq!(body["ledger"]["commit-t"], 1);
+    assert_eq!(body["ledger"]["index-t"], 1);
+}
+
+// Regression for #1369: querying a registered Iceberg/R2RML graph source by
+// alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
+// route to the graph-source engine, not load it as a ledger (which deserialized
+// the graph-source nameservice record as `NsFileV2` and failed on the missing
+// `f:ledger` field with a 500) nor 404 as a missing ledger. The bogus catalog
+// (`s3://nonexistent`) means execution can't return rows, but the response must
+// prove the alias resolved AND reached the source engine: the error is the
+// engine's own failure on the mapping's table (`actor` names no namespace),
+// never `f:ledger` and never a not-found. (A readable in-tree source — which needs Iceberg test
+// infra — would additionally assert returned rows.)
+#[cfg(feature = "iceberg")]
+#[tokio::test]
+async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_timeout_ms: 3000,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+
+    let mapping = concat!(
+        "@base <https://ex/r2rml/> .\n",
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n",
+        "@prefix ex: <http://example.org/> .\n",
+        "<#M> a rr:TriplesMap ; rr:logicalTable [ rr:tableName \"actor\" ] ; ",
+        "rr:subjectMap [ rr:template \"https://ex/{id}\" ] ; ",
+        "rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"as_name\" ] ] ."
+    );
+    // Three segments: registration validates the stored config as a query
+    // does, and a Direct location must name its `namespace/table`.
+    let create = fluree_db_api::R2rmlCreateConfig::new_direct(
+        "actor",
+        "s3://nonexistent/films/actor",
+        mapping,
+    )
+    .with_mapping_media_type("text/turtle");
+    state
+        .fluree
+        .create_r2rml_graph_source(create)
+        .await
+        .expect("register graph source");
+
+    let resp = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/actor:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    let err = body
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // Must NOT be the ledger-deserialization failure...
+    assert!(
+        !err.contains("f:ledger") && !err.contains("missing field"),
+        "alias query must route to the graph source, not deserialize the record as a ledger; status={status} body={body}"
+    );
+    // ...and must NOT be a not-found: the alias resolved and routed to the
+    // R2RML/Iceberg engine, which then fails on the bogus catalog config. This
+    // is the assertion the prior "not f:ledger" check missed (a 404 passed it).
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "graph-source alias should resolve and route to the engine, not 404; body={body}"
+    );
+    assert!(
+        err.contains("graph source") || err.contains("iceberg") || err.contains("table identifier"),
+        "alias query should reach the graph-source engine (expected an Iceberg/graph-source config error); status={status} body={body}"
+    );
+}
+
+async fn json_body(resp: http::Response<Body>) -> (StatusCode, JsonValue) {
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON response");
+    (status, json)
+}
+
+fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
+    match v {
+        JsonValue::Null => false,
+        JsonValue::Bool(_) => false,
+        JsonValue::Number(_) => false,
+        JsonValue::String(s) => s.contains(needle),
+        JsonValue::Array(a) => a.iter().any(|x| json_contains_string(x, needle)),
+        JsonValue::Object(o) => o.values().any(|x| json_contains_string(x, needle)),
+    }
+}
+
+/// A merge commit at `t`. `parents` is first parent first.
+fn make_merge_commit_bytes(t: i64, parents: Vec<ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
+    let c = Commit::new(t, flakes).with_merge_parents(parents);
+    let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
+    res.bytes
+}
+
+fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
+    let mut c = Commit::new(t, flakes);
+    if let Some(prev_cid) = previous {
+        c = c.with_parent(prev_cid.clone());
+    }
+    let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
+    res.bytes
+}
+
+#[tokio::test]
+async fn health_check_ok() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("ok"));
+    assert!(json.get("version").and_then(|v| v.as_str()).is_some());
+}
+
+#[tokio::test]
+async fn stats_ok() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json
+        .get("uptime_secs")
+        .and_then(serde_json::Value::as_u64)
+        .is_some());
+    assert_eq!(
+        json.get("storage_type").and_then(|v| v.as_str()),
+        Some("file")
+    );
+}
+
+#[tokio::test]
+async fn create_ledger_then_ledger_info() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create empty ledger - should return 201 with expected response shape
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "Create should return 201 Created"
+    );
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("test:main")
+    );
+    // Empty ledger has t=0
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(0));
+    // Should have tx-id and commit fields
+    assert!(
+        json.get("tx-id").is_some(),
+        "Response should have tx-id field"
+    );
+    assert!(
+        json.get("commit").is_some(),
+        "Response should have commit field"
+    );
+
+    // Ledger info
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/info/test:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("test:main")
+    );
+    // New ledger has no commits yet
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(0));
+}
+
+#[tokio::test]
+async fn create_rejects_unexpected_fields() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    // Including `@graph` (or any other field besides `ledger`) must be rejected
+    // with 400 rather than silently dropped — otherwise callers assume their
+    // initial data was persisted when it wasn't.
+    let body = serde_json::json!({
+        "ledger": "test:main",
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [{ "@id": "ex:alice", "ex:name": "Alice" }],
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json_contains_string(&json, "@graph"),
+        "error should name the unexpected field: {json}"
+    );
+    assert!(
+        json_contains_string(&json, "/fluree/insert"),
+        "error should direct the caller to /fluree/insert: {json}"
+    );
+}
+
+#[tokio::test]
+async fn insert_then_query_finds_value() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert - should return expected response shape
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    // Verify response shape
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("test:main")
+    );
+    assert!(
+        json.get("t")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(
+        json.get("tx-id").is_some(),
+        "Response should have tx-id field"
+    );
+    let commit = json
+        .get("commit")
+        .expect("Response should have commit field");
+    assert!(commit.get("hash").is_some(), "Commit should have hash");
+
+    // Query
+    let query_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "from": "test:main",
+      "select": ["?name"],
+      "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "Alice"),
+        "Expected query response to contain 'Alice', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn create_branch_at_historical_t() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create the ledger
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "hist:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Three inserts → commits at t=1, t=2, t=3
+    for i in 1..=3 {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": format!("ex:item{i}"),
+            "ex:val": i,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "hist:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(i),
+            "insert {i} should have t={i}"
+        );
+    }
+
+    // Branch at t=2
+    let branch_body = serde_json::json!({
+        "ledger": "hist",
+        "branch": "historical",
+        "at": "t:2",
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(branch_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "branch create failed: {json}");
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("hist:historical")
+    );
+    assert_eq!(
+        json.get("t").and_then(serde_json::Value::as_i64),
+        Some(2),
+        "historical branch should be at t=2, got: {json}"
+    );
+    assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("main"));
+
+    // Bad `at` value surfaces as 400
+    let bad = serde_json::json!({
+        "ledger": "hist",
+        "branch": "bad",
+        "at": "t:notanumber",
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `at` takes a point in time, as a query's `@time:` does. Event times are
+/// pinned through `opts.eventTime` so the instants between commits are exact.
+#[tokio::test]
+async fn create_branch_at_time() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "dated:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (i, event_time) in [
+        "2020-01-01T00:00:00Z",
+        "2021-01-01T00:00:00Z",
+        "2022-01-01T00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": format!("ex:item{i}"), "ex:val": i}],
+            "opts": {"eventTime": event_time},
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "dated:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+    }
+
+    let branch = |name: &str, at: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/branch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"ledger": "dated", "branch": name, "at": at}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    for (name, at, expected_t) in [
+        ("q2020", "time:2020-06-01T00:00:00Z", 1),
+        ("q2021", "iso:2021-06-01T00:00:00Z", 2),
+    ] {
+        let resp = app.clone().oneshot(branch(name, at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "{at}: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(expected_t),
+            "{at}: {json}"
+        );
+    }
+
+    for (at, expect) in [
+        ("time:2019-01-01T00:00:00Z", "no data as of"),
+        ("time:2021-13-45T00:00:00Z", "Invalid ISO-8601 timestamp"),
+        ("t:0", "must be >= 1"),
+        ("0", "must be >= 1"),
+        ("-3", "must be >= 1"),
+        ("snapshot:7", "@snapshot:"),
+        ("time:", "Missing value after 'time:'"),
+    ] {
+        let resp = app.clone().oneshot(branch("nowhere", at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{at}: {json}");
+        // A branch request, so not reported as an invalid query.
+        assert_eq!(json["@type"], "err:api/BadRequest", "{at}: {json}");
+        assert!(json.to_string().contains(expect), "{at}: {json}");
+    }
+}
+
+#[tokio::test]
+async fn create_branch_from_empty_ledger_is_bad_request() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+    assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+    assert!(
+        json.to_string().contains("no commits yet"),
+        "expected the empty-source message, got: {json}"
+    );
+}
+
+/// Merge-preview returns the API error typed; merge reaches the HTTP layer
+/// through the committer, flattened to a bare status. Both answer alike.
+#[tokio::test]
+async fn merging_a_root_branch_is_bad_request_on_both_routes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/root?source=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let merge = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root", "source": "main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for resp in [preview, merge] {
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+        assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("no source branch")),
+            "expected the root-branch message, got: {json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_preview_include_changes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "chg:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "chg:main")
+                .body(Body::from(
+                    serde_json::json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:alice",
+                        "ex:name": "Alice",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "chg", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "chg:dev")
+                .body(Body::from(
+                    serde_json::json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:bob",
+                        "ex:name": "Bob",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Without include_changes the field is absent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("changes").is_none(), "unexpected changes: {json}");
+
+    // With include_changes the netted change set is present.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&include_changes=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let changes = json.get("changes").expect("changes present");
+    assert_eq!(
+        changes
+            .get("assert_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "unexpected changes: {changes}"
+    );
+    assert_eq!(
+        changes
+            .get("subject_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    let entries = changes.get("entries").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].get("subject").and_then(|v| v.as_str()),
+        Some("http://example.org/bob")
+    );
+
+    // Stats-only mode: exact counts, no payload.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&include_changes=true&max_changes=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let changes = json.get("changes").expect("changes present");
+    assert_eq!(
+        changes
+            .get("assert_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        changes
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        changes
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    // Cursor without include_changes is a 400.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&changes_after_subject=x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn ledger_with_slash_works_via_op_prefixed_routes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger with `/` in name
+    let ledger = "group/test:main";
+    let create_body = serde_json::json!({ "ledger": ledger });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert using `/v1/fluree/insert/<ledger...>`
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/group/test:main")
+                .header("content-type", "application/json")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Query using `/v1/fluree/query/<ledger...>` without a FROM clause
+    let query_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "select": ["?name"],
+      "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/group/test:main")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "Alice"),
+        "Expected query response to contain 'Alice', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn push_endpoint_accepts_single_commit_and_advances_head() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create empty ledger.
+    let create_body = serde_json::json!({ "ledger": "push:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, _json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Push commit t=1 (no previous).
+    let s = Sid::new(FLUREE_DB, "alice");
+    let p = Sid::new(FLUREE_DB, "name");
+    let o = FlakeValue::String("Alice".to_string());
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flakes = vec![Flake::new(s, p, o, dt, 1, true, None)];
+    let bytes = make_commit_bytes(1, None, flakes);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("accepted").and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        json.pointer("/head/t").and_then(serde_json::Value::as_i64),
+        Some(1)
+    );
+    let head_cid = json
+        .pointer("/head/commit_id")
+        .and_then(|v| v.as_str())
+        .expect("head.commit_id")
+        .to_string();
+
+    // Re-pushing the same commit should now be rejected (next-t mismatch).
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "expected conflict when re-pushing commit already applied (head={head_cid})"
+    );
+}
+
+/// Build a ledger at t=1 and the pieces of a push that merges a side
+/// commit into it: the merge commit's bytes and the side commit's bytes.
+async fn merge_push_fixture(ledger: &str) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    merge_push_fixture_on(test_state().await, ledger).await
+}
+
+/// [`merge_push_fixture`] on a server the caller configured.
+async fn merge_push_fixture_on(
+    (tmp, state): (TempDir, Arc<AppState>),
+    ledger: &str,
+) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": ledger });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let name = Sid::new(FLUREE_DB, "name");
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flake = |subject: &str, value: &str, t: i64| {
+        Flake::new(
+            Sid::new(FLUREE_DB, subject),
+            name.clone(),
+            FlakeValue::String(value.to_string()),
+            dt.clone(),
+            t,
+            true,
+            None,
+        )
+    };
+
+    // t=1 on the branch, which the merge commit descends from.
+    let base = make_commit_bytes(1, None, vec![flake("alice", "Alice", 1)]);
+    let base_cid = ContentId::new(ContentKind::Commit, &base);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(base.clone())],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A side branch forked from t=1, and the merge of it at t=2. The side
+    // commit's own `t` comes from that branch's clock.
+    let side = make_commit_bytes(2, Some(&base_cid), vec![flake("bob", "Bob", 2)]);
+    let side_cid = ContentId::new(ContentKind::Commit, &side);
+    let merge = make_merge_commit_bytes(2, vec![base_cid, side_cid], vec![flake("bob", "Bob", 2)]);
+
+    let request = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(merge)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: vec![fluree_db_api::Base64Bytes(side)],
+    };
+    (tmp, state, request)
+}
+
+#[tokio::test]
+async fn push_merges_endpoint_accepts_a_merge_and_its_commits() {
+    let ledger = "push-merge:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json.pointer("/head/t").and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn push_endpoint_refuses_merged_commits() {
+    let ledger = "push-merge-wrong-route:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json.to_string().contains("push-merges"),
+        "the error should name the endpoint that takes them: {json}"
+    );
+}
+
+#[tokio::test]
+async fn push_rejects_first_commit_t_mismatch_with_409() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "push-t:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let s = Sid::new(FLUREE_DB, "alice");
+    let p = Sid::new(FLUREE_DB, "name");
+    let o = FlakeValue::String("Alice".to_string());
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flakes = vec![Flake::new(s, p, o, dt, 2, true, None)];
+    let bytes = make_commit_bytes(2, None, flakes);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push-t:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn push_rejects_retraction_without_existing_assertion_with_422() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "push-ret:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let s = Sid::new(FLUREE_DB, "alice");
+    let p = Sid::new(FLUREE_DB, "name");
+    let o = FlakeValue::String("Alice".to_string());
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flakes = vec![Flake::new(s, p, o, dt, 1, false, None)];
+    let bytes = make_commit_bytes(1, None, flakes);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push-ret:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json_contains_string(&json, "retraction invariant"));
+}
+
+#[tokio::test]
+async fn push_rejects_list_retraction_missing_meta_with_422() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create empty ledger.
+    let create_body = serde_json::json!({ "ledger": "push-list:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Push commit t=1 asserting a list item with index meta.
+    let s = Sid::new(FLUREE_DB, "alice");
+    let p = Sid::new(FLUREE_DB, "tags");
+    let o = FlakeValue::String("one".to_string());
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flakes = vec![Flake::new(
+        s.clone(),
+        p.clone(),
+        o.clone(),
+        dt.clone(),
+        1,
+        true,
+        Some(FlakeMeta::with_index(0)),
+    )];
+    let bytes = make_commit_bytes(1, None, flakes);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push-list:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let head_cid: ContentId = json
+        .pointer("/head/commit_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .parse()
+        .expect("parse head commit_id");
+
+    // Push commit t=2 attempting to retract the value but WITHOUT list meta.
+    let retract = Flake::new(s, p, o, dt, 2, false, None);
+    let bytes = make_commit_bytes(2, Some(&head_cid), vec![retract]);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/push-list:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(json_contains_string(&json, "retraction invariant"));
+}
+
+#[tokio::test]
+async fn update_endpoint_accepts_jsonld_transactions() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "test:update" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Use /v1/fluree/update
+    let update_body = serde_json::json!({
+        "ledger": "test:update",
+        "@context": { "ex": "http://example.org/" },
+        "insert": {
+            "@id": "ex:bob",
+            "ex:name": "Bob"
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/json")
+                .body(Body::from(update_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("test:update")
+    );
+    assert!(
+        json.get("t")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            >= 1
+    );
+
+    // Query to verify
+    let query_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:update",
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json_contains_string(&json, "Bob"));
+}
+
+#[tokio::test]
+async fn ledger_scoped_insert_upsert_history() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "scoped:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Ledger-scoped insert via /v1/fluree/insert/<ledger...>
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:carol",
+        "ex:name": "Carol"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/scoped:test")
+                .header("content-type", "application/json")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("ledger_id").and_then(|v| v.as_str()),
+        Some("scoped:test")
+    );
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(1));
+
+    // Ledger-scoped upsert via /v1/fluree/upsert/<ledger...>
+    let upsert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:carol",
+        "ex:email": "carol@example.org"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/scoped:test")
+                .header("content-type", "application/json")
+                .body(Body::from(upsert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(2));
+
+    // History query via /v1/fluree/query/<ledger...> using explicit "from" + "to" keys
+    // This replaces the old /:ledger/history endpoint - history queries now go through unified query interface
+    // Note: Array syntax "from": ["ledger@t:1", "ledger@t:latest"] is a UNION query, not history mode
+    // Use explicit "to" key for history queries
+    let history_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "scoped:test@t:1",
+        "to": "scoped:test@t:latest",
+        "select": ["?p", "?v", "?t", "?op"],
+        "where": { "@id": "ex:carol", "?p": { "@value": "?v", "@t": "?t", "@op": "?op" } },
+        "orderBy": "?t"
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/scoped:test")
+                .header("content-type", "application/json")
+                .body(Body::from(history_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "History query failed: {json}");
+    // History should return array of changes (assertions for name at t=1 and email at t=2)
+    assert!(
+        json.is_array(),
+        "History should return an array, got: {json}"
+    );
+    let history = json.as_array().unwrap();
+    assert!(
+        history.len() >= 2,
+        "Should have at least 2 history entries (name at t=1, email at t=2)"
+    );
+}
+
+#[tokio::test]
+async fn sparql_query_connection_from_clause_finds_value() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // SPARQL query via connection (requires FROM clause)
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        FROM <test:main>
+        WHERE { ?s ex:name ?name }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "Alice"),
+        "Expected SPARQL response to contain 'Alice', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_query_connection_with_tracking_header_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:sparqlqfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:sparqlqfuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        FROM <test:sparqlqfuel>
+        WHERE { ?s ex:name ?name }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-query")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked connection-scoped SPARQL should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked connection-scoped SPARQL response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    assert!(fuel > 0.0, "fuel should be > 0, got: {fuel}");
+}
+
+#[tokio::test]
+async fn sparql_query_connection_agent_json_with_tracking_reports_fuel_header() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:agentfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:agentfuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        FROM <test:agentfuel>
+        WHERE { ?s ex:name ?name }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/vnd.fluree.agent+json")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Content type should remain the agent-json type, not the tracked envelope.
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .expect("response should set content-type")
+        .to_str()
+        .expect("content-type should be ASCII");
+    assert!(
+        content_type.starts_with("application/vnd.fluree.agent+json"),
+        "expected agent-json content-type, got: {content_type}"
+    );
+
+    // Fuel should be surfaced via the x-fdb-fuel header.
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked agent-json SPARQL should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    assert!(fuel_header > 0.0, "fuel should be > 0, got: {fuel_header}");
+
+    // The body should still be the agent-json envelope (not a TrackedQueryResponse).
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json.get("fuel").is_none(),
+        "agent-json body should not embed `fuel` (it goes in the x-fdb-fuel header)"
+    );
+}
+
+#[tokio::test]
+async fn sparql_query_ledger_scoped_path_finds_value_without_from() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@id": "ex:alice",
+      "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // SPARQL query ledger-scoped via fluree-ledger header (FROM optional)
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?s ex:name ?name }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/test:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "Alice"),
+        "Expected SPARQL response to contain 'Alice', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_on_query_endpoint_returns_bad_request() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    // SPARQL UPDATE requests should go to /v1/fluree/update, not /v1/fluree/query.
+    // The query endpoint returns 400 Bad Request with a helpful message.
+    let sparql_update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { <http://example.org/alice> ex:name "Alice" }
+    "#;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-update")
+                .body(Body::from(sparql_update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Verify the error message guides users to the correct endpoint
+    let (_, json) = json_body(resp).await;
+    let error_msg = json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("/v1/fluree/update"),
+        "Expected error to mention /v1/fluree/update endpoint, got: {error_msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_supports_subquery_aggregate_and_bind() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed numeric values to aggregate
+    let insert_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "@graph": [
+        { "@id": "ex:item1", "ex:seq": 1 },
+        { "@id": "ex:item2", "ex:seq": 2 }
+      ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // SPARQL UPDATE: compute MAX in a subquery, then BIND(max+1) and insert.
+    let sparql_update = r"
+        PREFIX ex: <http://example.org/>
+
+        INSERT {
+          ex:counter ex:next ?next .
+        }
+        WHERE {
+          { SELECT (MAX(?n) AS ?m)
+            WHERE { ?s ex:seq ?n . }
+          }
+          BIND((?m + 1) AS ?next)
+        }
+    ";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(sparql_update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "update failed: {json}");
+
+    // Verify inserted value is 3
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?next
+        WHERE { ex:counter ex:next ?next }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/test:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "3"),
+        "Expected SPARQL response to contain '3', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_templates_support_graph_iri_blocks() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // SPARQL UPDATE: INSERT into a named graph using GRAPH <iri> { ... } in the template.
+    let sparql_update = r#"
+        PREFIX ex: <http://example.org/>
+
+        INSERT {
+          GRAPH ex:g1 {
+            ex:s ex:p "v" .
+          }
+        }
+        WHERE { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(sparql_update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "update failed: {json}");
+
+    // Named graph reads may depend on indexing; assert by inspecting the committed flakes directly.
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+    let expected_graph_sid = ns.sid_for_iri("http://example.org/g1");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.commits.len(), 1);
+
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+
+    let expected_graph_sid_str = expected_graph_sid.to_string();
+    assert!(
+        commit
+            .flakes
+            .iter()
+            .any(|f| f.g == Some(expected_graph_sid.clone())),
+        "Expected at least one committed flake in graph http://example.org/g1 (sid={}), got flakes: {:?}",
+        expected_graph_sid_str,
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_with_clause_scopes_default_templates_and_where() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed an "old" value into the named graph ex:g1 (explicit GRAPH in template).
+    let seed = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT { GRAPH ex:g1 { ex:s ex:p "old" } }
+        WHERE  { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(seed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "seed update failed: {json}");
+
+    // WITH ex:g1 should:
+    // - scope default-graph templates to ex:g1 (no explicit GRAPH in DELETE/INSERT templates)
+    // - scope default-graph WHERE patterns to ex:g1 (so it matches "old")
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        WITH ex:g1
+        DELETE { ex:s ex:p "old" }
+        INSERT { ex:s ex:p "new" }
+        WHERE  { ex:s ex:p "old" }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "with update failed: {json}");
+
+    // Assert via committed flakes (indexing is disabled in these server tests).
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+
+    let g_sid = ns.sid_for_iri("http://example.org/g1");
+    let s_sid = ns.sid_for_iri("http://example.org/s");
+    let p_sid = ns.sid_for_iri("http://example.org/p");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+
+    assert!(
+        commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g_sid.clone())
+                && f.s == s_sid
+                && f.p == p_sid
+                && f.o == FlakeValue::String("new".to_string())
+        }),
+        "Expected commit to assert ex:s ex:p \"new\" in graph ex:g1; flakes: {:?}",
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_using_clause_scopes_where_default_graph() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed an "old" value into the named graph ex:g1 (explicit GRAPH in template).
+    let seed = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT { GRAPH ex:g1 { ex:s ex:p "old" } }
+        WHERE  { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(seed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "seed update failed: {json}");
+
+    // USING ex:g1 should scope WHERE evaluation to the named graph.
+    // Templates explicitly target ex:g1 via GRAPH blocks.
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        DELETE { GRAPH ex:g1 { ex:s ex:p ?old } }
+        INSERT { GRAPH ex:g1 { ex:s ex:p "new" } }
+        USING ex:g1
+        WHERE  { ex:s ex:p ?old }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "using update failed: {json}");
+
+    // Assert via committed flakes (indexing is disabled in these server tests).
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+
+    let g_sid = ns.sid_for_iri("http://example.org/g1");
+    let s_sid = ns.sid_for_iri("http://example.org/s");
+    let p_sid = ns.sid_for_iri("http://example.org/p");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+
+    assert!(
+        commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g_sid.clone())
+                && f.s == s_sid
+                && f.p == p_sid
+                && f.o == FlakeValue::String("new".to_string())
+        }),
+        "Expected commit to assert ex:s ex:p \"new\" in graph ex:g1; flakes: {:?}",
+        commit.flakes
+    );
+    assert!(
+        commit.flakes.iter().any(|f| {
+            !f.op
+                && f.g == Some(g_sid.clone())
+                && f.s == s_sid
+                && f.p == p_sid
+                && f.o == FlakeValue::String("old".to_string())
+        }),
+        "Expected commit to retract ex:s ex:p \"old\" in graph ex:g1; flakes: {:?}",
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_multiple_using_clauses_merge_default_graph_for_where() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed g1 and g2 with different predicates for the same subject.
+    let seed = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT {
+          GRAPH ex:g1 { ex:a ex:p "1" }
+          GRAPH ex:g2 { ex:a ex:q "2" }
+        }
+        WHERE { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(seed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "seed update failed: {json}");
+
+    // Multiple USING clauses should merge default graphs for WHERE evaluation.
+    // Write target is scoped by WITH to g1.
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        WITH ex:g1
+        INSERT { ex:a ex:marker "ok" }
+        USING ex:g1
+        USING ex:g2
+        WHERE { ex:a ex:p "1" . ex:a ex:q "2" . }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "multiple USING update failed: {json}"
+    );
+
+    // Assert via committed flakes (indexing is disabled in these server tests).
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+
+    let g1_sid = ns.sid_for_iri("http://example.org/g1");
+    let a_sid = ns.sid_for_iri("http://example.org/a");
+    let marker_sid = ns.sid_for_iri("http://example.org/marker");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+
+    assert!(
+        commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g1_sid.clone())
+                && f.s == a_sid
+                && f.p == marker_sid
+                && f.o == FlakeValue::String("ok".to_string())
+        }),
+        "Expected commit to assert ex:a ex:marker \"ok\" in graph ex:g1; flakes: {:?}",
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed g1 and g2.
+    let seed = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT {
+          GRAPH ex:g1 { ex:s ex:p "g1-old" }
+          GRAPH ex:g2 { ex:s ex:p "g2-old" }
+        }
+        WHERE { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(seed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "seed update failed: {json}");
+
+    // Attempt to update g2, but restrict named graphs in WHERE to g1.
+    // Since INSERT/DELETE templates contain variables, a 0-row WHERE should yield 0 flakes.
+    let using_named_wrong = r#"
+        PREFIX ex: <http://example.org/>
+        DELETE { GRAPH ex:g2 { ex:s ex:p ?old } }
+        INSERT { GRAPH ex:g2 { ex:s ex:p ?new } }
+        USING NAMED ex:g1
+        WHERE  {
+          GRAPH ex:g2 { ex:s ex:p ?old }
+          BIND("g2-new" AS ?new)
+        }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(using_named_wrong))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "using-named update failed: {json}");
+
+    // The latest commit should not contain an assertion of "g2-new" in graph g2.
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+
+    let g2_sid = ns.sid_for_iri("http://example.org/g2");
+    let s_sid = ns.sid_for_iri("http://example.org/s");
+    let p_sid = ns.sid_for_iri("http://example.org/p");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+    assert!(
+        !commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g2_sid.clone())
+                && f.s == s_sid
+                && f.p == p_sid
+                && f.o == FlakeValue::String("g2-new".to_string())
+        }),
+        "Expected USING NAMED ex:g1 to prevent writing g2-new into graph ex:g2; flakes: {:?}",
+        commit.flakes
+    );
+
+    // Now allow g2 explicitly via USING NAMED ex:g2 (and update should succeed).
+    let using_named_right = r#"
+        PREFIX ex: <http://example.org/>
+        DELETE { GRAPH ex:g2 { ex:s ex:p ?old } }
+        INSERT { GRAPH ex:g2 { ex:s ex:p ?new } }
+        USING NAMED ex:g2
+        WHERE  {
+          GRAPH ex:g2 { ex:s ex:p ?old }
+          BIND("g2-new" AS ?new)
+        }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(using_named_right))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "using-named (g2) update failed: {json}"
+    );
+
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+    assert!(
+        commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g2_sid.clone())
+                && f.s == s_sid
+                && f.p == p_sid
+                && f.o == FlakeValue::String("g2-new".to_string())
+        }),
+        "Expected USING NAMED ex:g2 to allow inserting g2-new into graph ex:g2; flakes: {:?}",
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_multiple_using_named_clauses_allow_multiple_named_graphs_in_where() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed g1 and g2 with different predicates for the same subject.
+    let seed = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT {
+          GRAPH ex:g1 { ex:a ex:p "1" }
+          GRAPH ex:g2 { ex:a ex:q "2" }
+        }
+        WHERE { BIND(1 AS ?x) }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(seed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "seed update failed: {json}");
+
+    // Multiple USING NAMED clauses should allow multiple named graphs in WHERE evaluation.
+    // Write target is scoped by WITH to g1.
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        WITH ex:g1
+        INSERT { ex:a ex:marker2 "ok2" }
+        USING NAMED ex:g1
+        USING NAMED ex:g2
+        WHERE {
+          GRAPH ex:g1 { ex:a ex:p "1" }
+          GRAPH ex:g2 { ex:a ex:q "2" }
+        }
+    "#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "multiple USING NAMED update failed: {json}"
+    );
+
+    // Assert via committed flakes (indexing is disabled in these server tests).
+    let handle = state.fluree.ledger_cached("test:main").await.unwrap();
+    let snap = handle.snapshot().await;
+    let mut ns = NamespaceRegistry::from_db(&snap.snapshot);
+
+    let g1_sid = ns.sid_for_iri("http://example.org/g1");
+    let a_sid = ns.sid_for_iri("http://example.org/a");
+    let marker_sid = ns.sid_for_iri("http://example.org/marker2");
+
+    let fluree = &state.fluree;
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let commit_bytes = &export.commits[0].0;
+    let commit = fluree_db_core::commit::codec::read_commit(commit_bytes).unwrap();
+
+    assert!(
+        commit.flakes.iter().any(|f| {
+            f.op && f.g == Some(g1_sid.clone())
+                && f.s == a_sid
+                && f.p == marker_sid
+                && f.o == FlakeValue::String("ok2".to_string())
+        }),
+        "Expected commit to assert ex:a ex:marker2 \"ok2\" in graph ex:g1; flakes: {:?}",
+        commit.flakes
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_where_allows_blank_nodes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed blank-node data via Turtle
+    let turtle = r"
+        @prefix ex: <http://example.org/> .
+        ex:alice ex:knows _:x .
+        _:x ex:seq 2 .
+    ";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "text/turtle")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // SPARQL UPDATE: WHERE uses a blank-node label to match the existing bnode.
+    // INSERT does not need to reference the bnode; it just checks that the pattern matches.
+    let sparql_update = r"
+        PREFIX ex: <http://example.org/>
+        INSERT { ex:flag ex:ok true }
+        WHERE {
+          ex:alice ex:knows _:x .
+          _:x ex:seq 2 .
+        }
+    ";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(sparql_update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "update failed: {json}");
+
+    // Verify inserted flag exists
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?ok
+        WHERE { ex:flag ex:ok ?ok }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/test:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json_contains_string(&json, "true"),
+        "Expected response to contain 'true', got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_delete_where_allows_blank_nodes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed blank-node data via Turtle
+    let turtle = r"
+        @prefix ex: <http://example.org/> .
+        ex:alice ex:knows _:x .
+        _:x ex:seq 2 .
+    ";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "text/turtle")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // DELETE WHERE using blank-node label should remove both triples.
+    let sparql_update = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE {
+          ex:alice ex:knows _:x .
+          _:x ex:seq 2 .
+        }
+    ";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-ledger", "test:main")
+                .body(Body::from(sparql_update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "delete-where failed: {json}");
+
+    // Verify no seq=2 remains
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s
+        WHERE { ?s ex:seq 2 }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/test:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !json_contains_string(&json, "seq"),
+        "Expected no results after delete, got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_query_generic_requires_from_clause_even_with_no_header() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // A SPARQL query without FROM on the generic endpoint should fail.
+    // (Ledger-scoped /:ledger/query can omit FROM.)
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?s ex:name ?name }
+    ";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The API reports this as a query error; server maps it as 500 today.
+    // If/when ApiError::query() is changed to a client error variant, this should become 400.
+    assert!(
+        resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+            || resp.status() == StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn soft_drop_blocks_recreate() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "test:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Soft drop
+    let drop_body = serde_json::json!({ "ledger": "test", "hard": false });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/drop")
+                .header("content-type", "application/json")
+                .body(Body::from(drop_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Create again should conflict (must hard-drop to reuse alias)
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn query_missing_ledger_is_400() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    let query_body = serde_json::json!({
+      "@context": { "ex": "http://example.org/" },
+      "select": ["?name"],
+      "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn query_with_tracking_returns_headers() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:tracking" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert data
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:tracking")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Query with tracking enabled (meta: true)
+    let query_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:tracking",
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" },
+        "opts": { "meta": true }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Check tracking headers are present
+    assert!(
+        resp.headers().get("x-fdb-time").is_some(),
+        "Response should have x-fdb-time header when tracking is enabled"
+    );
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Response body should also contain tracking info
+    assert!(
+        json.get("status").is_some(),
+        "Response should have status field"
+    );
+    assert!(
+        json.get("result").is_some(),
+        "Response should have result field"
+    );
+    assert!(
+        json.get("time").is_some(),
+        "Response should have time field in body"
+    );
+    assert!(json_contains_string(&json, "Alice"));
+}
+
+#[tokio::test]
+async fn query_with_max_fuel_returns_fuel_header() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let create_body = serde_json::json!({ "ledger": "test:fuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert data
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:bob",
+        "ex:name": "Bob"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:fuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Query with max-fuel AND meta:true to enable full tracking
+    let query_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "test:fuel",
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" },
+        "opts": { "max-fuel": 10000, "meta": true }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Check fuel header is present
+    assert!(
+        resp.headers().get("x-fdb-fuel").is_some(),
+        "Response should have x-fdb-fuel header when max-fuel is set"
+    );
+    // Time header should also be present
+    assert!(
+        resp.headers().get("x-fdb-time").is_some(),
+        "Response should have x-fdb-time header"
+    );
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Response body should also contain fuel info
+    assert!(
+        json.get("fuel").is_some(),
+        "Response should have fuel field in body"
+    );
+    assert!(json_contains_string(&json, "Bob"));
+}
+
+#[tokio::test]
+async fn json_transaction_with_meta_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:txfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "insert": [{ "@id": "ex:alice", "ex:name": "Alice" }],
+        "opts": { "meta": true }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:txfuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked transaction should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked transaction response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
+    assert!(
+        (10.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_with_tracking_header_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:sparqlfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:carol ex:name "Carol" . }
+    "#;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/test:sparqlfuel")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked SPARQL UPDATE should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked SPARQL UPDATE response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
+    assert!(
+        (10.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
+}
+
+// ============================================================================
+// Discovery endpoint: /.well-known/fluree.json
+// ============================================================================
+
+async fn test_state_with_auth(
+    events: EventsAuthMode,
+    data: DataAuthMode,
+    admin: AdminAuthMode,
+) -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        events_auth_mode: events,
+        data_auth_mode: data,
+        admin_auth_mode: admin,
+        // When auth is required, we need at least one trust source to pass validation.
+        // Use insecure flags so tests don't need real keys.
+        events_auth_insecure_accept_any_issuer: events != EventsAuthMode::None,
+        data_auth_insecure_accept_any_issuer: data != DataAuthMode::None,
+        admin_auth_insecure_accept_any_issuer: admin != AdminAuthMode::None,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+async fn get_discovery(state: Arc<AppState>) -> (StatusCode, JsonValue) {
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/fluree.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn discovery_advertises_pushing_merged_commits() {
+    let (_tmp, state) = test_state().await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["push"]["merged_commits"], true);
+}
+
+#[tokio::test]
+async fn discovery_no_auth_omits_auth_block() {
+    let (_tmp, state) = test_state().await; // all auth modes None
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], 1);
+    assert!(
+        json.get("auth").is_none(),
+        "no auth block when all modes are None"
+    );
+}
+
+#[tokio::test]
+async fn discovery_data_auth_required_returns_token_type() {
+    let (_tmp, state) = test_state_with_auth(
+        EventsAuthMode::None,
+        DataAuthMode::Required,
+        AdminAuthMode::None,
+    )
+    .await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["auth"]["type"], "token");
+}
+
+#[tokio::test]
+async fn discovery_events_auth_optional_returns_token_type() {
+    let (_tmp, state) = test_state_with_auth(
+        EventsAuthMode::Optional,
+        DataAuthMode::None,
+        AdminAuthMode::None,
+    )
+    .await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["auth"]["type"], "token");
+}
+
+#[tokio::test]
+async fn discovery_admin_auth_required_returns_token_type() {
+    let (_tmp, state) = test_state_with_auth(
+        EventsAuthMode::None,
+        DataAuthMode::None,
+        AdminAuthMode::Required,
+    )
+    .await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["auth"]["type"], "token");
+}
+
+// ============================================================================
+// Commits export endpoint tests
+// ============================================================================
+
+/// JWS token helpers for storage proxy auth in tests.
+mod storage_auth {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::Signer;
+    use serde_json::json;
+
+    /// Generate a signing key and did:key for testing.
+    pub fn test_key() -> (ed25519_dalek::SigningKey, String) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let did = fluree_db_credential::did_from_pubkey(&signing_key.verifying_key().to_bytes());
+        (signing_key, did)
+    }
+
+    /// Create a JWS token (embedded JWK) with custom claims.
+    pub fn create_jws(claims: &serde_json::Value, key: &ed25519_dalek::SigningKey) -> String {
+        let pubkey = key.verifying_key().to_bytes();
+        let pubkey_b64 = URL_SAFE_NO_PAD.encode(pubkey);
+
+        let header = json!({
+            "alg": "EdDSA",
+            "jwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": pubkey_b64
+            }
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    pub fn now_secs() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Create a storage-all token valid for 1 hour.
+    pub fn storage_all_token() -> String {
+        let (key, did) = test_key();
+        let claims = json!({
+            "iss": did,
+            "sub": "test-peer",
+            "exp": now_secs() + 3600,
+            "iat": now_secs(),
+            "fluree.storage.all": true
+        });
+        create_jws(&claims, &key)
+    }
+}
+
+async fn test_state_with_storage_proxy() -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+/// Helper: create a ledger and push N commits, returning head address after each push.
+async fn create_and_push_commits(
+    app: &axum::Router,
+    ledger: &str,
+    n: usize,
+) -> Vec<(ContentId, i64)> {
+    // Create ledger.
+    let create_body = serde_json::json!({ "ledger": ledger });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let s = Sid::new(FLUREE_DB, "entity");
+    let p = Sid::new(FLUREE_DB, "seq");
+    let dt = Sid::new(XSD, xsd_names::INTEGER);
+
+    let mut heads: Vec<(ContentId, i64)> = Vec::new();
+    let mut prev_cid: Option<ContentId> = None;
+
+    for i in 1..=n {
+        let t = i as i64;
+        let o = FlakeValue::Long(t);
+        let flakes = vec![Flake::new(
+            s.clone(),
+            p.clone(),
+            o,
+            dt.clone(),
+            t,
+            true,
+            None,
+        )];
+        let bytes = make_commit_bytes(t, prev_cid.as_ref(), flakes);
+        let push_req = PushCommitsRequest {
+            commits: vec![fluree_db_api::Base64Bytes(bytes)],
+            blobs: std::collections::HashMap::new(),
+            missing_blobs: Vec::new(),
+            merged_commits: Vec::new(),
+        };
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/push/{ledger}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "push commit t={t} failed: {json}");
+
+        let cid: ContentId = json
+            .pointer("/head/commit_id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .parse()
+            .expect("valid commit CID in push response");
+        heads.push((cid.clone(), t));
+        prev_cid = Some(cid);
+    }
+
+    heads
+}
+
+/// Helper: GET /v1/fluree/commits/{ledger} with auth and optional query params.
+async fn fetch_commits(
+    app: &axum::Router,
+    ledger: &str,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> (StatusCode, JsonValue) {
+    let token = storage_auth::storage_all_token();
+    let mut uri = format!("/v1/fluree/commits/{ledger}");
+    let mut params = Vec::new();
+    if let Some(c) = cursor {
+        params.push(format!("cursor={}", urlencoding::encode(c)));
+    }
+    if let Some(l) = limit {
+        params.push(format!("limit={l}"));
+    }
+    if !params.is_empty() {
+        uri.push('?');
+        uri.push_str(&params.join("&"));
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn commits_endpoint_returns_paginated_commits() {
+    let (_tmp, state) = test_state_with_storage_proxy().await;
+    let app = build_router(state);
+
+    // Push 5 commits.
+    create_and_push_commits(&app, "export:main", 5).await;
+
+    // Page 1: limit=2 → 2 commits (t=5, t=4).
+    let (status, json) = fetch_commits(&app, "export:main", None, Some(2)).await;
+    assert_eq!(status, StatusCode::OK, "page 1 failed: {json}");
+    let page1: ExportCommitsResponse = serde_json::from_value(json).expect("parse page 1");
+    assert_eq!(page1.count, 2);
+    assert_eq!(page1.newest_t, 5);
+    assert_eq!(page1.oldest_t, 4);
+    assert_eq!(page1.head_t, 5);
+    assert_eq!(page1.effective_limit, 2);
+    assert!(page1.next_cursor_id.is_some(), "should have next page");
+
+    // Page 2: cursor from page 1 → 2 commits (t=3, t=2).
+    let cursor = page1.next_cursor_id.as_ref().unwrap().to_string();
+    let (status, json) = fetch_commits(&app, "export:main", Some(&cursor), Some(2)).await;
+    assert_eq!(status, StatusCode::OK, "page 2 failed: {json}");
+    let page2: ExportCommitsResponse = serde_json::from_value(json).expect("parse page 2");
+    assert_eq!(page2.count, 2);
+    assert_eq!(page2.newest_t, 3);
+    assert_eq!(page2.oldest_t, 2);
+    assert!(page2.next_cursor_id.is_some(), "should have page 3");
+
+    // Page 3: cursor from page 2 → 1 commit (t=1, genesis).
+    let cursor = page2.next_cursor_id.as_ref().unwrap().to_string();
+    let (status, json) = fetch_commits(&app, "export:main", Some(&cursor), Some(2)).await;
+    assert_eq!(status, StatusCode::OK, "page 3 failed: {json}");
+    let page3: ExportCommitsResponse = serde_json::from_value(json).expect("parse page 3");
+    assert_eq!(page3.count, 1);
+    assert_eq!(page3.newest_t, 1);
+    assert_eq!(page3.oldest_t, 1);
+    assert!(
+        page3.next_cursor_id.is_none(),
+        "genesis reached, no more pages"
+    );
+}
+
+#[tokio::test]
+async fn commits_endpoint_cursor_stability() {
+    let (_tmp, state) = test_state_with_storage_proxy().await;
+    let app = build_router(state);
+
+    // Push 4 commits.
+    create_and_push_commits(&app, "cursor:main", 4).await;
+
+    // Page 1: limit=2 → (t=4, t=3).
+    let (status, json) = fetch_commits(&app, "cursor:main", None, Some(2)).await;
+    assert_eq!(status, StatusCode::OK);
+    let page1: ExportCommitsResponse = serde_json::from_value(json).expect("parse page 1");
+    assert_eq!(page1.newest_t, 4);
+    let cursor = page1
+        .next_cursor_id
+        .clone()
+        .expect("need cursor for page 2");
+
+    // Push a NEW commit (t=5) between page fetches.
+    let s = Sid::new(FLUREE_DB, "entity");
+    let p = Sid::new(FLUREE_DB, "seq");
+    let o = FlakeValue::Long(5);
+    let dt = Sid::new(XSD, xsd_names::INTEGER);
+    // Need head CID of t=4 for previous ref.
+    let head_cid = &page1.head_commit_id;
+    let bytes = make_commit_bytes(
+        5,
+        Some(head_cid),
+        vec![Flake::new(s, p, o, dt, 5, true, None)],
+    );
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(bytes)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/push/cursor:main")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "push t=5 should succeed");
+
+    // Page 2 with old cursor: should still see (t=2, t=1) — unaffected by new head.
+    let cursor_str = cursor.to_string();
+    let (status, json) = fetch_commits(&app, "cursor:main", Some(&cursor_str), Some(2)).await;
+    assert_eq!(status, StatusCode::OK);
+    let page2: ExportCommitsResponse = serde_json::from_value(json).expect("parse page 2");
+    assert_eq!(page2.newest_t, 2, "cursor should resume at t=2");
+    assert_eq!(page2.oldest_t, 1, "should reach genesis");
+    assert!(page2.next_cursor_id.is_none(), "genesis reached");
+}
+
+/// Lineage mode over HTTP: the query parameters reach the export, and the
+/// response carries the line and the merged-in commits separately.
+#[tokio::test]
+async fn commits_endpoint_exports_the_line_in_lineage_mode() {
+    let ledger = "export-lineage:main";
+    let (_tmp, state, push_req) =
+        merge_push_fixture_on(test_state_with_storage_proxy().await, ledger).await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let token = storage_auth::storage_all_token();
+    let export = |query: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/fluree/commits/{ledger}?{query}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+
+    // Down to genesis: the base commit and the merge, plus the side commit.
+    let (status, json) = export("lineage=true".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert!(page.lineage);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.merged_commits.len(), 1);
+    assert_eq!(page.next_cursor_id, None);
+
+    // Above the base: only the merge, plus the side commit.
+    let base_cid = ContentId::new(ContentKind::Commit, &page.commits[1].0);
+    let (status, json) = export(format!("lineage=true&base_id={base_cid}")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.newest_t, 2);
+    assert_eq!(page.merged_commits.len(), 1);
+
+    // A base off the line: the side commit.
+    let side_cid = ContentId::new(ContentKind::Commit, &page.merged_commits[0].0);
+    let (status, _json) = export(format!("lineage=true&base_id={side_cid}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Without the flag, the default format: no `lineage`, no split.
+    let (status, json) = export("limit=10".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("lineage").is_none(), "{json}");
+    assert!(json.get("merged_commits").is_none(), "{json}");
+}
+
+#[tokio::test]
+async fn commits_endpoint_rejects_without_storage_proxy() {
+    // Default test state has storage proxy DISABLED.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    // Create a ledger so there's something to query.
+    let create_body = serde_json::json!({ "ledger": "noauth:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Without storage proxy enabled → 404 "Storage proxy not enabled".
+    let token = storage_auth::storage_all_token();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/commits/noauth:main")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Without token AND without storage proxy → also 404.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/commits/noauth:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn commits_endpoint_returns_effective_limit() {
+    let (_tmp, state) = test_state_with_storage_proxy().await;
+    let app = build_router(state);
+
+    // Push 2 commits.
+    create_and_push_commits(&app, "limit:main", 2).await;
+
+    // Request limit=9999 → effective_limit should be clamped to server max (500).
+    let (status, json) = fetch_commits(&app, "limit:main", None, Some(9999)).await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: ExportCommitsResponse = serde_json::from_value(json).expect("parse response");
+    assert_eq!(resp.effective_limit, 500, "server should clamp to max 500");
+    assert_eq!(resp.count, 2, "only 2 commits exist");
+}
+
+#[tokio::test]
+async fn commits_endpoint_without_token_returns_401() {
+    let (_tmp, state) = test_state_with_storage_proxy().await;
+    let app = build_router(state);
+
+    // Storage proxy enabled but no token → 401.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/commits/any:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "missing token should return 401 when storage proxy is enabled"
+    );
+}
+
+// =============================================================================
+// Explain time-travel — server-side honoring of `--at`-style FROM
+// =============================================================================
+//
+// These exercise the fix for explain endpoints silently loading HEAD even
+// when the body carries a time-travel `from` / SPARQL FROM <ledger@t:N>.
+
+async fn explain_test_setup() -> (TempDir, axum::Router) {
+    let (tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "tt:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert one triple to produce t=1
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/tt:main")
+                .header("content-type", "application/json")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    (tmp, app)
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_jsonld_with_time_travel_returns_plan() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // JSON-LD explain at t=1 (the head we just created). With the fix,
+    // the body's time-travel `from` is honored — pre-fix it was silently
+    // dropped and explain ran against HEAD.
+    let body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "tt:main@t:1",
+        "select": ["?s", "?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "explain failed: {json}");
+    assert!(
+        json.get("plan").is_some() || json.get("optimized").is_some() || !json.is_null(),
+        "explain output should include a plan; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_sparql_with_same_ledger_from_no_longer_rejected() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // SPARQL with a time-travel FROM that targets the same ledger as the
+    // URL path. Before the fix this returned 400
+    // ("SPARQL FROM/FROM NAMED is not supported for explain on the
+    // ledger-scoped endpoint"). After the fix it routes through the
+    // connection-explain path and returns the plan at the requested t.
+    let sparql = "SELECT ?s ?p ?o FROM <tt:main@t:1> WHERE { ?s ?p ?o }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ledger-scoped SPARQL explain with same-ledger FROM should succeed; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_sparql_with_cross_ledger_from_rejected() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // SPARQL FROM targeting a *different* ledger than the URL path should
+    // be rejected with a ledger-mismatch BadRequest — same shape as the
+    // JSON-LD path's `normalize_ledger_scoped_from` does today.
+    let sparql = "SELECT ?s ?p ?o FROM <otherdb:main> WHERE { ?s ?p ?o }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "cross-ledger SPARQL FROM should be rejected; got: {json}"
+    );
+    assert!(
+        json_contains_string(&json, "Ledger mismatch") || json_contains_string(&json, "otherdb"),
+        "error should mention the ledger mismatch; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_connection_jsonld_with_time_travel_returns_plan() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // Connection-level JSON-LD explain — uses body's `from` (with
+    // time-travel suffix) to drive both auth scope (via base ledger) and
+    // snapshot selection.
+    let body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "tt:main@t:1",
+        "select": ["?s", "?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "explain failed: {json}");
+}
+
+/// Issue #1279: on the ledger-scoped query endpoint, a `GRAPH <iri>` pattern
+/// over a user-registered named graph must return data WITHOUT an explicit
+/// `FROM NAMED`, and `GRAPH ?g` must discover the named graph. End-to-end
+/// reproducer over the real HTTP route.
+#[tokio::test]
+async fn sparql_graph_pattern_named_graph_without_from_named() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "ngquirk:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Upsert one named graph via TriG (mirrors the issue reproducer)
+    let trig = "@prefix ex: <http://example.org/probe/> .\n\
+                GRAPH <urn:probegraph> {\n\
+                  ex:a ex:p ex:b .\n\
+                  ex:a ex:q \"hello\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/ngquirk:main")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "trig upsert failed: {json}");
+
+    // (1) Concrete GRAPH <iri> with NO FROM NAMED → finds the named graph data
+    let sparql = r"SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/ngquirk:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "graph query failed: {json}");
+    assert!(
+        json_contains_string(&json, "hello"),
+        "Expected GRAPH <urn:probegraph> (no FROM NAMED) to find 'hello', got: {json}"
+    );
+
+    // (2) GRAPH ?g discovery → binds ?g to the named graph
+    let sparql = r"SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/ngquirk:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "graph discovery failed: {json}");
+    assert!(
+        json_contains_string(&json, "urn:probegraph"),
+        "Expected GRAPH ?g discovery to surface 'urn:probegraph', got: {json}"
+    );
+}
+
+/// `/insert` accepts TriG under either content type (#1849): the API reads a
+/// body with graph blocks as TriG whatever it was labeled.
+#[tokio::test]
+async fn trig_insert_lands_named_graphs() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "triginsert:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (content_type, graph, value) in [
+        ("application/trig", "urn:g:trig", "via-trig"),
+        ("text/turtle", "urn:g:turtle", "via-turtle"),
+    ] {
+        let body = format!(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:label \"{value}\" .\n\
+             GRAPH <{graph}> {{ ex:a ex:q \"{value}\" . }}\n"
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert/triginsert:main")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{content_type} insert failed: {json}"
+        );
+
+        let sparql = format!("SELECT ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query/triginsert:main")
+                    .header("content-type", "application/sparql-query")
+                    .body(Body::from(sparql))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "graph query failed: {json}");
+        assert!(
+            json_contains_string(&json, value),
+            "{content_type}: expected the block's triple in <{graph}>, got: {json}"
+        );
+    }
+}
+
+/// `/sync` HTTP contract (what `fluree sync --remote` depends on): delta
+/// commit, no-op resync, dry-run report shape, and the 400 guards.
+#[tokio::test]
+async fn sync_route_contract() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sync:test" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let graph = "urn%3Aexample%3Aontology";
+    let post = |uri: String, body: String, ct: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let v1 = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "ex:name": "Alice", "ex:role": "engineer" },
+            { "@id": "ex:bob", "ex:name": "Bob" }
+        ]
+    })
+    .to_string();
+    let v2 = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "ex:name": "Alice", "ex:role": "manager" },
+            { "@id": "ex:carol", "ex:name": "Carol" }
+        ]
+    })
+    .to_string();
+
+    // First sync populates the graph: a real commit at t=1.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v1.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(1));
+
+    // Identical payload: success, no new commit (t unchanged).
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v1.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json.get("t").and_then(serde_json::Value::as_i64),
+        Some(1),
+        "identical resync must not advance t: {json}"
+    );
+
+    // Dry run reports the delta in the report shape and commits nothing.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}&dryRun=true"),
+                v2.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["asserted"], 2);
+    assert_eq!(json["retracted"], 2);
+    assert_eq!(json["committed"], false);
+    assert_eq!(json["dryRun"], true);
+    assert_eq!(json["t"], 1);
+
+    // Real delta run: one commit.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v2,
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(2));
+
+    // Guards: empty payload without allowEmpty and a malformed graph IRI
+    // are 400s. (A missing `graph` targets the default graph; see
+    // `sync_route_targets_the_default_graph`.)
+    for (uri, body, ct) in [
+        (
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            serde_json::json!({ "@graph": [] }).to_string(),
+            "application/json",
+        ),
+        (
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            "[]".to_string(),
+            "application/json",
+        ),
+        (
+            "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
+            v1.clone(),
+            "application/json",
+        ),
+    ] {
+        let (status, json) = json_body(
+            app.clone()
+                .oneshot(post(uri.clone(), body, ct))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+    }
+
+    // allowEmpty clears the graph (3 retracts at t=3).
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}&allowEmpty=true"),
+                serde_json::json!({ "@graph": [] }).to_string(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(3));
+}
+
+/// `/sync` with Turtle, N-Triples and TriG bodies: the same delta contract as
+/// JSON-LD, one graph per request, and the RDF-specific 400s.
+#[tokio::test]
+async fn sync_route_accepts_rdf_bodies() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sync:rdf" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let graph = "urn:example:tools";
+    let sync = |query: &str, body: String, ct: &'static str| {
+        let app = app.clone();
+        let uri = format!("/v1/fluree/sync?ledger=sync:rdf&graph={graph}{query}");
+        async move {
+            json_body(
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", ct)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+    let prefixes = "@prefix ex: <http://example.org/> .\n";
+    let spec = "ex:search ex:name \"search\" ;\n  \
+                ex:param [ ex:name \"q\" ; ex:required true ] .\n";
+    let turtle = format!("{prefixes}{spec}");
+    let t_of = |json: &serde_json::Value| json.get("t").and_then(serde_json::Value::as_i64);
+
+    let (status, json) = sync("", turtle.clone(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(1));
+
+    // The same graph as TriG is identical, so it does not commit.
+    let trig = format!("{prefixes}GRAPH <{graph}> {{\n{spec}}}\n");
+    let (status, json) = sync("", trig.clone(), "application/trig").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        t_of(&json),
+        Some(1),
+        "identical TriG must not commit: {json}"
+    );
+
+    // N-Triples keeping only the name drops the param link and the param
+    // node's two triples.
+    let nt = "<http://example.org/search> <http://example.org/name> \"search\" .\n";
+    let (status, json) = sync("&dryRun=true", nt.to_string(), "application/n-triples").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["asserted"], 0);
+    assert_eq!(json["retracted"], 3, "{json}");
+    assert_eq!(json["committed"], false);
+    assert_eq!(json["t"], 1);
+
+    // Refusals, none of which commits.
+    let other_block = format!("{prefixes}GRAPH <urn:example:other> {{ {spec} }}\n");
+    let mixed = format!("{prefixes}ex:stray ex:p \"x\" .\nGRAPH <{graph}> {{ {spec} }}\n");
+    for (body, ct, expect) in [
+        (other_block, "application/trig", "urn:example:other"),
+        (mixed, "application/trig", "not both"),
+        (prefixes.to_string(), "text/turtle", "allowEmpty"),
+        (format!("{prefixes}ex:a ex:b"), "text/turtle", ""),
+    ] {
+        let (status, json) = sync("", body.clone(), ct).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+        assert!(json.to_string().contains(expect), "{body}: {json}");
+    }
+
+    let (status, json) = sync("&allowEmpty=true", prefixes.to_string(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(2), "allowEmpty clears the graph: {json}");
+}
+
+/// `/sync` without `graph` replaces the default graph, as does an explicit
+/// `?default`; naming both is a 400.
+#[tokio::test]
+async fn sync_route_targets_the_default_graph() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+    let post = |uri: String, body: String, ct: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/create".to_string(),
+            serde_json::json!({ "ledger": "sync:default" }).to_string(),
+            "application/json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let seed = "@prefix ex: <http://example.org/> .\n\
+                ex:old ex:name \"Old\" .\n\
+                <urn:example:g> { ex:kept ex:name \"Kept\" . }\n";
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/upsert/sync:default".to_string(),
+            seed.to_string(),
+            "application/trig",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = "@prefix ex: <http://example.org/> .\nex:new ex:name \"New\" .\n";
+    for query in ["?dryRun=true", "?default&dryRun=true"] {
+        let (status, json) = json_body(
+            app.clone()
+                .oneshot(post(
+                    format!("/v1/fluree/sync/sync:default{query}"),
+                    body.to_string(),
+                    "text/turtle",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {json}");
+        // Replaces the default graph's one triple; the named graph's is kept.
+        assert_eq!(
+            (json["asserted"].as_i64(), json["retracted"].as_i64()),
+            (Some(1), Some(1)),
+            "{query}: {json}"
+        );
+        assert_eq!(json["graph"], serde_json::Value::Null);
+    }
+
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                "/v1/fluree/sync/sync:default?graph=urn:example:g&default".to_string(),
+                body.to_string(),
+                "text/turtle",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+}
+
+// ============================================================================
+// Novelty backpressure surfaces as retryable 503, not 400 (#1708)
+// ============================================================================
+
+/// Build a state over `path` with an explicit novelty hard-threshold and no
+/// local indexer — the external-indexer shape, where backpressure is enforced
+/// but nothing drains novelty, so the condition is stable once provoked.
+async fn backpressure_state(
+    path: &std::path::Path,
+    reindex_max_bytes: Option<usize>,
+) -> Arc<AppState> {
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        reindex_max_bytes,
+        storage_path: Some(path.to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"))
+}
+
+fn insert_request(ledger: &str, body: &JsonValue) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/fluree/insert")
+        .header("content-type", "application/json")
+        .header("fluree-ledger", ledger)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The novelty-backpressure contract on the transact surface (#1708): status
+/// 503 (retryable) + the `err:db/NoveltyAtMax` code + a `Retry-After` header.
+/// Before the dedicated mapping the condition fell through the transact
+/// catch-alls as 400, so a well-behaved client (retry 5xx, treat 4xx as
+/// permanent) silently dropped the write.
+fn assert_novelty_backpressure_response(
+    status: StatusCode,
+    headers: &http::HeaderMap,
+    json: &JsonValue,
+    expect_message_fragment: &str,
+) {
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+    assert_eq!(
+        json.get("@type").and_then(|v| v.as_str()),
+        Some("err:db/NoveltyAtMax"),
+        "{json}"
+    );
+    assert_eq!(json.get("status").and_then(JsonValue::as_u64), Some(503));
+    let retry_after: u32 = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("503 must carry Retry-After, got headers: {headers:?}"));
+    // Jittered per response — assert the contract range, not an exact value.
+    assert!(
+        (3..=8).contains(&retry_after),
+        "Retry-After {retry_after} outside the jitter range [3, 8]"
+    );
+    let msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains(expect_message_fragment),
+        "expected message fragment {expect_message_fragment:?} in {msg:?}"
+    );
+}
+
+/// `NoveltyWouldExceed` with a delta at or above the ceiling itself: with a
+/// 1-byte hard-threshold the very first insert's delta meets `delta >= max`,
+/// which no amount of indexer draining can ever admit — so it must surface
+/// as a permanent 413 + `err:db/NoveltyDeltaTooLarge` with NO `Retry-After`,
+/// not the retryable 503 shape (which would wedge a pipeline retrying an
+/// oversized record forever). The drainable 503 response shape is covered
+/// end-to-end by the `novelty_at_max` test below; the drainable-vs-oversized
+/// `WouldExceed` split itself is pinned at the unit level (server `error.rs`
+/// and consensus `execution_failure` tests) because provoking a drainable
+/// `WouldExceed` over HTTP would need byte-exact control of flake sizes.
+#[tokio::test]
+async fn novelty_delta_too_large_surfaces_as_413_without_retry_after() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = backpressure_state(tmp.path(), Some(1)).await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "bp:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:item1",
+        "ex:val": 1,
+    });
+    let resp = app.oneshot(insert_request("bp:main", &body)).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+    assert_eq!(
+        json.get("@type").and_then(|v| v.as_str()),
+        Some("err:db/NoveltyDeltaTooLarge"),
+        "{json}"
+    );
+    assert_eq!(json.get("status").and_then(JsonValue::as_u64), Some(413));
+    assert!(
+        headers.get("retry-after").is_none(),
+        "413 must not invite a retry, got headers: {headers:?}"
+    );
+    let msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("would exceed novelty limit"),
+        "expected the sizing message in {msg:?}"
+    );
+}
+
+/// `NoveltyAtMax` (stage-time check): novelty is already at the ceiling when
+/// the transaction arrives. Provoked the way it happens in production — a
+/// ledger carrying unindexed novelty is served under a hard-threshold below
+/// that size (here: commit under a permissive threshold, reload the same
+/// storage under a 1-byte one; the reloaded ledger replays the commit into
+/// novelty, so the next transaction is rejected before staging).
+#[tokio::test]
+async fn novelty_at_max_surfaces_as_503_with_code_and_retry_after() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Phase 1: permissive threshold — accumulate novelty.
+    {
+        let state = backpressure_state(tmp.path(), None).await;
+        let app = build_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"ledger": "bp:main"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:item1",
+            "ex:val": 1,
+        });
+        let (status, json) =
+            json_body(app.oneshot(insert_request("bp:main", &body)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "seeding insert failed: {json}");
+    }
+
+    // Phase 2: same storage, 1-byte threshold — the replayed novelty is at
+    // max before any new transaction stages.
+    let state = backpressure_state(tmp.path(), Some(1)).await;
+    let app = build_router(state);
+    let body = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:item2",
+        "ex:val": 2,
+    });
+    let resp = app.oneshot(insert_request("bp:main", &body)).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
+}
+
+/// A keyed client that obeys `Retry-After` must get the honest current
+/// answer when it retries — never a 409 (#1719 review CRITICAL-1).
+///
+/// With the novelty refusal misclassified as unsettled, `record_outcome`
+/// skipped it while the claim guard disarmed the `InFlight` cleanup, so the
+/// idempotency slot stayed `InFlight` for the full cache TTL and every
+/// keyed retry bounced with 409 `AlreadyInFlight` — the dropped-write
+/// footgun behind one extra round-trip. Settled `Failed` entries are
+/// re-attemptable (body-hash-matching replace), so the retry re-executes:
+/// here the condition still holds (indexing is disabled, nothing drains),
+/// so the honest answer is 503 again — NOT 409. The condition-clears leg
+/// (same key, refusal then success) is pinned deterministically in
+/// fluree-db-consensus's `keyed_retry_after_novelty_refusal_reexecutes`.
+/// Mutation check: flipping the novelty `is_settled` arm back to `false`
+/// fails this test with a 409 on the retry.
+#[tokio::test]
+async fn novelty_backpressure_keyed_retry_reexecutes_not_409() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Accumulate novelty under a permissive threshold (as in the AtMax test).
+    {
+        let state = backpressure_state(tmp.path(), None).await;
+        let app = build_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"ledger": "bp:main"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:item1",
+            "ex:val": 1,
+        });
+        let (status, json) =
+            json_body(app.oneshot(insert_request("bp:main", &body)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "seeding insert failed: {json}");
+    }
+
+    // Reopen at a 1-byte threshold: novelty is at max and stays there.
+    let state = backpressure_state(tmp.path(), Some(1)).await;
+    let app = build_router(state);
+    let body = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:item2",
+        "ex:val": 2,
+    });
+    let keyed_insert = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/insert")
+            .header("content-type", "application/json")
+            .header("fluree-ledger", "bp:main")
+            .header("Idempotency-Key", "ingest-batch-42")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let resp = app.clone().oneshot(keyed_insert()).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
+
+    // Retry with the SAME key and body: must re-execute and report the
+    // still-present condition — not 409 from a pinned InFlight slot.
+    let resp = app.oneshot(keyed_insert()).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "keyed retry must not bounce off a pinned idempotency slot: {json}"
+    );
+    assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
+}

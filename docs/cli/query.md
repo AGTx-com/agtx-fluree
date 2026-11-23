@@ -1,0 +1,236 @@
+# fluree query
+
+Query a ledger.
+
+## Usage
+
+```bash
+fluree query [LEDGER] [QUERY] [OPTIONS]
+```
+
+## Arguments
+
+| Arguments | Behavior |
+|-----------|----------|
+| (none) | Active ledger; provide query via `-e`, `-f`, or stdin |
+| `<arg>` | Auto-detected: if it looks like a query, uses it inline with the active ledger; if it's an existing file, reads from it; otherwise treats it as a ledger name |
+| `<ledger> <query>` | Specified ledger + inline query |
+
+The ledger may also be given explicitly with `-l`/`--ledger`, which bypasses
+the positional auto-detection (e.g. `fluree query --ledger mydb:main 'SELECT …'`).
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger); explicit alternative to the positional ledger argument |
+| `-e, --expr <EXPR>` | Inline query expression (alternative to positional) |
+| `-f, --file <FILE>` | Read query from a file |
+| `--format <FORMAT>` | Output format: `json`, `jsonld`, `typed-json`, `cypher-json`, `table`, `csv`, `tsv`, or `ndjson` (default: `table`; Cypher defaults to `cypher-json`) |
+| `--envelope` | With `--format ndjson`, emit the full streaming record protocol verbatim instead of bare binding objects |
+| `--sparql` | Force SPARQL query format |
+| `--jsonld` | Force JSON-LD query format |
+| `--cypher` | Force openCypher query format (local ledgers only) |
+| `--at <TIME>` | Query at a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
+| `--normalize-arrays` | Always wrap multi-value properties in arrays (graph-crawl JSON-LD queries only) |
+| `--bench` | Benchmark mode: time execution only and print the first 5 rows as a table (no full-result JSON formatting) |
+| `--explain` | Print the query plan without executing it |
+| `--remote <NAME>` | Execute against a remote server (by remote name, e.g., `origin`) |
+
+## Description
+
+Executes a query against a ledger. Supports SPARQL, JSON-LD, and openCypher query formats.
+
+## Query Formats
+
+### SPARQL
+
+```bash
+fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+
+### JSON-LD Query
+
+```bash
+fluree query '{"select": ["?name"], "where": {"http://example.org/name": "?name"}}'
+```
+
+### Cypher
+
+openCypher reads run on **local ledgers only** (the HTTP Cypher route is not yet
+wired through `--remote`). Results default to `cypher-json` (a Neo4j-compatible
+envelope); pass `--format jsonld` for the RDF JSON-LD form.
+
+```bash
+fluree query mydb:main -e 'MATCH (p:Person) RETURN p.name' --cypher
+fluree query mydb:main -f find-people.cypher
+```
+
+Format is auto-detected if not specified:
+- Force with `--sparql`, `--jsonld`, or `--cypher`; a `.cypher`/`.cyp`/`.cql`
+  file extension also forces Cypher.
+- Leading `MATCH`/`MERGE`/`UNWIND`/`OPTIONAL`/`DETACH`/`CREATE`, or a
+  `{"cypher": "..."}` envelope → Cypher
+- Contains `SELECT`, `CONSTRUCT`, `ASK`, or `DESCRIBE` → SPARQL
+- Otherwise → JSON-LD
+
+For Cypher writes (`CREATE`/`MERGE`/`SET`/`DELETE`), use [`fluree update`](update.md)
+with `--format cypher` (or a `.cypher` file).
+
+## Output Formats
+
+### JSON (default)
+
+```bash
+fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```json
+{
+  "head": {"vars": ["name"]},
+  "results": {"bindings": [{"name": {"type": "literal", "value": "Alice"}}]}
+}
+```
+
+### Table
+
+```bash
+fluree query --format table 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+┌───────┐
+│ name  │
+├───────┤
+│ Alice │
+│ Bob   │
+└───────┘
+```
+
+### CSV
+
+```bash
+fluree query --format csv 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+name
+Alice
+Bob
+```
+
+Note: `--format csv` (and `--format tsv`) are only supported for **local** ledgers. Tracked/remote ledgers support `json` and `table` output.
+
+### NDJSON (streaming)
+
+`--format ndjson` streams SELECT results **incrementally** as newline-delimited
+JSON instead of buffering the whole result set — use it for large result sets
+and unix pipelines (`| jq`, `| while read`, etc.). Rows are flushed as the query
+produces them, so the CLI never holds the full result in memory.
+
+By default each line is a bare SPARQL-JSON binding object (the same term shapes
+as the `json` format's `results.bindings` entries), one per result row:
+
+```bash
+fluree query --format ndjson 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+{"name":{"type":"literal","value":"Alice"}}
+{"name":{"type":"literal","value":"Bob"}}
+```
+
+Add `--envelope` to emit the full streaming record protocol verbatim — the same
+bytes the server's [streaming query endpoint](../api/streaming-query.md) produces
+(`head` / `row` / `heartbeat` / `end` / `error`). This is useful for debugging
+and for detecting truncation (a stream that ends without a terminal record):
+
+```bash
+fluree query --format ndjson --envelope 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+{"type":"head","vars":["name"]}
+{"type":"row","row":{"name":{"type":"literal","value":"Alice"}}}
+{"type":"row","row":{"name":{"type":"literal","value":"Bob"}}}
+{"type":"end","rows":2}
+```
+
+In bare mode the CLI consumes the terminal record internally and exits **non-zero**
+if the stream carried an `error` or ended without a terminal (truncated /
+dropped connection). A closed downstream pipe (e.g. `| head`) ends the stream
+cleanly with exit 0.
+
+Scope (mirrors the server [streaming endpoint](../api/streaming-query.md)):
+NDJSON streaming applies to **SELECT** queries only. `ASK`, `CONSTRUCT`/`DESCRIBE`,
+`selectOne`, hydration, and history-range queries are rejected — use a buffered
+`--format`. On **local** ledgers, `--at` (time travel) and per-request `--policy`
+are not supported with `--format ndjson`; use `--remote` (where they route
+through the server's dataset path) or a buffered format instead. `--bench` and
+`--explain` are not compatible with `--format ndjson`.
+
+## Time Travel
+
+Query historical states with `--at`:
+
+```bash
+# Query at transaction 5 — `--at 5` and `--at t:5` are the same thing
+fluree query --at 5 'SELECT * WHERE { ?s ?p ?o }'
+fluree query --at t:5 'SELECT * WHERE { ?s ?p ?o }'
+
+# Query at specific commit
+fluree query --at abc123def 'SELECT * WHERE { ?s ?p ?o }'
+
+# A prefix that is all digits would otherwise read as a transaction
+# number; `commit:` forces the prefix.
+fluree query --at commit:123456 'SELECT * WHERE { ?s ?p ?o }'
+
+# Query at ISO-8601 timestamp
+fluree query --at 2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
+
+# Tag the axis explicitly. `time:` (alias `iso:`) resolves against commit *event* time
+# (`db:time`, user-suppliable on backdated loads); `recorded:` resolves
+# against the wall-clock time the commit was recorded (`db:receivedAt`).
+# They differ only on ledgers that used caller-supplied event times.
+fluree query --at time:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
+fluree query --at recorded:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
+
+# `latest` and `t:latest` both pin to the current head.
+fluree query --at latest 'SELECT * WHERE { ?s ?p ?o }'
+```
+
+A graph source backed by versioned tables (Iceberg, Delta) takes `--at
+snapshot:<id>` (an Iceberg snapshot id, or a Delta table version) or `--at
+time:<ISO-8601>`; `t:` and `commit:` name ledger states and are rejected there.
+See
+[time travel on graph sources](../concepts/time-travel.md#graph-sources-snapshot).
+
+```bash
+fluree query warehouse-orders --at snapshot:5648190075564901028 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+```
+
+Tracked/remote ledgers also support `--at`. The CLI sends the query as written to the ledger's route pinned to that time (`/query/{ledger}@t:N`), so a query's own `FROM` / `FROM NAMED` (or `from`) keeps what it names and is read at that time. NDJSON, TSV and CSV output, and a server older than v4.2.2, take the older form instead, which carries the time in an injected `FROM` (SPARQL) or in the body's `from` (JSON-LD); with that form, `--at` is refused for a SPARQL query that has its own `FROM` / `FROM NAMED`, so encode the time in the IRI instead (e.g., `FROM <myledger:main@t:5>`). See [Remote time travel](server-integration.md).
+
+A query whose dataset names another ledger runs on the connection path (`/query`); one that names only the ledger and its graphs runs on the ledger's own route. Against a remote server the CLI cannot read the ledger's graph registry, so text that reads both as a graph IRI and as another ledger's address (`other:main`, `urn:x`) is taken as that ledger and goes to the connection path. To name a graph of the ledger that is spelled that way, name it through the ledger: `FROM <myledger:main#urn:x>`.
+
+## Examples
+
+```bash
+# Inline SPARQL query (most common)
+fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+
+# JSON-LD query inline
+fluree query '{"select": {"?s": ["*"]}, "where": {"@id": "?s"}}'
+
+# Query specific ledger with CSV output
+fluree query production --format csv 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10'
+
+# SPARQL query from file
+fluree query -f query.rq
+
+# Time travel query
+fluree query --at 3 'SELECT * WHERE { ?s ?p ?o }'
+
+# Pipe from stdin
+cat query.rq | fluree query
+```
+
+## See Also
+
+- [history](history.md) - View entity change history
+- [export](export.md) - Export all data

@@ -1,0 +1,1594 @@
+//! Aggregate functions and operator for GROUP BY queries
+//!
+//! Implements SPARQL aggregate functions that operate on `Grouped(Vec<Binding>)` values:
+//! - COUNT, COUNT_DISTINCT - count values (excluding Unbound)
+//! - SUM, AVG - numeric sum/average
+//! - MIN, MAX - minimum/maximum by comparison
+//! - MEDIAN, VARIANCE, STDDEV - statistical functions
+//! - GROUP_CONCAT - concatenate strings
+//! - SAMPLE - return an arbitrary value from the group
+//!
+//! # Type Handling
+//!
+//! - Numeric aggregates (SUM, AVG, etc.) skip non-numeric values
+//! - Empty input → the aggregate's identity: COUNT/SUM/AVG → `0`^^xsd:integer
+//!   (SPARQL 1.1 §18.5.1); MIN/MAX/SAMPLE → Unbound (no identity element)
+//! - Mixed types → promote to double where possible
+//! - Unbound values are skipped
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
+use crate::ir::{AggregateFn, AggregateSpec};
+use crate::operator::{
+    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
+};
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use bigdecimal::{BigDecimal, ToPrimitive};
+use fluree_db_core::clock::Instant;
+use fluree_db_core::{FlakeValue, Sid};
+use num_bigint::BigInt;
+use num_traits::{Signed, Zero};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tracing::Instrument;
+
+/// Aggregate operator - applies aggregate functions to grouped values
+///
+/// Expects input from `GroupByOperator` where non-grouped columns contain
+/// `Grouped(Vec<Binding>)` values. Replaces those with aggregate results.
+pub struct AggregateOperator {
+    /// Child operator (typically GroupByOperator)
+    child: BoxedOperator,
+    /// Aggregate specifications
+    aggregates: Vec<AggregateSpec>,
+    /// Output schema
+    in_schema: Arc<[VarId]>,
+    /// Operator state
+    state: OperatorState,
+    /// Mapping from input column index to aggregate spec index (in-place aggregates)
+    aggregate_map: Vec<Option<usize>>,
+    /// Extra aggregates that append new columns (agg_idx, input_col_idx, output_col_idx)
+    extra_specs: Vec<(usize, Option<usize>, usize)>,
+    /// Column index to use for determining group size (first Grouped column)
+    /// Used by CountAll to determine how many rows are in each group
+    group_size_col: Option<usize>,
+    /// Number of columns from child schema (before extra additions)
+    child_col_count: usize,
+    /// Child columns each `COUNT(DISTINCT *)` composes its solution from,
+    /// parallel to `aggregates`; `None` for every other aggregate.
+    row_distinct_cols: Vec<Option<Vec<usize>>>,
+    /// Variables required by downstream operators; if set, output is trimmed.
+    out_schema: Option<Arc<[VarId]>>,
+    /// Graph view for materializing encoded bindings before value-folding
+    /// aggregates (GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV) — their matchers
+    /// silently drop encoded values.
+    graph_view: Option<fluree_db_binary_index::TermView>,
+}
+
+impl AggregateOperator {
+    /// Create a new aggregate operator
+    ///
+    /// # Arguments
+    ///
+    /// * `child` - Child operator (typically GroupByOperator)
+    /// * `aggregates` - List of aggregate specifications
+    ///
+    /// The output schema includes:
+    /// - All columns from child (with aggregate input vars replaced by output vars)
+    /// - Additional columns for COUNT(*) aggregates (which have no input var)
+    pub fn new(child: BoxedOperator, aggregates: Vec<AggregateSpec>) -> Self {
+        let child_schema = child.schema().to_vec();
+        let child_col_count = child_schema.len();
+
+        // Build output schema: start with child schema, but replace
+        // aggregate input vars with output vars
+        let mut output_vars = child_schema.clone();
+        let mut aggregate_map: Vec<Option<usize>> = vec![None; child_col_count];
+        let mut extra_specs: Vec<(usize, Option<usize>, usize)> = Vec::new();
+        let mut group_size_col: Option<usize> = None;
+
+        for (agg_idx, spec) in aggregates.iter().enumerate() {
+            match spec.function.input_var() {
+                Some(input_var) => {
+                    // Regular aggregate with input variable
+                    if let Some(col_idx) = child_schema.iter().position(|v| *v == input_var) {
+                        // Track this column for group size detection (any Grouped column works)
+                        if group_size_col.is_none() {
+                            group_size_col = Some(col_idx);
+                        }
+                        if spec.output_var == input_var {
+                            aggregate_map[col_idx] = Some(agg_idx);
+                        } else {
+                            let output_col_idx = output_vars.len();
+                            output_vars.push(spec.output_var);
+                            extra_specs.push((agg_idx, Some(col_idx), output_col_idx));
+                        }
+                    }
+                }
+                None => {
+                    // COUNT(*) - no input variable, add as new column
+                    let output_col_idx = output_vars.len();
+                    output_vars.push(spec.output_var);
+                    extra_specs.push((agg_idx, None, output_col_idx));
+                }
+            }
+        }
+
+        // If no regular aggregates found a Grouped column, find any non-key column
+        // (In practice, GROUP BY always produces at least one Grouped column unless
+        // all columns are keys, in which case group size is always 1)
+        if group_size_col.is_none()
+            && extra_specs
+                .iter()
+                .any(|(_, input_col, _)| input_col.is_none())
+        {
+            // Use the first column as fallback - it might be a group key (size=1)
+            // or the batch might be empty
+            group_size_col = Some(0);
+        }
+
+        let schema: Arc<[VarId]> = Arc::from(output_vars.into_boxed_slice());
+
+        // Resolve each COUNT(DISTINCT *)'s visible variables to child columns.
+        let row_distinct_cols: Vec<Option<Vec<usize>>> = aggregates
+            .iter()
+            .map(|spec| match &spec.function {
+                AggregateFn::CountDistinctAll(vars) => Some(
+                    vars.iter()
+                        .filter_map(|v| child_schema.iter().position(|sv| sv == v))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+
+        Self {
+            child,
+            aggregates,
+            in_schema: schema,
+            state: OperatorState::Created,
+            aggregate_map,
+            extra_specs,
+            group_size_col,
+            child_col_count,
+            row_distinct_cols,
+            out_schema: None,
+            graph_view: None,
+        }
+    }
+
+    /// Trim output to only the specified downstream variables.
+    pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
+        self.out_schema = compute_trimmed_vars(&self.in_schema, downstream_vars);
+        self
+    }
+}
+
+#[async_trait]
+impl Operator for AggregateOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — an aggregate consumes ALL input to
+    /// compute its result (a single output row folds every input row). Explicit
+    /// (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "AGGREGATE row-budget swallowed (unsound to forward: folds all input)"
+        );
+    }
+
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+    fn schema(&self) -> &[VarId] {
+        effective_schema(&self.out_schema, &self.in_schema)
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        if self.graph_view.is_none() {
+            self.graph_view = ctx.term_view();
+        }
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+
+        let span = tracing::debug_span!(
+            "aggregate_batch",
+            aggregates = self.aggregates.len(),
+            rows_in = tracing::field::Empty,
+            ms = tracing::field::Empty
+        );
+        async {
+            let span = tracing::Span::current();
+            let start = Instant::now();
+
+            let batch = match self.child.next_batch(ctx).await? {
+                Some(b) => b,
+                None => {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                }
+            };
+
+            if batch.is_empty() {
+                return Ok(Some(Batch::empty(self.in_schema.clone())?));
+            }
+
+            span.record("rows_in", batch.len() as u64);
+
+            let num_cols = self.in_schema.len();
+            let mut output_columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
+            // Namespace table for expanding IRI-valued GROUP_CONCAT members.
+            let namespaces = ctx.active_snapshot.namespaces();
+            ctx.check_cancelled()?;
+
+            // Process child columns (regular aggregates and pass-through)
+            for col_idx in 0..self.child_col_count {
+                ctx.check_cancelled()?;
+                let mut col_output = Vec::with_capacity(batch.len());
+
+                for row_idx in 0..batch.len() {
+                    let input_binding = batch.get_by_col(row_idx, col_idx);
+
+                    let output_binding = match self.aggregate_map.get(col_idx).copied().flatten() {
+                        Some(agg_idx) => {
+                            // This column needs aggregation
+                            let spec = &self.aggregates[agg_idx];
+                            apply_aggregate(
+                                &spec.function,
+                                input_binding,
+                                self.graph_view.as_ref(),
+                                Some(namespaces),
+                            )?
+                        }
+                        None => {
+                            // Pass through unchanged
+                            input_binding.clone()
+                        }
+                    };
+
+                    col_output.push(output_binding);
+                }
+
+                output_columns.push(col_output);
+            }
+            ctx.check_cancelled()?;
+
+            if !self.extra_specs.is_empty() {
+                let mut group_sizes: Option<Vec<i64>> = None;
+
+                for (agg_idx, input_col, _output_col_idx) in &self.extra_specs {
+                    ctx.check_cancelled()?;
+                    let spec = &self.aggregates[*agg_idx];
+                    let col_output: Vec<Binding> = match input_col {
+                        Some(col_idx) => (0..batch.len())
+                            .map(|row_idx| {
+                                let input_binding = batch.get_by_col(row_idx, *col_idx);
+                                apply_aggregate(
+                                    &spec.function,
+                                    input_binding,
+                                    self.graph_view.as_ref(),
+                                    Some(namespaces),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        // COUNT(DISTINCT *): the number of distinct solutions in
+                        // the group, composed across the user-visible columns.
+                        None if self.row_distinct_cols[*agg_idx].is_some() => {
+                            let cols = self.row_distinct_cols[*agg_idx]
+                                .as_deref()
+                                .unwrap_or_default();
+                            (0..batch.len())
+                                .map(|row_idx| {
+                                    let n = distinct_group_rows(
+                                        &batch,
+                                        row_idx,
+                                        cols,
+                                        self.graph_view.as_ref(),
+                                    )?;
+                                    Ok(Binding::lit(FlakeValue::Long(n), xsd_integer()))
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                        }
+                        None => {
+                            let sizes = group_sizes.get_or_insert_with(|| {
+                                (0..batch.len())
+                                    .map(|row_idx| {
+                                        if let Some(col_idx) = self.group_size_col {
+                                            let binding = batch.get_by_col(row_idx, col_idx);
+                                            if let Binding::Grouped(values) = binding {
+                                                return values.len() as i64;
+                                            }
+                                        }
+
+                                        for col_idx in 0..self.child_col_count {
+                                            let binding = batch.get_by_col(row_idx, col_idx);
+                                            if let Binding::Grouped(values) = binding {
+                                                return values.len() as i64;
+                                            }
+                                        }
+
+                                        1
+                                    })
+                                    .collect()
+                            });
+                            sizes
+                                .iter()
+                                .map(|&size| Binding::lit(FlakeValue::Long(size), xsd_integer()))
+                                .collect()
+                        }
+                    };
+                    output_columns.push(col_output);
+                }
+            }
+            ctx.check_cancelled()?;
+
+            let out = Batch::new(self.in_schema.clone(), output_columns)?;
+            span.record("ms", (start.elapsed().as_secs_f64() * 1000.0) as u64);
+            Ok(trim_batch(&self.out_schema, out))
+        }
+        .instrument(span)
+        .await
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        self.child.estimated_rows()
+    }
+}
+
+/// Apply an aggregate, first materializing encoded bindings for the variants
+/// that need decoded values:
+/// - GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV matchers silently drop encoded
+///   bindings (GROUP_CONCAT returned Unbound for every indexed-ledger string)
+/// - MIN/MAX compare via `compare_bindings`, which orders encoded bindings by
+///   raw dictionary ID — not value order (`min="zebra"`, `max="apple"`)
+///
+/// Count variants and the numeric accumulator handle encoded bindings
+/// natively, so they skip the decode.
+///
+/// GROUP_CONCAT additionally needs IRI-valued bindings expanded to their IRI
+/// string (`namespaces`); see [`group_concat_expand_iris`].
+fn apply_aggregate(
+    func: &AggregateFn,
+    binding: &Binding,
+    gv: Option<&fluree_db_binary_index::TermView>,
+    namespaces: Option<&HashMap<u16, String>>,
+) -> Result<Binding> {
+    let needs_decoded_values = matches!(
+        func,
+        AggregateFn::GroupConcat { .. }
+            // collect() must store fully-decoded elements so the formatter can
+            // render each one (the Grouped-of-encoded path can't materialize).
+            | AggregateFn::Collect(..)
+            | AggregateFn::Median { .. }
+            | AggregateFn::Variance { .. }
+            | AggregateFn::Stddev { .. }
+            | AggregateFn::Min(_)
+            | AggregateFn::Max(_)
+            // COUNT(DISTINCT) dedups structurally; mixed-representation
+            // Grouped values (scan ∪ VALUES/BIND) would overcount.
+            | AggregateFn::CountDistinct(_)
+    );
+    if needs_decoded_values && gv.is_some() {
+        if let Binding::Grouped(values) = binding {
+            let decoded: Vec<Binding> = values
+                .iter()
+                .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
+                .try_collect_vec()?;
+            // Decoding turns an encoded ref into `Binding::Sid`, which
+            // GROUP_CONCAT still cannot read — expand those too.
+            let decoded = match func {
+                AggregateFn::GroupConcat { .. } => group_concat_expand_iris(&decoded, namespaces),
+                _ => decoded,
+            };
+            return Ok(func.apply(&Binding::Grouped(decoded)));
+        }
+    }
+    // No graph view (memory ledgers): bindings arrive already decoded, but an
+    // IRI-valued one is still a `Sid`/`IriMatch`/`Iri` that GROUP_CONCAT drops.
+    if matches!(func, AggregateFn::GroupConcat { .. }) {
+        if let Binding::Grouped(values) = binding {
+            if values.iter().any(is_iri_binding) {
+                let expanded = group_concat_expand_iris(values, namespaces);
+                return Ok(func.apply(&Binding::Grouped(expanded)));
+            }
+        }
+    }
+    // SUM/AVG accumulate inline NUM_INT/NUM_F64 encodings natively, but
+    // arena-backed NUM_BIG (BigInt/BigDecimal) needs the graph view to
+    // decode — without this those rows silently drop from the aggregate.
+    if matches!(func, AggregateFn::Sum(..) | AggregateFn::Avg(..)) && gv.is_some() {
+        if let Binding::Grouped(values) = binding {
+            let is_numbig = |b: &Binding| {
+                matches!(
+                    b,
+                    Binding::EncodedLit { o_kind, .. }
+                        if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+                )
+            };
+            if values.iter().any(is_numbig) {
+                let decoded: Vec<Binding> = values
+                    .iter()
+                    .map(|b| {
+                        if is_numbig(b) {
+                            crate::group_aggregate::materialize_encoded(b, gv)
+                        } else {
+                            Ok(b.clone())
+                        }
+                    })
+                    .try_collect_vec()?;
+                return Ok(func.apply(&Binding::Grouped(decoded)));
+            }
+        }
+    }
+    Ok(func.apply(binding))
+}
+
+impl AggregateFn {
+    /// Apply this aggregate function to a binding.
+    ///
+    /// If the binding is `Grouped(values)`, compute the aggregate;
+    /// non-grouped values pass through (e.g. group-key columns).
+    /// Variants that need an upstream dedup pass (see
+    /// [`Self::needs_input_dedup`]) get one before being handed to
+    /// [`Self::compute`].
+    pub fn apply(&self, binding: &Binding) -> Binding {
+        let Binding::Grouped(values) = binding else {
+            return binding.clone();
+        };
+        if self.needs_input_dedup() {
+            let mut seen = HashSet::with_capacity(values.len());
+            let deduped: Vec<Binding> =
+                values.iter().filter(|b| seen.insert(*b)).cloned().collect();
+            self.compute(&deduped)
+        } else {
+            self.compute(values)
+        }
+    }
+
+    /// Whether [`Self::apply`] must deduplicate input values before
+    /// reducing. True for variants whose [`InputSemantics`] is
+    /// [`InputSemantics::Set`]; false for everything else, including
+    /// [`Self::CountDistinct`] — its streaming state is already a
+    /// `HashSet`, so an additional dedup pass would be redundant.
+    fn needs_input_dedup(&self) -> bool {
+        self.is_distinct() && !matches!(self, AggregateFn::CountDistinct(_))
+    }
+
+    /// Compute the aggregate result over an already-prepared list of
+    /// bindings (deduplicated upstream by [`Self::apply`] if needed).
+    fn compute(&self, values: &[Binding]) -> Binding {
+        match self {
+            Self::Count(_) => agg_count(values),
+            Self::CountAll => agg_count_all(values),
+            // Unreachable by construction: `CountDistinctAll` has no input
+            // variable, so it never gets a column and never reaches `apply`.
+            // `AggregateOperator` computes it from every child column instead
+            // (see `distinct_group_rows`). Assert in debug so a future wiring
+            // change is caught rather than silently answering Unbound.
+            Self::CountDistinctAll(_) => {
+                debug_assert!(
+                    false,
+                    "COUNT(DISTINCT *) must be computed over the whole row, not one column"
+                );
+                Binding::Unbound
+            }
+            Self::CountDistinct(_) => agg_count_distinct(values),
+            Self::Sum { .. } => agg_sum(values),
+            Self::Avg { .. } => agg_avg(values),
+            Self::Min(_) => agg_min(values),
+            Self::Max(_) => agg_max(values),
+            Self::Median { .. } => agg_median(values),
+            Self::Variance { .. } => agg_variance(values),
+            Self::Stddev { .. } => agg_stddev(values),
+            Self::GroupConcat { separator, .. } => agg_group_concat(values, separator),
+            Self::Sample(_) => agg_sample(values),
+            Self::Collect(..) => agg_collect(values),
+        }
+    }
+}
+
+fn xsd_integer() -> Sid {
+    Sid::xsd_integer()
+}
+
+fn xsd_double() -> Sid {
+    Sid::xsd_double()
+}
+
+fn xsd_decimal() -> Sid {
+    Sid::xsd_decimal()
+}
+
+fn xsd_string() -> Sid {
+    Sid::xsd_string()
+}
+
+/// Numeric inputs for aggregate accumulators, preserving original XSD class.
+pub(crate) enum NumericValue {
+    Long(i64),
+    BigInt(BigInt),
+    Decimal(BigDecimal),
+    Double(f64),
+}
+
+/// SUM/AVG accumulator with XSD numeric type promotion.
+///
+/// Promotion lattice (sticky upward):
+///   Integer → Decimal → Double
+///
+/// While in the `Integer`/`Decimal` states we accumulate exactly as `BigDecimal`.
+/// Once any `Double` input is seen we collapse to `f64` (per W3C XPath numeric
+/// promotion: xsd:double absorbs all other numeric types).
+#[derive(Debug)]
+pub(crate) struct NumericAcc {
+    kind: NumKind,
+    big_sum: BigDecimal,
+    dbl_sum: f64,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    Integer,
+    Decimal,
+    Double,
+}
+
+impl NumericAcc {
+    pub(crate) fn new() -> Self {
+        Self {
+            kind: NumKind::Integer,
+            big_sum: BigDecimal::zero(),
+            dbl_sum: 0.0,
+            count: 0,
+        }
+    }
+
+    /// Build an accumulator from a pre-reduced exact (integer/decimal) total —
+    /// for fused fast paths that sum column values natively, then reuse this
+    /// accumulator's finalize semantics. `decimal` selects an xsd:decimal vs
+    /// xsd:integer result type (matching the column's declared datatype).
+    pub(crate) fn from_exact_total(big_sum: BigDecimal, count: u64, decimal: bool) -> Self {
+        Self {
+            kind: if decimal {
+                NumKind::Decimal
+            } else {
+                NumKind::Integer
+            },
+            big_sum,
+            dbl_sum: 0.0,
+            count,
+        }
+    }
+
+    /// Build an accumulator from a pre-reduced floating (xsd:double) total.
+    pub(crate) fn from_double_total(dbl_sum: f64, count: u64) -> Self {
+        Self {
+            kind: NumKind::Double,
+            big_sum: BigDecimal::zero(),
+            dbl_sum,
+            count,
+        }
+    }
+
+    pub(crate) fn add(&mut self, v: NumericValue) {
+        self.count += 1;
+        match v {
+            NumericValue::Long(n) => match self.kind {
+                NumKind::Double => self.dbl_sum += n as f64,
+                _ => self.big_sum += BigDecimal::from(n),
+            },
+            NumericValue::BigInt(b) => match self.kind {
+                NumKind::Double => self.dbl_sum += bigint_to_f64(&b),
+                _ => self.big_sum += BigDecimal::from(b),
+            },
+            NumericValue::Decimal(d) => match self.kind {
+                NumKind::Double => self.dbl_sum += d.to_f64().unwrap_or(0.0),
+                NumKind::Integer => {
+                    self.kind = NumKind::Decimal;
+                    self.big_sum += d;
+                }
+                NumKind::Decimal => self.big_sum += d,
+            },
+            NumericValue::Double(f) => {
+                if self.kind != NumKind::Double {
+                    // Collapse exact accumulator into f64 once a double appears.
+                    self.dbl_sum = self.big_sum.to_f64().unwrap_or(0.0);
+                    self.big_sum = BigDecimal::zero();
+                    self.kind = NumKind::Double;
+                }
+                self.dbl_sum += f;
+            }
+        }
+    }
+
+    /// Finalize as SPARQL SUM. The empty multiset sums to the additive identity
+    /// `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.3; W3C agg-empty-group-sum).
+    ///
+    /// Result datatype follows the W3C arithmetic promotion lattice:
+    ///   all integer  → xsd:integer (Long if it fits, else BigInt)
+    ///   any decimal  → xsd:decimal
+    ///   any double   → xsd:double
+    pub(crate) fn finalize_sum(self) -> Binding {
+        if self.count == 0 {
+            return Binding::lit(FlakeValue::Long(0), xsd_integer());
+        }
+        match self.kind {
+            NumKind::Integer => integer_binding_from_bigdecimal(self.big_sum),
+            NumKind::Decimal => {
+                Binding::lit(FlakeValue::Decimal(Box::new(self.big_sum)), xsd_decimal())
+            }
+            NumKind::Double => Binding::lit(FlakeValue::Double(self.dbl_sum), xsd_double()),
+        }
+    }
+
+    /// Finalize as SPARQL AVG. The empty multiset averages to the identity
+    /// `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.4; W3C agg-avg-03).
+    ///
+    /// AVG promotes xsd:integer inputs to xsd:decimal output (matches XPath
+    /// `op:numeric-divide` of integers, which yields xsd:decimal).
+    ///
+    /// The division precision is capped at `AVG_DECIMAL_PRECISION` significant
+    /// digits to keep output bounded — `BigDecimal::div` would otherwise expand
+    /// recurring decimals to its default 100-digit precision, producing values
+    /// like `0.33333...` with 100 trailing digits.
+    pub(crate) fn finalize_avg(self) -> Binding {
+        if self.count == 0 {
+            return Binding::lit(FlakeValue::Long(0), xsd_integer());
+        }
+        match self.kind {
+            NumKind::Integer | NumKind::Decimal => {
+                let count_bd = BigDecimal::from(self.count as i64);
+                let avg = (self.big_sum / count_bd)
+                    .with_prec(AVG_DECIMAL_PRECISION)
+                    .normalized();
+                Binding::lit(FlakeValue::Decimal(Box::new(avg)), xsd_decimal())
+            }
+            NumKind::Double => Binding::lit(
+                FlakeValue::Double(self.dbl_sum / self.count as f64),
+                xsd_double(),
+            ),
+        }
+    }
+}
+
+/// Significant-digit cap for the result of AVG over xsd:decimal/xsd:integer
+/// inputs. Matches IEEE-754 decimal128 precision (34 digits) — well past
+/// xsd:double's ~17 digits of precision but small enough to keep output
+/// compact for typical financial / scientific aggregates.
+// Shared with the AVG fast path (fast_predicate_scalar_agg), whose integer
+// lane must produce byte-identical decimal output to finalize_avg.
+pub(crate) const AVG_DECIMAL_PRECISION: u64 = 34;
+
+/// Best-effort `BigInt → f64`. Saturates at infinity for out-of-range values.
+fn bigint_to_f64(b: &BigInt) -> f64 {
+    b.to_f64().unwrap_or_else(|| {
+        if b.is_negative() {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
+    })
+}
+
+/// Produce an xsd:integer binding from an integer-valued `BigDecimal`.
+/// Returns `Long` when the value fits in `i64`, else `BigInt`.
+fn integer_binding_from_bigdecimal(sum: BigDecimal) -> Binding {
+    // For NumKind::Integer the accumulator only ever received integer inputs,
+    // so the BigDecimal has zero fractional scale; conversion to BigInt is exact.
+    let (digits, _scale) = sum.into_bigint_and_exponent();
+    if let Some(n) = digits.to_i64() {
+        Binding::lit(FlakeValue::Long(n), xsd_integer())
+    } else {
+        Binding::lit(FlakeValue::BigInt(Box::new(digits)), xsd_integer())
+    }
+}
+
+/// Extract a numeric value from a binding, recognizing all XSD numeric kinds
+/// that Fluree can store: xsd:integer (Long/BigInt), xsd:decimal (BigDecimal),
+/// xsd:double, and xsd:boolean (treated as 0/1).
+///
+/// `EncodedLit` is decoded via `decode_encoded_lit_numeric` (only the inline
+/// kinds NUM_INT and NUM_F64; NUM_BIG arena handles require a graph view and
+/// are handled by the streaming aggregate path that has access to one).
+pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
+    use fluree_db_core::value_id::{ObjKey, ObjKind};
+    match binding {
+        Binding::Lit { val, dtc, .. } => {
+            flake_value_to_numeric(val).or_else(|| string_lit_to_numeric(val, dtc))
+        }
+        Binding::EncodedLit { o_kind, o_key, .. } => {
+            if *o_kind == ObjKind::NUM_INT.as_u8() {
+                Some(NumericValue::Long(ObjKey::from_u64(*o_key).decode_i64()))
+            } else if *o_kind == ObjKind::NUM_F64.as_u8() {
+                Some(NumericValue::Double(ObjKey::from_u64(*o_key).decode_f64()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// NaN and ±INF are numbers like any other double: SUM and AVG are built on
+/// `op:numeric-add` (SPARQL 1.1 §18.5.1.3, §18.5.1.4), so a NaN member makes
+/// the result NaN and `INF + -INF` is NaN.
+pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
+    match val {
+        FlakeValue::Long(n) => Some(NumericValue::Long(*n)),
+        FlakeValue::Boolean(b) => Some(NumericValue::Long(i64::from(*b))),
+        FlakeValue::Double(d) => Some(NumericValue::Double(*d)),
+        FlakeValue::BigInt(b) => Some(NumericValue::BigInt((**b).clone())),
+        FlakeValue::Decimal(d) => Some(NumericValue::Decimal((**d).clone())),
+        _ => None,
+    }
+}
+
+/// Coerce a numeric value that is stored as a `FlakeValue::String` to a number.
+///
+/// The query-time `xsd:float(?x)` cast is kept string-backed (to preserve f32
+/// precision — see `eval/cast.rs`), so SUM/AVG/etc. would otherwise silently
+/// drop it (`flake_value_to_numeric` has no `String` arm) and return unbound.
+/// Parse the string when the literal's datatype is a numeric XSD type. Yields
+/// `Double` (f64 is exact for f32-sourced values).
+///
+/// The `xsd:double` lexical space is read, and under `xsd:double` /
+/// `xsd:float` also `inf` / `-inf`, the text an earlier bulk import stored for
+/// INF / -INF. Any other string that is not a number of the datatype
+/// (`"Infinity"`, or `"NaN"` under `xsd:decimal`, which has no NaN) is not
+/// numeric and makes SUM/AVG a type error.
+fn string_lit_to_numeric(
+    val: &FlakeValue,
+    dtc: &fluree_db_core::DatatypeConstraint,
+) -> Option<NumericValue> {
+    let FlakeValue::String(s) = val else {
+        return None;
+    };
+    let dt = dtc.datatype();
+    if !is_numeric_xsd_datatype(dt) {
+        return None;
+    }
+    let floating = dt.namespace_code == fluree_vocab::namespaces::XSD
+        && matches!(
+            dt.name.as_ref(),
+            fluree_vocab::xsd_names::FLOAT | fluree_vocab::xsd_names::DOUBLE
+        );
+    let d = fluree_graph_ir::parse_xsd_double(s).or_else(|| {
+        floating
+            .then(|| crate::eval::legacy_import_infinity(s))
+            .flatten()
+    })?;
+    (floating || d.is_finite()).then_some(NumericValue::Double(d))
+}
+
+/// Whether `sid` is a numeric XSD datatype (the family that should accumulate
+/// in SUM/AVG even when carried as a string-backed literal).
+fn is_numeric_xsd_datatype(sid: &Sid) -> bool {
+    use fluree_vocab::{namespaces, xsd_names};
+    sid.namespace_code == namespaces::XSD
+        && matches!(
+            sid.name.as_ref(),
+            xsd_names::FLOAT
+                | xsd_names::DOUBLE
+                | xsd_names::DECIMAL
+                | xsd_names::INTEGER
+                | xsd_names::LONG
+                | xsd_names::INT
+                | xsd_names::SHORT
+                | xsd_names::BYTE
+                | xsd_names::UNSIGNED_LONG
+                | xsd_names::UNSIGNED_INT
+                | xsd_names::UNSIGNED_SHORT
+                | xsd_names::UNSIGNED_BYTE
+                | xsd_names::NON_NEGATIVE_INTEGER
+                | xsd_names::POSITIVE_INTEGER
+                | xsd_names::NON_POSITIVE_INTEGER
+                | xsd_names::NEGATIVE_INTEGER
+        )
+}
+
+/// COUNT - count non-Unbound values
+fn agg_count(values: &[Binding]) -> Binding {
+    let count = values
+        .iter()
+        .filter(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
+        .count();
+    Binding::lit(FlakeValue::Long(count as i64), xsd_integer())
+}
+
+/// COUNT(*) - count all rows (including Unbound/Poisoned)
+fn agg_count_all(values: &[Binding]) -> Binding {
+    Binding::lit(FlakeValue::Long(values.len() as i64), xsd_integer())
+}
+
+/// COUNT(DISTINCT) - count distinct non-Unbound values
+/// Whether a binding denotes an IRI (any of the three representations).
+fn is_iri_binding(b: &Binding) -> bool {
+    matches!(
+        b,
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_)
+    )
+}
+
+/// Expand IRI-valued bindings to `xsd:string` literals holding the full IRI,
+/// leaving everything else untouched.
+///
+/// `agg_group_concat` reads only `Binding::Lit`, so an IRI-valued group member
+/// was silently skipped: an all-IRI group concatenated nothing and returned
+/// Unbound (rendered `null`), and a mixed group dropped its IRI members from
+/// the result. Expanding here matches what `STR()` already does for the same
+/// term (`eval::string::eval_str`), so `GROUP_CONCAT(?s)` and
+/// `GROUP_CONCAT(STR(?s))` agree.
+///
+/// A `Sid` whose namespace code is missing from `namespaces` cannot be
+/// expanded; it stays as-is and is skipped downstream, exactly as before.
+fn group_concat_expand_iris(
+    values: &[Binding],
+    namespaces: Option<&HashMap<u16, String>>,
+) -> Vec<Binding> {
+    values
+        .iter()
+        .map(|b| {
+            let iri: Option<String> = match b {
+                Binding::Sid { sid, .. } => namespaces
+                    .and_then(|ns| ns.get(&sid.namespace_code))
+                    .map(|prefix| format!("{prefix}{}", sid.name)),
+                Binding::IriMatch { iri, .. } => Some(iri.to_string()),
+                Binding::Iri(iri) => Some(iri.to_string()),
+                _ => None,
+            };
+            match iri {
+                Some(iri) => Binding::lit(FlakeValue::String(iri), xsd_string()),
+                None => b.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Number of distinct solutions in one group of a `GroupByOperator` output row.
+///
+/// `GroupByOperator` emits one row per group: key columns carry the single key
+/// value, every other column carries `Grouped(Vec<Binding>)` with one entry per
+/// solution in the group. Zipping the grouped columns index-wise reconstructs
+/// the group's solutions. Key columns are constant within a group, so they
+/// cannot change which solutions are distinct — and a group with no grouped
+/// column at all is a set of rows agreeing on every column, i.e. exactly one
+/// distinct solution.
+///
+/// `cols` restricts the reconstruction to the user-visible columns, matching
+/// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
+///
+/// An arena-backed literal (a big number or a vector) is compared by its
+/// value, decoded through `gv` from the graph it carries: its handle is
+/// scoped per (graph, predicate), and a vector's is not its value's only
+/// handle. One that can't be decoded fails the query.
+fn distinct_group_rows(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> Result<i64> {
+    use std::borrow::Cow;
+    let grouped: Vec<&[Binding]> = cols
+        .iter()
+        .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
+            Binding::Grouped(values) => Some(values.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
+        return Ok(1);
+    };
+    fn key<'a>(
+        b: &'a Binding,
+        gv: Option<&fluree_db_binary_index::TermView>,
+    ) -> std::result::Result<Cow<'a, Binding>, crate::group_aggregate::Undecodable> {
+        if crate::object_binding::is_arena_encoded(b) {
+            Ok(Cow::Owned(crate::group_aggregate::materialize_encoded(
+                b, gv,
+            )?))
+        } else {
+            Ok(Cow::Borrowed(b))
+        }
+    }
+    let mut seen: HashSet<Vec<Cow<'_, Binding>>> = HashSet::with_capacity(group_size);
+    for i in 0..group_size {
+        seen.insert(
+            grouped
+                .iter()
+                .map(|col| key(&col[i], gv))
+                .try_collect_vec()?,
+        );
+    }
+    Ok(seen.len() as i64)
+}
+
+fn agg_count_distinct(values: &[Binding]) -> Binding {
+    let distinct: HashSet<_> = values
+        .iter()
+        .filter(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
+        .collect();
+    Binding::lit(FlakeValue::Long(distinct.len() as i64), xsd_integer())
+}
+
+/// SUM - numeric sum
+///
+/// Accumulates exactly via `BigDecimal` for xsd:integer and xsd:decimal inputs
+/// (preserving monetary precision), and falls back to `f64` once any xsd:double
+/// is encountered. Result datatype follows XPath numeric promotion.
+fn agg_sum(values: &[Binding]) -> Binding {
+    let mut acc = NumericAcc::new();
+    for v in values {
+        // A bound non-numeric group member (bnode/IRI/string) is a type error:
+        // SUM poisons to unbound rather than summing over the numeric subset
+        // (SPARQL §18.5.1; agg-err-01). Unbound/Poisoned members contribute
+        // nothing and do not poison.
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
+    }
+    acc.finalize_sum()
+}
+
+/// AVG - numeric average
+///
+/// Accumulates the sum exactly in `BigDecimal` for integer/decimal inputs and
+/// divides by the count at finalize time, yielding an xsd:decimal result.
+/// xsd:double inputs collapse the accumulator to f64 and yield xsd:double.
+fn agg_avg(values: &[Binding]) -> Binding {
+    let mut acc = NumericAcc::new();
+    for v in values {
+        // Same poison rule as SUM: a bound non-numeric member is a type error
+        // (AVG unbinds), not a silently-skipped value (agg-err-01).
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
+    }
+    acc.finalize_avg()
+}
+
+/// MIN - minimum value
+fn agg_min(values: &[Binding]) -> Binding {
+    values
+        .iter()
+        .filter(|b| {
+            !matches!(
+                b,
+                Binding::Unbound | Binding::Poisoned | Binding::Grouped(_)
+            )
+        })
+        .min_by(|a, b| crate::sort::compare_bindings(a, b))
+        .cloned()
+        .unwrap_or(Binding::Unbound)
+}
+
+/// MAX - maximum value
+fn agg_max(values: &[Binding]) -> Binding {
+    values
+        .iter()
+        .filter(|b| {
+            !matches!(
+                b,
+                Binding::Unbound | Binding::Poisoned | Binding::Grouped(_)
+            )
+        })
+        .max_by(|a, b| crate::sort::compare_bindings(a, b))
+        .cloned()
+        .unwrap_or(Binding::Unbound)
+}
+
+/// MEDIAN - median numeric value
+fn agg_median(values: &[Binding]) -> Binding {
+    let mut numbers = extract_numbers(values);
+    if numbers.is_empty() {
+        return Binding::Unbound;
+    }
+
+    numbers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let len = numbers.len();
+    let median = if len.is_multiple_of(2) {
+        f64::midpoint(numbers[len / 2 - 1], numbers[len / 2])
+    } else {
+        numbers[len / 2]
+    };
+
+    Binding::lit(FlakeValue::Double(median), xsd_double())
+}
+
+/// VARIANCE - population variance
+fn agg_variance(values: &[Binding]) -> Binding {
+    let numbers = extract_numbers(values);
+    if numbers.is_empty() {
+        return Binding::Unbound;
+    }
+
+    let n = numbers.len() as f64;
+    let mean: f64 = numbers.iter().sum::<f64>() / n;
+    let variance: f64 = numbers.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+    Binding::lit(FlakeValue::Double(variance), xsd_double())
+}
+
+/// STDDEV - population standard deviation
+fn agg_stddev(values: &[Binding]) -> Binding {
+    let numbers = extract_numbers(values);
+    if numbers.is_empty() {
+        return Binding::Unbound;
+    }
+
+    let n = numbers.len() as f64;
+    let mean: f64 = numbers.iter().sum::<f64>() / n;
+    let variance: f64 = numbers.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let stddev = variance.sqrt();
+
+    Binding::lit(FlakeValue::Double(stddev), xsd_double())
+}
+
+/// GROUP_CONCAT - concatenate string values
+fn agg_group_concat(values: &[Binding], separator: &str) -> Binding {
+    let strings: Vec<String> = values
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Lit { val, .. } => match val {
+                FlakeValue::String(s) => Some(s.clone()),
+                FlakeValue::Json(s) => Some(s.clone()), // JSON as string
+                FlakeValue::Long(n) => Some(n.to_string()),
+                // Canonical xsd:double lexical form — the same string the
+                // serializer and STR() give this value (#1695).
+                FlakeValue::Double(n) => Some(fluree_graph_ir::canonical_xsd_double(*n)),
+                FlakeValue::Decimal(d) => Some(d.to_plain_string()),
+                FlakeValue::BigInt(n) => Some(n.to_string()),
+                FlakeValue::Boolean(b) => Some(b.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+
+    if strings.is_empty() {
+        return Binding::Unbound;
+    }
+
+    let result = strings.join(separator);
+    Binding::lit(FlakeValue::String(result), xsd_string())
+}
+
+/// SAMPLE - return an arbitrary value (first non-Unbound)
+fn agg_sample(values: &[Binding]) -> Binding {
+    values
+        .iter()
+        .find(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
+        .cloned()
+        .unwrap_or(Binding::Unbound)
+}
+
+/// collect() - gather every non-null value into a list (Cypher semantics: nulls
+/// are dropped; an empty collection yields an empty list, not null). The list
+/// is a `Binding::List`, which the JSON-LD formatter renders as a JSON array.
+/// DISTINCT, when requested, is applied upstream by [`AggregateFn::apply`].
+fn agg_collect(values: &[Binding]) -> Binding {
+    let items: Vec<Binding> = values
+        .iter()
+        .filter(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
+        .cloned()
+        .collect();
+    // `collect()` yields a first-class list value (not a transient GROUP-BY
+    // `Grouped`), so list functions and the JSON-array formatter treat it as a
+    // real Cypher list.
+    Binding::List(items)
+}
+
+/// Extract numeric values as f64 from bindings.
+///
+/// Used by MEDIAN / VARIANCE / STDDEV which intrinsically operate in f64.
+/// Mirrors `binding_to_numeric` but collapses every numeric class to f64
+/// (xsd:integer / xsd:decimal / xsd:double / xsd:boolean), losing precision
+/// for large BigInt and exact-precision Decimal values — acceptable because
+/// these statistical aggregates have no exact-arithmetic semantics in SPARQL.
+fn extract_numbers(values: &[Binding]) -> Vec<f64> {
+    values
+        .iter()
+        .filter_map(binding_to_numeric)
+        .filter_map(|n| match n {
+            NumericValue::Long(v) => Some(v as f64),
+            NumericValue::BigInt(b) => Some(bigint_to_f64(&b)),
+            NumericValue::Decimal(d) => d.to_f64(),
+            NumericValue::Double(d) => {
+                if d.is_nan() {
+                    None
+                } else {
+                    Some(d)
+                }
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::InputSemantics;
+
+    #[test]
+    fn test_agg_count() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::Unbound,
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::Poisoned,
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+        ];
+
+        let result = agg_count(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(3));
+    }
+
+    #[test]
+    fn test_agg_count_all() {
+        // COUNT(*) counts ALL rows, including Unbound and Poisoned
+        let values = vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::Unbound,
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::Poisoned,
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+        ];
+
+        let result = agg_count_all(&values);
+        let (val, _) = result.as_lit().unwrap();
+        // All 5 rows are counted, not just the 3 bound values
+        assert_eq!(*val, FlakeValue::Long(5));
+    }
+
+    #[test]
+    fn test_agg_count_all_empty() {
+        let values: Vec<Binding> = vec![];
+        let result = agg_count_all(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(0));
+    }
+
+    #[test]
+    fn test_agg_count_distinct() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::Unbound,
+        ];
+
+        let result = agg_count_distinct(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(2));
+    }
+
+    #[test]
+    fn test_agg_sum() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(10), xsd_integer()),
+            Binding::lit(FlakeValue::Long(20), xsd_integer()),
+            Binding::lit(FlakeValue::Long(30), xsd_integer()),
+        ];
+
+        let result = agg_sum(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(60));
+    }
+
+    #[test]
+    fn test_agg_sum_empty() {
+        // SPARQL 1.1 §18.5.1.3: SUM of the empty multiset is "0"^^xsd:integer.
+        let values: Vec<Binding> = vec![];
+        let result = agg_sum(&values);
+        let (val, dt) = result.as_lit().expect("empty SUM must be a literal 0");
+        assert_eq!(*val, FlakeValue::Long(0));
+        assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_avg_empty() {
+        // SPARQL 1.1 §18.5.1.4 (W3C agg-avg-03): AVG of the empty multiset is
+        // "0"^^xsd:integer.
+        let values: Vec<Binding> = vec![];
+        let result = agg_avg(&values);
+        let (val, dt) = result.as_lit().expect("empty AVG must be a literal 0");
+        assert_eq!(*val, FlakeValue::Long(0));
+        assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_sum_and_avg_add_special_doubles() {
+        // SUM is op:numeric-add and AVG is SUM / COUNT (SPARQL 1.1 §18.5.1.3,
+        // §18.5.1.4): IEEE arithmetic, so a NaN member gives NaN and
+        // INF + -INF is NaN.
+        let dbl = |d: f64| Binding::lit(FlakeValue::Double(d), xsd_double());
+        let encoded = |d: f64| Binding::EncodedLit {
+            o_kind: fluree_db_core::value_id::ObjKind::NUM_F64.as_u8(),
+            o_key: fluree_db_core::value_id::ObjKey::encode_f64(d).as_u64(),
+            p_id: 0,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
+        };
+        let double_of = |b: Binding| match b.as_lit() {
+            Some((FlakeValue::Double(d), _)) => *d,
+            other => panic!("expected a double, got {other:?}"),
+        };
+        for values in [
+            vec![dbl(1.0), dbl(f64::NAN)],
+            vec![
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+                dbl(f64::NAN),
+            ],
+            vec![dbl(1.0), encoded(f64::NAN)],
+            vec![dbl(f64::INFINITY), dbl(f64::NEG_INFINITY)],
+        ] {
+            assert!(double_of(agg_sum(&values)).is_nan(), "SUM {values:?}");
+            assert!(double_of(agg_avg(&values)).is_nan(), "AVG {values:?}");
+        }
+        let values = vec![dbl(f64::INFINITY), encoded(2.5)];
+        assert_eq!(double_of(agg_sum(&values)), f64::INFINITY);
+        assert_eq!(double_of(agg_avg(&values)), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_agg_sum_reads_string_backed_numbers_in_the_xsd_lexical_space() {
+        let typed = |s: &str, dt: Sid| Binding::lit(FlakeValue::String(s.to_string()), dt);
+        let xsd_float = || {
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT,
+            )
+        };
+        // The query-time xsd:float cast is string-backed; its special values
+        // are numbers.
+        let sum = agg_sum(&[typed("NaN", xsd_float()), typed("1.5", xsd_float())]);
+        assert!(matches!(sum.as_lit(), Some((FlakeValue::Double(d), _)) if d.is_nan()));
+        // A spelling outside the lexical space is not a number, and neither is
+        // a special value under a datatype without one: SUM is a type error.
+        for value in [
+            typed("Infinity", xsd_double()),
+            typed("Infinity", xsd_float()),
+            typed("NaN", xsd_decimal()),
+            typed("INF", xsd_integer()),
+            typed("inf", xsd_decimal()),
+        ] {
+            let values = [
+                value.clone(),
+                Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            ];
+            assert!(
+                matches!(agg_sum(&values), Binding::Unbound),
+                "{value:?} must not be summed"
+            );
+        }
+    }
+
+    /// The text an earlier bulk import stored in the index for INF / -INF,
+    /// `inf` / `-inf` under `xsd:double` or `xsd:float`, sums as INF / -INF.
+    #[test]
+    fn test_agg_sum_reads_inf_text_under_double_and_float() {
+        let typed = |s: &str, dt: Sid| Binding::lit(FlakeValue::String(s.to_string()), dt);
+        let xsd_float = || {
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT,
+            )
+        };
+        let one = || Binding::lit(FlakeValue::Long(1), xsd_integer());
+        for (text, dt, expected) in [
+            ("inf", xsd_double(), f64::INFINITY),
+            ("-inf", xsd_double(), f64::NEG_INFINITY),
+            ("inf", xsd_float(), f64::INFINITY),
+            ("-inf", xsd_float(), f64::NEG_INFINITY),
+        ] {
+            let sum = agg_sum(&[typed(text, dt.clone()), one()]);
+            assert!(
+                matches!(sum.as_lit(), Some((FlakeValue::Double(d), _)) if *d == expected),
+                "{text}^^{dt:?}: {sum:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agg_sum_mixed_types() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(10), xsd_integer()),
+            Binding::lit(FlakeValue::Double(20.5), xsd_double()),
+        ];
+
+        let result = agg_sum(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Double(30.5));
+    }
+
+    #[test]
+    fn test_agg_sum_booleans_as_zero_one() {
+        let values = vec![
+            Binding::lit(
+                FlakeValue::Boolean(true),
+                Sid::new(
+                    fluree_vocab::namespaces::XSD,
+                    fluree_vocab::xsd_names::BOOLEAN,
+                ),
+            ),
+            Binding::lit(
+                FlakeValue::Boolean(false),
+                Sid::new(
+                    fluree_vocab::namespaces::XSD,
+                    fluree_vocab::xsd_names::BOOLEAN,
+                ),
+            ),
+            Binding::lit(
+                FlakeValue::Boolean(true),
+                Sid::new(
+                    fluree_vocab::namespaces::XSD,
+                    fluree_vocab::xsd_names::BOOLEAN,
+                ),
+            ),
+        ];
+
+        let result = agg_sum(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(2));
+    }
+
+    #[test]
+    fn test_agg_avg() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(10), xsd_integer()),
+            Binding::lit(FlakeValue::Long(20), xsd_integer()),
+            Binding::lit(FlakeValue::Long(30), xsd_integer()),
+        ];
+
+        let result = agg_avg(&values);
+        let (val, dtc) = result.as_lit().unwrap();
+        // Per W3C: AVG of integers yields xsd:decimal (op:numeric-divide on
+        // integers returns xsd:decimal).
+        assert_eq!(*val, FlakeValue::Decimal(Box::new(BigDecimal::from(20))));
+        assert!(format!("{dtc:?}").contains("decimal"));
+    }
+
+    #[test]
+    fn test_agg_sum_over_decimal() {
+        // Bug repro: SUM over xsd:decimal must return an exact xsd:decimal,
+        // not the additive identity 0 nor a lossy xsd:double.
+        let values = vec![
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("12.50".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("7.99".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+        ];
+
+        let result = agg_sum(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(
+            *val,
+            FlakeValue::Decimal(Box::new("20.49".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_agg_avg_over_decimal() {
+        let values = vec![
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("12.50".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("7.99".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+        ];
+
+        let result = agg_avg(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(
+            *val,
+            FlakeValue::Decimal(Box::new("10.245".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_agg_min() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(30), xsd_integer()),
+            Binding::lit(FlakeValue::Long(10), xsd_integer()),
+            Binding::lit(FlakeValue::Long(20), xsd_integer()),
+        ];
+
+        let result = agg_min(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(10));
+    }
+
+    #[test]
+    fn test_agg_max() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(30), xsd_integer()),
+            Binding::lit(FlakeValue::Long(10), xsd_integer()),
+            Binding::lit(FlakeValue::Long(20), xsd_integer()),
+        ];
+
+        let result = agg_max(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(30));
+    }
+
+    #[test]
+    fn test_agg_median_odd() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(5), xsd_integer()),
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+        ];
+
+        let result = agg_median(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Double(3.0));
+    }
+
+    #[test]
+    fn test_agg_median_even() {
+        let values = vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+        ];
+
+        let result = agg_median(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Double(2.5));
+    }
+
+    #[test]
+    fn test_agg_variance() {
+        // Values: 2, 4, 4, 4, 5, 5, 7, 9
+        // Mean: 5
+        // Variance: ((2-5)^2 + (4-5)^2 + (4-5)^2 + (4-5)^2 + (5-5)^2 + (5-5)^2 + (7-5)^2 + (9-5)^2) / 8
+        //         = (9 + 1 + 1 + 1 + 0 + 0 + 4 + 16) / 8 = 32 / 8 = 4
+        let values = vec![
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(5), xsd_integer()),
+            Binding::lit(FlakeValue::Long(5), xsd_integer()),
+            Binding::lit(FlakeValue::Long(7), xsd_integer()),
+            Binding::lit(FlakeValue::Long(9), xsd_integer()),
+        ];
+
+        let result = agg_variance(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Double(4.0));
+    }
+
+    #[test]
+    fn test_agg_stddev() {
+        // Same values as variance test, stddev = sqrt(4) = 2
+        let values = vec![
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(4), xsd_integer()),
+            Binding::lit(FlakeValue::Long(5), xsd_integer()),
+            Binding::lit(FlakeValue::Long(5), xsd_integer()),
+            Binding::lit(FlakeValue::Long(7), xsd_integer()),
+            Binding::lit(FlakeValue::Long(9), xsd_integer()),
+        ];
+
+        let result = agg_stddev(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Double(2.0));
+    }
+
+    #[test]
+    fn test_agg_group_concat() {
+        let values = vec![
+            Binding::lit(FlakeValue::String("a".into()), xsd_string()),
+            Binding::lit(FlakeValue::String("b".into()), xsd_string()),
+            Binding::lit(FlakeValue::String("c".into()), xsd_string()),
+        ];
+
+        let result = agg_group_concat(&values, ", ");
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::String("a, b, c".into()));
+    }
+
+    #[test]
+    fn test_agg_sample() {
+        let values = vec![
+            Binding::Unbound,
+            Binding::lit(FlakeValue::Long(42), xsd_integer()),
+            Binding::lit(FlakeValue::Long(99), xsd_integer()),
+        ];
+
+        let result = agg_sample(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(42)); // First non-unbound
+    }
+
+    #[test]
+    fn test_agg_sample_all_unbound() {
+        let values = vec![Binding::Unbound, Binding::Unbound];
+        let result = agg_sample(&values);
+        assert!(matches!(result, Binding::Unbound));
+    }
+
+    fn sum_of(input: VarId, distinct: bool) -> AggregateFn {
+        let semantics = if distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
+        AggregateFn::Sum(input, semantics)
+    }
+
+    #[test]
+    fn test_apply_aggregate_non_grouped() {
+        // Non-grouped values pass through unchanged
+        let binding = Binding::lit(FlakeValue::Long(42), xsd_integer());
+        let result = sum_of(VarId(0), false).apply(&binding);
+        assert_eq!(result, binding);
+    }
+
+    #[test]
+    fn test_apply_aggregate_grouped() {
+        let grouped = Binding::Grouped(vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+        ]);
+
+        let result = sum_of(VarId(0), false).apply(&grouped);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(6));
+    }
+
+    #[test]
+    fn test_apply_aggregate_distinct() {
+        // SUM(DISTINCT) should deduplicate before summing
+        let grouped = Binding::Grouped(vec![
+            Binding::lit(FlakeValue::Long(1), xsd_integer()),
+            Binding::lit(FlakeValue::Long(2), xsd_integer()),
+            Binding::lit(FlakeValue::Long(1), xsd_integer()), // duplicate
+            Binding::lit(FlakeValue::Long(3), xsd_integer()),
+            Binding::lit(FlakeValue::Long(2), xsd_integer()), // duplicate
+        ]);
+
+        let result = sum_of(VarId(0), true).apply(&grouped);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(*val, FlakeValue::Long(6)); // 1+2+3 = 6, not 1+2+1+3+2 = 9
+    }
+}

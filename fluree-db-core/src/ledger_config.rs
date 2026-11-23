@@ -1,0 +1,738 @@
+//! Ledger configuration types.
+//!
+//! Parsed, validated representation of a ledger's config graph contents.
+//! These types are pure data structures — no I/O, no async, no storage dependency.
+//! Resolution from raw flakes happens in `fluree-db-api::config_resolver`.
+//!
+//! # Config graph layout
+//!
+//! The config graph lives at g_id=2 (`urn:fluree:{ledger_id}#config`) and contains
+//! one `f:LedgerConfig` resource with optional setting groups and per-graph overrides.
+//! See `LEDGER-CONFIG-GRAPH.md` for the full proposal.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+// ============================================================================
+// Top-level config
+// ============================================================================
+
+/// Parsed ledger configuration from the config graph.
+///
+/// Resolved once per snapshot and cached on `GraphDb`. Fields are `Option` —
+/// `None` means "unconfigured, use system defaults."
+#[derive(Debug, Clone, Default)]
+pub struct LedgerConfig {
+    /// The `@id` of the `f:LedgerConfig` resource.
+    pub config_id: Option<String>,
+    /// Policy defaults (`f:policyDefaults`).
+    pub policy: Option<PolicyDefaults>,
+    /// SHACL validation defaults (`f:shaclDefaults`).
+    pub shacl: Option<ShaclDefaults>,
+    /// Reasoning defaults (`f:reasoningDefaults`).
+    pub reasoning: Option<ReasoningDefaults>,
+    /// Datalog rules defaults (`f:datalogDefaults`).
+    pub datalog: Option<DatalogDefaults>,
+    /// Transact-time constraint defaults (`f:transactDefaults`).
+    pub transact: Option<TransactDefaults>,
+    /// Full-text indexing defaults (`f:fullTextDefaults`).
+    pub full_text: Option<FullTextDefaults>,
+    /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
+    /// never merged per-graph and not subject to override control.
+    pub serving: Option<ServingDefaults>,
+    /// Query defaults (`f:queryDefaults`). Ledger-scoped: never merged
+    /// per-graph and not subject to override control.
+    pub query: Option<QueryDefaults>,
+    /// Per-graph config overrides (`f:graphOverrides`).
+    pub graph_overrides: Vec<GraphConfig>,
+}
+
+/// Effective config for a specific graph within a ledger.
+///
+/// Produced by [`resolve_effective_config`](fluree_db_api::config_resolver::resolve_effective_config)
+/// which merges ledger-wide defaults with per-graph overrides.
+/// Carried on `GraphDb` so downstream callers can apply identity gating at
+/// request time without re-reading the config graph.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedConfig {
+    /// Effective policy defaults (ledger-wide merged with per-graph override).
+    pub policy: Option<PolicyDefaults>,
+    /// Effective SHACL defaults.
+    pub shacl: Option<ShaclDefaults>,
+    /// Effective reasoning defaults.
+    pub reasoning: Option<ReasoningDefaults>,
+    /// Effective datalog defaults.
+    pub datalog: Option<DatalogDefaults>,
+    /// Effective transact-time constraint defaults.
+    pub transact: Option<TransactDefaults>,
+    /// Effective full-text indexing defaults.
+    pub full_text: Option<FullTextDefaults>,
+}
+
+// ============================================================================
+// Setting groups
+// ============================================================================
+
+/// Policy defaults from the config graph (`f:policyDefaults`).
+#[derive(Debug, Clone, Default)]
+pub struct PolicyDefaults {
+    /// `f:defaultAllow` — whether to permit access when no policy rule
+    /// matches. `None` means unconfigured, in which case the request's own
+    /// (also tri-state) `default-allow` governs; unset on both sides resolves
+    /// fail-closed to **false**.
+    ///
+    /// Note this is only ever consulted for a request that carries policy
+    /// inputs (an identity, a policy class, or an inline policy). A request
+    /// with none of those builds no policy context at all and reads
+    /// everything, whatever this is set to.
+    pub default_allow: Option<bool>,
+    /// `f:policySource` — reference to graph containing policy rules.
+    pub policy_source: Option<GraphSourceRef>,
+    /// `f:policyClass` — default policy classes to apply.
+    pub policy_class: Option<Vec<String>>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+/// SHACL validation defaults from the config graph (`f:shaclDefaults`).
+#[derive(Debug, Clone, Default)]
+pub struct ShaclDefaults {
+    /// `f:shaclEnabled` — enable/disable SHACL validation.
+    pub enabled: Option<bool>,
+    /// `f:shapesSource` — reference to graph containing SHACL shapes.
+    pub shapes_source: Option<GraphSourceRef>,
+    /// `f:additionalDataSource` — graphs read with the validated graph, as
+    /// one graph, when its nodes are checked. Which nodes are checked still
+    /// comes from the validated graph alone.
+    pub additional_data_sources: Vec<GraphSourceRef>,
+    /// `f:validationMode` — reject or warn on validation failure.
+    pub validation_mode: Option<ValidationMode>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+/// Reasoning defaults from the config graph (`f:reasoningDefaults`).
+#[derive(Debug, Clone, Default)]
+pub struct ReasoningDefaults {
+    /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2rl"]`.
+    pub modes: Option<Vec<String>>,
+    /// `f:schemaSource` — reference to graph containing schema hierarchy.
+    pub schema_source: Option<GraphSourceRef>,
+    /// `f:followOwlImports` — when `true`, resolve `owl:imports` transitively
+    /// from `schema_source` and include each imported graph in the schema
+    /// bundle used by reasoning. `None` or `Some(false)` both mean "don't
+    /// follow imports" — the bundle consists of only the starting graph.
+    /// Opt in explicitly with `true` when you want the closure.
+    pub follow_owl_imports: Option<bool>,
+    /// `f:ontologyImportMap` — explicit mapping from external `owl:imports`
+    /// IRIs to local `GraphSourceRef`s. Consulted when an import IRI does not
+    /// match a named graph in the current ledger.
+    pub ontology_import_map: Vec<OntologyImportBinding>,
+    /// `f:reasoningMaxFacts` — materialization budget: max derived facts
+    /// before the OWL2-RL closure is capped. A capped closure is incomplete
+    /// (queries may miss entailments), so this is a correctness control, not
+    /// a tuning knob. `None` means use the system default.
+    pub max_facts: Option<u64>,
+    /// `f:reasoningMaxSeconds` — materialization budget: max wall-clock
+    /// seconds before the OWL2-RL closure is capped. `None` means use the
+    /// system default.
+    pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — materialization budget: max megabytes of
+    /// derived facts before the closure is capped. Like the other two this is
+    /// a correctness control, not a tuning knob: a capped closure is
+    /// incomplete. `None` means derive it from the effective fact cap.
+    pub max_memory_mb: Option<u64>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+/// One entry in `f:ontologyImportMap`.
+///
+/// Binds an external ontology IRI (as it appears in `owl:imports`) to the
+/// local graph that provides that ontology's triples.
+#[derive(Debug, Clone)]
+pub struct OntologyImportBinding {
+    /// `f:ontologyIri` — the IRI that appears in `owl:imports` statements.
+    pub ontology_iri: String,
+    /// `f:graphRef` — where to find that ontology's triples locally.
+    pub graph_ref: GraphSourceRef,
+}
+
+/// Datalog rules defaults from the config graph (`f:datalogDefaults`).
+#[derive(Debug, Clone, Default)]
+pub struct DatalogDefaults {
+    /// `f:datalogEnabled` — enable/disable datalog rule evaluation.
+    pub enabled: Option<bool>,
+    /// `f:rulesSource` — reference to graph containing `f:rule` resources.
+    pub rules_source: Option<GraphSourceRef>,
+    /// `f:allowQueryTimeRules` — allow query-time rule injection.
+    pub allow_query_time_rules: Option<bool>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+/// Serving-posture defaults from the config graph (`f:servingDefaults`).
+///
+/// Declares which serving tiers the ledger's origin server offers to callers.
+/// Gates apply only on the origin (transaction-role) serving surface: a
+/// read-only peer or mount that holds the ledger's blocks always queries its
+/// own copy freely. `None` fields mean "allowed" (an unconfigured ledger is
+/// fully served); `public_visibility` defaults to false (token required).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control — it changes only by transacting the
+/// config graph.
+#[derive(Debug, Clone, Default)]
+pub struct ServingDefaults {
+    /// `f:serveQuery` — origin executes queries for this ledger.
+    pub serve_query: Option<bool>,
+    /// `f:serveBlocks` — origin serves raw CAS blocks (storage proxy).
+    pub serve_blocks: Option<bool>,
+    /// `f:publicVisibility` — ledger is discoverable/readable without a token.
+    pub public_visibility: Option<bool>,
+}
+
+/// Query defaults from the config graph (`f:queryDefaults`).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control. A request may still choose for
+/// itself, since these shape what a query reads rather than what it may
+/// read.
+#[derive(Debug, Clone, Default)]
+pub struct QueryDefaults {
+    /// `f:unionDefaultGraph` — a query that does not choose its own default
+    /// graph reads the union of the ledger's default graph and its named
+    /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
+    /// means off.
+    pub union_default_graph: Option<bool>,
+}
+
+/// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).
+///
+/// Declares properties whose string values should be BM25-indexed without
+/// requiring the `@fulltext` datatype per value, and sets the default analyzer
+/// language for untagged (non-`rdf:langString`) string values.
+///
+/// The `@fulltext` datatype keeps its zero-config shortcut semantics and
+/// always indexes as English regardless of this config. See
+/// `docs/indexing-and-search/fulltext.md` for the full user guide
+/// (when to use which path, language support, per-graph overrides,
+/// reindex workflow, datatype-vs-config coexistence rules).
+#[derive(Debug, Clone, Default)]
+pub struct FullTextDefaults {
+    /// `f:defaultLanguage` — BCP-47 tag (e.g. `"en"`, `"fr"`) used for untagged
+    /// plain-string values on configured properties. `None` falls back to
+    /// English at resolution time.
+    pub default_language: Option<String>,
+    /// `f:property` — one entry per property to full-text index.
+    pub properties: Vec<FullTextProperty>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+/// A configured full-text property (`f:FullTextProperty`).
+///
+/// Forward-compatible node shape: additional optional fields (per-property
+/// language, boost, tokenizer, etc.) can be added here without a breaking
+/// schema change.
+#[derive(Debug, Clone)]
+pub struct FullTextProperty {
+    /// `f:target` — IRI of the property being indexed.
+    pub target: String,
+}
+
+/// Transact-time constraint defaults from the config graph (`f:transactDefaults`).
+///
+/// Controls enforcement of property-level constraints (e.g., `f:enforceUnique`)
+/// during transaction staging. Constraint annotations are triples on property
+/// IRIs that live in source graphs; this setting group activates enforcement
+/// and points to those source graphs.
+#[derive(Debug, Clone, Default)]
+pub struct TransactDefaults {
+    /// `f:uniqueEnabled` — enable/disable unique constraint enforcement.
+    pub unique_enabled: Option<bool>,
+    /// `f:constraintsSource` — references to graphs containing constraint annotations.
+    /// Multiple sources are supported for additive per-graph merging.
+    /// Defaults to `[defaultGraph]` (g_id=0) when empty and uniqueEnabled is true.
+    pub constraints_sources: Vec<GraphSourceRef>,
+    /// Override control for this setting group.
+    pub override_control: OverrideControl,
+}
+
+// ============================================================================
+// Empty setting groups
+// ============================================================================
+//
+// A group node that sets nothing (no field, and the default override
+// control) reads the same as no group at all: every consumer treats an unset
+// field as the system default. The config reader normalizes such a group to
+// absent, which keeps the choice among several group pointers deterministic
+// (an empty group never wins over a populated one).
+
+impl PolicyDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_allow.is_none()
+            && self.policy_source.is_none()
+            && self.policy_class.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ShaclDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.shapes_source.is_none()
+            && self.additional_data_sources.is_empty()
+            && self.validation_mode.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ReasoningDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.modes.is_none()
+            && self.schema_source.is_none()
+            && self.follow_owl_imports.is_none()
+            && self.ontology_import_map.is_empty()
+            && self.max_facts.is_none()
+            && self.max_seconds.is_none()
+            && self.max_memory_mb.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl DatalogDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.rules_source.is_none()
+            && self.allow_query_time_rules.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ServingDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.serve_query.is_none()
+            && self.serve_blocks.is_none()
+            && self.public_visibility.is_none()
+    }
+}
+
+impl QueryDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.union_default_graph.is_none()
+    }
+}
+
+impl FullTextDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_language.is_none()
+            && self.properties.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+impl TransactDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.unique_enabled.is_none()
+            && self.constraints_sources.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+// ============================================================================
+// Per-graph overrides
+// ============================================================================
+
+/// Per-graph config override (`f:GraphConfig`).
+///
+/// Identifies a target graph by IRI and overrides specific settings.
+/// Only include settings being overridden — absent groups inherit
+/// from ledger-wide config.
+#[derive(Debug, Clone, Default)]
+pub struct GraphConfig {
+    /// `f:targetGraph` — IRI of the target graph, or `f:defaultGraph` /
+    /// `f:txnMetaGraph` sentinel.
+    pub target_graph: String,
+    /// Policy overrides for this graph.
+    pub policy: Option<PolicyDefaults>,
+    /// SHACL overrides for this graph.
+    pub shacl: Option<ShaclDefaults>,
+    /// Reasoning overrides for this graph.
+    pub reasoning: Option<ReasoningDefaults>,
+    /// Datalog overrides for this graph.
+    pub datalog: Option<DatalogDefaults>,
+    /// Transact-time constraint overrides for this graph.
+    pub transact: Option<TransactDefaults>,
+    /// Full-text indexing overrides for this graph.
+    pub full_text: Option<FullTextDefaults>,
+}
+
+// ============================================================================
+// Override control
+// ============================================================================
+
+/// Controls whether higher-priority sources (per-graph configs, query-time opts)
+/// can override a setting group's values.
+///
+/// Permissiveness ordering: `None` < `IdentityRestricted` < `AllowAll`.
+///
+/// Default is `AllowAll` (existing query behavior is unrestricted).
+#[derive(Debug, Clone, Default)]
+pub enum OverrideControl {
+    /// No overrides permitted, regardless of identity.
+    None,
+    /// Any request can override.
+    #[default]
+    AllowAll,
+    /// Only requests with a verified identity in `allowed_identities` can override.
+    IdentityRestricted {
+        allowed_identities: HashSet<Arc<str>>,
+    },
+}
+
+impl OverrideControl {
+    /// The control an absent `f:overrideControl` means (`AllowAll`).
+    pub fn is_default(&self) -> bool {
+        matches!(self, OverrideControl::AllowAll)
+    }
+
+    /// Permissiveness level for ordering comparisons.
+    /// `None` (0) < `IdentityRestricted` (1) < `AllowAll` (2).
+    fn permissiveness(&self) -> u8 {
+        match self {
+            OverrideControl::None => 0,
+            OverrideControl::IdentityRestricted { .. } => 1,
+            OverrideControl::AllowAll => 2,
+        }
+    }
+
+    /// Compute effective override control as the minimum of two controls.
+    ///
+    /// Per-graph configs can only **tighten** (restrict), not loosen, the
+    /// ledger-wide override control. This function computes `min(self, other)`
+    /// under the permissiveness ordering.
+    ///
+    /// When both are `IdentityRestricted`, the effective `allowed_identities`
+    /// is the **intersection** of the two sets.
+    pub fn effective_min(&self, other: &OverrideControl) -> OverrideControl {
+        let self_perm = self.permissiveness();
+        let other_perm = other.permissiveness();
+
+        match self_perm.cmp(&other_perm) {
+            std::cmp::Ordering::Less => self.clone(),
+            std::cmp::Ordering::Greater => other.clone(),
+            std::cmp::Ordering::Equal => match (self, other) {
+                (
+                    OverrideControl::IdentityRestricted {
+                        allowed_identities: a,
+                    },
+                    OverrideControl::IdentityRestricted {
+                        allowed_identities: b,
+                    },
+                ) => OverrideControl::IdentityRestricted {
+                    allowed_identities: a.intersection(b).cloned().collect(),
+                },
+                _ => self.clone(),
+            },
+        }
+    }
+
+    /// Check if a given request identity is permitted to override.
+    ///
+    /// `request_identity` is the auth-layer-verified identity.
+    /// `None` means anonymous (no verified identity).
+    pub fn permits_override(&self, request_identity: Option<&crate::VerifiedIdentity>) -> bool {
+        match self {
+            OverrideControl::None => false,
+            OverrideControl::AllowAll => true,
+            OverrideControl::IdentityRestricted { allowed_identities } => request_identity
+                .map(|id| allowed_identities.contains(id.as_str()))
+                .unwrap_or(false),
+        }
+    }
+}
+
+// ============================================================================
+// Graph source references
+// ============================================================================
+
+/// Reference to a graph source (local or remote) with trust controls.
+///
+/// Named `GraphSourceRef` (not `GraphRef`) to avoid confusion with the
+/// internal `GraphRef` enum used for fragment parsing in `fluree_ext.rs`.
+///
+/// Corresponds to `f:GraphRef` in the config graph schema.
+#[derive(Debug, Clone)]
+pub struct GraphSourceRef {
+    /// Ledger identifier (e.g., `"mydb:main"`). `None` = same ledger.
+    pub ledger: Option<String>,
+    /// Graph selector: `"f:defaultGraph"`, `"f:txnMetaGraph"`, or a graph IRI.
+    pub graph_selector: Option<String>,
+    /// Pin to a specific commit number. Mutually exclusive with other temporal selectors.
+    pub at_t: Option<i64>,
+    /// Trust policy for this reference.
+    pub trust_policy: Option<TrustPolicy>,
+    /// Rollback guard — freshness constraints for this reference.
+    pub rollback_guard: Option<RollbackGuard>,
+}
+
+/// Trust verification model for a [`GraphSourceRef`].
+#[derive(Debug, Clone)]
+pub struct TrustPolicy {
+    /// How to validate the referenced graph.
+    pub trust_mode: TrustMode,
+}
+
+/// Freshness constraints for a [`GraphSourceRef`].
+///
+/// Corresponds to `f:RollbackGuard` in the config graph schema.
+/// Prevents accepting stale or rolled-back heads from a nameservice.
+#[derive(Debug, Clone)]
+pub struct RollbackGuard {
+    /// Reject any resolved head where `head_t < min_t`.
+    pub min_t: Option<i64>,
+}
+
+/// How to validate a remote graph reference.
+///
+/// Values are IRIs in the `f:` namespace (e.g., `f:Trusted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustMode {
+    /// `f:Trusted` — accept nameservice head without additional validation.
+    Trusted,
+    /// `f:SignedIndex` — verify signed index root.
+    SignedIndex,
+    /// `f:CommitVerified` — full commit chain verification.
+    CommitVerified,
+}
+
+/// SHACL validation mode.
+///
+/// Values are IRIs in the `f:` namespace. Serialized lowercase
+/// (`"reject"` / `"warn"`) — the form `opts.validationMode` uses on
+/// transaction requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationMode {
+    /// `f:ValidationReject` — reject transactions that fail SHACL validation.
+    Reject,
+    /// `f:ValidationWarn` — warn but allow transactions that fail SHACL validation.
+    Warn,
+}
+
+impl ValidationMode {
+    /// Parse the request-surface string form (case-insensitive
+    /// `"reject"` / `"warn"`). `None` for anything else.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "reject" => Some(ValidationMode::Reject),
+            "warn" => Some(ValidationMode::Warn),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_set(ids: &[&str]) -> HashSet<Arc<str>> {
+        ids.iter().map(|s| Arc::from(*s)).collect()
+    }
+
+    // --- OverrideControl::effective_min ---
+
+    #[test]
+    fn effective_min_none_with_allow_all() {
+        let result = OverrideControl::None.effective_min(&OverrideControl::AllowAll);
+        assert!(matches!(result, OverrideControl::None));
+    }
+
+    #[test]
+    fn effective_min_allow_all_with_none() {
+        let result = OverrideControl::AllowAll.effective_min(&OverrideControl::None);
+        assert!(matches!(result, OverrideControl::None));
+    }
+
+    #[test]
+    fn effective_min_none_with_identity_restricted() {
+        let restricted = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        let result = OverrideControl::None.effective_min(&restricted);
+        assert!(matches!(result, OverrideControl::None));
+    }
+
+    #[test]
+    fn effective_min_identity_restricted_with_none() {
+        let restricted = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        let result = restricted.effective_min(&OverrideControl::None);
+        assert!(matches!(result, OverrideControl::None));
+    }
+
+    #[test]
+    fn effective_min_allow_all_with_identity_restricted() {
+        let restricted = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        let result = OverrideControl::AllowAll.effective_min(&restricted);
+        match result {
+            OverrideControl::IdentityRestricted { allowed_identities } => {
+                assert!(allowed_identities.contains("did:key:alice"));
+                assert_eq!(allowed_identities.len(), 1);
+            }
+            other => panic!("Expected IdentityRestricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_min_identity_restricted_with_allow_all() {
+        let restricted = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        let result = restricted.effective_min(&OverrideControl::AllowAll);
+        match result {
+            OverrideControl::IdentityRestricted { allowed_identities } => {
+                assert!(allowed_identities.contains("did:key:alice"));
+                assert_eq!(allowed_identities.len(), 1);
+            }
+            other => panic!("Expected IdentityRestricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_min_two_identity_restricted_intersects() {
+        let a = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice", "did:key:bob"]),
+        };
+        let b = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice", "did:key:carol"]),
+        };
+        let result = a.effective_min(&b);
+        match result {
+            OverrideControl::IdentityRestricted { allowed_identities } => {
+                assert!(allowed_identities.contains("did:key:alice"));
+                assert!(!allowed_identities.contains("did:key:bob"));
+                assert!(!allowed_identities.contains("did:key:carol"));
+                assert_eq!(allowed_identities.len(), 1);
+            }
+            other => panic!("Expected IdentityRestricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_min_two_identity_restricted_empty_intersection() {
+        let a = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        let b = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:bob"]),
+        };
+        let result = a.effective_min(&b);
+        match result {
+            OverrideControl::IdentityRestricted { allowed_identities } => {
+                assert!(allowed_identities.is_empty());
+            }
+            other => panic!("Expected IdentityRestricted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_min_none_with_none() {
+        let result = OverrideControl::None.effective_min(&OverrideControl::None);
+        assert!(matches!(result, OverrideControl::None));
+    }
+
+    #[test]
+    fn effective_min_allow_all_with_allow_all() {
+        let result = OverrideControl::AllowAll.effective_min(&OverrideControl::AllowAll);
+        assert!(matches!(result, OverrideControl::AllowAll));
+    }
+
+    // --- OverrideControl::permits_override ---
+
+    #[test]
+    fn permits_override_none_always_false() {
+        assert!(!OverrideControl::None
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(!OverrideControl::None.permits_override(None));
+    }
+
+    #[test]
+    fn permits_override_allow_all_always_true() {
+        assert!(OverrideControl::AllowAll
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(OverrideControl::AllowAll.permits_override(None));
+    }
+
+    #[test]
+    fn permits_override_identity_restricted_matching() {
+        let ctrl = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice", "did:key:bob"]),
+        };
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
+    }
+
+    #[test]
+    fn permits_override_identity_restricted_non_matching() {
+        let ctrl = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
+    }
+
+    #[test]
+    fn permits_override_identity_restricted_anonymous() {
+        let ctrl = OverrideControl::IdentityRestricted {
+            allowed_identities: identity_set(&["did:key:alice"]),
+        };
+        assert!(!ctrl.permits_override(None));
+    }
+
+    #[test]
+    fn permits_override_identity_restricted_empty_set() {
+        let ctrl = OverrideControl::IdentityRestricted {
+            allowed_identities: HashSet::new(),
+        };
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(!ctrl.permits_override(None));
+    }
+
+    // --- LedgerConfig defaults ---
+
+    #[test]
+    fn ledger_config_default_is_unconfigured() {
+        let config = LedgerConfig::default();
+        assert!(config.config_id.is_none());
+        assert!(config.policy.is_none());
+        assert!(config.shacl.is_none());
+        assert!(config.reasoning.is_none());
+        assert!(config.datalog.is_none());
+        assert!(config.transact.is_none());
+        assert!(config.graph_overrides.is_empty());
+    }
+
+    #[test]
+    fn override_control_default_is_allow_all() {
+        assert!(matches!(
+            OverrideControl::default(),
+            OverrideControl::AllowAll
+        ));
+    }
+}

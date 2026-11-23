@@ -1,0 +1,685 @@
+//! Integration tests for incremental LedgerManager::notify() paths.
+//!
+//! Verifies that notify() uses incremental updates (IndexOnly, CommitCatchUp)
+//! instead of full reloads when the gap is small enough.
+
+#![cfg(feature = "native")]
+
+use crate::support;
+use crate::support::{
+    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait,
+};
+use fluree_db_api::{
+    ledger_manager::{LedgerManager, LedgerManagerConfig, NotifyResult, NsNotify},
+    FlureeBuilder, IndexConfig,
+};
+use fluree_db_transact::{CommitOpts, TxnOpts};
+use serde_json::json;
+
+#[tokio::test]
+async fn published_index_matches_fresh_query_on_cached_handle() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/index-adoption:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let handle = fluree
+        .ledger_cached(ledger_id)
+        .await
+        .expect("cache genesis");
+    let graph: Vec<_> = (0..2000)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:p{i}"),
+                "@type": "ex:Person",
+                "ex:name": format!("Person {i}"),
+                "ex:age": i % 100,
+                "ex:city": format!("City {}", i % 10),
+                "ex:knows": {"@id": format!("ex:p{i}")}
+            })
+        })
+        .collect();
+    fluree
+        .stage(&handle)
+        .insert(&json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}))
+        .execute()
+        .await
+        .expect("insert through the original cached handle");
+
+    let before = handle.snapshot().await;
+    assert_eq!(before.snapshot.t, 0);
+    assert!(before.binary_store.is_none());
+    drop(before);
+    for expected_t in 1..=2 {
+        support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+        // Do not notify manually, reload, or evict: the publication listener
+        // must install the index on the original handle used by requests.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if handle.snapshot().await.snapshot.t == expected_t {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cached handle adopts the published index");
+
+        let cached = handle.snapshot().await.to_ledger_state();
+        assert!(cached.binary_store.is_some());
+        assert!(cached.snapshot.range_provider.is_some());
+        assert!(cached.novelty.is_empty());
+        assert_ne!(
+            cached.novelty.epoch, 0,
+            "indexing must preserve the mutation counter"
+        );
+        assert_cached_queries_match_fresh(&fluree, &cached).await;
+        assert!(
+            !scan_translates_overlay(&fluree, &cached).await,
+            "a drained overlay has nothing for a scan to translate"
+        );
+
+        if expected_t == 1 {
+            // A subsequent write must still use the overlay correctly. In
+            // particular these IRIs and strings do not exist in the base index.
+            fluree
+                .stage(&handle)
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": "ex:new-person",
+                    "@type": "ex:Person",
+                    "ex:name": "Person newly added",
+                    "ex:age": 101,
+                    "ex:city": "New city",
+                    "ex:knows": {"@id": "ex:new-person"}
+                }))
+                .execute()
+                .await
+                .expect("commit after the first index install");
+            let cached = handle.snapshot().await.to_ledger_state();
+            assert!(!cached.novelty.is_empty());
+            assert_cached_queries_match_fresh(&fluree, &cached).await;
+            assert!(scan_translates_overlay(&fluree, &cached).await);
+        }
+    }
+}
+
+/// Whether a plain scan of `state` translates its overlay into index ops.
+async fn scan_translates_overlay(
+    fluree: &fluree_db_api::Fluree,
+    state: &fluree_db_api::LedgerState,
+) -> bool {
+    let (spans, _guard) = support::span_capture::init_test_tracing();
+    fluree_db_api::GraphDb::from_ledger_state(state)
+        .query(fluree)
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT ?p ?name WHERE { ?p ex:name ?name } LIMIT 5",
+        )
+        .execute()
+        .await
+        .expect("scan query");
+    spans.has_span("overlay_translate")
+}
+
+async fn assert_cached_queries_match_fresh(
+    fluree: &fluree_db_api::Fluree,
+    cached: &fluree_db_api::LedgerState,
+) {
+    let fresh = fluree
+        .ledger(cached.ledger_id())
+        .await
+        .expect("uncached load");
+    let queries = [
+        "SELECT ?p WHERE { ?p a ex:Person } LIMIT 10",
+        "SELECT ?p ?name WHERE { ?p a ex:Person ; ex:name ?name ; ex:age ?age } LIMIT 10",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p a ex:Person ; ex:age ?age FILTER(?age > 60) }",
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?p ex:name ?v } UNION { ?p ex:city ?v } }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:name ?name FILTER(STRSTARTS(?name, 'Person 1')) }",
+        "SELECT (SUM(xsd:integer(STRSTARTS(?name, 'Person 1'))) AS ?n) WHERE { ?p ex:name ?name }",
+        "SELECT ?p ?age WHERE { ?p ex:age ?age } ORDER BY DESC(?age) LIMIT 10",
+        "SELECT ?city (COUNT(*) AS ?n) WHERE { ?p ex:city ?city ; ex:name ?name } GROUP BY ?city ORDER BY ?city",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?p ex:knows/ex:knows+ ?friend }",
+        "SELECT ?name WHERE { ex:new-person ex:name ?name }",
+    ];
+    for body in queries {
+        let query = format!("PREFIX ex: <http://example.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        // This is also how the HTTP route constructs its single-ledger query.
+        let cached_result = fluree_db_api::GraphDb::from_ledger_state(cached)
+            .query(fluree)
+            .sparql(&query)
+            .track_all()
+            .execute_tracked()
+            .await
+            .expect("cached query");
+        let fresh_result = fluree_db_api::GraphDb::from_ledger_state(&fresh)
+            .query(fluree)
+            .sparql(&query)
+            .track_all()
+            .execute_tracked()
+            .await
+            .expect("fresh query");
+        assert_eq!(
+            cached_result.result,
+            fresh_result.result,
+            "{body}, t={}",
+            cached.t()
+        );
+        assert_eq!(
+            cached_result.fuel,
+            fresh_result.fuel,
+            "{body}, t={}",
+            cached.t()
+        );
+        if body == "SELECT ?name WHERE { ex:new-person ex:name ?name }" {
+            let rows = cached_result.result["results"]["bindings"]
+                .as_array()
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(cached.t() == 2));
+            if let Some(row) = rows.first() {
+                assert_eq!(row["name"]["value"], "Person newly added");
+            }
+        }
+    }
+}
+
+/// A second ledger-manager over the same backend + nameservice as `fluree`,
+/// simulating a separate node whose cache can fall behind when another writer
+/// (here, `fluree` itself) advances the shared nameservice head. This is the
+/// scenario `notify` catch-up exists for: a writer in this process keeps its
+/// own cache current ([read-your-writes], issue #1330), so an in-process commit
+/// no longer leaves the *writer's* cache stale — only a peer's does.
+fn peer_manager(fluree: &support::MemoryFluree) -> LedgerManager {
+    LedgerManager::new(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().clone(),
+        LedgerManagerConfig::default(),
+    )
+}
+
+/// Helper: transact one insert and return the committed ledger state.
+async fn insert_data(
+    fluree: &support::MemoryFluree,
+    ledger: fluree_db_api::LedgerState,
+    label: &str,
+) -> fluree_db_api::LedgerState {
+    let txn = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [{
+            "@id": format!("ex:{label}"),
+            "ex:name": label
+        }]
+    });
+    fluree
+        .insert_with_opts(
+            ledger,
+            &txn,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                // Very large thresholds to prevent auto-indexing
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .expect("insert should succeed")
+        .ledger
+}
+
+#[tokio::test]
+async fn notify_single_commit_uses_incremental_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/notify-incremental:main";
+    let manager = peer_manager(&fluree);
+
+    // Create ledger and insert initial data
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger1 = insert_data(&fluree, ledger0, "item1").await;
+    let t_after_first = ledger1.t();
+    assert!(t_after_first >= 1);
+
+    // Cache the ledger in the manager (simulates a prior request)
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
+
+    // Verify it's cached and current
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify");
+    assert_eq!(
+        result,
+        NotifyResult::Current,
+        "should be current after load"
+    );
+
+    // Transact one more commit (advances commit_t by 1)
+    let _ledger2 = insert_data(&fluree, ledger1, "item2").await;
+
+    // Notify — should use CommitCatchUp (gap=1), NOT reload
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify after second insert");
+
+    assert!(
+        matches!(result, NotifyResult::CommitsApplied { count: 1 }),
+        "expected CommitsApplied {{ count: 1 }}, got: {result:?}"
+    );
+
+    // Verify the cached state now reflects the new commit
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("re-load");
+    let state = handle.snapshot().await;
+    assert_eq!(
+        state.t,
+        t_after_first + 1,
+        "cached ledger should be at t={} after incremental apply",
+        t_after_first + 1
+    );
+}
+
+#[tokio::test]
+async fn notify_small_gap_uses_incremental_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/notify-gap:main";
+    let manager = peer_manager(&fluree);
+
+    // Create and commit initial data
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger1 = insert_data(&fluree, ledger0, "item1").await;
+    let t_initial = ledger1.t();
+
+    // Cache the ledger
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
+
+    // Transact 3 more commits
+    let ledger2 = insert_data(&fluree, ledger1, "item2").await;
+    let ledger3 = insert_data(&fluree, ledger2, "item3").await;
+    let _ledger4 = insert_data(&fluree, ledger3, "item4").await;
+
+    // Notify — should catch up 3 commits incrementally
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify after 3 inserts");
+
+    assert!(
+        matches!(result, NotifyResult::CommitsApplied { count: 3 }),
+        "expected CommitsApplied {{ count: 3 }}, got: {result:?}"
+    );
+
+    // Verify final t
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("re-load");
+    let state = handle.snapshot().await;
+    assert_eq!(state.t, t_initial + 3);
+}
+
+#[tokio::test]
+async fn notify_large_gap_falls_back_to_reload() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/notify-reload:main";
+    let manager = peer_manager(&fluree);
+
+    // Create and commit initial data
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let mut ledger = insert_data(&fluree, ledger0, "item0").await;
+
+    // Cache the ledger
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+        .await
+        .expect("load");
+
+    // Transact 6 more commits (exceeds MAX_INCREMENTAL_COMMITS = 5)
+    for i in 1..=6 {
+        ledger = insert_data(&fluree, ledger, &format!("item{i}")).await;
+    }
+
+    // Notify — gap is 6, should fall back to full reload
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify after 6 inserts");
+
+    assert_eq!(
+        result,
+        NotifyResult::Reloaded,
+        "expected Reloaded for gap > 5"
+    );
+}
+
+#[tokio::test]
+async fn notify_index_only_trims_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/notify-index-only:main";
+    // A peer manager (not `fluree.ledger_manager()`): the built-in manager's
+    // event listener reconciles the cache as soon as the indexer publishes,
+    // which would make this notify() observe `Current` instead of exercising
+    // the IndexOnly path.
+    let manager = peer_manager(&fluree);
+
+    // Start a background indexer
+    let (local, indexer_handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async {
+            // Create and commit data
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let mut graph = Vec::new();
+            for i in 0..50u32 {
+                graph.push(json!({
+                    "@id": format!("ex:s{i}"),
+                    "ex:name": format!("name-{i}"),
+                    "ex:n": i
+                }));
+            }
+            let txn = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": graph
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &IndexConfig {
+                        reindex_min_bytes: 1_000_000_000,
+                        reindex_max_bytes: 1_000_000_000,
+                    },
+                )
+                .await
+                .expect("insert");
+            let commit_t = ledger1.ledger.t();
+
+            // Cache the ledger (has novelty, no index yet)
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+                .await
+                .expect("load");
+            let state_before = handle.snapshot().await;
+            // snapshot.t is the index_t (from the LedgerSnapshot)
+            assert_eq!(
+                state_before.snapshot.t, 0,
+                "index_t should be 0 before indexing"
+            );
+            // Overall t includes novelty
+            assert_eq!(state_before.t, commit_t, "overall t should reflect commits");
+
+            // Trigger indexing — publishes new index root to nameservice
+            trigger_index_and_wait(&indexer_handle, ledger_id, commit_t).await;
+
+            // Notify — commit_t unchanged, index advanced → IndexOnly plan
+            let result = manager
+                .notify(NsNotify {
+                    ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    record: None,
+                })
+                .await
+                .expect("notify after indexing");
+
+            assert_eq!(
+                result,
+                NotifyResult::IndexUpdated,
+                "expected IndexUpdated, got: {result:?}"
+            );
+
+            // Verify the cached state now has the index
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(ledger_id).unwrap())
+                .await
+                .expect("re-load");
+            let state_after = handle.snapshot().await;
+            assert_eq!(
+                state_after.snapshot.t, commit_t,
+                "index_t should match commit_t after IndexOnly update"
+            );
+            // Overall t should be unchanged
+            assert_eq!(state_after.t, commit_t);
+        })
+        .await;
+}
+
+/// Catch-up across a branch fork point must not 404 on the parent commit.
+///
+/// Regression test for the bug where the commit-chain walker scoped its
+/// content store to the branch's own namespace, causing reads of pre-fork
+/// commits (which live under the source branch's prefix) to fail with
+/// "Not found".
+#[tokio::test]
+async fn notify_branch_catch_up_resolves_pre_fork_parent() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_name = "it/notify-branch";
+    let main_id = "it/notify-branch:main";
+    let dev_id = "it/notify-branch:dev";
+    let manager = peer_manager(&fluree);
+
+    // 1. Create main and seed one commit so commit_head_id is set
+    //    (create_branch uses the source branch's commit head).
+    fluree
+        .create_ledger(ledger_name)
+        .await
+        .expect("create_ledger");
+    let main_ledger = fluree.ledger(main_id).await.expect("open main");
+    let _ = insert_data(&fluree, main_ledger, "seed").await;
+
+    // 2. Create branch dev from main at t=1
+    fluree
+        .create_branch(ledger_name, "dev", None, None)
+        .await
+        .expect("create_branch");
+
+    // 3. Cache the dev branch — its initial commit_t equals main's t at
+    //    fork time. Critical: this is the local_t the catch-up walker
+    //    will compare against when dev advances.
+    let dev_ledger = fluree.ledger(dev_id).await.expect("open dev");
+    let local_t_before = dev_ledger.t();
+    let _handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+        .await
+        .expect("cache dev");
+
+    // 4. Transact on dev — this commit's `previous` points at the t=1
+    //    commit that lives under main's namespace, not dev's.
+    let _dev_after = insert_data(&fluree, dev_ledger, "dev-only").await;
+
+    // 5. Notify on dev — small gap, takes the CommitCatchUp path.
+    //    Without the branched-store fix, this fails with "Not found"
+    //    when the walker tries to read the parent envelope from dev's
+    //    own prefix. With the fix, BranchedContentStore falls through
+    //    to main's namespace and resolves it.
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse(dev_id).unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify on dev branch");
+
+    assert!(
+        matches!(result, NotifyResult::CommitsApplied { count: 1 }),
+        "expected CommitsApplied {{ count: 1 }} via branch-aware catch-up, got: {result:?}"
+    );
+
+    let handle = manager
+        .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+        .await
+        .expect("re-load dev");
+    let state = handle.snapshot().await;
+    assert_eq!(
+        state.t,
+        local_t_before + 1,
+        "cached dev branch should be at t={} after incremental apply",
+        local_t_before + 1
+    );
+}
+
+/// A branch's first *own* incremental index must be stamped with the branch's
+/// ledger_id, not the parent's.
+///
+/// `create_branch` copies the parent's index root by CID, so the branch's base
+/// root carries the parent's `ledger_id`. The load path re-stamps the cached
+/// snapshot from the nameservice record, but the incremental indexer used to
+/// clone the base root's `ledger_id` into every root it published. A cached
+/// branch handle refreshing onto that root then failed `apply_loaded_db`'s
+/// identity check ("Index ledger_id '<parent>' does not match expected
+/// '<branch>'") on every retry — leaving the branch permanently unwritable
+/// for any process holding it in cache.
+#[tokio::test]
+async fn notify_branch_refresh_after_incremental_index_on_branch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_name = "it/notify-branch-idx";
+    let main_id = "it/notify-branch-idx:main";
+    let dev_id = "it/notify-branch-idx:dev";
+    let manager = peer_manager(&fluree);
+
+    let (local, indexer_handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async {
+            // 1. main: two commits, then an index — so the branch inherits a
+            //    root whose ledger_id is main's.
+            fluree
+                .create_ledger(ledger_name)
+                .await
+                .expect("create_ledger");
+            let main_ledger = fluree.ledger(main_id).await.expect("open main");
+            let main_ledger = insert_data(&fluree, main_ledger, "seed1").await;
+            let main_ledger = insert_data(&fluree, main_ledger, "seed2").await;
+            trigger_index_and_wait(&indexer_handle, main_id, main_ledger.t()).await;
+
+            // 2. Branch dev from indexed main and cache it (re-stamped to dev_id
+            //    by the load path).
+            fluree
+                .create_branch(ledger_name, "dev", None, None)
+                .await
+                .expect("create_branch");
+            let handle = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+                .await
+                .expect("cache dev");
+            assert_eq!(handle.snapshot().await.ledger_id(), Some(dev_id));
+
+            // 3. Write on dev, then let the indexer index the branch itself.
+            let dev_ledger = fluree.ledger(dev_id).await.expect("open dev");
+            let dev_ledger = insert_data(&fluree, dev_ledger, "dev-only").await;
+            let dev_t = dev_ledger.t();
+            let outcome =
+                support::trigger_index_and_wait_outcome(&indexer_handle, dev_id, dev_t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                panic!("expected Completed");
+            };
+            let root_id = root_id.expect("completed index publishes a root");
+
+            // The published root must name the branch it indexes.
+            let record = fluree
+                .nameservice()
+                .lookup(dev_id)
+                .await
+                .expect("lookup dev")
+                .expect("dev record");
+            let cs = fluree_db_nameservice::branched_content_store_for_record(
+                fluree.backend(),
+                fluree.nameservice_mode().reader(),
+                &record,
+            )
+            .await
+            .expect("branched store");
+            let root_bytes = cs.get(&root_id).await.expect("read dev root");
+            let root =
+                fluree_db_binary_index::IndexRoot::decode(&root_bytes).expect("decode dev root");
+            assert_eq!(
+                root.ledger_id, dev_id,
+                "branch's incremental index root must carry the branch's ledger_id"
+            );
+
+            // 4. Refresh the cached handle: one commit behind plus the new
+            //    index → CommitCatchUp with an index update. This is the
+            //    transactor's cache-refresh step that used to fail with
+            //    LedgerIdMismatch on the branch's first own index.
+            let result = manager
+                .notify(NsNotify {
+                    ledger_id: fluree_db_api::LedgerId::parse(dev_id).unwrap(),
+                    record: None,
+                })
+                .await
+                .expect("notify on dev after branch index");
+            assert!(
+                matches!(result, NotifyResult::CommitsApplied { count: 1 }),
+                "expected CommitsApplied {{ count: 1 }}, got: {result:?}"
+            );
+
+            let state = manager
+                .get_or_load(&fluree_db_api::LedgerId::parse(dev_id).unwrap())
+                .await
+                .expect("re-load dev")
+                .snapshot()
+                .await;
+            assert_eq!(
+                state.snapshot.t, dev_t,
+                "cached dev should be on the new index"
+            );
+            assert_eq!(state.ledger_id(), Some(dev_id));
+
+            // 5. And the branch stays writable through the cached path.
+            let _ = insert_data(&fluree, dev_ledger, "after-index").await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn notify_returns_not_loaded_for_uncached_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let manager = fluree
+        .ledger_manager()
+        .expect("ledger_manager should be present");
+
+    let result = manager
+        .notify(NsNotify {
+            ledger_id: fluree_db_api::LedgerId::parse("nonexistent:main").unwrap(),
+            record: None,
+        })
+        .await
+        .expect("notify");
+
+    assert_eq!(result, NotifyResult::NotLoaded);
+}

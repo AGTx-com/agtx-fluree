@@ -1,0 +1,941 @@
+//! XSD datatype constructor (cast) functions
+//!
+//! Implements W3C SPARQL 1.1 §17.5 XSD casting:
+//! xsd:boolean(), xsd:integer(), xsd:float(), xsd:double(), xsd:decimal(), xsd:string()
+//!
+//! Per the spec, invalid casts produce no binding (Ok(None)), not errors.
+
+use crate::binding::RowAccess;
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::ir::Expression;
+use bigdecimal::BigDecimal;
+use fluree_db_core::FlakeValue;
+use num_traits::ToPrimitive;
+use std::sync::{Arc, LazyLock};
+
+use super::helpers::check_arity;
+use super::value::ComparableValue;
+use crate::parse::UnresolvedDatatypeConstraint;
+
+static XSD_FLOAT_IRI: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(fluree_vocab::xsd::FLOAT));
+
+/// Unwrap a `TypedLiteral` into the corresponding primitive `ComparableValue`.
+///
+/// If the inner `FlakeValue` maps to a known primitive variant, returns that
+/// variant. Otherwise returns the original value unchanged. This eliminates
+/// the need to duplicate match arms for `TypedLiteral` in every cast function.
+fn unwrap_typed_literal(v: ComparableValue) -> ComparableValue {
+    match v {
+        ComparableValue::TypedLiteral { val, .. } => match val {
+            FlakeValue::Boolean(b) => ComparableValue::Bool(b),
+            FlakeValue::Long(n) => ComparableValue::Long(n),
+            FlakeValue::Double(d) => ComparableValue::Double(d),
+            FlakeValue::String(s) => ComparableValue::String(Arc::from(s.as_str())),
+            _ => ComparableValue::TypedLiteral { val, dtc: None },
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xsd:boolean
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_boolean<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:boolean")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_boolean(v))
+}
+
+fn cast_to_boolean(v: ComparableValue) -> Option<ComparableValue> {
+    let v = unwrap_typed_literal(v);
+    let b = match v {
+        ComparableValue::Bool(b) => b,
+        ComparableValue::Long(n) => n != 0,
+        ComparableValue::Double(d) => {
+            if d.is_nan() {
+                return None;
+            }
+            d != 0.0
+        }
+        ComparableValue::Float(f) => {
+            if f.is_nan() {
+                return None;
+            }
+            f != 0.0
+        }
+        ComparableValue::BigInt(n) => !num_traits::Zero::is_zero(&*n),
+        ComparableValue::Decimal(d) => !num_traits::Zero::is_zero(&*d),
+        ComparableValue::String(s) => match s.as_ref() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(ComparableValue::Bool(b))
+}
+
+// ---------------------------------------------------------------------------
+// xsd:integer
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_integer<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:integer")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_integer(v))
+}
+
+fn cast_to_integer(v: ComparableValue) -> Option<ComparableValue> {
+    let v = unwrap_typed_literal(v);
+    let n = match v {
+        ComparableValue::Long(n) => n,
+        ComparableValue::Bool(b) => i64::from(b),
+        ComparableValue::Double(d) => {
+            if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
+                return None;
+            }
+            d.trunc() as i64
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
+            if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
+                return None;
+            }
+            d.trunc() as i64
+        }
+        ComparableValue::BigInt(bi) => bi.to_i64()?,
+        ComparableValue::Decimal(dec) => {
+            if let Some(i) = dec.to_i64() {
+                i
+            } else {
+                let f = dec.to_f64()?;
+                if !f.is_finite() || f > i64::MAX as f64 || f < i64::MIN as f64 {
+                    return None;
+                }
+                f.trunc() as i64
+            }
+        }
+        ComparableValue::String(s) => s.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    Some(ComparableValue::Long(n))
+}
+
+// ---------------------------------------------------------------------------
+// xsd:float
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_float<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:float")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_float(v))
+}
+
+fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
+    // A numeric typed literal held as text reads as arithmetic reads it,
+    // including the `inf`/`-inf` text of earlier imports.
+    let v = unwrap_typed_literal(v.coerce_numeric_operand());
+    let f: f32 = match v {
+        ComparableValue::Bool(b) => {
+            if b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ComparableValue::Long(n) => n as f32,
+        ComparableValue::Double(d) => d as f32,
+        ComparableValue::Float(f) => f,
+        ComparableValue::BigInt(n) => n.to_f32()?,
+        ComparableValue::Decimal(d) => d.to_f64()? as f32,
+        // XPath casts a string through the target type's lexical space
+        // (F&O 3.1 §19.2), so `inf` or `Infinity` is a cast error.
+        ComparableValue::String(s) => fluree_graph_ir::parse_xsd_float(&s)?,
+        _ => return None,
+    };
+    Some(float_typed_literal(f))
+}
+
+/// Construct a TypedLiteral with xsd:float datatype.
+///
+/// We store the value as a String (not Double) because f32→f64 conversion
+/// introduces precision artifacts (e.g., 33.33f32 → 33.33000183105469f64).
+/// Using the f32 string representation avoids this.
+fn float_typed_literal(f: f32) -> ComparableValue {
+    let s = format_f32(f);
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::String(s),
+        dtc: Some(UnresolvedDatatypeConstraint::Explicit(
+            XSD_FLOAT_IRI.clone(),
+        )),
+    }
+}
+
+/// Format an `f32` the way an XSD *cast* renders it.
+///
+/// Deliberately NOT always the canonical XSD lexical form `STR()` produces
+/// (`fluree_graph_ir::canonical_xsd_float`): SPARQL §17.5 defers casting to
+/// XPath, whose float/double→string rule converts a value with absolute
+/// value in `[1e-6, 1e6)` through `xs:decimal` — plain decimal notation,
+/// shortest round-trip digits (Rust's `Display`). W3C `cast-string` pins
+/// it: `xsd:string("1E0"^^xsd:float)` is `"1"`, not `"1.0E0"`. Outside that
+/// range (both sides — `1.0E-7` no less than `1.0E30`) XPath prescribes the
+/// canonical lexical representation, which IS the canonical form, so the two
+/// renderings converge there and this reuses the canonical writer. The
+/// special values agree everywhere: `NaN`/`INF`/`-INF` in both.
+pub(crate) fn format_f32(f: f32) -> String {
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(f) {
+        return s.to_string();
+    }
+    let a = f.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_float(f)
+    } else {
+        f.to_string()
+    }
+}
+
+/// `f64` counterpart of [`format_f32`], for the `xsd:string()` cast of a
+/// double: `xs:decimal` (plain, shortest round-trip) notation inside
+/// `[1e-6, 1e6)`, the canonical lexical form outside it, XSD spellings for
+/// the special values — `f64::to_string()` alone yields `"inf"`, which is
+/// not a valid lexical form under either the cast rules or the canonical
+/// ones (#1695).
+fn format_f64(d: f64) -> String {
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(d) {
+        return s.to_string();
+    }
+    let a = d.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_double(d)
+    } else {
+        d.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xsd:double
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_double<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:double")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_double(v, fluree_graph_ir::parse_xsd_double))
+}
+
+/// Cypher `toFloat(x)`: [`eval_xsd_double`], except that a string reads as
+/// Cypher reads a float, which takes `Infinity`, `-Infinity`, `NaN` and `inf`
+/// alongside the numerals.
+pub fn eval_cypher_to_float<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "toFloat")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_double(v, |s| s.parse::<f64>().ok()))
+}
+
+/// A value as a double; `parse` reads a string. A numeric typed literal held
+/// as text reads as arithmetic reads it, including the `inf`/`-inf` text of
+/// earlier imports.
+fn cast_to_double(
+    v: ComparableValue,
+    parse: impl Fn(&str) -> Option<f64>,
+) -> Option<ComparableValue> {
+    let v = unwrap_typed_literal(v.coerce_numeric_operand());
+    let d: f64 = match v {
+        ComparableValue::Bool(b) => {
+            if b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ComparableValue::Long(n) => n as f64,
+        ComparableValue::Double(d) => d,
+        ComparableValue::Float(f) => f as f64,
+        ComparableValue::BigInt(n) => n.to_f64()?,
+        ComparableValue::Decimal(dec) => dec.to_f64()?,
+        ComparableValue::String(s) => parse(&s)?,
+        _ => return None,
+    };
+    Some(ComparableValue::Double(d))
+}
+
+// ---------------------------------------------------------------------------
+// xsd:decimal
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_decimal<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:decimal")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_decimal(v))
+}
+
+fn cast_to_decimal(v: ComparableValue) -> Option<ComparableValue> {
+    let v = unwrap_typed_literal(v);
+    let d = match v {
+        ComparableValue::Decimal(d) => return Some(ComparableValue::Decimal(d)),
+        ComparableValue::Bool(b) => BigDecimal::from(i64::from(b)),
+        ComparableValue::Long(n) => BigDecimal::from(n),
+        ComparableValue::Double(d) => {
+            if !d.is_finite() {
+                return None;
+            }
+            BigDecimal::try_from(d).ok()?
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
+            if !d.is_finite() {
+                return None;
+            }
+            BigDecimal::try_from(d).ok()?
+        }
+        ComparableValue::BigInt(n) => BigDecimal::from((*n).clone()),
+        ComparableValue::String(s) => parse_decimal_string(&s)?,
+        _ => return None,
+    };
+    Some(ComparableValue::Decimal(Box::new(d)))
+}
+
+/// Parse a string as xsd:decimal. Rejects scientific notation per XSD spec.
+fn parse_decimal_string(s: &str) -> Option<BigDecimal> {
+    // xsd:decimal does not accept scientific notation (e.g. "1.5E2")
+    if s.contains('e') || s.contains('E') {
+        return None;
+    }
+    s.parse::<BigDecimal>().ok()
+}
+
+// ---------------------------------------------------------------------------
+// xsd:string
+// ---------------------------------------------------------------------------
+
+pub fn eval_xsd_string<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:string")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(cast_to_string(v, ctx))
+}
+
+fn cast_to_string(
+    v: ComparableValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<ComparableValue> {
+    // Decimal needs special handling: W3C canonical form strips trailing zeros
+    // and trailing decimal point (e.g., "1.0" → "1", "2.50" → "2.5").
+    if let ComparableValue::Decimal(ref d) = v {
+        let s = canonical_decimal_string(d);
+        return Some(ComparableValue::String(Arc::from(s)));
+    }
+    // Doubles and floats likewise render by the XPath *cast* rule, not the
+    // canonical XSD lexical form `STR()` returns — see `format_f32` (#1695).
+    // Without these arms the cast would fall through to `into_string_value`
+    // and pick up STR()'s canonical form, failing W3C `cast-string`.
+    match &v {
+        // The `TypedLiteral` arm deliberately ignores `dtc`: no producer in
+        // the engine wraps a `FlakeValue::Double` in a `TypedLiteral` today
+        // (a stored float materializes as `Float` via `lit_to_comparable`;
+        // STRDT/cast results are string-backed; `TryFrom<FlakeValue>` maps
+        // `Double` to the bare variant), so a float-datatyped `Double`
+        // cannot reach the f64 branch. If such a producer ever appears,
+        // this arm must split on the datatype — the same variant-vs-datatype
+        // conflation the serializers carry (#1776).
+        ComparableValue::Double(d)
+        | ComparableValue::TypedLiteral {
+            val: FlakeValue::Double(d),
+            ..
+        } => return Some(ComparableValue::String(Arc::from(format_f64(*d)))),
+        ComparableValue::Float(f) => {
+            return Some(ComparableValue::String(Arc::from(format_f32(*f))))
+        }
+        _ => {}
+    }
+    let namespace_codes = ctx.map(|c| c.active_snapshot.namespaces());
+    v.into_string_value_with_namespaces(namespace_codes)
+}
+
+// ---------------------------------------------------------------------------
+// xsd:dateTime / xsd:date / xsd:time
+// ---------------------------------------------------------------------------
+
+/// Extract the string form of a castable temporal source value: a plain or
+/// typed string literal. Non-string, non-temporal values (numbers, booleans,
+/// IRIs) are not castable to temporal types (W3C SPARQL 1.1 §17.5 / XPath
+/// casting) — the cast produces no value.
+fn temporal_source_string(v: &ComparableValue) -> Option<&str> {
+    match v {
+        ComparableValue::String(s) => Some(s.as_ref()),
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            ..
+        } => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+pub fn eval_xsd_datetime<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:dateTime")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::DateTime(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::DateTime::parse(s).ok())
+            .map(ComparableValue::DateTime),
+    })
+}
+
+pub fn eval_xsd_date<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:date")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Date(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Date::parse(s).ok())
+            .map(ComparableValue::Date),
+    })
+}
+
+pub fn eval_xsd_time<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:time")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Time(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Time::parse(s).ok())
+            .map(ComparableValue::Time),
+    })
+}
+
+/// Produce the XSD canonical string form of a decimal value.
+///
+/// Strips trailing zeros after the decimal point and removes the decimal
+/// point if no fractional part remains. E.g., "1.0" → "1", "2.50" → "2.5".
+fn canonical_decimal_string(d: &BigDecimal) -> String {
+    let s = d.normalized().to_string();
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0');
+        trimmed.trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::BindingRow;
+    use fluree_db_core::value::FlakeValue;
+
+    fn long(v: i64) -> Expression {
+        Expression::Const(FlakeValue::Long(v))
+    }
+
+    fn double(v: f64) -> Expression {
+        Expression::Const(FlakeValue::Double(v))
+    }
+
+    fn bool_expr(v: bool) -> Expression {
+        Expression::Const(FlakeValue::Boolean(v))
+    }
+
+    fn string_expr(s: &str) -> Expression {
+        Expression::Const(FlakeValue::String(s.to_string()))
+    }
+
+    fn empty_row() -> BindingRow<'static> {
+        BindingRow::new(&[], &[])
+    }
+
+    // === xsd:boolean ===
+
+    #[test]
+    fn boolean_from_bool_identity() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_boolean(&[bool_expr(true)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(true))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[bool_expr(false)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn boolean_from_numeric() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_boolean(&[long(1)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(true))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[long(0)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(false))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[double(0.0)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(false))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[double(1.5)], &row, None).unwrap(),
+            Some(ComparableValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn boolean_from_string() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_boolean(&[string_expr("true")], &row, None).unwrap(),
+            Some(ComparableValue::Bool(true))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[string_expr("false")], &row, None).unwrap(),
+            Some(ComparableValue::Bool(false))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[string_expr("1")], &row, None).unwrap(),
+            Some(ComparableValue::Bool(true))
+        );
+        assert_eq!(
+            eval_xsd_boolean(&[string_expr("0")], &row, None).unwrap(),
+            Some(ComparableValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn boolean_from_invalid_string_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_boolean(&[string_expr("yes")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn boolean_from_nan_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_boolean(&[double(f64::NAN)], &row, None).unwrap(),
+            None
+        );
+    }
+
+    // === xsd:integer ===
+
+    #[test]
+    fn integer_from_long_identity() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[long(42)], &row, None).unwrap(),
+            Some(ComparableValue::Long(42))
+        );
+    }
+
+    #[test]
+    fn integer_from_bool() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[bool_expr(true)], &row, None).unwrap(),
+            Some(ComparableValue::Long(1))
+        );
+        assert_eq!(
+            eval_xsd_integer(&[bool_expr(false)], &row, None).unwrap(),
+            Some(ComparableValue::Long(0))
+        );
+    }
+
+    #[test]
+    fn integer_from_double_truncates() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[double(3.9)], &row, None).unwrap(),
+            Some(ComparableValue::Long(3))
+        );
+        assert_eq!(
+            eval_xsd_integer(&[double(-2.7)], &row, None).unwrap(),
+            Some(ComparableValue::Long(-2))
+        );
+    }
+
+    #[test]
+    fn integer_from_nan_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[double(f64::NAN)], &row, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn integer_from_infinity_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[double(f64::INFINITY)], &row, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn integer_from_string() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[string_expr("123")], &row, None).unwrap(),
+            Some(ComparableValue::Long(123))
+        );
+    }
+
+    #[test]
+    fn integer_from_non_numeric_string_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[string_expr("abc")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn integer_from_float_string_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[string_expr("2.75")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    // === xsd:double ===
+
+    #[test]
+    fn double_from_double_identity() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[double(2.75)], &row, None).unwrap(),
+            Some(ComparableValue::Double(2.75))
+        );
+    }
+
+    #[test]
+    fn double_from_bool() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[bool_expr(true)], &row, None).unwrap(),
+            Some(ComparableValue::Double(1.0))
+        );
+        assert_eq!(
+            eval_xsd_double(&[bool_expr(false)], &row, None).unwrap(),
+            Some(ComparableValue::Double(0.0))
+        );
+    }
+
+    #[test]
+    fn double_from_long() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[long(42)], &row, None).unwrap(),
+            Some(ComparableValue::Double(42.0))
+        );
+    }
+
+    #[test]
+    fn double_from_string() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[string_expr("2.75")], &row, None).unwrap(),
+            Some(ComparableValue::Double(2.75))
+        );
+    }
+
+    #[test]
+    fn double_from_non_numeric_string_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[string_expr("abc")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    // === xsd:decimal ===
+
+    #[test]
+    fn decimal_from_long() {
+        let row = empty_row();
+        let result = eval_xsd_decimal(&[long(42)], &row, None).unwrap();
+        assert_eq!(
+            result,
+            Some(ComparableValue::Decimal(Box::new(BigDecimal::from(42))))
+        );
+    }
+
+    #[test]
+    fn decimal_from_bool() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_decimal(&[bool_expr(true)], &row, None).unwrap(),
+            Some(ComparableValue::Decimal(Box::new(BigDecimal::from(1))))
+        );
+    }
+
+    #[test]
+    fn decimal_from_string() {
+        let row = empty_row();
+        let result = eval_xsd_decimal(&[string_expr("33.33")], &row, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn decimal_rejects_scientific_notation_string() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_decimal(&[string_expr("1.5E2")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decimal_from_nan_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_decimal(&[double(f64::NAN)], &row, None).unwrap(),
+            None
+        );
+    }
+
+    // === xsd:string ===
+
+    #[test]
+    fn string_from_long() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_string(&[long(42)], &row, None).unwrap(),
+            Some(ComparableValue::String(Arc::from("42")))
+        );
+    }
+
+    #[test]
+    fn string_from_bool() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_string(&[bool_expr(true)], &row, None).unwrap(),
+            Some(ComparableValue::String(Arc::from("true")))
+        );
+    }
+
+    #[test]
+    fn string_from_double() {
+        let row = empty_row();
+        let result = eval_xsd_string(&[double(2.75)], &row, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    // === xsd:float ===
+
+    #[test]
+    fn float_from_bool() {
+        let row = empty_row();
+        let result = eval_xsd_float(&[bool_expr(true)], &row, None).unwrap();
+        assert!(result.is_some());
+        // Should be a TypedLiteral with xsd:float datatype
+        if let Some(ComparableValue::TypedLiteral { dtc, .. }) = &result {
+            assert_eq!(
+                dtc.as_ref()
+                    .map(fluree_vocab::UnresolvedDatatypeConstraint::datatype_iri),
+                Some("http://www.w3.org/2001/XMLSchema#float")
+            );
+        } else {
+            panic!("Expected TypedLiteral, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn float_from_long() {
+        let row = empty_row();
+        let result = eval_xsd_float(&[long(42)], &row, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn float_from_non_numeric_string_is_none() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_float(&[string_expr("abc")], &row, None).unwrap(),
+            None
+        );
+    }
+
+    // === arity validation ===
+
+    #[test]
+    fn cast_wrong_arity_two_args_errors() {
+        let row = empty_row();
+        assert!(eval_xsd_integer(&[long(1), long(2)], &row, None).is_err());
+        assert!(eval_xsd_boolean(&[bool_expr(true), bool_expr(false)], &row, None).is_err());
+        assert!(eval_xsd_double(&[double(1.0), double(2.0)], &row, None).is_err());
+        assert!(eval_xsd_float(&[double(1.0), double(2.0)], &row, None).is_err());
+        assert!(eval_xsd_decimal(&[long(1), long(2)], &row, None).is_err());
+        assert!(eval_xsd_string(&[long(1), long(2)], &row, None).is_err());
+    }
+
+    #[test]
+    fn cast_wrong_arity_zero_args_errors() {
+        let row = empty_row();
+        assert!(eval_xsd_integer(&[], &row, None).is_err());
+        assert!(eval_xsd_boolean(&[], &row, None).is_err());
+        assert!(eval_xsd_double(&[], &row, None).is_err());
+        assert!(eval_xsd_float(&[], &row, None).is_err());
+        assert!(eval_xsd_decimal(&[], &row, None).is_err());
+        assert!(eval_xsd_string(&[], &row, None).is_err());
+    }
+
+    // === negative values ===
+
+    #[test]
+    fn integer_from_negative_long() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_integer(&[long(-7)], &row, None).unwrap(),
+            Some(ComparableValue::Long(-7))
+        );
+    }
+
+    #[test]
+    fn double_from_negative() {
+        let row = empty_row();
+        assert_eq!(
+            eval_xsd_double(&[double(-2.75)], &row, None).unwrap(),
+            Some(ComparableValue::Double(-2.75))
+        );
+    }
+
+    // === the XPath cast range, both sides (F&O: xs:decimal notation inside
+    // [1e-6, 1e6), canonical scientific outside) ===
+
+    #[test]
+    fn format_f64_xpath_range_is_two_sided() {
+        // Inside the range: plain decimal, shortest round-trip.
+        assert_eq!(format_f64(1.0), "1");
+        assert_eq!(format_f64(0.001), "0.001");
+        assert_eq!(format_f64(1e-6), "0.000001"); // lower bound is inclusive
+        assert_eq!(format_f64(999_999.5), "999999.5");
+        assert_eq!(format_f64(0.0), "0");
+        assert_eq!(format_f64(-12.5), "-12.5");
+        // Outside the range: the canonical (scientific) lexical form.
+        assert_eq!(format_f64(1e-7), "1.0E-7"); // NOT "0.0000001"
+        assert_eq!(format_f64(1e6), "1.0E6"); // upper bound is exclusive
+        assert_eq!(format_f64(1e30), "1.0E30"); // NOT a 31-digit integer
+        assert_eq!(format_f64(-2.5e6), "-2.5E6");
+        // Specials keep the XSD spellings on every path.
+        assert_eq!(format_f64(f64::NAN), "NaN");
+        assert_eq!(format_f64(f64::INFINITY), "INF");
+        assert_eq!(format_f64(f64::NEG_INFINITY), "-INF");
+    }
+
+    #[test]
+    fn format_f32_xpath_range_is_two_sided() {
+        assert_eq!(format_f32(1.0), "1");
+        assert_eq!(format_f32(33.33), "33.33");
+        assert_eq!(format_f32(0.0), "0");
+        assert_eq!(format_f32(1e-7), "1.0E-7");
+        assert_eq!(format_f32(1e6), "1.0E6");
+        assert_eq!(format_f32(1e30), "1.0E30");
+        assert_eq!(format_f32(f32::NAN), "NaN");
+        assert_eq!(format_f32(f32::NEG_INFINITY), "-INF");
+    }
+
+    // === Cypher toFloat ===
+
+    /// Cypher's `toFloat` reads `Infinity`, `-Infinity`, `NaN` and `inf` as
+    /// Cypher does; the `xsd:double` cast keeps to the XSD lexical space.
+    #[test]
+    fn cypher_to_float_reads_cypher_spellings() {
+        let row = empty_row();
+        let to_float = |s: &str| eval_cypher_to_float(&[string_expr(s)], &row, None).unwrap();
+        let double_of = |v: Option<ComparableValue>| match v {
+            Some(ComparableValue::Double(d)) => Some(d),
+            other => panic!("expected a double, got {other:?}"),
+        };
+        for (lexical, expected) in [
+            ("Infinity", f64::INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+            ("inf", f64::INFINITY),
+            ("INF", f64::INFINITY),
+            ("-INF", f64::NEG_INFINITY),
+            ("1.5", 1.5),
+            ("1e400", f64::INFINITY),
+        ] {
+            assert_eq!(double_of(to_float(lexical)), Some(expected), "{lexical}");
+        }
+        assert!(double_of(to_float("NaN")).is_some_and(f64::is_nan));
+        assert_eq!(to_float("abc"), None);
+        assert_eq!(
+            eval_xsd_double(&[string_expr("Infinity")], &row, None).unwrap(),
+            None,
+            "xsd:double keeps to the XSD lexical space"
+        );
+    }
+}

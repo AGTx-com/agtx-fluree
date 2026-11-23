@@ -1,0 +1,105 @@
+//! Policy query evaluation trait (async)
+//!
+//! This module defines the async trait for evaluating policy queries (f:query).
+//! The trait allows the policy crate to delegate query execution to the
+//! query engine without creating a circular dependency.
+//!
+//! # Design
+//!
+//! - `PolicyQueryExecutor` trait is implemented by the caller (e.g., fluree-db-query)
+//! - The implementation converts `PolicyQuery` to the query engine's IR
+//! - Queries are executed with a "root" context (no policy filtering)
+//! - Returns true if any results are found
+//!
+//! # Async Architecture
+//!
+//! The trait is async to avoid blocking inside async contexts (which causes deadlocks).
+//! This enables "async all the way" policy enforcement in the query pipeline.
+//!
+//! The `PolicyQueryFut` type alias handles Send bounds differently for WASM vs native:
+//! - Native: `Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>`
+//! - WASM: `Pin<Box<dyn Future<Output = Result<bool>> + 'a>>` (no Send requirement)
+
+use crate::types::PolicyQuery;
+use crate::Result;
+use core::future::Future;
+use core::pin::Pin;
+use fluree_db_core::FlakeValue;
+use std::collections::HashMap;
+
+/// Future type for policy query evaluation.
+///
+/// `Send` on every target: the engine's operator futures are uniformly
+/// `Send`-bounded, and single-threaded wasm32 implementors satisfy
+/// `Send + Sync` trivially (no `Rc`/JS handles in engine state).
+pub type PolicyQueryFut<'a> = Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+
+/// Async trait for evaluating policy queries
+///
+/// Implementations must execute the policy query against the database
+/// with the provided variable bindings and return whether any results
+/// were found.
+///
+/// # Variable Bindings
+///
+/// The `bindings` parameter contains pre-bound special variables:
+/// - `?$this` - The subject being checked (`FlakeValue::Ref`)
+/// - `?$identity` - The requesting identity (`FlakeValue::Ref`)
+/// - `?$value` - The object of the flake being authorized
+/// - `?$op` - `"assert"` / `"retract"` (write path; reads bind `"assert"`)
+/// - Additional user-provided policy values (`FlakeValue::Ref`)
+///
+/// # Execution Context
+///
+/// Policy queries must be executed with a "root" context:
+/// - Same database state (same `t`, same overlays/staged view)
+/// - NO policy filtering (to avoid recursion and ensure policy
+///   evaluation can access all data needed for authorization)
+///
+/// # Implementation Notes
+///
+/// Implementations should convert the `PolicyQuery` JSON to the query engine's IR,
+/// inject the bindings as a VALUES clause, execute with root context (no policy
+/// filtering to avoid recursion), and return `true` if any results are found.
+///
+pub trait PolicyQueryExecutor: Send + Sync {
+    /// Evaluate a policy query with the given variable bindings
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - The policy query to evaluate
+    /// * `bindings` - Pre-bound special variables (?$this, ?$identity, etc.)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Query returned at least one result (allow)
+    /// * `Ok(false)` - Query returned no results (continue to next policy)
+    /// * `Err(_)` - Query execution failed
+    fn evaluate_policy_query<'a>(
+        &'a self,
+        query: &'a PolicyQuery,
+        bindings: &'a HashMap<String, FlakeValue>,
+    ) -> PolicyQueryFut<'a>;
+}
+
+/// A no-op executor that treats all query policies as deny
+///
+/// Used when no query executor is provided. This is the conservative
+/// default - query policies won't allow access, but Allow/Deny policies
+/// still work correctly.
+pub struct NoOpQueryExecutor;
+
+impl PolicyQueryExecutor for NoOpQueryExecutor {
+    fn evaluate_policy_query<'a>(
+        &'a self,
+        _query: &'a PolicyQuery,
+        _bindings: &'a HashMap<String, FlakeValue>,
+    ) -> PolicyQueryFut<'a> {
+        Box::pin(async move {
+            // Conservative default: query policies don't allow
+            // This means Allow/Deny policies work, but Query policies
+            // always continue to next policy (like deny, but not short-circuit)
+            Ok(false)
+        })
+    }
+}

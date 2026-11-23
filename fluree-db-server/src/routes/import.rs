@@ -1,0 +1,1067 @@
+//! Ledger restore endpoint: `POST /v1/fluree/import/*ledger`.
+//!
+//! Accepts a `.flpack` archive request body and creates a **new** ledger under
+//! the path name by streaming the archive frames into storage — commits, txn
+//! blobs, and (when present) prebuilt index artifacts — then finalizing the
+//! commit/index heads from the embedded nameservice manifest. This is the
+//! wholesale-restore counterpart of the `POST /pack/*ledger` export endpoint:
+//! the archive is trusted byte-for-byte (every frame is SHA-256 verified) and
+//! not replayed, so the restored ledger is immediately queryable.
+//!
+//! The new name is independent of whatever the source ledger was called, so
+//! the same archive can be restored under a different name.
+//!
+//! Auth: lives in the admin-protected route group (same bracket as
+//! create/drop). The body carries prebuilt index artifacts the server did not
+//! produce, so this is an admin-grade operation.
+
+use crate::config::ServerRole;
+use crate::error::{Result, ServerError};
+use crate::import_jobs::{
+    CompletionTarget, ImportJob, ImportSourceKind, ImportStatus, MultipartPlan,
+    SourceImportOptions, StagedResidue, IMPORT_JOB_TTL,
+};
+use crate::state::AppState;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use futures::TryStreamExt;
+use serde::Deserialize;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio_util::io::StreamReader;
+use tracing::debug;
+
+/// S3's hard ceiling on parts per multipart upload. The server raises the part
+/// size when an archive would otherwise need more parts than this. This is the
+/// real correctness constraint; the 5 MiB-per-part S3 minimum is left to the
+/// configured `import_multipart_part_size_bytes` (default 256 MiB), which sits
+/// comfortably above it.
+const MAX_MULTIPART_PARTS: u64 = 10_000;
+
+/// Import endpoint (ledger in path tail).
+///
+/// `POST /v1/fluree/import/<ledger...>`
+pub async fn import_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to the transactor — restore is a write.
+    if state.config.server_role == ServerRole::Peer {
+        let client = match state.forwarding_client.as_ref() {
+            Some(c) => c,
+            None => {
+                return ServerError::internal("Forwarding client not configured").into_response()
+            }
+        };
+        return match client.forward(request).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        };
+    }
+
+    import_ledger_local(state, ledger, request)
+        .await
+        .into_response()
+}
+
+async fn import_ledger_local(
+    state: Arc<AppState>,
+    ledger: String,
+    request: Request,
+) -> Result<Response> {
+    debug!(ledger = %ledger, "import: starting .flpack restore");
+
+    // Adapt the request body into an `AsyncRead` so `restore_ledger` decodes
+    // the archive frame-by-frame instead of buffering it whole — production
+    // archives can be many gigabytes.
+    let body_stream = request
+        .into_body()
+        .into_data_stream()
+        .map_err(std::io::Error::other);
+    let mut reader = StreamReader::new(body_stream);
+
+    // `restore_ledger` creates the ledger itself and errors if the name is
+    // already taken (mapped to 409 via the ApiError → response conversion,
+    // same as `POST /create`). On any mid-stream failure it rolls back the
+    // half-created ledger before returning.
+    let result = state
+        .fluree
+        .restore_ledger(&ledger, &mut reader)
+        .await
+        .map_err(ServerError::Api)?;
+
+    debug!(
+        ledger = %result.ledger_id,
+        commits = result.commits,
+        txn_blobs = result.txn_blobs,
+        index_artifacts = result.index_artifacts,
+        "import: restore complete"
+    );
+
+    Ok((StatusCode::CREATED, Json(result)).into_response())
+}
+
+// ============================================================================
+// Negotiated upload flow (reference implementation)
+//
+// For clients that cannot send a large body to `POST /import` (e.g. behind a
+// payload-capped gateway): mint an upload slot, the client PUTs the archive
+// out-of-band, then notifies `complete`, and the server restores from the
+// staged archive asynchronously. The client polls status to a terminal state.
+//
+// This reference backend stages uploads to the local filesystem and points the
+// upload URL back at the server's own blob endpoint. A production server would
+// instead mint a presigned PUT to real object storage; the CLI handshake is
+// identical either way.
+// ============================================================================
+
+#[derive(Deserialize)]
+struct MintRequest {
+    /// Target ledger name (path is fixed; the ledger rides in the body so it
+    /// doesn't collide with the greedy `*ledger` tail on `POST /import`).
+    ledger: String,
+    /// Archive size hint (bytes). Drives the single-PUT vs multipart choice:
+    /// an archive at or above the configured threshold is minted as multipart.
+    #[serde(default)]
+    size: Option<u64>,
+    /// What the upload contains: `"flpack"` (default — wholesale restore) or
+    /// `"source"` (raw data for the bulk-import pipeline, same formats as
+    /// `fluree create --from`). Source uploads must also send `filename`.
+    #[serde(default)]
+    source_kind: Option<String>,
+    /// Original filename of a `"source"` upload. Only its extension is used —
+    /// the bulk pipeline sniffs the format from it (`.ttl`, `.jsonl`,
+    /// `.csv`, `.cypher`, …, with `.gz`/`.zst` on RDF/JSONL formats).
+    #[serde(default)]
+    filename: Option<String>,
+    /// CSV/Cypher relationship-property encoding (`annotated`, `plain`, or
+    /// `nary`), matching `fluree create --edge-properties`.
+    #[serde(default)]
+    edge_properties: Option<String>,
+    /// CSV/Cypher namespace for minted names, matching
+    /// `fluree create --base-iri`.
+    #[serde(default)]
+    base_iri: Option<String>,
+    /// Import a `"source"` upload into this new named graph of the
+    /// existing ledger `ledger`, as `fluree graph import` does, instead of
+    /// creating `ledger`.
+    #[serde(default)]
+    graph: Option<String>,
+    /// Salt for the import's blank-node ids instead of the ledger id,
+    /// matching `fluree create --skolem-namespace`.
+    #[serde(default)]
+    skolem_namespace: Option<String>,
+}
+
+/// Pipeline-native single-file extensions (importable as staged, and the only
+/// ones that may carry a `.gz`/`.zst` compression suffix).
+const SOURCE_DATA_EXTENSIONS: &[&str] = &[
+    "ttl", "nt", "nq", "trig", "jsonld", "json", "jsonl", "ndjson",
+];
+/// Extensions converted server-side to `.jsonl` shards before import.
+const SOURCE_CONVERT_EXTENSIONS: &[&str] = &["csv", "cypher", "cyp", "cql"];
+
+/// Validate a source upload's filename and return the extension suffix the
+/// staged file must keep (e.g. `ttl`, `ttl.gz`, `csv`, `cypher`) so the bulk
+/// pipeline's extension-based format sniffing sees the real format. Only the
+/// extension decides anything; the client's path never touches the
+/// filesystem, and its last component names the file only inside the job's
+/// own scratch dir ([`SourceImportOptions::file_name`]).
+fn source_staged_extension(filename: &str) -> Result<String> {
+    let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    let mut parts: Vec<&str> = name.split('.').collect();
+    let compression = match parts.last() {
+        Some(&("gz" | "zst")) => {
+            let c = parts.pop().expect("checked last");
+            Some(c.to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    let ext = parts
+        .last()
+        .filter(|e| !e.is_empty() && parts.len() > 1)
+        .map(|e| e.to_ascii_lowercase())
+        .ok_or_else(|| {
+            ServerError::bad_request(format!(
+                "source filename '{filename}' has no recognizable format extension"
+            ))
+        })?;
+    let is_data = SOURCE_DATA_EXTENSIONS.contains(&ext.as_str());
+    let is_convert = SOURCE_CONVERT_EXTENSIONS.contains(&ext.as_str());
+    if !is_data && !is_convert {
+        return Err(ServerError::bad_request(format!(
+            "unsupported source format '.{ext}'; supported: {} (optionally .gz/.zst), {}",
+            SOURCE_DATA_EXTENSIONS.join("/."),
+            SOURCE_CONVERT_EXTENSIONS.join("/.")
+        )));
+    }
+    match compression {
+        Some(c) if is_data => Ok(format!("{ext}.{c}")),
+        Some(c) => Err(ServerError::bad_request(format!(
+            "compressed {ext} is not supported (.{ext}.{c}); upload it uncompressed"
+        ))),
+        None => Ok(ext),
+    }
+}
+
+/// Whether server-side bulk import is available on this deployment. False on
+/// Raft-replicated servers: the pipeline publishes commit/index heads to the
+/// nameservice directly and repeatedly, bypassing the replicated write log.
+/// `.flpack` restore (single final head-set) remains available there.
+pub(crate) fn source_import_supported(state: &AppState) -> bool {
+    #[cfg(feature = "raft")]
+    if state.raft.is_some() {
+        return false;
+    }
+    let _ = state;
+    true
+}
+
+/// The source formats advertised in discovery (`import.source_formats`).
+pub(crate) fn advertised_source_formats() -> Vec<&'static str> {
+    SOURCE_DATA_EXTENSIONS
+        .iter()
+        .chain(SOURCE_CONVERT_EXTENSIONS)
+        .copied()
+        .collect()
+}
+
+fn ensure_source_import_supported(state: &AppState) -> Result<()> {
+    if source_import_supported(state) {
+        Ok(())
+    } else {
+        Err(ServerError::bad_request(
+            "server-side bulk import is not supported on Raft-replicated servers; \
+             use a .flpack restore instead",
+        ))
+    }
+}
+
+fn source_import_options(req: &MintRequest) -> Result<SourceImportOptions> {
+    use fluree_db_api::csv_import::EdgePolicy;
+
+    let edge_policy = match req.edge_properties.as_deref() {
+        None | Some("annotated") => EdgePolicy::Annotated,
+        Some("plain") => EdgePolicy::Plain,
+        Some("nary") => EdgePolicy::Nary,
+        Some(other) => {
+            return Err(ServerError::bad_request(format!(
+                "unknown edge_properties '{other}' (expected \"annotated\", \"plain\", or \"nary\")"
+            )))
+        }
+    };
+    let graph = match req.graph.as_deref() {
+        Some(graph) => Some(
+            fluree_db_api::graph_import_target(&req.ledger, graph)
+                .map_err(|e| ServerError::bad_request(e.to_string()))?,
+        ),
+        None => None,
+    };
+    Ok(SourceImportOptions {
+        edge_policy,
+        base_iri: req.base_iri.clone(),
+        graph,
+        skolem_namespace: req.skolem_namespace.clone(),
+        file_name: req
+            .filename
+            .as_deref()
+            .and_then(|name| name.rsplit(['/', '\\']).next())
+            .map(str::to_string),
+    })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BlobQuery {
+    token: String,
+}
+
+/// One completed part reported by the client on `complete` (multipart).
+#[derive(Deserialize)]
+struct CompletedPart {
+    part_number: u32,
+    /// Object-store ETag for the part. The reference backend doesn't re-verify
+    /// it (restore re-hashes every frame anyway); a real backend passes it to
+    /// `CompleteMultipartUpload`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    etag: Option<String>,
+}
+
+/// Optional body on `POST …/complete`. Empty for single-PUT uploads; carries
+/// the part list for multipart uploads.
+#[derive(Deserialize, Default)]
+struct CompleteRequest {
+    #[serde(default)]
+    parts: Vec<CompletedPart>,
+}
+
+/// Path a multipart part is staged at: a sibling of the assembled archive,
+/// e.g. `<staging>/imp_abc.flpack` → `<staging>/imp_abc.part.00001`.
+fn part_staging_path(staged_path: &FsPath, part_number: u32) -> PathBuf {
+    let stem = staged_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("import");
+    let parent = staged_path.parent().unwrap_or(FsPath::new("."));
+    parent.join(format!("{stem}.part.{part_number:05}"))
+}
+
+/// Choose a part size and count for an archive of `size` bytes, starting from
+/// the configured target and raising it so the count never exceeds S3's
+/// 10,000-part ceiling. Returns `(part_size, num_parts)`, both ≥ 1.
+fn plan_multipart(size: u64, configured_part_size: u64) -> (u64, u32) {
+    let mut part_size = configured_part_size.max(1);
+    if size.div_ceil(part_size) > MAX_MULTIPART_PARTS {
+        // Raise to the smallest MiB-aligned size that fits under the ceiling.
+        let needed = size.div_ceil(MAX_MULTIPART_PARTS);
+        part_size = needed.div_ceil(1024 * 1024) * 1024 * 1024;
+    }
+    let num_parts = size.div_ceil(part_size).max(1) as u32;
+    (part_size, num_parts)
+}
+
+/// Forward a request to the transactor. Callers check `server_role == Peer`
+/// before calling, so this only runs in peer mode.
+async fn forward_to_transactor(state: &Arc<AppState>, request: Request) -> Response {
+    match state.forwarding_client.as_ref() {
+        Some(c) => match c.forward(request).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        },
+        None => ServerError::internal("Forwarding client not configured").into_response(),
+    }
+}
+
+/// Reject when the negotiated upload flow is not enabled on this server.
+fn ensure_presign_enabled(state: &AppState) -> Result<()> {
+    if state.config.import_presign_enabled {
+        Ok(())
+    } else {
+        Err(ServerError::not_found(
+            "Negotiated upload import is not enabled",
+        ))
+    }
+}
+
+/// `POST /v1/fluree/import-upload` — mint an upload slot for a `.flpack`.
+///
+/// Body: `{ "ledger": "<name>", "size"?: <bytes> }`. Returns an `import_id` and
+/// an `upload` descriptor the client PUTs the archive to. Admin-protected.
+pub async fn mint_upload(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    mint_upload_local(state, request).await.into_response()
+}
+
+async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    // Reclaim expired jobs (and their staged files) before minting a new one so
+    // the in-process registry and the staging dir cannot grow without bound.
+    purge_staged(&state.import_jobs.sweep_expired(IMPORT_JOB_TTL)).await;
+
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
+    let req: MintRequest = serde_json::from_slice(&body)
+        .map_err(|e| ServerError::bad_request(format!("invalid mint request: {e}")))?;
+
+    // Resolve what the upload contains. Source uploads must carry a filename
+    // whose extension the staged file keeps (format sniffing), and are
+    // refused up front on deployments that can't run the pipeline.
+    let (source, staged_ext, source_options) = match req.source_kind.as_deref() {
+        None | Some("flpack") if req.graph.is_some() => {
+            return Err(ServerError::bad_request(
+                "\"graph\" applies to a source upload; a .flpack restores a whole ledger",
+            ))
+        }
+        None | Some("flpack") => (
+            ImportSourceKind::Flpack,
+            "flpack".to_string(),
+            SourceImportOptions::default(),
+        ),
+        Some("source") => {
+            ensure_source_import_supported(&state)?;
+            let filename = req.filename.as_deref().ok_or_else(|| {
+                ServerError::bad_request(
+                    "source uploads must include \"filename\" so the format can be detected",
+                )
+            })?;
+            let options = source_import_options(&req)?;
+            // Into a graph, the ledger must be there to receive it: say so
+            // before the upload rather than after.
+            if options.graph.is_some()
+                && !state
+                    .fluree
+                    .ledger_exists(&req.ledger)
+                    .await
+                    .map_err(ServerError::Api)?
+            {
+                return Err(ServerError::not_found(format!(
+                    "ledger '{}' not found; an import into a graph needs an existing ledger",
+                    req.ledger
+                )));
+            }
+            (
+                ImportSourceKind::Source,
+                source_staged_extension(filename)?,
+                options,
+            )
+        }
+        Some(other) => {
+            return Err(ServerError::bad_request(format!(
+                "unknown source_kind '{other}' (expected \"flpack\" or \"source\")"
+            )))
+        }
+    };
+
+    // Opaque, unguessable identifiers. `import_id` keys the job; `token` is the
+    // capability embedded in the upload URL (models a presigned signature).
+    let import_id = format!("imp_{:016x}", rand::random::<u64>());
+    let token = format!("{:032x}", rand::random::<u128>());
+
+    // Stage under the configured dir (or the system temp dir).
+    let staging_dir = state
+        .config
+        .import_staging_dir
+        .clone()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fluree-import-staging");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|e| ServerError::internal(format!("failed to create staging dir: {e}")))?;
+    let staged_path = staging_dir.join(format!("{import_id}.{staged_ext}"));
+
+    let expires_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() + IMPORT_JOB_TTL.as_secs())
+        .unwrap_or(0);
+
+    // An archive at or above the multipart threshold is uploaded in parts: a
+    // single S3 PUT caps at 5 GiB, so anything larger MUST go multipart.
+    let multipart = req
+        .size
+        .filter(|&sz| sz >= state.config.import_multipart_threshold_bytes)
+        .map(|sz| plan_multipart(sz, state.config.import_multipart_part_size_bytes));
+
+    let response = if let Some((part_size, num_parts)) = multipart {
+        // Reference backend: one upload URL per part, each pointing back at this
+        // server's own part-sink endpoint. A production backend mints one
+        // presigned `UploadPart` URL per part against its object store instead.
+        let parts: Vec<serde_json::Value> = (1..=num_parts)
+            .map(|part_number| {
+                serde_json::json!({
+                    "part_number": part_number,
+                    "url": format!(
+                        "/v1/fluree/import-upload/{import_id}/part/{part_number}?token={token}"
+                    ),
+                    "headers": { "Content-Type": "application/x-fluree-pack" },
+                })
+            })
+            .collect();
+
+        // The reference `upload_id` is just the import_id; a real backend
+        // carries the object-store UploadId here.
+        state.import_jobs.insert(
+            import_id.clone(),
+            ImportJob {
+                ledger_id: req.ledger.clone(),
+                source,
+                source_options: source_options.clone(),
+                token: token.clone(),
+                staged_path,
+                multipart: Some(MultipartPlan {
+                    upload_id: import_id.clone(),
+                    part_size,
+                    num_parts,
+                }),
+                status: ImportStatus::AwaitingUpload,
+                result: None,
+                error: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        serde_json::json!({
+            "import_id": import_id,
+            "ledger": req.ledger,
+            "multipart": {
+                "upload_id": import_id,
+                "part_size_bytes": part_size,
+                "parts": parts,
+                "expires_at_unix": expires_at_unix,
+            },
+        })
+    } else {
+        state.import_jobs.insert(
+            import_id.clone(),
+            ImportJob {
+                ledger_id: req.ledger.clone(),
+                source,
+                source_options,
+                token: token.clone(),
+                staged_path,
+                multipart: None,
+                status: ImportStatus::AwaitingUpload,
+                result: None,
+                error: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        // Reference backend: the upload URL points back at this server's own
+        // blob endpoint (relative — the client resolves it against the origin
+        // it is already talking to). A production backend returns an absolute
+        // presigned object-store URL here instead.
+        serde_json::json!({
+            "import_id": import_id,
+            "ledger": req.ledger,
+            "upload": {
+                "method": "PUT",
+                "url": format!("/v1/fluree/import-upload/{import_id}/blob?token={token}"),
+                "headers": { "Content-Type": "application/x-fluree-pack" },
+                "expires_at_unix": expires_at_unix,
+            },
+        })
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `PUT /v1/fluree/import-upload/:import_id/blob?token=…` — stage the archive.
+///
+/// Authorized by the capability `token` in the query string (not admin auth) —
+/// the URL is the capability, mirroring a presigned object-store PUT.
+pub async fn put_blob(
+    State(state): State<Arc<AppState>>,
+    Path(import_id): Path<String>,
+    Query(q): Query<BlobQuery>,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    put_blob_local(state, import_id, q.token, request)
+        .await
+        .into_response()
+}
+
+async fn put_blob_local(
+    state: Arc<AppState>,
+    import_id: String,
+    token: String,
+    request: Request,
+) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    let (expected_token, staged_path, status, multipart, created_at) = state
+        .import_jobs
+        .upload_target(&import_id)
+        .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    // Constant-time-ish token check (length + equality). A mismatch is a 404 to
+    // avoid confirming the import_id exists.
+    if token != expected_token {
+        return Err(ServerError::not_found("unknown import_id"));
+    }
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
+    }
+    if multipart.is_some() {
+        return Err(ServerError::bad_request(
+            "this import was minted for multipart upload; PUT parts to the part URLs instead",
+        ));
+    }
+    if status != ImportStatus::AwaitingUpload {
+        return Err(ServerError::bad_request(
+            "upload slot is no longer awaiting an upload",
+        ));
+    }
+
+    // Stream the body straight to the staged file — never buffer the archive.
+    stream_body_to_file(request, &staged_path)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to stage upload: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "uploaded" })),
+    )
+        .into_response())
+}
+
+/// `PUT /v1/fluree/import-upload/:import_id/part/:part_number?token=…` — stage
+/// one multipart part. Token-authorized via the URL (not admin auth), mirroring
+/// a presigned `UploadPart`.
+pub async fn put_part(
+    State(state): State<Arc<AppState>>,
+    Path((import_id, part_number)): Path<(String, u32)>,
+    Query(q): Query<BlobQuery>,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    put_part_local(state, import_id, part_number, q.token, request)
+        .await
+        .into_response()
+}
+
+async fn put_part_local(
+    state: Arc<AppState>,
+    import_id: String,
+    part_number: u32,
+    token: String,
+    request: Request,
+) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    let (expected_token, staged_path, status, multipart, created_at) = state
+        .import_jobs
+        .upload_target(&import_id)
+        .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    if token != expected_token {
+        return Err(ServerError::not_found("unknown import_id"));
+    }
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
+    }
+    let Some(plan) = multipart else {
+        return Err(ServerError::bad_request(
+            "this import was not minted for multipart upload",
+        ));
+    };
+    if part_number < 1 || part_number > plan.num_parts {
+        return Err(ServerError::bad_request(format!(
+            "part_number {part_number} out of range 1..={}",
+            plan.num_parts
+        )));
+    }
+    if status != ImportStatus::AwaitingUpload {
+        return Err(ServerError::bad_request(
+            "upload slot is no longer awaiting an upload",
+        ));
+    }
+
+    // Stream the part straight to its sibling file, hashing as we go so the
+    // response carries an ETag the client echoes back on `complete`.
+    let part_path = part_staging_path(&staged_path, part_number);
+    let etag = stream_body_to_file_hashed(request, &part_path)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to stage part: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::ETAG, format!("\"{etag}\""))],
+        Json(serde_json::json!({ "status": "uploaded", "part_number": part_number })),
+    )
+        .into_response())
+}
+
+/// Stream a request body to `path`, never buffering the whole body.
+async fn stream_body_to_file(request: Request, path: &FsPath) -> std::io::Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
+    let body_stream = request
+        .into_body()
+        .into_data_stream()
+        .map_err(std::io::Error::other);
+    let mut reader = StreamReader::new(body_stream);
+    tokio::io::copy(&mut reader, &mut file).await?;
+    Ok(())
+}
+
+/// Like [`stream_body_to_file`] but returns the SHA-256 hex of the bytes
+/// written — the reference backend's stand-in for an object-store part ETag.
+async fn stream_body_to_file_hashed(request: Request, path: &FsPath) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut hasher = Sha256::new();
+    let mut stream = request.into_body().into_data_stream();
+    while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// `POST /v1/fluree/import-upload/:import_id/complete` — begin the restore.
+///
+/// Transitions the job to `running` and restores from the staged archive on a
+/// background task; the client polls the status endpoint. Admin-protected.
+pub async fn complete_upload(
+    State(state): State<Arc<AppState>>,
+    Path(import_id): Path<String>,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    complete_upload_local(state, import_id, request)
+        .await
+        .into_response()
+}
+
+async fn complete_upload_local(
+    state: Arc<AppState>,
+    import_id: String,
+    request: Request,
+) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    let CompletionTarget {
+        ledger_id,
+        staged_path,
+        status,
+        multipart,
+        created_at,
+        source,
+        source_options,
+    } = state
+        .import_jobs
+        .completion_target(&import_id)
+        .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
+    }
+
+    match status {
+        ImportStatus::AwaitingUpload => {}
+        ImportStatus::Running => {
+            return Err(ServerError::bad_request("import is already running"));
+        }
+        ImportStatus::Succeeded | ImportStatus::Failed => {
+            return Err(ServerError::bad_request("import has already completed"));
+        }
+    }
+
+    // Parse the (optional) part list. Empty body is fine for single-PUT.
+    let body = axum::body::to_bytes(request.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
+    let complete_req: CompleteRequest = if body.is_empty() {
+        CompleteRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ServerError::bad_request(format!("invalid complete request: {e}")))?
+    };
+
+    // For multipart, every part must be staged before we assemble. The blob
+    // (single-PUT) case just checks the staged archive exists.
+    if let Some(ref plan) = multipart {
+        let reported: std::collections::BTreeSet<u32> =
+            complete_req.parts.iter().map(|p| p.part_number).collect();
+        let expected: std::collections::BTreeSet<u32> = (1..=plan.num_parts).collect();
+        if reported != expected {
+            return Err(ServerError::bad_request(format!(
+                "complete must list exactly parts 1..={} (got {} distinct)",
+                plan.num_parts,
+                reported.len()
+            )));
+        }
+        for part_number in 1..=plan.num_parts {
+            let part_path = part_staging_path(&staged_path, part_number);
+            if !tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
+                return Err(ServerError::bad_request(format!(
+                    "part {part_number} was never uploaded"
+                )));
+            }
+        }
+    } else if !tokio::fs::try_exists(&staged_path).await.unwrap_or(false) {
+        return Err(ServerError::bad_request(
+            "no archive was uploaded for this import_id",
+        ));
+    }
+
+    state
+        .import_jobs
+        .set_status(&import_id, ImportStatus::Running);
+
+    // Assemble (multipart) + restore on a background task so a large restore is
+    // not bounded by the request lifetime; the client polls to a terminal state.
+    let bg_state = Arc::clone(&state);
+    let bg_import_id = import_id.clone();
+    let num_parts = multipart.as_ref().map(|p| p.num_parts);
+    tokio::spawn(async move {
+        let outcome = async {
+            // Concatenate parts in order into the assembled archive. A real
+            // object-store backend would instead call CompleteMultipartUpload
+            // with the reported ETags; here the parts are local files.
+            if let Some(num_parts) = num_parts {
+                assemble_parts(&staged_path, num_parts)
+                    .await
+                    .map_err(|e| format!("failed to assemble multipart upload: {e}"))?;
+            }
+            match source {
+                ImportSourceKind::Flpack => {
+                    let mut file = tokio::fs::File::open(&staged_path)
+                        .await
+                        .map_err(|e| format!("failed to open staged archive: {e}"))?;
+                    bg_state
+                        .fluree
+                        .restore_ledger(&ledger_id, &mut file)
+                        .await
+                        .map(|r| serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({})))
+                        .map_err(|e| e.to_string())
+                }
+                ImportSourceKind::Source => {
+                    run_source_import(&bg_state, &ledger_id, &staged_path, &source_options).await
+                }
+            }
+        }
+        .await;
+
+        match outcome {
+            Ok(json) => {
+                bg_state.import_jobs.set_succeeded(&bg_import_id, json);
+            }
+            Err(msg) => {
+                bg_state.import_jobs.set_failed(&bg_import_id, msg);
+            }
+        }
+        // Best-effort cleanup of the staged archive (parts are removed by
+        // `assemble_parts` as they are consumed).
+        let _ = tokio::fs::remove_file(&staged_path).await;
+    });
+
+    let response = serde_json::json!({ "import_id": import_id, "status": "running" });
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// Run the bulk-import pipeline over a staged source upload: CSV/Cypher
+/// inputs are first converted to `.jsonl` shards in a scratch dir beside the
+/// staged file (the same conversion `fluree create --from` runs client-side),
+/// then the pipeline ingests the file (or shard dir) and publishes the new
+/// ledger. Returns the success JSON stored on the job.
+async fn run_source_import(
+    state: &Arc<AppState>,
+    ledger_id: &str,
+    staged_path: &FsPath,
+    options: &SourceImportOptions,
+) -> std::result::Result<serde_json::Value, String> {
+    let ext = staged_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // CSV/Cypher: convert into a scratch dir of `.jsonl` shards. The
+    // conversion is synchronous streaming IO — run it off the async runtime.
+    let (import_path, _shards_guard) = if SOURCE_CONVERT_EXTENSIONS.contains(&ext.as_str()) {
+        let shards_dir = staged_path.with_extension(format!("{ext}.shards"));
+        tokio::fs::create_dir_all(&shards_dir)
+            .await
+            .map_err(|e| format!("failed to create conversion scratch dir: {e}"))?;
+        let src = staged_path.to_path_buf();
+        let out = shards_dir.clone();
+        let is_csv = ext == "csv";
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            if is_csv {
+                fluree_db_api::import_source::csv_to_shards(
+                    &src,
+                    &fluree_db_api::csv_import::CsvImportOptions {
+                        edge_policy: options.edge_policy,
+                        base_iri: options.base_iri.clone().unwrap_or_else(|| {
+                            fluree_db_api::csv_import::CsvImportOptions::default().base_iri
+                        }),
+                        ..Default::default()
+                    },
+                    &out,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            } else {
+                fluree_db_api::import_source::cypher_to_shards(
+                    &src,
+                    fluree_db_api::cypher_import::CypherImportOptions {
+                        edge_policy: options.edge_policy,
+                        vocab: options.base_iri.clone(),
+                    },
+                    &out,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .map_err(|e| format!("conversion task failed: {e}"))??;
+        (shards_dir.clone(), Some(ScratchDirGuard(shards_dir)))
+    } else if let Some(name) = options.file_name.as_deref() {
+        let named_dir = staged_path.with_extension(format!("{ext}.named"));
+        tokio::fs::create_dir_all(&named_dir)
+            .await
+            .map_err(|e| format!("failed to create import scratch dir: {e}"))?;
+        let named = named_dir.join(name);
+        tokio::fs::rename(staged_path, &named)
+            .await
+            .map_err(|e| format!("failed to name the staged upload: {e}"))?;
+        (named, Some(ScratchDirGuard(named_dir)))
+    } else {
+        (staged_path.to_path_buf(), None)
+    };
+
+    if let Some(graph) = &options.graph {
+        let result = skolemized(
+            state
+                .fluree
+                .import_into_graph(ledger_id, graph)
+                .import(&import_path),
+            options,
+        )
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
+        // Unlike a new ledger, no reindex follows an annotated graph: it
+        // would rebuild the whole ledger. `has_annotations` tells the
+        // caller its annotation arena waits for one.
+        return Ok(serde_json::json!({
+            "kind": "graph-import",
+            "ledger_id": result.ledger_id,
+            "graph": result.graph.as_ref().map(|g| serde_json::json!({
+                "iri": g.iri,
+                "g_id": g.g_id,
+                "base_t": g.base_t,
+            })),
+            "t": result.t,
+            "flake_count": result.flake_count,
+            "commit_head_id": result.commit_head_id.to_string(),
+            "root_id": result.root_id.as_ref().map(std::string::ToString::to_string),
+            "index_t": result.index_t,
+            "has_annotations": result.has_annotations,
+        }));
+    }
+
+    let result = skolemized(state.fluree.create(ledger_id).import(&import_path), options)
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The bulk-imported root carries `annotation_index: None`. One reindex
+    // through the api's attachment provider runs the bulk-import bootstrap
+    // scan and seals an authoritative annotation arena, so relationship-
+    // binding queries take the arena probe instead of scan-fallback —
+    // mirroring what `fluree create --from` does after a local import.
+    let sealed_root_id = if result.has_annotations {
+        Some(
+            state
+                .fluree
+                .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+                .await
+                .map_err(|e| format!("post-import annotation-arena seal (reindex): {e}"))?
+                .root_id,
+        )
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "kind": "bulk-import",
+        "ledger_id": result.ledger_id,
+        "t": result.t,
+        "flake_count": result.flake_count,
+        "commit_head_id": result.commit_head_id.to_string(),
+        "root_id": sealed_root_id
+            .as_ref()
+            .or(result.root_id.as_ref())
+            .map(std::string::ToString::to_string),
+        "index_t": result.index_t,
+        "has_annotations": result.has_annotations,
+    }))
+}
+
+/// `builder` salting blank-node ids with the upload's namespace, when it
+/// named one.
+fn skolemized<'a>(
+    builder: fluree_db_api::ImportBuilder<'a>,
+    options: &SourceImportOptions,
+) -> fluree_db_api::ImportBuilder<'a> {
+    match &options.skolem_namespace {
+        Some(namespace) => builder.skolem_namespace(namespace),
+        None => builder,
+    }
+}
+
+/// Deletes a conversion scratch dir when the import (success or failure)
+/// finishes.
+struct ScratchDirGuard(PathBuf);
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Best-effort deletion of the staged residue of swept (expired) jobs: the
+/// assembled archive and, for a multipart job, any part files still beside it.
+/// Missing files are ignored — a completed job's archive is already gone.
+async fn purge_staged(residue: &[StagedResidue]) {
+    for r in residue {
+        let _ = tokio::fs::remove_file(&r.staged_path).await;
+        if let Some(num_parts) = r.num_parts {
+            for part_number in 1..=num_parts {
+                let _ =
+                    tokio::fs::remove_file(part_staging_path(&r.staged_path, part_number)).await;
+            }
+        }
+    }
+}
+
+/// Concatenate staged parts `1..=num_parts` into `staged_path` (in order), then
+/// remove each part file. Streams part-by-part — never holds a whole part, let
+/// alone the whole archive, in memory.
+async fn assemble_parts(staged_path: &FsPath, num_parts: u32) -> std::io::Result<()> {
+    let mut out = tokio::fs::File::create(staged_path).await?;
+    for part_number in 1..=num_parts {
+        let part_path = part_staging_path(staged_path, part_number);
+        let mut part = tokio::fs::File::open(&part_path).await?;
+        tokio::io::copy(&mut part, &mut out).await?;
+        drop(part);
+        let _ = tokio::fs::remove_file(&part_path).await;
+    }
+    use tokio::io::AsyncWriteExt as _;
+    out.flush().await?;
+    Ok(())
+}
+
+/// `GET /v1/fluree/import-upload/:import_id` — poll import status.
+///
+/// Returns `{ status, result?, error? }`. Admin-protected.
+pub async fn import_status(
+    State(state): State<Arc<AppState>>,
+    Path(import_id): Path<String>,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    import_status_local(state, import_id).await.into_response()
+}
+
+async fn import_status_local(state: Arc<AppState>, import_id: String) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    let (status, result, error) = state
+        .import_jobs
+        .status_snapshot(&import_id)
+        .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    let mut body = serde_json::json!({
+        "import_id": import_id,
+        "status": status.as_str(),
+    });
+    if let Some(result) = result {
+        body["result"] = result;
+    }
+    if let Some(error) = error {
+        body["error"] = serde_json::Value::String(error);
+    }
+    Ok((StatusCode::OK, Json(body)).into_response())
+}

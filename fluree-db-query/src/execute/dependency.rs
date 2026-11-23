@@ -1,0 +1,654 @@
+//! Variable dependency tracking for projection pushdown.
+//!
+//! Computes which variables the query output depends on by working backward
+//! from the final output through ORDER BY, post-binds, HAVING, aggregates,
+//! and GROUP BY. Variables without downstream dependencies are dead and can
+//! be projected away early.
+
+use crate::ir::{AggregateFn, Expression, Grouping, Query};
+use crate::var_registry::VarId;
+use std::collections::HashSet;
+
+/// Per-operator required variable sets.
+///
+/// Each field holds the variables that the operator's output must contain
+/// for all downstream consumers to function correctly.  The sets are
+/// computed once (backward from SELECT) and consulted by each operator to
+/// trim dead columns from its output.
+#[derive(Debug, Clone)]
+pub struct VariableDeps {
+    pub required_where_vars: Vec<VarId>,
+    pub required_groupby_vars: Vec<VarId>,
+    pub required_aggregate_vars: Vec<VarId>,
+    pub required_having_vars: Vec<VarId>,
+    pub required_bind_vars: Vec<Vec<VarId>>,
+    pub required_sort_vars: Vec<VarId>,
+}
+
+/// Compute per-operator downstream dependency sets.
+///
+/// Works backward from SELECT through ORDER BY, post-binds, HAVING,
+/// aggregates, and GROUP BY, recording the dependency set at each stage
+/// boundary.
+///
+/// Returns `None` when trimming is not applicable:
+/// - `Wildcard` / `Boolean` select mode (all WHERE vars are needed)
+/// - Empty select list (no explicit projection)
+/// - `Construct` without a template
+pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
+    // ---- backward walk ----
+
+    // Seed deps from the query output requirements.
+    // Wildcard/Boolean return None from `variables()`, disabling trimming.
+    // Selection::Hydration contributes its root variable via bound_var.
+    let mut deps: HashSet<VarId> = query.output.referenced_vars()?;
+
+    // ORDER BY vars must survive to the sort operator.
+    for spec in &query.ordering {
+        deps.insert(spec.var);
+    }
+    let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    // What a post-grouping stage (ORDER BY bind, grouping bind, HAVING) reads.
+    // Over a group row that is the expression's row reads plus the variables
+    // its EXISTS / pattern-comprehension bodies correlate on that grouping
+    // produces: any other body variable is free in the body, and tracing it
+    // would carry it through grouping as a per-group list. Without grouping
+    // the row is a WHERE solution, and every variable the expression mentions
+    // correlates with it.
+    let grouping_outputs: Option<HashSet<VarId>> = query.grouping.as_ref().map(|g| {
+        g.group_by_vars()
+            .chain(g.aggregates().map(|spec| spec.output_var))
+            .chain(g.binds().map(|(var, _)| *var))
+            .chain(query.order_binds.iter().map(|(var, _)| *var))
+            .collect()
+    });
+    let reads = |expr: &Expression| -> Vec<VarId> {
+        match &grouping_outputs {
+            None => expr.referenced_vars(),
+            Some(produced) => {
+                let mut vars = expr.row_reads();
+                vars.extend(
+                    expr.referenced_vars()
+                        .into_iter()
+                        .filter(|v| produced.contains(v)),
+                );
+                vars
+            }
+        }
+    };
+
+    // Expression-based ORDER BY binds run as a dedicated stage AFTER the
+    // post-aggregation binds, so they are traced FIRST in this backward walk:
+    // tracing their expression inputs keeps the referenced GROUP BY keys,
+    // aggregate outputs, and post-binds alive through grouping/trimming.
+    for (var, expr) in query.order_binds.iter().rev() {
+        if deps.remove(var) {
+            deps.extend(reads(expr));
+        }
+    }
+
+    // Post-aggregation binds, traced backward in execution order: the binds
+    // that run after HAVING, HAVING, then the ones HAVING reads, which run
+    // before it (`Grouping::binds_before_having`). Record deps BEFORE tracing
+    // each bind backward: that is what the bind's output must contain for
+    // downstream. Indexed like the binds.
+    let binds = query
+        .grouping
+        .as_ref()
+        .map(Grouping::bind_list)
+        .unwrap_or(&[]);
+    let before_having: Vec<bool> = query
+        .grouping
+        .as_ref()
+        .map(Grouping::binds_before_having)
+        .unwrap_or_default();
+    let mut required_bind_vars: Vec<Vec<VarId>> = vec![Vec::new(); binds.len()];
+    let mut trace_binds = |deps: &mut HashSet<VarId>, before: bool| {
+        for (i, (var, expr)) in binds.iter().enumerate().rev() {
+            if before_having[i] != before {
+                continue;
+            }
+            required_bind_vars[i] = deps.iter().copied().collect();
+            if deps.remove(var) {
+                deps.extend(reads(expr));
+            }
+        }
+    };
+    trace_binds(&mut deps, false);
+
+    // Record what HAVING's output must contain (before tracing HAVING backward).
+    let required_having_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    // HAVING expression variables: needed in HAVING's input but not
+    // necessarily in its output (HAVING evaluates before trimming).
+    if let Some(having_expr) = query.grouping.as_ref().and_then(Grouping::having) {
+        deps.extend(reads(having_expr));
+    }
+    trace_binds(&mut deps, true);
+
+    // Record what Aggregate's output must contain (before tracing aggregates backward).
+    let required_aggregate_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    // Aggregates: replace output vars with input vars.
+    for spec in query.grouping.iter().flat_map(Grouping::aggregates) {
+        if deps.remove(&spec.output_var) {
+            match &spec.function {
+                // `COUNT(DISTINCT *)` counts distinct SOLUTIONS, so its input is
+                // not one column but every user-visible variable (the list it
+                // carries — see `AggregateFn::CountDistinctAll`). Tracing them
+                // here is what keeps the pre-grouping stages from trimming away
+                // a column that two solutions differ only in; naming them
+                // individually leaves genuinely dead columns still trimmable,
+                // and leaves the post-grouping stages — already recorded above —
+                // untouched. Variables this list names from other scopes simply
+                // never match a schema and drop out.
+                AggregateFn::CountDistinctAll(vars) => deps.extend(vars.iter().copied()),
+                other => deps.extend(other.input_var()),
+            }
+        }
+    }
+
+    // Record what GROUP BY's output must contain (before tracing GROUP BY backward).
+    let required_groupby_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    // GROUP BY keys must survive.
+    if let Some(Grouping::Explicit { group_by, .. }) = &query.grouping {
+        deps.extend(group_by.iter().copied());
+    }
+
+    // Post-query VALUES joins its rows against the WHERE output directly
+    // above the WHERE tree, so its vars must survive WHERE-level trimming
+    // (otherwise the join degenerates to a cross product). The binds after the
+    // join run before grouping: trace them backward first, so the WHERE keeps
+    // their inputs.
+    if let Some(post_values) = &query.post_values {
+        for (var, expr) in post_values.then.iter().rev() {
+            if deps.remove(var) {
+                deps.extend(expr.referenced_vars());
+            }
+        }
+        deps.extend(post_values.vars.iter().copied());
+    }
+
+    // deps now contains the full set of WHERE-produced variables needed downstream.
+    let required_where_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    Some(VariableDeps {
+        required_where_vars,
+        required_groupby_vars,
+        required_aggregate_vars,
+        required_having_vars,
+        required_bind_vars,
+        required_sort_vars,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::triple::{Ref, Term, TriplePattern};
+    use crate::ir::{
+        AggregateFn, AggregateSpec, Aggregation, ConstructTemplate, Expression, FlakeValue,
+        InputSemantics, Pattern, Query, QueryOutput, ReasoningConfig,
+    };
+    use crate::parse::SelectMode;
+    use crate::sort::SortSpec;
+    use fluree_db_core::Sid;
+    use fluree_graph_json_ld::ParsedContext;
+    use std::collections::HashMap;
+
+    fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>, select_mode: SelectMode) -> Query {
+        let output = match select_mode {
+            SelectMode::Many => QueryOutput::select_all(select),
+            SelectMode::One => QueryOutput::select_one(select),
+            SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
+            SelectMode::Ask => QueryOutput::Ask,
+        };
+        Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output,
+            patterns,
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
+        }
+    }
+
+    fn make_wildcard_query(patterns: Vec<Pattern>) -> Query {
+        Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::wildcard(),
+            patterns,
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
+        }
+    }
+
+    fn make_tp(s: VarId, p: &str, o: VarId) -> TriplePattern {
+        TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p)), Term::Var(o))
+    }
+
+    #[test]
+    fn none_for_wildcard() {
+        let query = make_wildcard_query(vec![]);
+        assert!(compute_variable_deps(&query).is_none());
+    }
+
+    #[test]
+    fn none_for_boolean() {
+        let query = make_query(vec![], vec![], SelectMode::Ask);
+        assert!(compute_variable_deps(&query).is_none());
+    }
+
+    #[test]
+    fn none_for_construct_without_template() {
+        let query = make_query(vec![], vec![], SelectMode::Construct);
+        assert!(compute_variable_deps(&query).is_none());
+    }
+
+    #[test]
+    fn none_for_empty_select() {
+        let query = make_query(vec![], vec![], SelectMode::Many);
+        assert!(compute_variable_deps(&query).is_none());
+    }
+
+    #[test]
+    fn simple_select_where_vars() {
+        let query = make_query(vec![VarId(1), VarId(2)], vec![], SelectMode::Many);
+        let deps = compute_variable_deps(&query).unwrap();
+        let where_set: HashSet<VarId> = deps.required_where_vars.into_iter().collect();
+        assert_eq!(where_set, HashSet::from([VarId(1), VarId(2)]));
+    }
+
+    #[test]
+    fn order_by_adds_where_vars() {
+        let mut query = make_query(vec![VarId(1)], vec![], SelectMode::Many);
+        query.ordering = vec![SortSpec::asc(VarId(3))];
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert!(deps.required_where_vars.contains(&VarId(3)));
+    }
+
+    #[test]
+    fn aggregate_replaces_output_with_input_in_where_vars() {
+        // SELECT ?city (AVG(?age) AS ?avg) ... GROUP BY ?city
+        let mut query = make_query(vec![VarId(2), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(2)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
+                    output_var: VarId(3),
+                }])
+                .unwrap(),
+            }),
+            having: None,
+            binds: Vec::new(),
+        });
+
+        let deps = compute_variable_deps(&query).unwrap();
+        // ?city (group key) and ?age (aggregate input) are WHERE dependencies
+        assert!(deps.required_where_vars.contains(&VarId(2)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        // ?avg (aggregate output) is NOT a WHERE dependency
+        assert!(!deps.required_where_vars.contains(&VarId(3)));
+    }
+
+    #[test]
+    fn post_bind_traces_where_vars() {
+        // SELECT ?x (AVG(?n) AS ?avg) (CEIL(?avg) AS ?ceil)
+        // GROUP BY ?x — the post-bind ?ceil = CEIL(?avg) references the
+        // aggregate output ?avg, which traces back to the WHERE var ?n.
+        let mut query = make_query(vec![VarId(0), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
+                    output_var: VarId(2),
+                }])
+                .unwrap(),
+            }),
+            having: None,
+            binds: vec![(
+                VarId(3),
+                Expression::Call {
+                    func: crate::ir::Function::Ceil,
+                    args: vec![Expression::Var(VarId(2))],
+                },
+            )],
+        });
+
+        let deps = compute_variable_deps(&query).unwrap();
+        // ?x (group key) and ?n (aggregate input traced from ?avg) are WHERE deps.
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        // ?ceil (post-bind output) is not a WHERE dep — it's computed.
+        assert!(!deps.required_where_vars.contains(&VarId(3)));
+    }
+
+    #[test]
+    fn having_adds_where_vars() {
+        let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: None,
+            having: Some(Expression::gt(
+                Expression::Var(VarId(1)),
+                Expression::Const(FlakeValue::Long(10)),
+            )),
+            binds: Vec::new(),
+        });
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+    }
+
+    #[test]
+    fn construct_uses_template_vars() {
+        let query = Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::Construct(ConstructTemplate::new(vec![make_tp(
+                VarId(0),
+                "name",
+                VarId(1),
+            )])),
+            patterns: vec![],
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
+        };
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+    }
+
+    // ---- hydration tests ----
+
+    fn make_query_with_selections(columns: Vec<crate::ir::Column>) -> Query {
+        Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::Select {
+                projection: crate::ir::Projection::Tuple(columns),
+                restriction: None,
+                ungrouped: crate::ir::UngroupedProjection::Reject,
+            },
+            patterns: vec![],
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            union_default_graph: None,
+            cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
+        }
+    }
+
+    #[test]
+    fn hydration_adds_root_var() {
+        // SELECT ?name + hydration rooted at ?s
+        // The formatter needs both ?name (var selection) and ?s (root var).
+        let query = make_query_with_selections(vec![
+            crate::ir::Column::Var(VarId(1)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: HashMap::new(),
+                },
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0))); // root var
+        assert!(deps.required_where_vars.contains(&VarId(1))); // var selection
+    }
+
+    #[test]
+    fn hydration_root_already_in_select() {
+        // Var selection ?s + hydration rooted at ?s — only ?s needed.
+        let query = make_query_with_selections(vec![
+            crate::ir::Column::Var(VarId(0)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: HashMap::new(),
+                },
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert_eq!(deps.required_where_vars.len(), 1);
+    }
+
+    #[test]
+    fn hydration_sid_root_no_extra_vars() {
+        // SELECT ?name + hydration rooted at an IRI constant.
+        // Sid root binds no variable — only ?name needed.
+        let query = make_query_with_selections(vec![
+            crate::ir::Column::Var(VarId(1)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Sid(Sid::new(100, "alice")),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: HashMap::new(),
+                },
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert_eq!(deps.required_where_vars.len(), 1);
+    }
+
+    #[test]
+    fn hydration_two_roots_both_added() {
+        // Two hydration columns with distinct variable roots: both root vars
+        // must contribute to required_where_vars so the executor produces
+        // bindings for each.
+        let query = make_query_with_selections(vec![
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: HashMap::new(),
+                },
+            )),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(1)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: HashMap::new(),
+                },
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert_eq!(deps.required_where_vars.len(), 2);
+    }
+
+    // ---- per-operator pipeline deps tests ----
+
+    #[test]
+    fn variable_deps_with_order_by() {
+        // SELECT ?name WHERE { ... } ORDER BY ?age
+        let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
+        query.ordering = vec![SortSpec::asc(VarId(1))];
+
+        let deps = compute_variable_deps(&query).unwrap();
+        // required_sort_vars needs both ?name and ?age
+        assert!(deps.required_sort_vars.contains(&VarId(0)));
+        assert!(deps.required_sort_vars.contains(&VarId(1)));
+        // required_where_vars same as sort (no post-WHERE ops between sort and WHERE)
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+    }
+
+    #[test]
+    fn variable_deps_with_group_by_and_aggregate() {
+        // SELECT ?city (AVG(?age) AS ?avg) WHERE { ... } GROUP BY ?city
+        let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
+                    output_var: VarId(2),
+                }])
+                .unwrap(),
+            }),
+            having: None,
+            binds: Vec::new(),
+        });
+
+        let deps = compute_variable_deps(&query).unwrap();
+
+        // required_aggregate_vars = what Aggregate's OUTPUT must contain = SELECT vars
+        assert!(deps.required_aggregate_vars.contains(&VarId(0)));
+        assert!(deps.required_aggregate_vars.contains(&VarId(2)));
+
+        // required_groupby_vars = what GROUP BY's OUTPUT must contain
+        // = after tracing aggregates backward: ?avg→?age, so {?city, ?age}
+        assert!(deps.required_groupby_vars.contains(&VarId(0)));
+        assert!(deps.required_groupby_vars.contains(&VarId(1)));
+        assert!(!deps.required_groupby_vars.contains(&VarId(2)));
+
+        // required_where_vars = groupby deps + GROUP BY keys = {?city, ?age}
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert!(!deps.required_where_vars.contains(&VarId(2)));
+    }
+
+    #[test]
+    fn variable_deps_with_post_bind() {
+        // SELECT ?x (AVG(?n) AS ?avg) (CEIL(?avg) AS ?ceil)
+        // GROUP BY ?x ORDER BY ?ceil — bind on aggregate output, sorted on bind output.
+        let mut query = make_query(vec![VarId(0), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
+                    output_var: VarId(2),
+                }])
+                .unwrap(),
+            }),
+            having: None,
+            binds: vec![(
+                VarId(3),
+                Expression::Call {
+                    func: crate::ir::Function::Ceil,
+                    args: vec![Expression::Var(VarId(2))],
+                },
+            )],
+        });
+        query.ordering = vec![SortSpec::asc(VarId(3))];
+
+        let deps = compute_variable_deps(&query).unwrap();
+
+        // required_sort_vars needs ?x and ?ceil
+        assert!(deps.required_sort_vars.contains(&VarId(0)));
+        assert!(deps.required_sort_vars.contains(&VarId(3)));
+
+        // required_bind_vars[0] is what bind 0's output must contain.
+        // Same as required_sort_vars since there's only one bind.
+        assert_eq!(deps.required_bind_vars.len(), 1);
+        assert!(deps.required_bind_vars[0].contains(&VarId(0)));
+        assert!(deps.required_bind_vars[0].contains(&VarId(3)));
+
+        // required_where_vars: bind ?ceil→?avg, aggregate ?avg→?n, so {?x, ?n}.
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert!(!deps.required_where_vars.contains(&VarId(2)));
+        assert!(!deps.required_where_vars.contains(&VarId(3)));
+    }
+
+    #[test]
+    fn variable_deps_with_having() {
+        // SELECT ?city (COUNT(?p) AS ?cnt) WHERE { ... }
+        // GROUP BY ?city HAVING (?cnt > 5)
+        let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Count(VarId(1)),
+                    output_var: VarId(2),
+                }])
+                .unwrap(),
+            }),
+            having: Some(Expression::gt(
+                Expression::Var(VarId(2)),
+                Expression::Const(FlakeValue::Long(5)),
+            )),
+            binds: Vec::new(),
+        });
+
+        let deps = compute_variable_deps(&query).unwrap();
+
+        // required_having_vars = what HAVING's OUTPUT must contain = SELECT vars
+        // HAVING expression vars are NOT needed in output (only in input)
+        assert!(deps.required_having_vars.contains(&VarId(0)));
+        assert!(deps.required_having_vars.contains(&VarId(2)));
+
+        // required_aggregate_vars = what Aggregate's OUTPUT must contain
+        // = required_having_vars ∪ HAVING expr vars (HAVING needs them from its child)
+        assert!(deps.required_aggregate_vars.contains(&VarId(0)));
+        assert!(deps.required_aggregate_vars.contains(&VarId(2)));
+
+        // required_groupby_vars = what GROUP BY's OUTPUT must contain
+        // = after tracing aggregates backward: ?cnt→?p, so {?city, ?p}
+        assert!(deps.required_groupby_vars.contains(&VarId(0)));
+        assert!(deps.required_groupby_vars.contains(&VarId(1)));
+        assert!(!deps.required_groupby_vars.contains(&VarId(2)));
+
+        // required_where_vars = groupby deps + GROUP BY keys = {?city, ?p}
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert!(!deps.required_where_vars.contains(&VarId(2)));
+    }
+}

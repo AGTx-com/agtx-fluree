@@ -1,0 +1,3757 @@
+//! Config graph reader and resolver.
+//!
+//! Reads `f:LedgerConfig` from the config graph (g_id=2) via privileged
+//! (policy-bypassing) queries, resolves effective settings by merging
+//! ledger-wide defaults with per-graph overrides, and provides per-subsystem
+//! merge functions for request-time identity gating.
+//!
+//! # Architecture
+//!
+//! ```text
+//! resolve_ledger_config()     — privileged read from g_id=2 → LedgerConfig
+//! resolve_effective_config()  — three-tier merge → ResolvedConfig
+//! merge_policy_opts()         — request-scoped policy merge
+//! merge_reasoning()           — request-scoped reasoning merge
+//! merge_shacl_opts()          — transaction-scoped SHACL merge
+//! merge_transact_opts()       — transaction-scoped uniqueness merge
+//! merge_datalog_opts()        — query-scoped datalog merge
+//! ```
+//!
+//! Identity gating happens at the request boundary (not here) because
+//! the server-verified identity is only available per-request.
+
+use fluree_db_core::VerifiedIdentity;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use fluree_db_core::ledger_config::{
+    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphSourceRef, LedgerConfig,
+    OntologyImportBinding, OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults,
+    ResolvedConfig, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
+    TrustPolicy, ValidationMode,
+};
+use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
+use fluree_db_novelty::Novelty;
+use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
+use fluree_vocab::config_iris;
+use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
+
+use crate::error::Result;
+use crate::view::{ConfigReasoningBudget, ReasoningModePrecedence};
+use crate::GovernanceOptions;
+
+/// Test-only fault injection for [`resolve_ledger_config`]: while a guard
+/// from [`arm`](config_read_fault::arm) is alive, every config read on this
+/// thread fails, as a storage error would, so a test sees each caller's
+/// mapping of the failure.
+#[cfg(test)]
+pub(crate) mod config_read_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    pub(crate) fn arm() -> Guard {
+        ARMED.with(|armed| armed.set(true));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|armed| armed.set(false));
+        }
+    }
+}
+
+// ============================================================================
+// Public: Privileged config read
+// ============================================================================
+
+/// Read the `f:LedgerConfig` from the config graph (g_id=2).
+///
+/// This is a **privileged** read — it bypasses policy by querying the config
+/// graph directly via `GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t)`.
+///
+/// Returns `Ok(None)` if the config graph is empty (no `f:LedgerConfig`
+/// resource found). System defaults apply in that case.
+pub async fn resolve_ledger_config(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<LedgerConfig>> {
+    // Residency mode: the read is a pure function of resident state, and
+    // view construction runs it outside any query's retry frame, so a miss
+    // is fetched and the read run again here. Any other error surfaces.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if let Some(cs) = crate::residency::content_store(snapshot) {
+        use fluree_db_binary_index::read::need_fetch::{RetryBudget, DEFAULT_FETCH_WIDTH};
+        let _guard = cs.query_guard();
+        let mut budget = RetryBudget::default();
+        loop {
+            match read_ledger_config(snapshot, overlay, to_t).await {
+                Ok(config) => return Ok(config),
+                Err(e) => {
+                    let retried = budget
+                        .after_error(cs.as_ref(), DEFAULT_FETCH_WIDTH)
+                        .await
+                        .map_err(|re| crate::error::ApiError::internal(re.to_string()))?;
+                    if !retried {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    read_ledger_config(snapshot, overlay, to_t).await
+}
+
+async fn read_ledger_config(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<LedgerConfig>> {
+    #[cfg(test)]
+    if config_read_fault::armed() {
+        return Err(crate::error::ApiError::internal(
+            "injected config read failure",
+        ));
+    }
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+
+    // Read the config_id (@id)
+    let config_id = snapshot.decode_sid(&config_sid);
+
+    // Read each setting group
+    let policy = read_policy_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let shacl = read_shacl_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let datalog = read_datalog_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let transact = read_transact_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
+
+    Ok(Some(LedgerConfig {
+        config_id,
+        policy,
+        shacl,
+        reasoning,
+        datalog,
+        transact,
+        full_text,
+        serving,
+        query,
+        graph_overrides,
+    }))
+}
+
+/// Locate the single `f:LedgerConfig` subject in the config graph as-of `to_t`,
+/// or `None` when the ledger has no config. Shared prefix of
+/// [`resolve_ledger_config`] and [`resolve_serving_only`].
+async fn resolve_config_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<Sid>> {
+    let config_sids = ledger_config_subjects(snapshot, overlay, to_t).await?;
+    if config_sids.len() > 1 {
+        tracing::warn!(
+            count = config_sids.len(),
+            "Multiple f:LedgerConfig resources found in config graph — using first by IRI order"
+        );
+    }
+    Ok(config_sids.into_iter().next())
+}
+
+/// Whether the config graph may hold data: false only when neither the
+/// novelty overlay nor the base index has any flake in it. The overlay check
+/// applies when the overlay is a `Novelty`; for other overlay types, and for
+/// an index root without per-graph stats, the answer is conservatively true.
+/// NOTE: `graph_registry` always *registers* the reserved config graph (via
+/// `new_for_ledger`), so registry presence is NOT a data signal.
+pub(crate) fn config_graph_may_hold_data(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+) -> bool {
+    let overlay_has_config_graph = overlay
+        .as_any()
+        .downcast_ref::<Novelty>()
+        .is_none_or(|novelty| novelty.segment_count(CONFIG_GRAPH_ID) > 0);
+    let base_has_config_graph = match snapshot.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
+        Some(graphs) => graphs
+            .iter()
+            .any(|g| g.g_id == CONFIG_GRAPH_ID && g.flakes > 0),
+        None => true,
+    };
+    overlay_has_config_graph || base_has_config_graph
+}
+
+/// Every `f:LedgerConfig` subject in the config graph as-of `to_t`, ordered by
+/// decoded IRI (the first is the one the reader uses).
+pub(crate) async fn ledger_config_subjects(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Vec<Sid>> {
+    // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
+    // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
+    // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
+    // lookup below resolves an object IRI that is absent from the dictionary,
+    // which drops the bound-object filter and full-scans the rdf:type predicate
+    // over the (growing) novelty overlay on EVERY transaction and query —
+    // O(novelty) per call once an index is attached.
+    if !config_graph_may_hold_data(snapshot, overlay) {
+        return Ok(Vec::new());
+    }
+
+    // Encode rdf:type (namespace code 3) and f:LedgerConfig (namespace code 7).
+    // Both namespaces are always in default_namespace_codes().
+    let rdf_type_sid = match snapshot.encode_iri(RDF_TYPE_IRI) {
+        Some(sid) => sid,
+        None => {
+            tracing::warn!("Failed to encode rdf:type IRI — config graph unavailable");
+            return Ok(Vec::new());
+        }
+    };
+    let config_type_sid = match snapshot.encode_iri(config_iris::LEDGER_CONFIG) {
+        Some(sid) => sid,
+        None => {
+            tracing::warn!("Failed to encode f:LedgerConfig IRI — config graph unavailable");
+            return Ok(Vec::new());
+        }
+    };
+
+    // Query: ?s rdf:type f:LedgerConfig at CONFIG_GRAPH_ID
+    let mut config_sids = find_instances_of_type(
+        snapshot,
+        overlay,
+        to_t,
+        CONFIG_GRAPH_ID,
+        &rdf_type_sid,
+        &config_type_sid,
+    )
+    .await?;
+
+    // Several config resources: order by decoded IRI (the first is used).
+    if config_sids.len() > 1 {
+        config_sids.sort_by_cached_key(|sid| {
+            snapshot
+                .decode_sid(sid)
+                .unwrap_or_else(|| format!("<unknown:{sid:?}>"))
+        });
+    }
+    Ok(config_sids)
+}
+
+// ============================================================================
+// Public: Config diagnostics
+// ============================================================================
+
+/// A problem in a ledger's config graph that the reader resolves
+/// deterministically but that means the config does not say what its writer
+/// meant. Reported in ledger info (`configDiagnostics`); transactions do not
+/// fail on them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigDiagnostic {
+    /// What kind of problem.
+    pub code: ConfigDiagnosticCode,
+    /// A sentence for people.
+    pub message: String,
+    /// The config nodes concerned, by IRI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+/// The kinds of [`ConfigDiagnostic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigDiagnosticCode {
+    /// Several `f:LedgerConfig` subjects; the one whose IRI sorts lowest is used.
+    MultipleLedgerConfigs,
+    /// A single-valued setting-group pointer has several values; the
+    /// non-empty group whose IRI sorts lowest is used.
+    AmbiguousPointer,
+    /// A setting group sets nothing in the config graph, so it reads as absent.
+    EmptyGroup,
+    /// An empty setting group's node has `f:` fields in another graph, where
+    /// the config reader never looks (typically a nested config group written
+    /// to the default graph).
+    StrandedFields,
+    /// Shapes exist but no config enables SHACL, so they are not enforced.
+    ShaclNotConfigured,
+    /// Several `f:GraphConfig` overrides target one graph; only one is used.
+    DuplicateGraphOverride,
+}
+
+/// Whether the group node `group_sid`, named by `pointer_iri`, sets nothing.
+async fn group_is_empty(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    pointer_iri: &str,
+    group_sid: &Sid,
+) -> Result<bool> {
+    Ok(match pointer_iri {
+        config_iris::POLICY_DEFAULTS => read_policy_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::SHACL_DEFAULTS => read_shacl_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::REASONING_DEFAULTS => {
+            read_reasoning_fields(snapshot, overlay, to_t, group_sid)
+                .await?
+                .is_empty()
+        }
+        config_iris::DATALOG_DEFAULTS => read_datalog_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::TRANSACT_DEFAULTS => read_transact_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::FULL_TEXT_DEFAULTS => read_fulltext_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::SERVING_DEFAULTS => read_serving_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::QUERY_DEFAULTS => read_query_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        _ => false,
+    })
+}
+
+/// Examine a ledger's config graph for degenerate state: several
+/// `f:LedgerConfig` subjects, ambiguous group pointers, empty groups (and the
+/// fields stranded in other graphs that emptied them), and shapes that no
+/// config enables. Diagnostics only: it reads, never repairs, and costs a few
+/// bounded lookups per config node, so it belongs to ledger info, not the
+/// transaction path.
+pub async fn diagnose(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Vec<ConfigDiagnostic>> {
+    let mut out = Vec::new();
+    let iri = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .unwrap_or_else(|| format!("<unknown:{sid:?}>"))
+    };
+
+    let config_sids = ledger_config_subjects(snapshot, overlay, to_t).await?;
+    if config_sids.len() > 1 {
+        out.push(ConfigDiagnostic {
+            code: ConfigDiagnosticCode::MultipleLedgerConfigs,
+            message: format!(
+                "{} f:LedgerConfig subjects in the config graph; only {} is used",
+                config_sids.len(),
+                iri(&config_sids[0])
+            ),
+            subjects: config_sids.iter().map(iri).collect(),
+        });
+    }
+
+    // The config node and its per-graph override nodes carry group pointers.
+    let mut config_nodes: Vec<Sid> = config_sids.first().cloned().into_iter().collect();
+    if let (Some(config_sid), Some(overrides)) = (
+        config_sids.first(),
+        try_encode(snapshot, config_iris::GRAPH_OVERRIDES),
+    ) {
+        for binding in
+            query_config_predicate(snapshot, overlay, to_t, config_sid, &overrides).await?
+        {
+            if let Some(sid) = binding.as_sid() {
+                config_nodes.push(sid.clone());
+            }
+        }
+    }
+    for node in &config_nodes {
+        for pointer in crate::config_vocab::GROUP_POINTERS {
+            let candidates = read_group_candidates(snapshot, overlay, to_t, node, pointer).await?;
+            if candidates.len() > 1 {
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::AmbiguousPointer,
+                    message: format!(
+                        "{} on {} has {} values; a setting group has one (use upsert, or delete \
+                         the old value)",
+                        pointer,
+                        iri(node),
+                        candidates.len()
+                    ),
+                    subjects: candidates.iter().map(iri).collect(),
+                });
+            }
+            for group in &candidates {
+                if !group_is_empty(snapshot, overlay, to_t, pointer, group).await? {
+                    continue;
+                }
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::EmptyGroup,
+                    message: format!(
+                        "the {pointer} group {} sets nothing in the config graph, so it reads as \
+                         absent",
+                        iri(group)
+                    ),
+                    subjects: vec![iri(group)],
+                });
+            }
+        }
+    }
+
+    // A per-graph override the reader skips: no `f:targetGraph` in the config
+    // graph (typically written to another graph with its groups).
+    for node in config_nodes.iter().skip(1) {
+        if read_iri_field(snapshot, overlay, to_t, node, config_iris::TARGET_GRAPH)
+            .await?
+            .is_none()
+        {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::EmptyGroup,
+                message: format!(
+                    "the f:graphOverrides entry {} has no f:targetGraph in the config graph, so \
+                     it is skipped",
+                    iri(node)
+                ),
+                subjects: vec![iri(node)],
+            });
+        }
+    }
+
+    // Config fields stranded outside the config graph, on any config node:
+    // the config subject, a per-graph override, a setting group, a source or
+    // any node they link to, whether or not the node sets anything in the
+    // config graph.
+    if let Some(root) = config_sids.first() {
+        for node in reachable_config_nodes(snapshot, overlay, to_t, root).await? {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &node).await?;
+            if stranded.is_empty() {
+                continue;
+            }
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::StrandedFields,
+                message: format!(
+                    "config node {} has config fields in {}, not in the config graph, where \
+                     they are not read; move them into the config graph (see the repair recipe \
+                     in docs/ledger-config/writing-config.md)",
+                    iri(&node),
+                    stranded.join(", ")
+                ),
+                subjects: vec![iri(&node)],
+            });
+        }
+    }
+
+    // The conventional config subject (`urn:fluree:<ledger>:config:ledger`)
+    // with config fields outside the config graph while the config graph does
+    // not hold it: a whole config written to the wrong graph. Transactions
+    // refuse that write; data written before may hold it.
+    let conventional = crate::config_vocab::conventional_config_subject(&snapshot.ledger_id);
+    if let Some(subject) = snapshot.encode_iri(&conventional) {
+        if !config_sids.contains(&subject) {
+            let stranded = graphs_with_config_fields(snapshot, overlay, to_t, &subject).await?;
+            if !stranded.is_empty() {
+                out.push(ConfigDiagnostic {
+                    code: ConfigDiagnosticCode::StrandedFields,
+                    message: format!(
+                        "the config subject {conventional} has config fields in {}, and the \
+                         config graph does not type it f:LedgerConfig, so none of them is read; \
+                         write the config into the config graph (see the repair recipe in \
+                         docs/ledger-config/writing-config.md)",
+                        stranded.join(", ")
+                    ),
+                    subjects: vec![conventional],
+                });
+            }
+        }
+    }
+
+    if let Some(config) = resolve_ledger_config(snapshot, overlay, to_t).await? {
+        let mut by_target: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for graph in &config.graph_overrides {
+            *by_target.entry(graph.target_graph.as_str()).or_default() += 1;
+        }
+        for (target, count) in by_target.into_iter().filter(|(_, n)| *n > 1) {
+            out.push(ConfigDiagnostic {
+                code: ConfigDiagnosticCode::DuplicateGraphOverride,
+                message: format!(
+                    "{count} f:GraphConfig overrides target {target}; only one of them is \
+                     used, so merge them into one"
+                ),
+                subjects: vec![target.to_string()],
+            });
+        }
+    }
+
+    if let Some(diagnostic) = shapes_without_enforcement(snapshot, overlay, to_t).await? {
+        out.push(diagnostic);
+    }
+    Ok(out)
+}
+
+/// The config graph's nodes reachable from the config subject `root` through
+/// config edges ([`crate::config_vocab::CONFIG_EDGES`]) asserted in the config
+/// graph, `root` first. The config graph is small; it is read once.
+async fn reachable_config_nodes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    root: &Sid,
+) -> Result<Vec<Sid>> {
+    let edges: Vec<Sid> = crate::config_vocab::CONFIG_EDGES
+        .iter()
+        .filter_map(|iri| try_encode(snapshot, iri))
+        .collect();
+    let flakes = fluree_db_core::range_with_overlay(
+        snapshot,
+        CONFIG_GRAPH_ID,
+        overlay,
+        fluree_db_core::IndexType::Spot,
+        fluree_db_core::RangeTest::Eq,
+        fluree_db_core::RangeMatch::new(),
+        fluree_db_core::RangeOptions {
+            to_t: Some(to_t),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut out: Vec<Sid> = vec![root.clone()];
+    let mut seen: HashSet<Sid> = out.iter().cloned().collect();
+    let mut next = 0;
+    while next < out.len() {
+        let node = out[next].clone();
+        next += 1;
+        for flake in flakes
+            .iter()
+            .filter(|f| f.s == node && edges.contains(&f.p))
+        {
+            if let fluree_db_core::FlakeValue::Ref(target) = &flake.o {
+                if seen.insert(target.clone()) {
+                    out.push(target.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The graphs other than the config graph where `node` has config fields
+/// ([`crate::config_vocab::is_config_field`]).
+async fn graphs_with_config_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    node: &Sid,
+) -> Result<Vec<String>> {
+    let mut graphs: Vec<(fluree_db_core::GraphId, String)> = vec![(
+        fluree_db_core::DEFAULT_GRAPH_ID,
+        "the default graph".to_string(),
+    )];
+    graphs.extend(
+        snapshot
+            .graph_registry
+            .iter_entries()
+            .filter(|(g_id, _)| *g_id >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)
+            .map(|(g_id, iri)| (g_id, format!("graph <{iri}>"))),
+    );
+    let mut found = Vec::new();
+    for (g_id, label) in graphs {
+        let mut vars = VarRegistry::new();
+        let p = vars.get_or_insert("?p");
+        let o = vars.get_or_insert("?o");
+        let pattern = TriplePattern::new(Ref::Sid(node.clone()), Ref::Var(p), Term::Var(o));
+        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
+        let batches = execute_pattern(db, &vars, pattern).await?;
+        let has_config_field = batches.iter().any(|batch| {
+            (0..batch.len()).any(|row| {
+                batch
+                    .get(row, p)
+                    .and_then(|b| b.as_sid())
+                    .is_some_and(crate::config_vocab::is_config_field)
+            })
+        });
+        if has_config_field {
+            found.push(label);
+        }
+    }
+    Ok(found)
+}
+
+/// "Shapes present; SHACL enforcement not configured": SHACL is off for
+/// every graph (ledger-wide and each graph override) and the shapes source
+/// holds at least one `sh:NodeShape` or `sh:PropertyShape`. A config that
+/// enables SHACL for one graph only is configured.
+async fn shapes_without_enforcement(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ConfigDiagnostic>> {
+    let config = resolve_ledger_config(snapshot, overlay, to_t).await?;
+    unenforced_shapes(snapshot, overlay, to_t, config.as_ref()).await
+}
+
+/// The SHACL target predicates: a subject with one is a shape the compiler
+/// enforces where SHACL is on, typed `sh:NodeShape` or not.
+const SHAPE_TARGETS: [&str; 4] = [
+    fluree_vocab::shacl::TARGET_CLASS,
+    fluree_vocab::shacl::TARGET_NODE,
+    fluree_vocab::shacl::TARGET_SUBJECTS_OF,
+    fluree_vocab::shacl::TARGET_OBJECTS_OF,
+];
+
+/// Whether the ledger may hold a SHACL shape, decided in memory, without
+/// reading the index: its index stats count instances of `sh:NodeShape` or
+/// `sh:PropertyShape` or uses of a target predicate (an untyped shape), or
+/// its novelty asserts one of those in the default graph. An index without
+/// class or property stats counts as holding none. A gate for checks that
+/// would otherwise read the ledger.
+#[cfg(feature = "shacl")]
+pub(crate) fn may_hold_shapes(
+    snapshot: &LedgerSnapshot,
+    novelty: &dyn OverlayProvider,
+    to_t: i64,
+) -> bool {
+    let shape_types: Vec<Sid> = [
+        fluree_vocab::shacl::NODE_SHAPE,
+        fluree_vocab::shacl::PROPERTY_SHAPE,
+    ]
+    .iter()
+    .filter_map(|iri| snapshot.encode_iri_strict(iri))
+    .collect();
+    let targets: Vec<Sid> = SHAPE_TARGETS
+        .iter()
+        .filter_map(|iri| snapshot.encode_iri_strict(iri))
+        .collect();
+    if shape_types.is_empty() && targets.is_empty() {
+        return false;
+    }
+    let stats = snapshot.stats.as_ref();
+    let indexed = stats
+        .and_then(|stats| stats.classes.as_ref())
+        .is_some_and(|classes| {
+            classes
+                .iter()
+                .any(|class| class.count > 0 && shape_types.contains(&class.class_sid))
+        })
+        || stats
+            .and_then(|stats| stats.properties.as_ref())
+            .is_some_and(|properties| {
+                properties.iter().any(|property| {
+                    property.count > 0
+                        && targets.iter().any(|target| {
+                            target.namespace_code == property.sid.0
+                                && *target.name == *property.sid.1
+                        })
+                })
+            });
+    if indexed {
+        return true;
+    }
+    let targeted = targets.into_iter().any(|target| {
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Psot,
+            Some(&fluree_db_core::Flake::min_for_predicate(target.clone())),
+            Some(&fluree_db_core::Flake::max_for_predicate(target)),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    });
+    if targeted {
+        return true;
+    }
+    let Some(rdf_type) = snapshot.encode_iri_strict(RDF_TYPE_IRI) else {
+        return false;
+    };
+    shape_types.into_iter().any(|shape_type| {
+        let shape_type = fluree_db_core::FlakeValue::Ref(shape_type);
+        let mut asserted = false;
+        novelty.for_each_overlay_flake(
+            fluree_db_core::DEFAULT_GRAPH_ID,
+            fluree_db_core::IndexType::Post,
+            Some(&fluree_db_core::Flake::min_for_predicate_object(
+                rdf_type.clone(),
+                shape_type.clone(),
+            )),
+            Some(&fluree_db_core::Flake::max_for_predicate_object(
+                rdf_type.clone(),
+                shape_type,
+            )),
+            false,
+            to_t,
+            &mut |flake| asserted |= flake.op,
+        );
+        asserted
+    })
+}
+
+/// [`shapes_without_enforcement`] under an already-resolved `config`.
+pub(crate) async fn unenforced_shapes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    config: Option<&LedgerConfig>,
+) -> Result<Option<ConfigDiagnostic>> {
+    let enabled = config.is_some_and(|c| {
+        std::iter::once(None)
+            .chain(
+                c.graph_overrides
+                    .iter()
+                    .map(|graph| Some(graph.target_graph.as_str())),
+            )
+            .any(|graph| {
+                merge_shacl_opts(&resolve_effective_config(c, graph), None, None)
+                    .is_some_and(|shacl| shacl.enabled)
+            })
+    });
+    if enabled {
+        return Ok(None);
+    }
+    // SHACL switched off on purpose (`f:shaclEnabled false`, ledger-wide or
+    // for a graph) is the ledger's posture, not a gap to report.
+    let switched_off = config.is_some_and(|c| {
+        std::iter::once(c.shacl.as_ref())
+            .chain(c.graph_overrides.iter().map(|graph| graph.shacl.as_ref()))
+            .any(|shacl| shacl.is_some_and(|shacl| shacl.enabled == Some(false)))
+    });
+    if switched_off {
+        return Ok(None);
+    }
+    // The configured shapes graph when it is a local one, else the default
+    // graph (a cross-ledger source is not examined here).
+    let source = config
+        .and_then(|c| c.shacl.as_ref())
+        .and_then(|s| s.shapes_source.as_ref());
+    let g_id = match source {
+        Some(src) if src.ledger.is_some() => return Ok(None),
+        Some(src) => match src.graph_selector.as_deref() {
+            None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+            Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
+                Some(fluree_db_core::DEFAULT_GRAPH_ID)
+            }
+            Some(sel) => snapshot
+                .graph_registry
+                .existing_graph_id(sel, to_t)
+                .ok()
+                .flatten(),
+        },
+        None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+    };
+    let (Some(g_id), Some(rdf_type)) = (g_id, try_encode(snapshot, RDF_TYPE_IRI)) else {
+        return Ok(None);
+    };
+    let diagnostic = || ConfigDiagnostic {
+        code: ConfigDiagnosticCode::ShaclNotConfigured,
+        message: "shapes present; SHACL enforcement not configured (shapes are enforced \
+                  only where the ledger config sets f:shaclEnabled true)"
+            .to_string(),
+        subjects: Vec::new(),
+    };
+    for shape_type in [
+        fluree_vocab::shacl::NODE_SHAPE,
+        fluree_vocab::shacl::PROPERTY_SHAPE,
+    ] {
+        let Some(type_sid) = try_encode(snapshot, shape_type) else {
+            continue;
+        };
+        let shapes =
+            find_instances_of_type(snapshot, overlay, to_t, g_id, &rdf_type, &type_sid).await?;
+        if !shapes.is_empty() {
+            return Ok(Some(diagnostic()));
+        }
+    }
+    // An untyped shape: a subject with a target predicate.
+    for target in SHAPE_TARGETS {
+        let Some(target) = snapshot.encode_iri(target) else {
+            continue;
+        };
+        let used = fluree_db_core::range_with_overlay(
+            snapshot,
+            g_id,
+            overlay,
+            fluree_db_core::IndexType::Psot,
+            fluree_db_core::RangeTest::Eq,
+            fluree_db_core::RangeMatch::predicate(target),
+            fluree_db_core::RangeOptions {
+                to_t: Some(to_t),
+                flake_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if !used.is_empty() {
+            return Ok(Some(diagnostic()));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve only the serving posture (`f:servingDefaults`), skipping the other
+/// setting groups. The serving gates read only `config.serving`, so this
+/// avoids the wasted group reads a full [`resolve_ledger_config`] would do.
+pub async fn resolve_serving_only(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<ServingDefaults>> {
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+    read_serving_defaults(snapshot, overlay, to_t, &config_sid).await
+}
+
+// ============================================================================
+// Public: Three-tier merge
+// ============================================================================
+
+/// Resolve effective config for a specific graph within a ledger.
+///
+/// Merges ledger-wide defaults with matching per-graph overrides.
+/// `graph_iri` is `None` for the default graph (g_id=0).
+///
+/// For each setting group:
+/// 1. Start with ledger-wide group
+/// 2. Find matching `GraphConfig` by `target_graph` IRI
+/// 3. If per-graph group exists: merge field-by-field, tighten override control
+pub fn resolve_effective_config(config: &LedgerConfig, graph_iri: Option<&str>) -> ResolvedConfig {
+    // Find matching per-graph override
+    let graph_override = config
+        .graph_overrides
+        .iter()
+        .find(|gc| matches_graph_target(&gc.target_graph, graph_iri));
+
+    ResolvedConfig {
+        policy: merge_setting_group(
+            &config.policy,
+            graph_override.and_then(|gc| gc.policy.as_ref()),
+        ),
+        shacl: merge_setting_group(
+            &config.shacl,
+            graph_override.and_then(|gc| gc.shacl.as_ref()),
+        ),
+        reasoning: merge_setting_group(
+            &config.reasoning,
+            graph_override.and_then(|gc| gc.reasoning.as_ref()),
+        ),
+        datalog: merge_setting_group(
+            &config.datalog,
+            graph_override.and_then(|gc| gc.datalog.as_ref()),
+        ),
+        transact: merge_setting_group(
+            &config.transact,
+            graph_override.and_then(|gc| gc.transact.as_ref()),
+        ),
+        full_text: merge_setting_group(
+            &config.full_text,
+            graph_override.and_then(|gc| gc.full_text.as_ref()),
+        ),
+    }
+}
+
+/// Check if a `target_graph` IRI matches the given graph context.
+///
+/// Sentinel IRIs:
+/// - `f:defaultGraph` matches `None` (g_id=0)
+/// - `f:txnMetaGraph` matches the txn-meta IRI
+/// - Other IRIs match by exact string comparison
+fn matches_graph_target(target: &str, graph_iri: Option<&str>) -> bool {
+    match graph_iri {
+        None => target == config_iris::DEFAULT_GRAPH,
+        Some(iri) => {
+            target == iri || (target == config_iris::TXN_META_GRAPH && iri.ends_with("#txn-meta"))
+        }
+    }
+}
+
+/// Collect the effective configured full-text properties from a resolved
+/// [`LedgerConfig`], in the shape the indexer expects.
+///
+/// Semantics:
+/// - Ledger-wide properties (declared on `LedgerConfig.full_text.properties`)
+///   are emitted with scope `AnyGraph` — they apply to every graph in the
+///   ledger.
+/// - Per-graph overrides emit only the **delta** — properties added on top
+///   of the ledger-wide list — with a scope that mirrors the override's
+///   `f:targetGraph`: `DefaultGraph` for `f:defaultGraph`, `TxnMetaGraph`
+///   for `f:txnMetaGraph`, or `NamedGraph(iri)` otherwise. Inherited
+///   ledger-wide entries are not re-emitted per graph because `AnyGraph`
+///   already covers them.
+/// - Override blocking (`f:OverrideNone` on the ledger-wide group) is
+///   enforced by reusing the shared `merge_setting_group` helper: when
+///   blocked, the "effective" per-graph group equals the ledger-wide group,
+///   so the delta is empty and no extra entries are emitted.
+///
+/// Empty result when no full-text defaults are configured — the indexer treats
+/// this as "only the `@fulltext` datatype path contributes entries."
+pub fn configured_fulltext_properties_for_indexer(
+    config: &LedgerConfig,
+) -> Vec<crate::wasm_compat::ConfiguredFulltextProperty> {
+    use crate::wasm_compat::{ConfiguredFulltextProperty, ConfiguredFulltextScope};
+
+    let mut out: Vec<ConfiguredFulltextProperty> = Vec::new();
+
+    // Ledger-wide: applies to every graph (scope::AnyGraph).
+    let ledger_wide_iris: std::collections::HashSet<&str> = config
+        .full_text
+        .as_ref()
+        .map(|ft| ft.properties.iter().map(|p| p.target.as_str()).collect())
+        .unwrap_or_default();
+    if let Some(ref ft) = config.full_text {
+        for prop in &ft.properties {
+            out.push(ConfiguredFulltextProperty {
+                scope: ConfiguredFulltextScope::AnyGraph,
+                property_iri: prop.target.clone(),
+            });
+        }
+    }
+
+    // Per-graph overrides: emit only the DELTA (properties the override adds
+    // beyond the ledger-wide list), under a scope that matches the override's
+    // `f:targetGraph`. Sentinel IRIs `f:defaultGraph` / `f:txnMetaGraph` map
+    // to the `DefaultGraph` / `TxnMetaGraph` scope variants so the indexer
+    // can resolve them to the correct `GraphId` without treating them as
+    // literal IRIs.
+    for gc in &config.graph_overrides {
+        let effective_full_text = merge_setting_group(&config.full_text, gc.full_text.as_ref());
+        let props = match &effective_full_text {
+            Some(ft) => &ft.properties[..],
+            None => continue,
+        };
+
+        let scope = if gc.target_graph == config_iris::DEFAULT_GRAPH {
+            ConfiguredFulltextScope::DefaultGraph
+        } else if gc.target_graph == config_iris::TXN_META_GRAPH {
+            ConfiguredFulltextScope::TxnMetaGraph
+        } else {
+            ConfiguredFulltextScope::NamedGraph(gc.target_graph.clone())
+        };
+
+        for prop in props {
+            if ledger_wide_iris.contains(prop.target.as_str()) {
+                // Already covered by the ledger-wide `AnyGraph` entry.
+                continue;
+            }
+            out.push(ConfiguredFulltextProperty {
+                scope: scope.clone(),
+                property_iri: prop.target.clone(),
+            });
+        }
+    }
+
+    out
+}
+
+// ============================================================================
+// Public: Per-subsystem merge functions (request-scoped)
+// ============================================================================
+
+/// Merge config policy defaults with query-time opts.
+///
+/// Override control is checked against `opts.server_identity`, the
+/// auth-layer-verified identity, never against `opts.identity`, which is the
+/// user-settable policy evaluation context.
+///
+/// Algorithm:
+/// 1. No config policy → return opts unchanged
+/// 2. Override control denies a policy-carrying request → log warning and let
+///    config *force* its values over the request's (the documented truth table)
+/// 3. Otherwise → config fills only what the request left genuinely unset;
+///    `policy_class` additionally applies only when the request carried no
+///    policy inputs at all, preserving the pre-tri-state behavior
+///
+/// The distinction that matters for `default_allow`: `None` means the caller
+/// never spoke, so config governs; `Some(v)` is an explicit request value and
+/// survives, because the only thing entitled to overrule an explicit caller
+/// value is override control saying so.
+pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) -> GovernanceOptions {
+    let policy = match &resolved.policy {
+        Some(p) => p,
+        None => return opts.clone(),
+    };
+
+    // No configured grant may widen an explicit deny-all selection. This is
+    // also how an empty host authorization survives the JSON/consensus wire.
+    if opts.denies_all() {
+        return opts.clone();
+    }
+
+    let query_selects_policy = opts.selects_policy_set();
+    let server_identity = opts.server_identity.as_ref();
+    let override_denied =
+        query_selects_policy && !policy.override_control.permits_override(server_identity);
+
+    let mut merged = opts.clone();
+
+    if override_denied {
+        tracing::warn!(
+            server_identity = ?server_identity,
+            "Query-time policy override denied by config override control — applying config defaults"
+        );
+
+        // Denying an override must clear *all* caller-selected grants, even
+        // fields for which config has no replacement. Inline required grants
+        // and policy-values can otherwise weaken the configured policy set.
+        merged.policy_class = policy.policy_class.clone();
+        merged.policy = None;
+        merged.policy_values = None;
+        merged.default_allow = if opts.default_allow == Some(false) {
+            Some(false)
+        } else {
+            policy.default_allow
+        };
+        if !merged.has_any_policy_inputs() {
+            merged.policy = Some(serde_json::json!([]));
+        }
+        return merged;
+    }
+
+    // Config fills only a genuine unset. An explicit `Some(false)` reaches here
+    // via a request that carries no *other* policy selection, and it
+    // must not be clobbered by config's `f:defaultAllow true`.
+    if merged.default_allow.is_none() {
+        merged.default_allow = policy.default_allow;
+    }
+
+    // policy_class stays request-first: config supplies it only when the request
+    // did not select a policy set (a deny default alone only narrows it).
+    // Widening this to "fill when unset" would
+    // start applying config's f:policyClass to identity-carrying requests on the
+    // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
+    if !query_selects_policy {
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
+    }
+
+    // policy_source (GraphSourceRef) is resolved to graph IDs by the caller
+    // via resolve_policy_source_g_ids() and passed to build_policy_context_from_opts().
+    // See wrap_policy() in fluree_ext.rs.
+
+    merged
+}
+
+/// Compute effective reasoning for a view, respecting override control.
+///
+/// `server_identity` is the auth-layer-verified identity (NOT `opts.identity`).
+///
+/// Returns `(modes, precedence)` to apply via `view.with_reasoning_precedence()`,
+/// or `None` if no config reasoning is configured.
+///
+/// Override control determines precedence:
+/// - `OverrideControl::None` → `Force` (query cannot override)
+/// - `AllowAll` → `DefaultUnlessQueryOverrides`
+/// - `IdentityRestricted` → check identity:
+///   - Permitted → `DefaultUnlessQueryOverrides`
+///   - Denied → `Force`
+pub fn merge_reasoning(
+    resolved: &ResolvedConfig,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Option<(Vec<String>, ReasoningModePrecedence)> {
+    let reasoning = resolved.reasoning.as_ref()?;
+    let modes = reasoning.modes.as_ref()?;
+
+    if modes.is_empty() {
+        return None;
+    }
+
+    let precedence = if reasoning.override_control.permits_override(server_identity) {
+        ReasoningModePrecedence::DefaultUnlessQueryOverrides
+    } else {
+        ReasoningModePrecedence::Force
+    };
+
+    Some((modes.clone(), precedence))
+}
+
+/// Compute the effective OWL2-RL materialization budget from ledger config.
+///
+/// Independent of [`merge_reasoning`]: a ledger can configure a budget
+/// without configuring default modes (the budget then governs queries that
+/// request reasoning themselves). Returns `None` when neither budget field
+/// is configured.
+///
+/// `force` follows the reasoning group's override control: when the request
+/// identity may not override, a query-supplied budget is discarded in favor
+/// of these values.
+pub fn config_reasoning_budget(
+    resolved: &ResolvedConfig,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Option<ConfigReasoningBudget> {
+    let reasoning = resolved.reasoning.as_ref()?;
+    if reasoning.max_facts.is_none()
+        && reasoning.max_seconds.is_none()
+        && reasoning.max_memory_mb.is_none()
+    {
+        return None;
+    }
+    Some(ConfigReasoningBudget {
+        max_facts: reasoning.max_facts,
+        max_seconds: reasoning.max_seconds,
+        max_memory_mb: reasoning.max_memory_mb,
+        force: !reasoning.override_control.permits_override(server_identity),
+    })
+}
+
+/// Transaction-time SHACL configuration from config graph.
+#[derive(Debug, Clone)]
+pub struct EffectiveShaclConfig {
+    /// Whether SHACL validation should run.
+    pub enabled: bool,
+    /// How to handle validation failures.
+    pub validation_mode: ValidationMode,
+}
+
+/// Compute effective SHACL settings from resolved config, honoring a
+/// transaction-requested validation mode under override control.
+///
+/// Returns `None` if no SHACL config section is present, which means SHACL is
+/// off for the graph: shapes alone never enable validation.
+///
+/// `requested_mode` is the transaction's `opts.validationMode`
+/// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified
+/// identity (NOT the user-settable `opts.identity`). Gating is asymmetric:
+///
+/// - **Strengthening** (config `Warn`, request `Reject`) is always honored —
+///   asking for stricter validation needs no permission.
+/// - **Softening** (config `Reject`, request `Warn`) is honored only when the
+///   SHACL group's `f:overrideControl` permits it for `server_identity`
+///   (`f:OverrideAll` — the default — permits everyone; `f:OverrideNone`
+///   denies all; an identity-restricted list checks membership). A denied
+///   request keeps the configured posture and logs a warning; it does not
+///   fail the transaction.
+///
+/// The request can never toggle `enabled` — only the failure handling of
+/// validation that config already turned on.
+pub fn merge_shacl_opts(
+    resolved: &ResolvedConfig,
+    requested_mode: Option<ValidationMode>,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Option<EffectiveShaclConfig> {
+    let shacl = resolved.shacl.as_ref()?;
+    let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
+    let validation_mode = match requested_mode {
+        None => config_mode,
+        Some(ValidationMode::Reject) => ValidationMode::Reject,
+        Some(ValidationMode::Warn) => {
+            if config_mode == ValidationMode::Warn
+                || shacl.override_control.permits_override(server_identity)
+            {
+                ValidationMode::Warn
+            } else {
+                tracing::warn!(
+                    server_identity = ?server_identity,
+                    "Transaction-requested SHACL warn mode denied by config override control \
+                     — keeping configured reject posture"
+                );
+                config_mode
+            }
+        }
+    };
+    Some(EffectiveShaclConfig {
+        // Default `false` per docs/ledger-config/setting-groups.md — opt-in is
+        // the safer posture. Prior code defaulted to `true`, silently enabling
+        // SHACL for any config that declared an `f:shaclDefaults` section
+        // without setting `f:shaclEnabled`, diverging from documented behavior.
+        enabled: shacl.enabled.unwrap_or(false),
+        validation_mode,
+    })
+}
+
+/// Query-time datalog configuration from config graph.
+#[derive(Debug, Clone)]
+pub struct EffectiveDatalogConfig {
+    /// Whether datalog rule execution is enabled.
+    pub enabled: bool,
+    /// Whether query-time rule injection (the `rules` JSON field) is permitted.
+    pub allow_query_time_rules: bool,
+    /// Whether the query can override these settings.
+    pub override_allowed: bool,
+    /// Pre-resolved `f:rulesSource` reference. When `Some`, the rule
+    /// extractor reads `f:rule` flakes from this `GraphSourceRef`
+    /// instead of the default graph. Cross-ledger (`f:ledger` set)
+    /// dispatches to the cross-ledger resolver at query time; pure
+    /// local references resolve to a graph id in the same ledger.
+    pub rules_source: Option<fluree_db_core::ledger_config::GraphSourceRef>,
+}
+
+/// Compute effective datalog settings from resolved config, respecting override control.
+///
+/// The `override_allowed` flag follows the same pattern as reasoning precedence:
+/// when `true`, query-time options can override config defaults;
+/// when `false`, config settings are forced.
+pub fn merge_datalog_opts(
+    resolved: &ResolvedConfig,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Option<EffectiveDatalogConfig> {
+    let datalog = resolved.datalog.as_ref()?;
+    let override_allowed = datalog.override_control.permits_override(server_identity);
+
+    Some(EffectiveDatalogConfig {
+        enabled: datalog.enabled.unwrap_or(true),
+        allow_query_time_rules: datalog.allow_query_time_rules.unwrap_or(true),
+        override_allowed,
+        rules_source: datalog.rules_source.clone(),
+    })
+}
+
+/// Transaction-time uniqueness configuration from config graph.
+#[derive(Debug, Clone)]
+pub struct EffectiveTransactConfig {
+    /// Whether unique constraint enforcement should run.
+    pub unique_enabled: bool,
+    /// Graphs containing `f:enforceUnique` annotations.
+    pub constraints_sources: Vec<GraphSourceRef>,
+}
+
+/// Compute effective transact settings from resolved config.
+///
+/// Returns `None` if no transact config section is present. When `None`,
+/// callers skip uniqueness enforcement entirely (zero-cost path).
+pub fn merge_transact_opts(resolved: &ResolvedConfig) -> Option<EffectiveTransactConfig> {
+    let transact = resolved.transact.as_ref()?;
+    let enabled = transact.unique_enabled.unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    Some(EffectiveTransactConfig {
+        unique_enabled: true,
+        constraints_sources: transact.constraints_sources.clone(),
+    })
+}
+
+// ============================================================================
+// Internal: Setting group merge helpers
+// ============================================================================
+
+/// Generic merge for setting groups: per-graph `Some` fields override ledger-wide.
+///
+/// If the ledger-wide group's `override_control` is `OverrideNone`, per-graph
+/// overrides are blocked entirely — the ledger-wide value is final.
+/// Otherwise, per-graph `Some` fields override ledger-wide, and override control
+/// is tightened via `effective_min`.
+fn merge_setting_group<T: MergeableGroup>(
+    ledger_wide: &Option<T>,
+    per_graph: Option<&T>,
+) -> Option<T> {
+    match (ledger_wide, per_graph) {
+        (None, None) => None,
+        (Some(lw), None) => Some(lw.clone()),
+        (None, Some(pg)) => Some(pg.clone()),
+        (Some(lw), Some(pg)) => {
+            // Step 4 of the resolution algorithm: if ledger-wide overrideControl
+            // is OverrideNone, the group is final — per-graph cannot override.
+            if matches!(lw.override_control(), OverrideControl::None) {
+                tracing::debug!(
+                    "Ledger-wide OverrideNone blocks per-graph override for setting group"
+                );
+                Some(lw.clone())
+            } else {
+                Some(pg.merge_over(lw))
+            }
+        }
+    }
+}
+
+/// Trait for setting groups that support field-level merge with override control tightening.
+trait MergeableGroup: Clone {
+    /// Access the override control for this group.
+    fn override_control(&self) -> &OverrideControl;
+
+    /// Merge `self` (per-graph) over `base` (ledger-wide).
+    /// Per-graph `Some` fields override base; override control is tightened.
+    fn merge_over(&self, base: &Self) -> Self;
+}
+
+impl MergeableGroup for PolicyDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    fn merge_over(&self, base: &Self) -> Self {
+        PolicyDefaults {
+            default_allow: self.default_allow.or(base.default_allow),
+            policy_source: self.policy_source.clone().or(base.policy_source.clone()),
+            policy_class: self.policy_class.clone().or(base.policy_class.clone()),
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+impl MergeableGroup for ShaclDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    fn merge_over(&self, base: &Self) -> Self {
+        ShaclDefaults {
+            enabled: self.enabled.or(base.enabled),
+            shapes_source: self.shapes_source.clone().or(base.shapes_source.clone()),
+            additional_data_sources: if self.additional_data_sources.is_empty() {
+                base.additional_data_sources.clone()
+            } else {
+                self.additional_data_sources.clone()
+            },
+            validation_mode: self.validation_mode.or(base.validation_mode),
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+impl MergeableGroup for ReasoningDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    fn merge_over(&self, base: &Self) -> Self {
+        // `ontology_import_map`: per-graph additions extend ledger-wide bindings.
+        // Per-graph entries come first so they win on duplicate ontology IRIs.
+        let mut import_map = self.ontology_import_map.clone();
+        let existing: std::collections::HashSet<String> =
+            import_map.iter().map(|b| b.ontology_iri.clone()).collect();
+        for b in &base.ontology_import_map {
+            if !existing.contains(&b.ontology_iri) {
+                import_map.push(b.clone());
+            }
+        }
+        ReasoningDefaults {
+            modes: self.modes.clone().or(base.modes.clone()),
+            schema_source: self.schema_source.clone().or(base.schema_source.clone()),
+            follow_owl_imports: self.follow_owl_imports.or(base.follow_owl_imports),
+            ontology_import_map: import_map,
+            max_facts: self.max_facts.or(base.max_facts),
+            max_seconds: self.max_seconds.or(base.max_seconds),
+            max_memory_mb: self.max_memory_mb.or(base.max_memory_mb),
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+impl MergeableGroup for DatalogDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    fn merge_over(&self, base: &Self) -> Self {
+        DatalogDefaults {
+            enabled: self.enabled.or(base.enabled),
+            rules_source: self.rules_source.clone().or(base.rules_source.clone()),
+            allow_query_time_rules: self.allow_query_time_rules.or(base.allow_query_time_rules),
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+impl MergeableGroup for TransactDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    /// Additive merge: once enabled at ledger level, stays enabled;
+    /// per-graph sources ADD TO ledger-wide sources.
+    fn merge_over(&self, base: &Self) -> Self {
+        TransactDefaults {
+            unique_enabled: Some(
+                self.unique_enabled.unwrap_or(false) || base.unique_enabled.unwrap_or(false),
+            ),
+            constraints_sources: {
+                let mut sources = base.constraints_sources.clone();
+                sources.extend(self.constraints_sources.iter().cloned());
+                sources
+            },
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+impl MergeableGroup for FullTextDefaults {
+    fn override_control(&self) -> &OverrideControl {
+        &self.override_control
+    }
+
+    /// Additive merge for `properties`: per-graph entries append to ledger-wide.
+    /// Duplicate `target` IRIs resolve to a single entry with per-graph winning,
+    /// which leaves room for future per-property knobs (language, boost, …).
+    fn merge_over(&self, base: &Self) -> Self {
+        let mut properties = base.properties.clone();
+        for entry in &self.properties {
+            if let Some(slot) = properties.iter_mut().find(|p| p.target == entry.target) {
+                *slot = entry.clone();
+            } else {
+                properties.push(entry.clone());
+            }
+        }
+        FullTextDefaults {
+            default_language: self
+                .default_language
+                .clone()
+                .or(base.default_language.clone()),
+            properties,
+            override_control: base.override_control.effective_min(&self.override_control),
+        }
+    }
+}
+
+// ============================================================================
+// Internal: Privileged query helpers
+// ============================================================================
+
+/// Query for subjects of a given rdf:type in graph `g_id`.
+async fn find_instances_of_type(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    g_id: fluree_db_core::GraphId,
+    rdf_type_sid: &Sid,
+    type_sid: &Sid,
+) -> Result<Vec<Sid>> {
+    let mut vars = VarRegistry::new();
+    let subj_var = vars.get_or_insert("?s");
+
+    let pattern = TriplePattern::new(
+        Ref::Var(subj_var),
+        Ref::Sid(rdf_type_sid.clone()),
+        Term::Sid(type_sid.clone()),
+    );
+
+    // Eager materialization: config resolver needs concrete Sid/Lit bindings,
+    // not late-materialized EncodedSid/EncodedLit from binary scans.
+    let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
+    let batches = execute_pattern(db, &vars, pattern).await?;
+
+    let mut results = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.len() {
+            if let Some(binding) = batch.get(row, subj_var) {
+                if let Some(sid) = binding.as_sid() {
+                    results.push(sid.clone());
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Query for all objects of a predicate on a subject at the config graph.
+///
+/// Follows the exact pattern from `policy_builder::query_predicate`, but
+/// targets `CONFIG_GRAPH_ID` instead of graph 0.
+async fn query_config_predicate(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    predicate_sid: &Sid,
+) -> Result<Vec<Binding>> {
+    let mut vars = VarRegistry::new();
+    let obj_var = vars.get_or_insert("?obj");
+
+    let pattern = TriplePattern::new(
+        Ref::Sid(subject_sid.clone()),
+        Ref::Sid(predicate_sid.clone()),
+        Term::Var(obj_var),
+    );
+
+    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let batches = execute_pattern(db, &vars, pattern).await?;
+
+    let mut results = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.len() {
+            if let Some(binding) = batch.get(row, obj_var) {
+                results.push(binding.clone());
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Encode an IRI to a SID, returning None if the IRI cannot be encoded.
+///
+/// Unlike `policy_builder::resolve_iri_to_sid`, this returns `None` instead
+/// of an error — missing config predicates are normal (unconfigured fields).
+fn try_encode(snapshot: &LedgerSnapshot, iri: &str) -> Option<Sid> {
+    #[cfg(test)]
+    crate::config_vocab::read_recorder::note(iri);
+    snapshot.encode_iri(iri)
+}
+
+// ============================================================================
+// Internal: Field readers
+// ============================================================================
+
+/// Read a boolean field from a subject at the config graph.
+async fn read_bool_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<bool>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    for binding in bindings {
+        if let Some((fluree_db_core::FlakeValue::Boolean(b), _)) = binding.as_lit() {
+            return Ok(Some(*b));
+        }
+    }
+    Ok(None)
+}
+
+/// Read a single IRI-valued field (object reference) from a subject.
+///
+/// Returns the SID of the referenced object, suitable for further querying.
+async fn read_ref_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<Sid>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    for binding in bindings {
+        if let Some(sid) = binding.as_sid() {
+            return Ok(Some(sid.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The values of a single-valued setting-group pointer (`f:shaclDefaults`
+/// and the like) on `subject_sid`, as candidates for the group it names.
+///
+/// Written as documented a pointer has one value. Several values (a config
+/// re-inserted rather than upserted, say) are ordered by decoded IRI, the rule
+/// [`resolve_config_sid`] applies to several `f:LedgerConfig` subjects, so the
+/// choice is deterministic; they are reported by [`diagnose`] and logged here
+/// (rate-limited: the config is resolved on every transaction).
+async fn read_group_candidates(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Vec<Sid>> {
+    let Some(pred_sid) = try_encode(snapshot, pred_iri) else {
+        return Ok(Vec::new());
+    };
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    let mut sids: Vec<Sid> = bindings
+        .iter()
+        .filter_map(|b| b.as_sid().cloned())
+        .collect();
+    if sids.len() > 1 {
+        sids.sort_by_cached_key(|sid| snapshot.decode_sid(sid).unwrap_or_default());
+        sids.dedup();
+        if sids.len() > 1 {
+            warn_degenerate_config(pred_iri);
+        }
+    }
+    Ok(sids)
+}
+
+/// Log a degenerate config (an ambiguous group pointer) at most once per
+/// thousand occurrences: config is resolved on every transaction, so an
+/// unthrottled warning would repeat on every write. [`diagnose`] reports the
+/// details on demand (ledger info `configDiagnostics`).
+fn warn_degenerate_config(pointer_iri: &str) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(1000)
+    {
+        tracing::warn!(
+            pointer = pointer_iri,
+            "ledger config has several values for a single-valued setting-group pointer; \
+             using the non-empty group whose IRI sorts lowest (see ledger info \
+             configDiagnostics)"
+        );
+    }
+}
+
+/// Log a config node the reader skips at most once per thousand occurrences:
+/// the config is resolved on every transaction, so an unthrottled warning
+/// would repeat on every write. [`diagnose`] reports it on demand (ledger
+/// info `configDiagnostics`).
+fn warn_degenerate_node(what: &'static str) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(1000)
+    {
+        tracing::warn!("{what} (see ledger info configDiagnostics)");
+    }
+}
+
+/// Read an IRI-valued field and decode to its IRI string.
+async fn read_iri_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<String>> {
+    let ref_sid = read_ref_field(snapshot, overlay, to_t, subject_sid, pred_iri).await?;
+    Ok(ref_sid.and_then(|sid| snapshot.decode_sid(&sid)))
+}
+
+/// Read a multi-value IRI list field from a subject at the config graph.
+///
+/// Each value is an IRI reference (not a string literal), written as
+/// repeated objects or as an RDF list. Returns decoded IRI strings.
+async fn read_iri_list_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<Vec<String>>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
+
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values))
+    }
+}
+
+/// The values of `subject_sid`'s `predicate_sid` in the config graph, with
+/// each RDF list among them — compact or an `rdf:first`/`rdf:rest` chain —
+/// replaced by its members.
+async fn config_values(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    predicate_sid: &Sid,
+) -> Result<Vec<fluree_db_core::FlakeValue>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+
+    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let flakes = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(subject_sid.clone()),
+                p: Some(predicate_sid.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let read = fluree_db_core::rdf_list::read_lists(db, &flakes).await?;
+    if read.malformed > 0 {
+        tracing::warn!(
+            malformed = read.malformed,
+            "config list is not a well-formed RDF collection; ignoring it"
+        );
+    }
+    Ok(read
+        .lists
+        .into_iter()
+        .flatten()
+        .chain(read.values)
+        .collect())
+}
+
+/// Read `f:reasoningModes`, accepting every shape users naturally write:
+///
+/// - repeated IRI objects — `f:reasoningModes f:rdfs, f:datalog`
+/// - repeated string literals — `f:reasoningModes "rdfs"`
+/// - an RDF collection of either — `f:reasoningModes ( "rdfs" "datalog" )`
+///
+/// `ReasoningModes::from_mode_strings` downstream handles both full IRIs
+/// and bare mode names, so all shapes normalize to the same modes.
+///
+/// This is deliberately more permissive than [`read_iri_list_field`]
+/// (which stays IRI-only for `f:policyClass` / `f:allowedIdentities`,
+/// where a stray string must not widen policy). Before this reader,
+/// string-literal and collection shapes silently produced no modes —
+/// config-declared reasoning never engaged and queries returned
+/// non-entailed results with no error.
+async fn read_reasoning_modes_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+) -> Result<Option<Vec<String>>> {
+    let pred_sid = match try_encode(snapshot, config_iris::REASONING_MODES) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let values: Vec<String> = config_values(snapshot, overlay, to_t, subject_sid, &pred_sid)
+        .await?
+        .into_iter()
+        .filter_map(|value| match value {
+            fluree_db_core::FlakeValue::String(s) => Some(s),
+            fluree_db_core::FlakeValue::Ref(sid) => snapshot.decode_sid(&sid),
+            _ => None,
+        })
+        .collect();
+
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values))
+    }
+}
+
+/// Read an integer field from a subject at the config graph.
+async fn read_i64_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<i64>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    for binding in bindings {
+        if let Some((fluree_db_core::FlakeValue::Long(n), _)) = binding.as_lit() {
+            return Ok(Some(*n));
+        }
+    }
+    Ok(None)
+}
+
+// ============================================================================
+// Internal: Setting group readers
+// ============================================================================
+
+/// Read policy defaults from a parent subject (LedgerConfig or GraphConfig).
+async fn read_policy_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<PolicyDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::POLICY_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_policy_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `PolicyDefaults` group node.
+async fn read_policy_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<PolicyDefaults> {
+    let default_allow = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::DEFAULT_ALLOW,
+    )
+    .await?;
+    let policy_source = read_graph_source_ref(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::POLICY_SOURCE,
+    )
+    .await?;
+    let policy_class = read_iri_list_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        fluree_vocab::policy_iris::POLICY_CLASS,
+    )
+    .await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(PolicyDefaults {
+        default_allow,
+        policy_source,
+        policy_class,
+        override_control,
+    })
+}
+
+/// Read SHACL defaults from a parent subject.
+async fn read_shacl_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ShaclDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::SHACL_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_shacl_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `ShaclDefaults` group node.
+async fn read_shacl_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ShaclDefaults> {
+    let enabled = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::SHACL_ENABLED,
+    )
+    .await?;
+    let shapes_source = read_graph_source_ref(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::SHAPES_SOURCE,
+    )
+    .await?;
+    let additional_data_sources = read_graph_source_refs(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::ADDITIONAL_DATA_SOURCE,
+    )
+    .await?;
+    let validation_mode = read_validation_mode(snapshot, overlay, to_t, group_sid).await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(ShaclDefaults {
+        enabled,
+        shapes_source,
+        additional_data_sources,
+        validation_mode,
+        override_control,
+    })
+}
+
+/// Read reasoning defaults from a parent subject.
+async fn read_reasoning_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ReasoningDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::REASONING_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_reasoning_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `ReasoningDefaults` group node.
+async fn read_reasoning_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ReasoningDefaults> {
+    let modes = read_reasoning_modes_field(snapshot, overlay, to_t, group_sid).await?;
+    let schema_source = read_graph_source_ref(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::SCHEMA_SOURCE,
+    )
+    .await?;
+    let follow_owl_imports = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::FOLLOW_OWL_IMPORTS,
+    )
+    .await?;
+    let ontology_import_map = read_ontology_import_map(snapshot, overlay, to_t, group_sid).await?;
+    let max_facts = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::REASONING_MAX_FACTS,
+    )
+    .await?;
+    let max_seconds = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::REASONING_MAX_SECONDS,
+    )
+    .await?;
+    let max_memory_mb = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::REASONING_MAX_MEMORY_MB,
+    )
+    .await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(ReasoningDefaults {
+        modes,
+        schema_source,
+        follow_owl_imports,
+        ontology_import_map,
+        max_facts,
+        max_seconds,
+        max_memory_mb,
+        override_control,
+    })
+}
+
+/// Read a non-negative integer budget field; negative values are rejected
+/// with a warning rather than silently truncating the closure to zero.
+async fn read_budget_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<u64>> {
+    match read_i64_field(snapshot, overlay, to_t, subject_sid, pred_iri).await? {
+        Some(n) if n >= 0 => Ok(Some(n as u64)),
+        Some(n) => {
+            tracing::warn!(
+                value = n,
+                predicate = pred_iri,
+                "Ignoring negative reasoning budget in ledger config"
+            );
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Read an `f:ontologyImportMap` as a list of [`OntologyImportBinding`].
+///
+/// Each binding subject has:
+/// - `f:ontologyIri` — the external import IRI (IRI ref)
+/// - `f:graphRef` — nested `f:GraphRef` resolved via [`read_single_graph_ref_from_sid`]
+///
+/// Bindings missing either field are skipped with a debug log rather than
+/// failing the whole config read — strict error semantics live at the
+/// resolution layer in `fluree-db-api::ontology_imports`.
+async fn read_ontology_import_map(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Vec<OntologyImportBinding>> {
+    let pred_sid = match try_encode(snapshot, config_iris::ONTOLOGY_IMPORT_MAP) {
+        Some(sid) => sid,
+        None => return Ok(Vec::new()),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, parent_sid, &pred_sid).await?;
+
+    let mut result = Vec::new();
+    for binding in bindings {
+        let Some(entry_sid) = binding.as_sid() else {
+            continue;
+        };
+        let Some(ontology_iri) = read_iri_field(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::ONTOLOGY_IRI,
+        )
+        .await?
+        else {
+            tracing::debug!("f:ontologyImportMap entry missing f:ontologyIri — skipping");
+            continue;
+        };
+        let Some(graph_ref_sid) = read_ref_field(
+            snapshot,
+            overlay,
+            to_t,
+            entry_sid,
+            config_iris::GRAPH_REF_PROP,
+        )
+        .await?
+        else {
+            tracing::debug!(
+                ontology_iri = %ontology_iri,
+                "f:ontologyImportMap entry missing f:graphRef — skipping"
+            );
+            continue;
+        };
+        let Some(graph_ref) =
+            read_single_graph_ref_from_sid(snapshot, overlay, to_t, &graph_ref_sid).await?
+        else {
+            tracing::debug!(
+                ontology_iri = %ontology_iri,
+                "f:ontologyImportMap entry's f:graphRef could not be resolved — skipping"
+            );
+            continue;
+        };
+        result.push(OntologyImportBinding {
+            ontology_iri,
+            graph_ref,
+        });
+    }
+    Ok(result)
+}
+
+/// Read datalog defaults from a parent subject.
+async fn read_datalog_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<DatalogDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::DATALOG_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_datalog_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `DatalogDefaults` group node.
+async fn read_datalog_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<DatalogDefaults> {
+    let enabled = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::DATALOG_ENABLED,
+    )
+    .await?;
+    let rules_source = read_graph_source_ref(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::RULES_SOURCE,
+    )
+    .await?;
+    let allow_query_time_rules = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::ALLOW_QUERY_TIME_RULES,
+    )
+    .await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(DatalogDefaults {
+        enabled,
+        rules_source,
+        allow_query_time_rules,
+        override_control,
+    })
+}
+
+/// Read serving defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_serving_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<ServingDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::SERVING_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_serving_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `ServingDefaults` group node.
+async fn read_serving_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<ServingDefaults> {
+    let serve_query =
+        read_bool_field(snapshot, overlay, to_t, group_sid, config_iris::SERVE_QUERY).await?;
+    let serve_blocks = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::SERVE_BLOCKS,
+    )
+    .await?;
+    let public_visibility = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::PUBLIC_VISIBILITY,
+    )
+    .await?;
+
+    Ok(ServingDefaults {
+        serve_query,
+        serve_blocks,
+        public_visibility,
+    })
+}
+
+/// Read query defaults from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control.
+async fn read_query_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<QueryDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::QUERY_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_query_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `QueryDefaults` group node.
+async fn read_query_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<QueryDefaults> {
+    let union_default_graph = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::UNION_DEFAULT_GRAPH,
+    )
+    .await?;
+    Ok(QueryDefaults {
+        union_default_graph,
+    })
+}
+
+/// Read transact defaults from a parent subject (LedgerConfig or GraphConfig).
+///
+/// `f:transactDefaults` points to a group with `f:uniqueEnabled` (bool) and
+/// `f:constraintsSource` (one or more `f:GraphRef`). Multiple sources are
+/// supported for additive per-graph merging.
+async fn read_transact_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<TransactDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::TRANSACT_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_transact_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `TransactDefaults` group node.
+async fn read_transact_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<TransactDefaults> {
+    let unique_enabled = read_bool_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::UNIQUE_ENABLED,
+    )
+    .await?;
+    let constraints_sources = read_graph_source_refs(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::CONSTRAINTS_SOURCE,
+    )
+    .await?;
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(TransactDefaults {
+        unique_enabled,
+        constraints_sources,
+        override_control,
+    })
+}
+
+/// Read a plain string field (e.g., BCP-47 language tag) from a subject.
+async fn read_string_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<String>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, subject_sid, &pred_sid).await?;
+    for binding in bindings {
+        if let Some((fluree_db_core::FlakeValue::String(s), _)) = binding.as_lit() {
+            return Ok(Some(s.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Read full-text defaults from a parent subject (LedgerConfig or GraphConfig).
+///
+/// `f:fullTextDefaults` points to a group with:
+///  - `f:defaultLanguage` — optional BCP-47 string
+///  - `f:property` — 0..n refs to `f:FullTextProperty` nodes (each with `f:target`)
+///  - `f:overrideControl` — optional override control
+///
+/// Absent fields yield `None` / empty. Returns `None` if the parent has no
+/// `f:fullTextDefaults` at all (not even an empty one).
+async fn read_fulltext_defaults(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<FullTextDefaults>> {
+    for group_sid in read_group_candidates(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::FULL_TEXT_DEFAULTS,
+    )
+    .await?
+    {
+        let group = read_fulltext_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+/// The fields of one `FullTextDefaults` group node.
+async fn read_fulltext_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<FullTextDefaults> {
+    let default_language = read_string_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::DEFAULT_LANGUAGE,
+    )
+    .await?;
+
+    // Read each `f:property` ref and resolve its `f:target` IRI.
+    let pred_sid = try_encode(snapshot, config_iris::FULL_TEXT_PROPERTY);
+    let mut properties = Vec::new();
+    if let Some(pred_sid) = pred_sid {
+        let bindings =
+            query_config_predicate(snapshot, overlay, to_t, group_sid, &pred_sid).await?;
+        for binding in bindings {
+            if let Some(prop_sid) = binding.as_sid() {
+                let target = read_iri_field(
+                    snapshot,
+                    overlay,
+                    to_t,
+                    prop_sid,
+                    config_iris::FULL_TEXT_TARGET,
+                )
+                .await?;
+                match target {
+                    Some(iri) => properties.push(FullTextProperty { target: iri }),
+                    None => {
+                        warn_degenerate_node("FullTextProperty node without f:target — skipping");
+                    }
+                }
+            }
+        }
+    }
+
+    let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
+
+    Ok(FullTextDefaults {
+        default_language,
+        properties,
+        override_control,
+    })
+}
+
+/// Read per-graph config overrides (`f:graphOverrides`).
+async fn read_graph_overrides(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    config_sid: &Sid,
+) -> Result<Vec<GraphConfig>> {
+    let pred_sid = match try_encode(snapshot, config_iris::GRAPH_OVERRIDES) {
+        Some(sid) => sid,
+        None => return Ok(Vec::new()),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, config_sid, &pred_sid).await?;
+
+    let mut overrides = Vec::new();
+    for binding in bindings {
+        if let Some(gc_sid) = binding.as_sid() {
+            if let Some(gc) = read_single_graph_config(snapshot, overlay, to_t, gc_sid).await? {
+                overrides.push(gc);
+            }
+        }
+    }
+
+    Ok(overrides)
+}
+
+/// Read a single `f:GraphConfig` resource.
+async fn read_single_graph_config(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    gc_sid: &Sid,
+) -> Result<Option<GraphConfig>> {
+    // f:targetGraph is required
+    let target_graph =
+        match read_iri_field(snapshot, overlay, to_t, gc_sid, config_iris::TARGET_GRAPH).await? {
+            Some(iri) => iri,
+            None => {
+                warn_degenerate_node("GraphConfig without f:targetGraph — skipping");
+                return Ok(None);
+            }
+        };
+
+    let policy = read_policy_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let shacl = read_shacl_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let reasoning = read_reasoning_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let datalog = read_datalog_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let transact = read_transact_defaults(snapshot, overlay, to_t, gc_sid).await?;
+    let full_text = read_fulltext_defaults(snapshot, overlay, to_t, gc_sid).await?;
+
+    Ok(Some(GraphConfig {
+        target_graph,
+        policy,
+        shacl,
+        reasoning,
+        datalog,
+        transact,
+        full_text,
+    }))
+}
+
+/// Read override control from a setting group subject.
+///
+/// Reads `f:overrideControl` which can be:
+/// - IRI: `f:OverrideNone` → `OverrideControl::None`
+/// - IRI: `f:OverrideAll` → `OverrideControl::AllowAll`
+/// - Ref to an object with `f:controlMode` = `f:IdentityRestricted` and `f:allowedIdentities` (IRI list)
+///
+/// Defaults to `AllowAll` if not specified.
+async fn read_override_control(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<OverrideControl> {
+    let ref_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::OVERRIDE_CONTROL,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(OverrideControl::default()),
+    };
+
+    // Decode to IRI and check for simple mode values
+    if let Some(iri) = snapshot.decode_sid(&ref_sid) {
+        if iri == config_iris::OVERRIDE_NONE {
+            return Ok(OverrideControl::None);
+        }
+        if iri == config_iris::OVERRIDE_ALL {
+            return Ok(OverrideControl::AllowAll);
+        }
+    }
+
+    // Otherwise it's an object — read controlMode (IRI) and allowedIdentities (IRI list)
+    let control_mode_iri =
+        read_iri_field(snapshot, overlay, to_t, &ref_sid, config_iris::CONTROL_MODE).await?;
+
+    if control_mode_iri.as_deref() == Some(config_iris::IDENTITY_RESTRICTED) {
+        let identities = read_iri_list_field(
+            snapshot,
+            overlay,
+            to_t,
+            &ref_sid,
+            config_iris::ALLOWED_IDENTITIES,
+        )
+        .await?;
+        let set: HashSet<Arc<str>> = identities
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect();
+        return Ok(OverrideControl::IdentityRestricted {
+            allowed_identities: set,
+        });
+    }
+
+    // Unrecognized — default to AllowAll
+    tracing::warn!(
+        control_mode = ?control_mode_iri,
+        "Unrecognized override control mode — defaulting to AllowAll"
+    );
+    Ok(OverrideControl::AllowAll)
+}
+
+/// Read a `GraphSourceRef` from a predicate on a subject.
+///
+/// The proposal specifies a two-level structure:
+/// ```json
+/// "f:policySource": {
+///   "@type": "f:GraphRef",
+///   "f:graphSource": { "f:ledger": {"@id": "..."}, "f:graphSelector": {"@id": "..."}, "f:atT": 123 },
+///   "f:trustPolicy": { "f:trustMode": {"@id": "f:Trusted"} }
+/// }
+/// ```
+///
+/// `f:graphSource` is a nested object containing source coordinates;
+/// `f:trustPolicy` sits on the `f:GraphRef` level.
+async fn read_graph_source_ref(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<GraphSourceRef>> {
+    // Follow pred_iri to get the f:GraphRef subject
+    let ref_sid = match read_ref_field(snapshot, overlay, to_t, parent_sid, pred_iri).await? {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    // Follow f:graphSource to the nested source object
+    let source_sid =
+        match read_ref_field(snapshot, overlay, to_t, &ref_sid, config_iris::GRAPH_SOURCE).await? {
+            Some(sid) => sid,
+            None => {
+                tracing::debug!("GraphRef without f:graphSource — no source coordinates");
+                return Ok(Some(GraphSourceRef {
+                    ledger: None,
+                    graph_selector: None,
+                    at_t: None,
+                    trust_policy: read_trust_policy(snapshot, overlay, to_t, &ref_sid).await?,
+                    rollback_guard: read_rollback_guard(snapshot, overlay, to_t, &ref_sid).await?,
+                }));
+            }
+        };
+
+    // Read source fields from the nested f:graphSource object
+    let ledger = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &source_sid,
+        config_iris::LEDGER_PRED,
+    )
+    .await?;
+    let graph_selector = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &source_sid,
+        config_iris::GRAPH_SELECTOR,
+    )
+    .await?;
+    let at_t = read_i64_field(snapshot, overlay, to_t, &source_sid, config_iris::AT_T).await?;
+
+    // Read trust policy and rollback guard from the GraphRef level (not the nested source)
+    let trust_policy = read_trust_policy(snapshot, overlay, to_t, &ref_sid).await?;
+    let rollback_guard = read_rollback_guard(snapshot, overlay, to_t, &ref_sid).await?;
+
+    Ok(Some(GraphSourceRef {
+        ledger,
+        graph_selector,
+        at_t,
+        trust_policy,
+        rollback_guard,
+    }))
+}
+
+/// Read zero or more `GraphSourceRef` values from a multi-valued predicate.
+///
+/// Unlike `read_graph_source_ref()` which returns `Option<GraphSourceRef>`,
+/// this returns a `Vec` — each object of the predicate is independently
+/// resolved as a `GraphSourceRef`. Used for `f:constraintsSource` which
+/// supports multiple constraint annotation sources.
+async fn read_graph_source_refs(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Vec<GraphSourceRef>> {
+    let pred_sid = match try_encode(snapshot, pred_iri) {
+        Some(sid) => sid,
+        None => return Ok(Vec::new()),
+    };
+
+    let bindings = query_config_predicate(snapshot, overlay, to_t, parent_sid, &pred_sid).await?;
+
+    let mut refs = Vec::new();
+    for binding in bindings {
+        if let Some(ref_sid) = binding.as_sid() {
+            if let Some(gsr) =
+                read_single_graph_ref_from_sid(snapshot, overlay, to_t, ref_sid).await?
+            {
+                refs.push(gsr);
+            }
+        }
+    }
+
+    Ok(refs)
+}
+
+/// Read a `GraphSourceRef` from a known ref SID (the `f:GraphRef` subject).
+///
+/// Shared logic between `read_graph_source_ref()` (single-valued) and
+/// `read_graph_source_refs()` (multi-valued).
+async fn read_single_graph_ref_from_sid(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    ref_sid: &Sid,
+) -> Result<Option<GraphSourceRef>> {
+    // Follow f:graphSource to the nested source object
+    let source_sid =
+        match read_ref_field(snapshot, overlay, to_t, ref_sid, config_iris::GRAPH_SOURCE).await? {
+            Some(sid) => sid,
+            None => {
+                tracing::debug!("GraphRef without f:graphSource — no source coordinates");
+                return Ok(Some(GraphSourceRef {
+                    ledger: None,
+                    graph_selector: None,
+                    at_t: None,
+                    trust_policy: read_trust_policy(snapshot, overlay, to_t, ref_sid).await?,
+                    rollback_guard: read_rollback_guard(snapshot, overlay, to_t, ref_sid).await?,
+                }));
+            }
+        };
+
+    let ledger = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &source_sid,
+        config_iris::LEDGER_PRED,
+    )
+    .await?;
+    let graph_selector = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        &source_sid,
+        config_iris::GRAPH_SELECTOR,
+    )
+    .await?;
+    let at_t = read_i64_field(snapshot, overlay, to_t, &source_sid, config_iris::AT_T).await?;
+
+    let trust_policy = read_trust_policy(snapshot, overlay, to_t, ref_sid).await?;
+    let rollback_guard = read_rollback_guard(snapshot, overlay, to_t, ref_sid).await?;
+
+    Ok(Some(GraphSourceRef {
+        ledger,
+        graph_selector,
+        at_t,
+        trust_policy,
+        rollback_guard,
+    }))
+}
+
+/// Read a `TrustPolicy` from a subject.
+async fn read_trust_policy(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<TrustPolicy>> {
+    let tp_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::TRUST_POLICY_PRED,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let mode_iri =
+        read_iri_field(snapshot, overlay, to_t, &tp_sid, config_iris::TRUST_MODE).await?;
+    let trust_mode = match mode_iri.as_deref() {
+        Some(iri) if iri == config_iris::TRUSTED => TrustMode::Trusted,
+        Some(iri) if iri == config_iris::SIGNED_INDEX => TrustMode::SignedIndex,
+        Some(iri) if iri == config_iris::COMMIT_VERIFIED => TrustMode::CommitVerified,
+        _ => TrustMode::Trusted, // default
+    };
+
+    Ok(Some(TrustPolicy { trust_mode }))
+}
+
+/// Read a `RollbackGuard` from a subject.
+///
+/// `f:rollbackGuard` is a sibling of `f:trustPolicy` on the `f:GraphRef` level.
+async fn read_rollback_guard(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<RollbackGuard>> {
+    let rg_sid = match read_ref_field(
+        snapshot,
+        overlay,
+        to_t,
+        parent_sid,
+        config_iris::ROLLBACK_GUARD,
+    )
+    .await?
+    {
+        Some(sid) => sid,
+        None => return Ok(None),
+    };
+
+    let min_t = read_i64_field(snapshot, overlay, to_t, &rg_sid, config_iris::MIN_T).await?;
+
+    Ok(Some(RollbackGuard { min_t }))
+}
+
+/// Read the validation mode IRI field.
+async fn read_validation_mode(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<Option<ValidationMode>> {
+    let mode_iri = read_iri_field(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::VALIDATION_MODE,
+    )
+    .await?;
+    Ok(match mode_iri.as_deref() {
+        Some(iri) if iri == config_iris::VALIDATION_REJECT => Some(ValidationMode::Reject),
+        Some(iri) if iri == config_iris::VALIDATION_WARN => Some(ValidationMode::Warn),
+        _ => None,
+    })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::ledger_config::OverrideControl;
+    use std::collections::HashSet;
+
+    fn identity_set(ids: &[&str]) -> HashSet<Arc<str>> {
+        ids.iter().map(|s| Arc::from(*s)).collect()
+    }
+
+    // --- resolve_effective_config ---
+
+    #[test]
+    fn empty_config_gives_all_none() {
+        let config = LedgerConfig::default();
+        let resolved = resolve_effective_config(&config, None);
+        assert!(resolved.policy.is_none());
+        assert!(resolved.shacl.is_none());
+        assert!(resolved.reasoning.is_none());
+        assert!(resolved.datalog.is_none());
+        assert!(resolved.transact.is_none());
+    }
+
+    #[test]
+    fn ledger_wide_policy_propagates() {
+        let config = LedgerConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                policy_class: Some(vec!["ex:AdminPolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_effective_config(&config, None);
+        let p = resolved.policy.unwrap();
+        assert_eq!(p.default_allow, Some(false));
+        assert_eq!(
+            p.policy_class.as_deref(),
+            Some(&["ex:AdminPolicy".into()][..])
+        );
+    }
+
+    #[test]
+    fn per_graph_override_merges_correctly() {
+        let config = LedgerConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                policy_class: Some(vec!["ex:Base".into()]),
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                policy: Some(PolicyDefaults {
+                    default_allow: Some(false), // override
+                    policy_class: None,         // inherit from ledger-wide
+                    ..Default::default()
+                }),
+                shacl: None,
+                reasoning: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        // Default graph (matches the override)
+        let resolved = resolve_effective_config(&config, None);
+        let p = resolved.policy.unwrap();
+        assert_eq!(p.default_allow, Some(false)); // per-graph wins
+        assert_eq!(p.policy_class.as_deref(), Some(&["ex:Base".into()][..])); // inherited
+    }
+
+    #[test]
+    fn non_matching_per_graph_falls_back_to_ledger_wide() {
+        let config = LedgerConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: "urn:other:graph".into(),
+                reasoning: Some(ReasoningDefaults {
+                    modes: Some(vec!["owl2rl".into()]),
+                    ..Default::default()
+                }),
+                policy: None,
+                shacl: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        // Default graph — doesn't match "urn:other:graph"
+        let resolved = resolve_effective_config(&config, None);
+        let r = resolved.reasoning.unwrap();
+        assert_eq!(r.modes.as_deref(), Some(&["rdfs".into()][..]));
+    }
+
+    #[test]
+    fn override_control_tightens_on_merge() {
+        let config = LedgerConfig {
+            policy: Some(PolicyDefaults {
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                policy: Some(PolicyDefaults {
+                    override_control: OverrideControl::None, // tighter
+                    ..Default::default()
+                }),
+                shacl: None,
+                reasoning: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        let p = resolved.policy.unwrap();
+        assert!(matches!(p.override_control, OverrideControl::None));
+    }
+
+    #[test]
+    fn ledger_wide_override_none_blocks_per_graph_policy() {
+        // Truth table: `defaultAllow: false`, OverrideNone | `defaultAllow: true` | → **deny**
+        let config = LedgerConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                policy: Some(PolicyDefaults {
+                    default_allow: Some(true), // attempts to loosen — should be blocked
+                    ..Default::default()
+                }),
+                shacl: None,
+                reasoning: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        let p = resolved.policy.unwrap();
+        assert_eq!(p.default_allow, Some(false)); // ledger-wide wins
+        assert!(matches!(p.override_control, OverrideControl::None));
+    }
+
+    #[test]
+    fn ledger_wide_override_none_blocks_per_graph_reasoning() {
+        // Truth table: `reasoningModes: [rdfs]`, OverrideNone | `[owl2rl]` | → **rdfs**
+        let config = LedgerConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                reasoning: Some(ReasoningDefaults {
+                    modes: Some(vec!["owl2rl".into()]),
+                    ..Default::default()
+                }),
+                policy: None,
+                shacl: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        let r = resolved.reasoning.unwrap();
+        assert_eq!(r.modes.as_deref(), Some(&["rdfs".into()][..])); // ledger-wide wins
+    }
+
+    /// Asymmetric transaction-mode gating: strengthening is free, softening
+    /// obeys the SHACL group's override control against the verified identity.
+    #[test]
+    fn merge_shacl_opts_gates_requested_mode() {
+        use fluree_db_core::ledger_config::ShaclDefaults;
+
+        let resolved_with = |control: OverrideControl| ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                additional_data_sources: Vec::new(),
+                validation_mode: Some(ValidationMode::Reject),
+                override_control: control,
+            }),
+            ..Default::default()
+        };
+
+        // AllowAll (default): softening honored for anyone, identity or not.
+        let cfg = resolved_with(OverrideControl::AllowAll);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+
+        // OverrideNone: softening denied, configured posture kept.
+        let cfg = resolved_with(OverrideControl::None);
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:alice"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Reject
+        );
+        // ...but strengthening a Warn posture never needs permission.
+        let warn_cfg = ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                additional_data_sources: Vec::new(),
+                validation_mode: Some(ValidationMode::Warn),
+                override_control: OverrideControl::None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_shacl_opts(&warn_cfg, Some(ValidationMode::Reject), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+
+        // IdentityRestricted: only the listed verified identity may soften.
+        let cfg = resolved_with(OverrideControl::IdentityRestricted {
+            allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
+        });
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:remediator"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Warn
+        );
+        assert_eq!(
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:intruder"))
+            )
+            .unwrap()
+            .validation_mode,
+            ValidationMode::Reject
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+    }
+
+    #[test]
+    fn ledger_wide_override_none_blocks_per_graph_shacl() {
+        // Truth table: `shaclEnabled: false`, OverrideNone | `shaclEnabled: true` | → **disabled**
+        let config = LedgerConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                shacl: Some(ShaclDefaults {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+                policy: None,
+                reasoning: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        let s = resolved.shacl.unwrap();
+        assert_eq!(s.enabled, Some(false)); // ledger-wide wins
+    }
+
+    #[test]
+    fn ledger_wide_override_none_independent_per_group() {
+        // OverrideNone on policy should NOT affect reasoning (per-group independence)
+        let config = LedgerConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                policy: Some(PolicyDefaults {
+                    default_allow: Some(true),
+                    ..Default::default()
+                }),
+                reasoning: Some(ReasoningDefaults {
+                    modes: Some(vec!["owl2rl".into()]),
+                    ..Default::default()
+                }),
+                shacl: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        // Policy: blocked by OverrideNone
+        let p = resolved.policy.unwrap();
+        assert_eq!(p.default_allow, Some(false));
+        // Reasoning: per-graph wins (AllowAll)
+        let r = resolved.reasoning.unwrap();
+        assert_eq!(r.modes.as_deref(), Some(&["owl2rl".into()][..]));
+    }
+
+    #[test]
+    fn sentinel_default_graph_matches_none_iri() {
+        let config = LedgerConfig {
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::DEFAULT_GRAPH.into(),
+                reasoning: Some(ReasoningDefaults {
+                    modes: Some(vec!["owl2ql".into()]),
+                    ..Default::default()
+                }),
+                policy: None,
+                shacl: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, None);
+        assert!(resolved.reasoning.is_some());
+        assert_eq!(
+            resolved.reasoning.unwrap().modes.as_deref(),
+            Some(&["owl2ql".into()][..])
+        );
+    }
+
+    #[test]
+    fn sentinel_txn_meta_matches_txn_meta_iri() {
+        let config = LedgerConfig {
+            graph_overrides: vec![GraphConfig {
+                target_graph: config_iris::TXN_META_GRAPH.into(),
+                reasoning: Some(ReasoningDefaults {
+                    modes: Some(vec!["owl2rl".into()]),
+                    ..Default::default()
+                }),
+                policy: None,
+                shacl: None,
+                datalog: None,
+                transact: None,
+                full_text: None,
+            }],
+            ..Default::default()
+        };
+
+        let resolved = resolve_effective_config(&config, Some("urn:fluree:mydb:main#txn-meta"));
+        assert!(resolved.reasoning.is_some());
+    }
+
+    // --- merge_policy_opts ---
+
+    #[test]
+    fn no_config_policy_returns_opts_unchanged() {
+        let resolved = ResolvedConfig::default();
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+    }
+
+    #[test]
+    fn applies_config_defaults_when_no_query_policy() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                policy_class: Some(vec!["ex:DefaultPolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions::default();
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.default_allow, Some(false));
+        assert_eq!(
+            merged.policy_class.as_deref(),
+            Some(&["ex:DefaultPolicy".into()][..])
+        );
+    }
+
+    #[test]
+    fn permits_override_with_allow_all() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        // Query opts kept because AllowAll permits override
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+    }
+
+    #[test]
+    fn denies_override_with_control_none() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                policy_class: Some(vec!["ex:Locked".into()]),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:alice")),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        // Config defaults applied despite query specifying identity
+        assert_eq!(merged.default_allow, Some(false));
+        assert_eq!(
+            merged.policy_class.as_deref(),
+            Some(&["ex:Locked".into()][..])
+        );
+    }
+
+    #[test]
+    fn identity_restricted_matching_permits_override() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        // Server identity is admin → override permitted
+        assert_eq!(merged.identity.as_deref(), Some("did:key:user"));
+    }
+
+    #[test]
+    fn identity_restricted_non_matching_denies_override() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                policy_class: Some(vec!["ex:Restricted".into()]),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:non-admin")),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        // Server identity is not admin → override denied
+        assert_eq!(merged.default_allow, Some(false));
+        assert_eq!(
+            merged.policy_class.as_deref(),
+            Some(&["ex:Restricted".into()][..])
+        );
+    }
+
+    // --- merge_policy_opts: the tri-state default_allow ---
+    //
+    // Every test above supplies an explicit `default_allow`, so none of them can
+    // see the case the tri-state exists for: a request that carries policy
+    // inputs but says nothing about default-allow.
+
+    /// The headline case. An identity-only request used to short-circuit the
+    /// merge entirely, so config's `f:defaultAllow true` never applied.
+    #[test]
+    fn config_default_allow_fills_unset_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+        assert_eq!(
+            merged.default_allow,
+            Some(true),
+            "config default-allow must fill a request that never named it"
+        );
+    }
+
+    /// An explicit request value wins over config in both directions, even
+    /// though override control is `AllowAll`.
+    #[test]
+    fn explicit_request_default_allow_wins_over_config() {
+        let open_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let deny = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&open_config, &deny).default_allow,
+            Some(false)
+        );
+
+        let closed_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let allow = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&closed_config, &allow).default_allow,
+            Some(true)
+        );
+    }
+
+    /// Unset on both sides stays unset, and resolves fail-closed.
+    #[test]
+    fn unset_on_both_sides_resolves_fail_closed() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: None,
+                policy_class: Some(vec!["ex:SomePolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.default_allow, None);
+        assert!(
+            !merged.effective_default_allow(),
+            "nobody configured a default → deny"
+        );
+    }
+
+    /// A config that configures no policy at all leaves the request untouched.
+    #[test]
+    fn no_config_policy_leaves_default_allow_unset() {
+        let resolved = ResolvedConfig::default();
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(merge_policy_opts(&resolved, &opts).default_allow, None);
+    }
+
+    /// Either explicit default engages enforcement; absent remains no input.
+    #[test]
+    fn either_explicit_default_counts_as_a_policy_input() {
+        let unset = GovernanceOptions::default();
+        assert!(!unset.has_any_policy_inputs());
+        assert!(!unset.selects_policy_set());
+
+        let explicit_false = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(explicit_false.has_any_policy_inputs());
+        assert!(!explicit_false.selects_policy_set());
+
+        let explicit_true = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert!(explicit_true.has_any_policy_inputs());
+        assert!(explicit_true.selects_policy_set());
+
+        let empty_classes = GovernanceOptions {
+            policy_class: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty_classes.has_any_policy_inputs());
+        assert!(empty_classes.selects_policy_set());
+    }
+
+    /// An explicit `Some(false)` survives even though it carries no *other*
+    /// policy input and so lands on the config-defaults path.
+    ///
+    /// This is the shape a per-source `SourcePolicyOverride` takes when it names
+    /// only `default_allow: false`: `SourcePolicyOverride::has_policy()` counts
+    /// `is_some()` so the override is applied. Config still supplies the
+    /// class selection, without overwriting the explicit deny default.
+    #[test]
+    fn explicit_false_survives_the_no_policy_input_path() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false),
+            "config f:defaultAllow true must not clobber an explicit request false"
+        );
+    }
+
+    /// The same shape as it actually arrives: through
+    /// `SourcePolicyOverride::to_query_connection_options()`.
+    #[test]
+    fn per_source_override_of_only_default_allow_false_survives_config() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let override_opts = crate::dataset::SourcePolicyOverride {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            override_opts.has_policy(),
+            "an override naming only default_allow is still an override"
+        );
+
+        let opts = override_opts.to_query_connection_options();
+        assert!(
+            opts.has_any_policy_inputs(),
+            "an explicit deny default engages enforcement"
+        );
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false)
+        );
+    }
+
+    /// Override control still overrules an explicit request value — that is the
+    /// one thing entitled to, and the documented truth table.
+    #[test]
+    fn override_control_none_still_forces_config_over_explicit_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts).default_allow,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn denied_override_clears_inline_classes_values_and_permissive_defaults() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:employee".into()),
+            policy_class: Some(vec!["ex:Manager".into()]),
+            policy: Some(serde_json::json!([{"f:required": true, "f:allow": true}])),
+            policy_values: Some(std::collections::HashMap::from([(
+                "?$identity".into(),
+                serde_json::json!({"@id": "did:key:manager"}),
+            )])),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity, opts.identity);
+        assert!(
+            merged.policy_class.is_none()
+                && merged.policy.is_none()
+                && merged.policy_values.is_none()
+        );
+        assert!(!merged.effective_default_allow());
+        let anonymous = merge_policy_opts(
+            &resolved,
+            &GovernanceOptions {
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(anonymous.has_any_policy_inputs());
+        assert!(!anonymous.effective_default_allow());
+    }
+
+    // --- merge_reasoning ---
+
+    #[test]
+    fn no_config_reasoning_returns_none() {
+        let resolved = ResolvedConfig::default();
+        assert!(merge_reasoning(&resolved, None).is_none());
+    }
+
+    #[test]
+    fn config_reasoning_with_control_none_gives_force() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (modes, prec) = merge_reasoning(&resolved, None).unwrap();
+        assert_eq!(modes, vec!["rdfs".to_string()]);
+        assert_eq!(prec, ReasoningModePrecedence::Force);
+    }
+
+    #[test]
+    fn config_reasoning_with_allow_all_gives_default_unless() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["owl2rl".into()]),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (modes, prec) = merge_reasoning(&resolved, None).unwrap();
+        assert_eq!(modes, vec!["owl2rl".to_string()]);
+        assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
+    }
+
+    #[test]
+    fn config_reasoning_identity_restricted_matching_gives_default_unless() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:admin"))).unwrap();
+        assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
+    }
+
+    #[test]
+    fn config_reasoning_identity_restricted_non_matching_gives_force() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:user"))).unwrap();
+        assert_eq!(prec, ReasoningModePrecedence::Force);
+    }
+
+    #[test]
+    fn empty_reasoning_modes_returns_none() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(merge_reasoning(&resolved, None).is_none());
+    }
+
+    #[test]
+    fn no_modes_field_returns_none() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(merge_reasoning(&resolved, None).is_none());
+    }
+
+    // --- config_reasoning_budget ---
+
+    #[test]
+    fn reasoning_budget_absent_returns_none() {
+        assert!(config_reasoning_budget(&ResolvedConfig::default(), None).is_none());
+
+        // A reasoning group without budget fields contributes no budget.
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config_reasoning_budget(&resolved, None).is_none());
+    }
+
+    #[test]
+    fn reasoning_budget_allow_all_is_not_forced() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_facts: Some(100),
+                max_seconds: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let budget = config_reasoning_budget(&resolved, None).unwrap();
+        assert_eq!(budget.max_facts, Some(100));
+        assert_eq!(budget.max_seconds, Some(10));
+        assert!(!budget.force);
+    }
+
+    #[test]
+    fn reasoning_budget_override_none_is_forced() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_facts: Some(100),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let budget = config_reasoning_budget(&resolved, None).unwrap();
+        assert!(budget.force);
+    }
+
+    #[test]
+    fn reasoning_budget_identity_restricted_follows_identity() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_seconds: Some(60),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:admin")))
+                .unwrap()
+                .force
+        );
+        assert!(
+            config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:user")))
+                .unwrap()
+                .force
+        );
+    }
+
+    // --- matches_graph_target ---
+
+    #[test]
+    fn matches_default_graph_sentinel() {
+        assert!(matches_graph_target(config_iris::DEFAULT_GRAPH, None));
+        assert!(!matches_graph_target(
+            config_iris::DEFAULT_GRAPH,
+            Some("urn:other")
+        ));
+    }
+
+    #[test]
+    fn matches_exact_iri() {
+        assert!(matches_graph_target("urn:my:graph", Some("urn:my:graph")));
+        assert!(!matches_graph_target("urn:my:graph", Some("urn:other")));
+    }
+
+    #[test]
+    fn matches_txn_meta_sentinel() {
+        assert!(matches_graph_target(
+            config_iris::TXN_META_GRAPH,
+            Some("urn:fluree:mydb:main#txn-meta")
+        ));
+        assert!(!matches_graph_target(config_iris::TXN_META_GRAPH, None));
+    }
+}

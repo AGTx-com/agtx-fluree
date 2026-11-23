@@ -1,0 +1,825 @@
+# Time Travel
+
+**Differentiator**: Fluree is a **temporal database** that preserves the complete history of all changes. Every transaction is timestamped, enabling queries against any previous state of the data. This "time travel" capability is fundamental to Fluree's architecture and provides capabilities that most databases cannot match.
+
+## Query Formats
+
+Time travel is supported in both JSON-LD and SPARQL query formats. Examples in this document primarily use JSON-LD syntax with SPARQL equivalents shown where relevant.
+
+## Transaction Time
+
+Every transaction in Fluree receives a unique **transaction time** (`t`) - a monotonically increasing integer that represents the logical time of the transaction.
+
+### Transaction Ordering
+
+```text
+Transaction 1: t=1
+Transaction 2: t=2
+Transaction 3: t=3
+...
+```
+
+- **Monotonic**: Each new transaction gets a higher `t` than all previous transactions
+- **Unique**: No two transactions share the same `t`
+- **Global**: Transaction times are unique across the entire Fluree instance
+
+### Current Time
+
+The **current time** is the highest transaction time that has been committed. Queries without a time specifier automatically query the current state:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+You can also explicitly specify `@t:latest` to query the latest state:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:latest",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+## Historical Queries
+
+Fluree supports querying data as it existed at any point in time using the `@` syntax in ledger references.
+
+### Point-in-Time Queries
+
+Query data as it existed at a specific transaction using the `from` field with `@t:`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:100",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+### Query at ISO Timestamp
+
+Query using ISO 8601 datetime with `@time:` (`@iso:` is its original spelling
+and remains accepted as an alias):
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@time:2024-01-15T10:30:00Z",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+### Query at Commit ContentId
+
+Query at a specific commit using `@commit:` with a commit ContentId:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@commit:bafybeig...",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+### Pinning the Ledger in the Request Path
+
+Over HTTP, the pin can go on the ledger in the path of a ledger-scoped query instead of in the body. `POST /v1/fluree/query/ledger:main@t:100` (or `@time:`, `@recorded:`, `@commit:`) reads the whole ledger as of that point, including its named graphs: `GRAPH ?g` enumerates the graphs that existed then. A time the body names for the same ledger must agree with the path's. See [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger).
+
+### Policy at a Past Point
+
+A read at a past point is governed by the ledger's policy as it stood at that point, however the time is given (a path pin, `from: "ledger:main@t:1"`, or `FROM <ledger:main@t:1>`): its configured policy defaults, such as `f:defaultAllow`, and its policy rules are read from the pinned state. Tightening policy later does not protect earlier states. A ledger that allowed anonymous reads at t=1 and denies them from t=2 still answers a read pinned to t=1. To keep a reader away from a ledger's history, restrict the reader's access to the ledger itself, for example with token ledger scopes. See [Policy in queries](../security/policy-in-queries.md#time-travel-queries).
+
+## Event Time: Backdated Commits
+
+Every commit carries an **event time** (`db:time` in the txn-meta graph) — the
+wall-clock instant the commit's changes are *about*. By default it is stamped
+with the current time at commit, but a transaction may supply its own:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@graph": [{ "@id": "ex:alice", "ex:role": "Engineer" }],
+  "opts": { "eventTime": "2021-03-15T00:00:00Z" }
+}
+```
+
+A SPARQL UPDATE supplies it with `# PRAGMA event-time: 2021-03-15T00:00:00Z`
+(see [Request options](../query/sparql.md#request-options--pragma)).
+
+This is how historical data gets *real* time travel: replay a year of history
+as ordinary transactions, each stamped with the date the change actually
+happened, and `@time:` queries work over that custom timeline with no further
+setup. (The Rust API equivalent is `CommitOpts::with_timestamp`.)
+
+Two rules keep the timeline coherent — both enforced at commit time:
+
+1. **Monotonic**: a commit's event time must be `>=` the head commit's event
+   time. `@time:` resolution depends on this ordering; a fresh ledger's first
+   commit can carry any past time (there is no floor — pre-1970 works).
+2. **No future times**: event time may not exceed the current wall clock
+   (plus a small skew allowance). Commits are immutable, so one future-dated
+   stamp would otherwise permanently pin the ledger's timeline ahead of
+   reality.
+
+The default stamp is also clamped to the head's event time, so a system clock
+that steps backwards can no longer corrupt `@time:` resolution.
+
+### Recorded Time: the Audit Axis (`@recorded:`)
+
+When the server pairs a caller-supplied event time with a second,
+system-controlled timestamp — **`db:receivedAt`**, the wall-clock time the
+commit was actually recorded — the ledger gains an audit axis. The HTTP
+transact route does this automatically (it pairs `eventTime` with the current
+time); programmatically it is enabled by `CommitOpts::with_received_at`. Once a
+commit dual-stamps, every commit thereafter does too (sticky), so the audit
+trail has no gaps.
+
+The audit axis is *not* triggered by event time alone. A ledger that only ever
+backdates via `CommitOpts::with_timestamp` (for example fluree-memory's git
+replay) is event-axis-only and carries no `db:receivedAt`; on it, `@recorded:`
+falls back to the event axis. Ledgers that never supply event times carry no
+extra metadata at all.
+
+The `@recorded:` selector time-travels along that axis:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@recorded:2026-01-15T00:00:00Z",
+  "select": ["?name"],
+  "where": [{ "@id": "?person", "ex:name": "?name" }]
+}
+```
+
+- `@time:` answers *"what was true at this time?"* (event axis)
+- `@recorded:` answers *"what had been loaded into the ledger by this
+  time?"* (audit axis)
+
+On a ledger that never used `eventTime`, the two axes are identical and
+`@recorded:` behaves exactly like `@time:`. Both timestamps live inside the
+signed commit envelope, so a signature attests to the claimed event time and
+the recording time together.
+
+### Graph Sources (`@snapshot:`)
+
+A virtual graph source backed by a versioned table (Iceberg, Delta) has no
+transaction numbers or commit hashes, so `@t:` and `@commit:` are rejected on
+its alias. It is pinned instead with `@time:` / `@recorded:` (the latest table
+state committed at or before that instant — a table commit has one time, so
+the two coincide) or with the table format's own identifier, `@snapshot:<id>`
+— an Iceberg snapshot id, or a Delta table version — which is meaningless on a
+native ledger and rejected there. A pin no retained state satisfies is an
+error, never the current state. See
+[Iceberg time travel](../graph-sources/iceberg.md#time-travel) and
+[Delta time travel](../graph-sources/delta.md#time-travel).
+
+## Temporal Data Model
+
+### Immutable Facts
+
+Once committed, data is **immutable**. Changes are represented as new facts that supersede previous ones:
+
+```text
+t=1: Alice age 25  (assertion)
+t=5: Alice age 26  (retraction of age 25, assertion of age 26)
+```
+
+History queries capture both the retraction and assertion with `@op`:
+
+```json
+[
+  [25, 1, true],
+  [25, 5, false],
+  [26, 5, true]
+]
+```
+
+Each row shows `[value, transaction_time, op]` where `op` is `true` for assertions and `false` for retractions.
+
+### Valid Time vs Transaction Time
+
+Fluree primarily uses **transaction time** (when the fact was recorded in the database). For applications needing **valid time** (when the fact was true in the real world), this can be modeled explicitly as properties:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@graph": [
+    {
+      "@id": "ex:alice-employment-1",
+      "ex:person": "ex:alice",
+      "ex:company": "ex:company-a",
+      "ex:validFrom": "2020-01-01T00:00:00Z",
+      "ex:validTo": "2023-12-31T23:59:59Z"
+    }
+  ]
+}
+```
+
+This allows you to query by both:
+- **Transaction time**: When was this recorded? (using `@t:`, `@recorded:`, `@commit:`)
+- **Valid time**: When was this true? (using standard WHERE clause filters on `ex:validFrom`/`ex:validTo`)
+
+For commit-granular valid time — importing historical data so `@time:` time
+travel works over the dates things actually changed — see
+[Event Time: Backdated Commits](#event-time-backdated-commits) above. Explicit
+`validFrom`/`validTo` properties remain the right model for *fact*-granular
+intervals and overlapping validity.
+
+## Snapshot and Indexing
+
+### Database Snapshots
+
+Fluree maintains **indexed snapshots** at regular intervals for efficient historical access:
+
+- **Index**: A complete, optimized snapshot of the database at a specific `t`
+- **Novelty**: Uncommitted transactions since the last index
+- **Background Indexing**: Continuous process that creates new indexes
+
+### Query Execution Model
+
+Queries combine indexed data with novelty:
+
+```text
+Query Result = Indexed Database (up to t=index) + Novelty (t=index+1 to current)
+```
+
+This provides:
+- **Fast historical queries**: Use appropriate index
+- **Real-time current queries**: Include latest transactions
+- **Consistent snapshots**: Each query sees a consistent state
+
+## Consistency and Read-After-Write
+
+A writer reads its own writes: a commit through the embedded API updates the
+in-process ledger cache, so a later query in that same process sees `t=N`. Across
+processes, Fluree's query engine is **eventually consistent** — a transaction that
+commits at `t=N` in one process may not be visible to another process holding a warm
+cache until that cache is refreshed.
+
+### The Problem
+
+```text
+Process A: transact → receives t=42
+Process B: query    → sees t=40 (stale cache)
+```
+
+This is expected in architectures where the query server is a separate peer, or in serverless environments where a warm Lambda invocation holds a cached ledger state from a previous request.
+
+### The Solution: `refresh()` with `min_t`
+
+The `refresh()` API accepts a `min_t` parameter that asserts the cached ledger has reached at least a specific transaction time. If the ledger hasn't reached that `t` after pulling the latest state from the nameservice, the call returns an error so the caller can retry.
+
+**Flow:**
+
+```text
+1. Client transacts → receives t=42
+2. Client calls refresh(ledger, min_t=42)
+3. Fluree checks cached t:
+   - If cached t >= 42 → immediate success (no I/O)
+   - If cached t < 42  → pull latest from nameservice, apply commits
+   - If still t < 42   → return AwaitTNotReached error
+4. Client queries at t >= 42 with confidence
+```
+
+### Usage Patterns
+
+**Same-process (embedded Fluree):**
+
+In a single process where you transact and query through the same `Fluree` instance, the cache is updated in-place by the transaction. `min_t` is typically not needed, but can serve as a safety assertion.
+
+**Multi-process / Serverless:**
+
+When the transacting process and querying process are separate (e.g., a Lambda that writes and another that reads), pass the `t` from the transaction receipt through your event/message payload and use `min_t` to gate the query:
+
+```text
+Writer Lambda:
+  receipt = transact(data)
+  publish_event({ t: receipt.t, ... })
+
+Reader Lambda:
+  event = receive_event()
+  refresh(ledger, min_t=event.t, timeout=5s)
+  query(ledger)  // guaranteed to see at least t=event.t
+```
+
+**HTTP API:**
+
+HTTP query clients can request the same read-after-write guarantee by sending the transaction time in the `fluree-min-t` header. The server refreshes the target ledger(s) until each reaches at least that `t`, or until the min-t wait timeout expires:
+
+```http
+fluree-min-t: 42
+```
+
+JSON-LD query bodies may also use `opts.min-t` (or `opts.minT`) for the same request-level guarantee. Numeric query snapshot pins like `from: "ledger:main@t:42"` or `from: {"@id": "ledger:main", "t": 42}` also force the server to observe at least that `t` before executing, then read that pinned snapshot. ISO and commit pins still resolve through normal snapshot resolution.
+
+The wait is capped by `query_min_t_timeout_ms` (default 5 seconds), even if the general query execution timeout is disabled.
+
+Long-running HTTP query servers can also enable TTL-gated query-time refresh with `--query-refresh-enabled` and `--query-refresh-ttl-ms`. This makes the server call `refresh()` on demand before current-head queries, after that ledger's TTL window expires, so warm caches observe nameservice advances without checking DynamoDB on every request. The first query in a new TTL window pays the nameservice round-trip; idle ledgers are not refreshed. The TTL bounds ordinary staleness, but callers that must prove they observed a specific transaction should use `fluree-min-t` or `opts.min-t`.
+
+### Rust API
+
+See [Using Fluree as a Rust Library — Read-After-Write Consistency](../getting-started/rust-api.md#read-after-write-consistency) for full code examples including retry-with-backoff patterns.
+
+```rust
+use fluree_db_api::RefreshOpts;
+
+// After a transaction returns t=42:
+let opts = RefreshOpts { min_t: Some(42) };
+let result = fluree.refresh("mydb:main", opts).await?;
+// result.t >= 42 is guaranteed if Ok
+```
+
+## History Queries for Change Tracking
+
+History queries let you see all changes (assertions and retractions) within a time range. Specify the range using `from` and `to` keys with time-specced endpoints.
+
+### Entity History (JSON-LD)
+
+Track all changes to a specific entity over time by specifying a time range:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?name", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+The `@t` and `@op` annotations bind the transaction time and operation type:
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Boolean: `true` for assertions, `false` for retractions. Mirrors `Flake.op` on disk. Both literal- and IRI-valued objects carry the metadata.
+
+Returns results showing all changes:
+
+```json
+[
+  ["Alice", 1, true],
+  ["Alice", 5, false],
+  ["Alicia", 5, true]
+]
+```
+
+### Entity History (SPARQL)
+
+The same query in SPARQL uses RDF-star syntax with `FROM...TO`:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?name ?t ?op
+FROM <ledger:main@t:1>
+TO <ledger:main@t:latest>
+WHERE {
+  << ex:alice ex:name ?name >> f:t ?t .
+  << ex:alice ex:name ?name >> f:op ?op .
+}
+ORDER BY ?t
+```
+
+The `<< ... >>` bindings are what populate `?t` and `?op`. Selecting those
+variables without them is **not** an error — the query returns history rows
+with both columns null, and no way to tell an assert from a retract. The
+quoted triple's object must be a variable; a constant object is rejected.
+
+Two restrictions on the SPARQL form:
+
+- `FROM ... TO ...` is accepted only on the **connection-scoped** endpoint
+  (`POST /v1/fluree/query`). The ledger-scoped path (`/v1/fluree/query/{ledger}`)
+  and the streaming path (`/v1/fluree/stream/query`) reject it.
+- History mode and [reasoning](../query/reasoning.md) are mutually exclusive;
+  a history-range query that requests reasoning is rejected.
+
+### Property-Specific History
+
+Query changes for specific properties:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:100",
+  "select": ["?age", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:age": { "@value": "?age", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+### All Properties History
+
+Query all property changes for an entity:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?p", "?v", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "?p": { "@value": "?v", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+### Time Range with Datetime
+
+Query history using ISO 8601 datetime strings:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@time:2024-01-01T00:00:00Z",
+  "to": "ledger:main@time:2024-12-31T23:59:59Z",
+  "select": ["?name", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
+  ]
+}
+```
+
+### Filter by Operation Type
+
+Filter to show only assertions or only retractions. `@op` is a **boolean**
+(`true` = assert, `false` = retract), so filter against `true` / `false` —
+the strings `"assert"` / `"retract"` are not accepted and match nothing:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?name", "?t"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
+    ["filter", "(= ?op false)"]
+  ]
+}
+```
+
+The constant shorthand is equivalent and shorter — `"@op": false` lowers to
+the same filter without binding a variable:
+
+```json
+{ "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
+```
+
+### Pattern History Across Subjects
+
+Query changes for a specific property across all subjects:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?person", "?status", "?t", "?op"],
+  "where": [
+    { "@id": "?person", "ex:status": { "@value": "?status", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+## Performance Characteristics
+
+### Time Resolution Performance
+
+Different time specifiers have different performance characteristics:
+
+- **@t:NNN** (fastest): Direct transaction number, no resolution needed
+- **@time:DATETIME**: O(log n) binary search through commit event timestamps using POST index
+- **@recorded:DATETIME**: Same POST-index probes over `db:receivedAt`; identical to `@time:` cost (and identical *behavior* on ledgers that never used `eventTime`)
+- **@commit:CID**: Bounded SPOT scan, O(k) where k is commits matching prefix (use longer prefixes for better performance)
+
+### Index Selection
+
+Fluree automatically selects the most appropriate index for historical queries:
+
+- **Recent history**: Uses current index + novelty (uncommitted transactions)
+- **Historical snapshots**: Uses closest index snapshot to target time
+- **Point queries** (`@t:`): Direct index lookup for specific transaction
+
+### History Query Performance
+
+History queries scan flakes within the specified time range:
+
+- **Entity history** (specific `@id`): SPOT index scan on subject
+- **Property history** (specific predicate): Narrower SPOT scan with predicate filter
+- **All properties** (variable predicate `?p`): Full SPOT scan for subject
+- **Cross-entity** (variable subject `?s`): POST/PSOT index scan (can be slower for common predicates)
+
+### Optimization Strategies
+
+1. **Use Transaction Numbers**: When possible, use `@t:NNN` instead of `@time:DATETIME`
+2. **Narrow History Patterns**: Use `[subject, predicate]` instead of `[subject]` when you only need specific properties
+3. **Limit Time Ranges**: Specify realistic `from`/`to` bounds rather than querying all history
+4. **ContentId Prefix Length**: Use sufficiently long ContentId prefixes to avoid ambiguity checks
+5. **Index Density**: More frequent indexing improves historical query performance for distant past
+
+### Storage Implications
+
+- **Full History**: All transaction history is preserved (immutable append-only)
+- **Index Snapshots**: Periodic snapshots enable efficient historical queries without replaying all transactions. A historical query reads history from the current index, so superseded index versions are kept only while queries already running may still read them (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention))
+- **Commit Metadata**: Stored as queryable flakes (~8-9 flakes per commit)
+- **Transaction JSON**: Not stored by default. A transaction opts in with `TxnOpts::store_raw_txn` (Rust API) to keep its payload with the commit for audit trails, and a signed transaction always keeps its envelope
+
+## Practical Applications
+
+### Version Control
+
+Treat data like code with version control:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "app:production@t:1000",
+  "select": ["?config"],
+  "where": [
+    { "@id": "?setting", "ex:value": "?config" }
+  ]
+}
+```
+
+### Regulatory Compliance
+
+Maintain complete audit trails - query data as it existed at time of consent:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "users:main@time:2024-05-25T14:30:00Z",
+  "select": ["?predicate", "?data"],
+  "where": [
+    { "@id": "ex:alice", "?predicate": "?data" }
+  ]
+}
+```
+
+### Change History Analysis
+
+Track how data evolved over time:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "sales:main@time:2024-01-01T00:00:00Z",
+  "to": "sales:main@time:2024-12-31T23:59:59Z",
+  "select": ["?order", "?amount", "?t", "?op"],
+  "where": [
+    { "@id": "?order", "ex:amount": { "@value": "?amount", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+### Debugging and Troubleshooting
+
+Investigate system state at time of incident:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "system:config@time:2024-01-15T09:15:00Z",
+  "select": ["?setting", "?config"],
+  "where": [
+    { "@id": "?setting", "ex:value": "?config" }
+  ]
+}
+```
+
+## Time Travel in Multi-Ledger Scenarios
+
+### Cross-Ledger Temporal Queries
+
+Query across ledgers at consistent time points:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": [
+    "customers:main@t:1000",
+    "orders:main@t:1000"
+  ],
+  "select": ["?customer", "?order"],
+  "where": [
+    { "@id": "?customer", "ex:name": "Alice" },
+    { "@id": "?order", "ex:customer": "?customer" }
+  ]
+}
+```
+
+### Ledger Branching
+
+Time travel enables sophisticated branching workflows by querying historical states:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:500",
+  "select": ["?entity", "?property", "?value"],
+  "where": [
+    { "@id": "?entity", "?property": "?value" }
+  ]
+}
+```
+
+You can then use this historical state as a basis for creating a new branch or comparing against current state.
+
+## Common Patterns
+
+### Compare Current vs Historical State
+
+Query the same entity at two different points in time:
+
+```json
+// Query current state
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main",
+  "select": ["?price"],
+  "where": [
+    { "@id": "ex:product-123", "ex:price": "?price" }
+  ]
+}
+
+// Query historical state
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:100",
+  "select": ["?price"],
+  "where": [
+    { "@id": "ex:product-123", "ex:price": "?price" }
+  ]
+}
+```
+
+### Find When a Change Occurred
+
+Use history queries to identify when a specific change happened:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?status", "?t", "?op"],
+  "where": [
+    { "@id": "ex:product-123", "ex:status": { "@value": "?status", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+The results show when `ex:status` changed, with `?op = false` (retract) for the old value and `?op = true` (assert) for the new value at the same transaction time.
+
+### Audit Trail for Compliance
+
+Generate a complete audit trail for a sensitive entity:
+
+```json
+{
+  "@context": { "schema": "http://schema.org/" },
+  "from": "users:main@time:2024-01-01T00:00:00Z",
+  "to": "users:main@t:latest",
+  "select": ["?property", "?value", "?t", "?op"],
+  "where": [
+    { "@id": "schema:Person/12345", "?property": { "@value": "?value", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+This returns all changes with transaction times for audit purposes. Each result row shows the property, value, when it was changed, and whether it was an assertion or retraction.
+
+### Rollback Detection
+
+Find what changed after a specific commit:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "config:main@t:50",
+  "to": "config:main@t:latest",
+  "select": ["?setting", "?value", "?t", "?op"],
+  "where": [
+    { "@id": "?setting", "ex:config": { "@value": "?value", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+This shows all configuration changes since transaction 50, useful for identifying what to rollback. You can first query `"from": "config:main@commit:bafybeig..."` to find the transaction number (using point-in-time queries), then use that in the history query.
+
+### Reproduce a Bug at Specific Time
+
+Query the exact state of the system when a bug was reported:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": [
+    "products:main@time:2024-06-15T14:30:00Z",
+    "inventory:main@time:2024-06-15T14:30:00Z"
+  ],
+  "select": ["?product", "?stock", "?reserved"],
+  "where": [
+    { "@id": "?product", "ex:stockLevel": "?stock" },
+    { "@id": "?product", "ex:reserved": "?reserved" }
+  ]
+}
+```
+
+This recreates the exact state across multiple ledgers at the time the bug occurred, making debugging much easier.
+
+## Best Practices
+
+### Time Travel Guidelines
+
+1. **Explicit Time References**: Always specify clear time references (`@t:`, `@time:`, or `@commit:`) for reproducible queries
+2. **Time Zone Awareness**: Use UTC for ISO timestamps to avoid ambiguity
+3. **ContentId Length**: Use sufficiently long ContentId prefixes to avoid collisions
+4. **Performance Testing**: Test query performance across different time ranges and ledger sizes
+
+### History Query Patterns
+
+1. **Narrow Your Scope**: Use specific property patterns rather than wildcard `?p` when you only need certain properties
+2. **Limit Time Ranges**: Specify realistic time ranges with `from` and `to` rather than `@t:1` to `@t:latest`
+3. **Use Filters**: Filter by `@op` to show only assertions or retractions when you don't need both
+4. **Order Results**: Use `orderBy: "?t"` to see changes in chronological order
+
+### Data Modeling for Time
+
+1. **Temporal Validity**: Model valid time explicitly when needed (separate from transaction time)
+2. **Change Tracking**: Use history queries rather than storing change logs manually
+3. **Immutable Design**: Design for immutability from the start - never update in place
+4. **Audit Patterns**: Leverage history queries for audit trails instead of separate audit tables
+
+### Operational Considerations
+
+1. **Index Maintenance**: Monitor and tune background indexing for optimal historical query performance
+2. **Storage Planning**: Plan storage growth for historical data (all history is preserved)
+3. **Query Optimization**: Use time-specific queries (`@t:`) rather than datetime resolution (`@time:`) when transaction numbers are known
+4. **Backup Strategy**: Include temporal aspects in backup/recovery plans - commits and indexes are both critical
+
+## Implementation Architecture
+
+### Transaction Pipeline
+
+1. **Transaction Reception**: Assign new transaction time (`t`)
+2. **Validation**: Check against current state
+3. **Commitment**: Persist transaction with ISO timestamp
+4. **Commit Metadata**: Store commit ContentId, timestamp, and optional transaction JSON
+5. **Indexing**: Background process creates new indexes
+6. **Publication**: Update nameservice with new transaction time
+
+### Time Travel Resolution
+
+When you query with `@t:`, `@time:`, `@recorded:`, or `@commit:`:
+
+1. **@t:NNN** - Direct transaction number (fastest)
+2. **@time:DATETIME** - Binary search through commit event timestamps using POST index
+3. **@recorded:DATETIME** - Same probes over `db:receivedAt` (audit axis), falling back to the event axis for history before the first backdated commit
+4. **@commit:CID** - Bounded SPOT scan to find matching commit
+
+### Query Execution
+
+1. **Time Resolution**: Resolve time specifiers to specific `t` values
+2. **Index Selection**: Choose appropriate index for target time
+3. **Novelty Application**: Apply intervening transactions if needed
+4. **Result Generation**: Return consistent snapshot
+
+### History Query Execution
+
+1. **Time Range Detection**: The `from` and `to` keys with time-specced endpoints activates history mode
+2. **Pattern Resolution**: WHERE patterns are executed with history mode enabled
+3. **Metadata Capture**: Transaction time (`@t`) and operation (`@op`) are captured for each binding
+4. **Result Generation**: Results include both assertions and retractions within the time range
+
+This temporal foundation makes Fluree uniquely powerful for applications requiring complete historical visibility, audit capabilities, and temporal analytics.

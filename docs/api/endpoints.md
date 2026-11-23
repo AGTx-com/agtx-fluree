@@ -1,0 +1,4138 @@
+# API Endpoints
+
+Complete reference for all Fluree HTTP API endpoints.
+
+## Base URL / versioning
+
+All endpoints listed below are under the server’s **API base URL** (`api_base_url` from `GET /.well-known/fluree.json`).
+
+- Standalone `fluree-server` default: `api_base_url = "/v1/fluree"`
+- All curl examples in this document use the full URL including the base path (e.g., `http://localhost:8090/v1/fluree/query/<ledger...>`)
+
+## Discovery and diagnostics
+
+### GET /.well-known/fluree.json
+
+CLI auth discovery endpoint. Used by `fluree remote add` and `fluree auth login` to auto-configure authentication for a remote.
+
+See [Auth contract (CLI ↔ Server)](../design/auth-contract.md) for the full schema.
+
+Standalone `fluree-server` returns:
+
+- `{"version":1,"api_base_url":"/v1/fluree"}` when no server auth is enabled
+- `{"version":1,"api_base_url":"/v1/fluree","auth":{"type":"token"}}` when any server auth mode is enabled (data/events/admin)
+
+OIDC-capable implementations should return `auth.type="oidc_device"` plus `issuer`, `client_id`, and `exchange_url`.
+The CLI treats `oidc_device` as "OIDC interactive login": it uses device-code when the IdP supports it, otherwise authorization-code + PKCE.
+
+Implementations MAY also return `api_base_url` to tell the CLI where the Fluree API is mounted (for example,
+when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
+
+Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
+
+Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it.
+
+### GET {api_base_url}/whoami
+
+Diagnostic endpoint for Bearer tokens. Returns a summary of the principal:
+
+- `token_present`: whether a Bearer token was present
+- `verified`: whether cryptographic verification succeeded
+- `auth_method`: `"embedded_jwk"` (Ed25519) or `"oidc"` (JWKS/RS256)
+- identity + scope summary (when verified)
+
+This endpoint is intended for debugging and operator support. See also [Admin, health, and stats](../operations/admin-and-health.md).
+
+## Transaction Endpoints
+
+### POST /update
+
+Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher `CREATE`/`MERGE`/`SET`/`DELETE`) to write data to a ledger.
+
+**URL:**
+```
+POST /update?ledger={ledger-id}
+POST /update/{ledger-id}
+```
+
+**Query Parameters:**
+- `ledger` (required for /update): Target ledger (format: `name:branch`)
+- `context` (optional): URL to default JSON-LD context
+- `using-graph-uri` (optional, repeatable, SPARQL UPDATE only): a graph for each operation's WHERE clause, as `USING <iri>` would name it
+- `using-named-graph-uri` (optional, repeatable, SPARQL UPDATE only): a named graph for each WHERE clause, as `USING NAMED <iri>` would name it
+
+The `using-*` parameters apply to every `DELETE`/`INSERT … WHERE` operation in the request (W3C SPARQL 1.1 Protocol §2.2.3). With the form-encoded transport (`Content-Type: application/x-www-form-urlencoded`, `update=…`) they may also be sent in the body. The request is a `400` if an operation already has its own `USING`, `USING NAMED`, or `WITH` clause, or if it contains `DELETE WHERE`, which has no `USING` form. It is also a `400` on a JSON-LD update, which scopes its WHERE with `from` / `fromNamed`, and on the insert, upsert and sync routes, which take no SPARQL UPDATE.
+
+**Request Headers:**
+
+For JSON-LD transactions:
+```http
+Content-Type: application/json
+Accept: application/json
+```
+
+For SPARQL UPDATE:
+```http
+Content-Type: application/sparql-update
+Accept: application/json
+```
+
+For Cypher writes (`CREATE`/`MERGE`/`SET`/`DELETE`):
+```http
+Content-Type: application/cypher
+Accept: application/json
+```
+
+Note: Cypher targets a ledger directly and must use the path form
+(`POST /update/{ledger-id}`); it has no `FROM`/dataset clause. The body may be
+raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the
+[Cypher reference](../query/cypher.md) for details.
+
+Note: Turtle/TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
+
+**Request Body (JSON-LD):**
+
+JSON-LD transaction document:
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "@graph": [
+    { "@id": "ex:alice", "ex:name": "Alice" }
+  ]
+}
+```
+
+Or WHERE/DELETE/INSERT update:
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "where": [
+    { "@id": "ex:alice", "ex:age": "?oldAge" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "ex:age": "?oldAge" }
+  ],
+  "insert": [
+    { "@id": "ex:alice", "ex:age": 31 }
+  ]
+}
+```
+
+**Request Body (SPARQL UPDATE):**
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA {
+  ex:alice ex:name "Alice" .
+  ex:alice ex:age 30 .
+}
+```
+
+Or with DELETE/INSERT:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE {
+  ?person ex:age ?oldAge .
+}
+INSERT {
+  ?person ex:age 31 .
+}
+WHERE {
+  ?person ex:name "Alice" .
+  ?person ex:age ?oldAge .
+}
+```
+
+`INSERT DATA` and `DELETE DATA` accept named-graph blocks per SPARQL 1.1 Update
+§3.1.1 (`QuadData`). A `GRAPH <iri> { ... }` block routes its (ground) triples
+into the named graph; this is what RDF4J's `SPARQLConnection.add(stmts, context)`
+emits:
+
+```sparql
+INSERT DATA {
+  GRAPH <https://example.org/g/1> {
+    <https://example.org/s/1> <https://example.org/p> "v" .
+  }
+}
+```
+
+The graph name must be a fixed IRI — a variable graph name (`GRAPH ?g { ... }`)
+is rejected, since DATA must be ground. Use DELETE/INSERT … WHERE for variable
+graph targets.
+
+**Response:**
+
+```json
+{
+  "t": 5,
+  "timestamp": "2024-01-22T10:30:00.000Z",
+  "commit_id": "bafybeig...commitT5",
+  "flakes_added": 3,
+  "flakes_retracted": 1,
+  "previous_commit_id": "bafybeig...commitT4"
+}
+```
+
+**Status Codes:**
+- `200 OK` - Transaction successful
+- `400 Bad Request` - Invalid transaction syntax
+- `401 Unauthorized` - Authentication required
+- `403 Forbidden` - Not authorized for this ledger
+- `404 Not Found` - Ledger not found
+- `409 Conflict` - Optimistic-concurrency conflict that survived the server's
+  bounded reconcile-and-retry (rare; safe to retry the request)
+- `413 Payload Too Large` - Transaction exceeds size limit
+- `500 Internal Server Error` - Server error
+
+**Concurrency:** Writes to a single ledger are serialized by a per-ledger write
+lock (concurrent writes to *different* ledgers proceed in parallel). When a
+transaction is lowered/sequenced against a snapshot that is no longer the head
+by commit time — two writers racing on a first-time namespace code, or a cached
+writer state that fell behind the durable head — the server reconciles the
+cached state to the current head and re-tries (bounded, up to 16 attempts). A
+`409 Conflict` is returned only if the retry budget is exhausted; clients should
+treat it as retryable (distinct from a `400` bad request).
+
+**Examples:**
+
+JSON-LD transaction:
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [{ "@id": "ex:alice", "ex:name": "Alice" }]
+  }'
+```
+
+JSON-LD transaction with a caller-supplied event time (backdated commit — see
+[Time Travel: Event Time](../concepts/time-travel.md#event-time-backdated-commits);
+must be RFC 3339, monotonically non-decreasing along the ledger's commit
+chain, and not in the future):
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [{ "@id": "ex:alice", "ex:role": "Engineer" }],
+    "opts": { "eventTime": "2021-03-15T00:00:00Z" }
+  }'
+```
+
+SPARQL UPDATE (ledger-scoped endpoint):
+```bash
+curl -X POST http://localhost:8090/v1/fluree/update/mydb:main \
+  -H "Content-Type: application/sparql-update" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+      INSERT DATA { ex:alice ex:name "Alice" }'
+```
+
+SPARQL UPDATE (connection-scoped with header):
+```bash
+curl -X POST http://localhost:8090/v1/fluree/update \
+  -H "Content-Type: application/sparql-update" \
+  -H "Fluree-Ledger: mydb:main" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+      DELETE { ?s ex:age ?old } INSERT { ?s ex:age 31 }
+      WHERE { ?s ex:name "Alice" . ?s ex:age ?old }'
+```
+
+Note: Turtle and TriG are not accepted on `/update`. Use `/insert` or `/upsert`.
+
+### POST /insert
+
+Insert new data into a ledger. Data must not conflict with existing data.
+
+**URL:**
+```
+POST /insert?ledger={ledger-id}
+POST /insert/{ledger-id}
+```
+
+**Supported Content Types:**
+- `application/json` - JSON-LD
+- `text/turtle` - Turtle (fast direct flake path)
+- `application/n-triples` - N-Triples (parsed as Turtle)
+- `application/trig` - TriG: `GRAPH` blocks land in their named graphs, and a `<#txn-meta>` block becomes commit metadata. A `text/turtle` body with graph blocks is read the same way. To replace one named graph's contents instead, use [`/sync`](#post-sync).
+
+**Example (JSON-LD):**
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [{ "@id": "ex:alice", "ex:name": "Alice" }]
+  }'
+```
+
+**Example (Turtle):**
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: text/turtle" \
+  -d '@prefix ex: <http://example.org/ns/> .
+      ex:alice ex:name "Alice" ; ex:age 30 .'
+```
+
+### POST /upsert
+
+Upsert data into a ledger. For each (subject, predicate) pair, existing values are retracted before new values are asserted.
+
+**URL:**
+```
+POST /upsert?ledger={ledger-id}
+POST /upsert/{ledger-id}
+```
+
+**Supported Content Types:**
+- `application/json` - JSON-LD
+- `text/turtle` - Turtle
+- `application/n-triples` - N-Triples (parsed as Turtle)
+- `application/trig` - TriG with named graphs
+
+**Example (JSON-LD):**
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@id": "ex:alice",
+    "ex:age": 31
+  }'
+```
+
+**Example (TriG with named graphs):**
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  -d '@prefix ex: <http://example.org/ns/> .
+
+      # Default graph
+      ex:company ex:name "Acme Corp" .
+
+      # Named graph for products
+      GRAPH <http://example.org/graphs/products> {
+          ex:widget ex:name "Widget" ;
+                    ex:price "29.99"^^xsd:decimal .
+      }'
+```
+
+Both W3C TriG graph-block forms are accepted: the SPARQL-style keyword form
+`GRAPH <iri> { ... }` shown above and the compact form `<iri> { ... }` (the
+`GRAPH` keyword is optional per the [TriG grammar](https://www.w3.org/TR/trig/#sec-graph)).
+The compact form is what stock RDF tooling — rdflib, Apache Jena, RDF4J — emits
+by default, so payloads generated by those libraries are ingested as-is.
+
+### POST /sync
+
+Synchronize a named graph: make its contents exactly the payload,
+committing only the delta (`current − payload` retracted, `payload −
+current` asserted; unchanged facts produce no flakes). An identical payload
+produces no commit. See [Sync](../transactions/sync.md).
+
+**URL:**
+```
+POST /sync?ledger={ledger-id}&graph={graph-iri}
+POST /sync/{ledger-id}?graph={graph-iri}
+POST /sync/{ledger-id}
+```
+
+**Query parameters:** `graph` (target named graph IRI; omit it for the default graph, or pass a bare `default` to say so explicitly), `dryRun=true`
+(stage and report the delta without committing), `allowEmpty=true` (confirm
+an explicitly empty payload, which clears the graph).
+
+**Supported Content Types:**
+- `application/json` - JSON-LD
+- `text/turtle` - Turtle
+- `application/n-triples` - N-Triples
+- `application/trig` - TriG: `GRAPH` blocks must name the `graph` parameter's IRI, and may not sit beside default-graph triples (see [Payload formats](../transactions/sync.md#payload-formats))
+
+**Example:**
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/sync?ledger=mydb:main&graph=http://example.org/graphs/ontology" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "@graph": [
+      { "@id": "ex:alice", "ex:name": "Alice" }
+    ]
+  }'
+```
+
+### GET | HEAD | PUT | POST | DELETE /data/*ledger
+
+The W3C SPARQL 1.1 Graph Store HTTP Protocol: read (`GET`/`HEAD`), replace
+(`PUT`), add to (`POST`) or remove (`DELETE`) one graph, named by
+`?graph={iri}` or `?default`. `PUT` is [sync](../transactions/sync.md), so it
+commits only the difference. `PUT`/`POST` take Turtle, N-Triples, TriG or
+JSON-LD; `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML. `GET` and
+`HEAD` accept a time pin in the path (`/data/mydb:main@t:5?graph=...`). See
+[Graph Store Protocol](graph-store.md) for status codes, formats and policy.
+
+```bash
+curl -X PUT "http://localhost:8090/v1/fluree/data/mydb:main?graph=urn:example:tools" \
+  -H "Content-Type: text/turtle" \
+  --data-binary @tools.ttl
+```
+
+### POST /push/*ledger
+
+Push precomputed commit v2 blobs to the server.
+
+This endpoint is intended for Git-like workflows (`fluree push`) where a client has written commits locally and wants the server to validate and commit them.
+
+**URL:**
+
+```
+POST /push/<ledger...>
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer <token>
+Idempotency-Key: <string>   (optional; recommended)
+```
+
+If `Idempotency-Key` is provided, servers MAY treat `POST /push/*ledger` as idempotent for that key (same request body + key should yield the same response), returning the prior success response instead of `409` on client retry after timeouts.
+
+**Request Body:**
+
+JSON object:
+
+- `commits`: array of base64-encoded commit v2 blobs (oldest → newest)
+- `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
+- `missing_blobs` (optional): array of CID strings the sender knows it cannot supply. Mirrors `missing_blobs` on the export response, so a sender declares a provenance gap instead of leaving the receiver to infer it from an absent `blobs` key. Undeclared gaps are still accepted today (a sender predating this field cannot declare one) but are logged at `warn` rather than `debug`.
+- `merged_commits`: must be absent or empty on this endpoint. A push that carries merged commits goes to [`POST /push-merges/*ledger`](#post-push-mergesledger). This endpoint refuses one with `400`.
+
+**Chain rules:**
+
+- Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
+- Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
+- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
+- Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
+
+**Response Body (200 OK):**
+
+```json
+{
+  "ledger": "mydb:main",
+  "accepted": 3,
+  "head": {
+    "t": 42,
+    "commit_id": "bafy...headCommit"
+  },
+  "indexing": {
+    "enabled": false,
+    "needed": true,
+    "novelty_size": 524288,
+    "index_t": 30,
+    "commit_t": 42
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `indexing.enabled` | Whether background indexing is active on this server. |
+| `indexing.needed` | Whether novelty has exceeded `reindex_min_bytes` and indexing should be triggered. |
+| `indexing.novelty_size` | Current novelty size in bytes after the push. |
+| `indexing.index_t` | Transaction time of the last indexed state. |
+| `indexing.commit_t` | Transaction time of the latest committed data (after push). |
+
+When `enabled` is `false` (external indexer mode), the caller should use `needed` and related fields to decide whether to trigger indexing through its own mechanism.
+
+**Error Responses:**
+
+- `400 Bad Request`: the body carries `merged_commits`
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
+- `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
+- `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
+- `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
+
+### POST /push-merges/*ledger
+
+Push commits whose history contains a merge. The request, response, headers, and idempotency behavior are those of [`POST /push/*ledger`](#post-pushledger), plus `merged_commits`.
+
+**URL:**
+
+```
+POST /push-merges/<ledger...>
+```
+
+**Request Body:**
+
+The fields of `POST /push/*ledger`, plus:
+
+- `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
+
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
+
+A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
+
+**Trust model:**
+
+The chain's own commits are staged under policy and SHACL, as a transaction would be. Merged commits are stored as history and never replayed, so neither check runs on them. What a merge brings into a branch's state travels in the merge commit, which is validated against the state it lands on, so everything the ledger's state holds has been checked.
+
+The merged commits themselves are history. They are readable through views such as `GET /show/*ledger`, which applies the caller's policy to what it returns, and no path that builds a branch's state reads them. `POST /branch` refuses `--at` on a commit that reached the branch through a merge, for the same reason.
+
+**Why a separate endpoint:**
+
+A server predating this endpoint answers `404`. Given the same body on `POST /push`, that server would accept the push and drop `merged_commits`. It would then store merge commits without their parents. Servers that implement this endpoint advertise it in discovery with `"push": {"merged_commits": true}`.
+
+**Error Responses:**
+
+As for `POST /push/*ledger`, without the `400` for `merged_commits`.
+
+### GET /show/*ledger
+
+Fetch and decode a single commit's contents with resolved IRIs. This is the server-side equivalent of `fluree show` — it returns assertions, retractions, and flake tuples with IRIs compacted using the ledger's namespace prefix table.
+
+**URL:**
+
+```
+GET /show/<ledger...>?commit=<ref>
+```
+
+**Query Parameters:**
+
+- `commit` (required): Commit identifier — `t:<N>` for transaction number, hex-digest prefix (min 6 chars), or full CID
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (when data auth is enabled)
+```
+
+**Response Body (200 OK):**
+
+```json
+{
+  "id": "bagaybqabciq...",
+  "t": 5,
+  "time": "2026-03-12T16:58:18.395474217+00:00",
+  "size": 327,
+  "previous": "bagaybqabciq...",
+  "asserts": 1,
+  "retracts": 1,
+  "@context": {
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "schema": "http://schema.org/"
+  },
+  "flakes": [
+    ["urn:fsys:dataset:zoho3", "schema:dateModified", "2026-03-12T14:15:30Z", "xsd:string", false],
+    ["urn:fsys:dataset:zoho3", "schema:dateModified", "2026-03-12T16:58:16Z", "xsd:string", true]
+  ]
+}
+```
+
+Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Operation `true` = assert (added), `false` = retract (removed). When metadata is present (language tag, list index, or named graph), a 6th element is appended.
+
+**Policy filtering:** Flakes are filtered by the caller's data-auth identity (extracted from the Bearer token) and the server's configured `default_policy_class`. When neither is present, all flakes are returned (root/admin access). Flakes the caller cannot read are silently omitted — the `asserts` and `retracts` counts reflect only the visible flakes. Unlike the query endpoints, show does not accept per-request policy overrides via headers or request body.
+
+**Responses:**
+
+- `200 OK`: Decoded commit returned
+- `400 Bad Request`: Missing or invalid `commit` parameter
+- `401 Unauthorized`: Bearer token required but missing
+- `404 Not Found`: Ledger or commit not found; a `commit` that names no commit is typed `err:db/CommitNotFound`
+
+**Peer mode:** Forwards to the transactor.
+
+### GET /log/*ledger
+
+Return a paginated list of lightweight commit summaries (newest-first by `t`). Server-side equivalent of `fluree log`. Read-auth — does **not** require storage-replication permissions, unlike `/commits`.
+
+**URL:**
+
+```
+GET /log/<ledger...>?limit=<N>
+```
+
+**Query Parameters:**
+
+- `limit` (optional, default `100`): Number of summaries to return. Server clamps to a hard maximum (reference: `5000`).
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (when data auth is enabled)
+```
+
+**Response Body (200 OK):**
+
+```json
+{
+  "ledger_id": "logdemo:main",
+  "commits": [
+    {
+      "t": 6,
+      "commit_id": "bagaybqabciqlncenzcn3foxeomxb62nftmihwu776fnj6n5lxl3zdro2nm3g7gi",
+      "time": "2026-09-15T05:58:52.676621+00:00",
+      "asserts": 1,
+      "retracts": 0,
+      "flake_count": 1,
+      "message": null
+    }
+  ],
+  "count": 6,
+  "truncated": true
+}
+```
+
+`commits` is strictly newest-first by `t` and capped by `limit`. `count` is the full chain length; `truncated == count > commits.len()`. `message` is extracted from `txn_meta` when an `f:message` entry with a string value is present, otherwise `null`. Each summary mirrors `fluree_db_core::CommitSummary`.
+
+**`commit_id` spelling:** this is the full base32 CID, the canonical wire form of a `ContentId`. It is *not* what `fluree log` prints — that is the commit's hex SHA-256 digest, which is what the commit prefix resolvers scan and therefore the only abbreviable spelling. Both name the same commit; a full CID from this response can be passed wherever a commit reference is accepted, but a *truncated* one cannot, because every commit CID opens with the same twelve-character header.
+
+**Branch-aware walk:** The walk loads commit envelopes via a branch-aware content store so it can cross fork points — pre-fork commits live under the source branch's namespace.
+
+**Responses:**
+
+- `200 OK`: Summaries returned (possibly empty array when the ledger has no commits)
+- `401 Unauthorized`: Bearer token required but missing
+- `404 Not Found`: Ledger does not exist; or the bearer cannot `can_read`
+- `5xx`: Storage / nameservice errors during walk
+
+**Peer mode:** Forwards to the transactor.
+
+### GET /commits/*ledger
+
+Export commit blobs from a ledger using stable cursors. Pages walk backward via each commit's `parents` — O(limit) per page regardless of ledger size. Used by `fluree pull` and `fluree clone`.
+
+**Requires replication-grade permissions** (`fluree.storage.*`). The storage proxy must be enabled on the server.
+
+**URL:**
+
+```
+GET /commits/<ledger...>?limit=100&cursor_id=<cid>
+```
+
+**Query Parameters:**
+
+- `limit` (optional): Max commits per page (default 100, server clamps to max 500). In lineage mode it counts `merged_commits` too.
+- `cursor_id` (optional): Commit CID cursor for pagination. Omit for first page (starts from head). Use `next_cursor_id` from the previous response for subsequent pages.
+- `lineage` (optional): `true` selects lineage mode, described below. Defaults to `false`.
+- `base_id` (optional, lineage mode only): the client's head. The export stops above it. Omit it to export down to genesis.
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (requires fluree.storage.* claims)
+```
+
+**Response Body (200 OK):**
+
+```json
+{
+  "ledger": "mydb:main",
+  "head_commit_id": "bafy...headCommit",
+  "head_t": 42,
+  "commits": ["<base64>", "<base64>"],
+  "blobs": { "bafy...txnBlob": "<base64>" },
+  "missing_blobs": [],
+  "newest_t": 42,
+  "oldest_t": 41,
+  "next_cursor_id": "bafy...prevCommit",
+  "count": 2,
+  "effective_limit": 100
+}
+```
+
+- `commits`: Raw commit v2 blobs, newest → oldest within each page.
+- `blobs`: Referenced txn blobs keyed by CID string.
+- `missing_blobs`: Txn CIDs referenced by commits in this page that the server could not read (omitted when empty). The commits are still exported; run `fluree verify` on the source to locate the referencing commit.
+- `next_cursor_id`: CID cursor for the next page; `null` when genesis is reached.
+- `effective_limit`: Actual limit used (after server clamping).
+- `lineage`: `true` in lineage mode. Omitted otherwise.
+- `merged_commits`: in lineage mode, the commits that merges in this page's `commits` brought in, parents before children. Omitted when empty.
+
+**Lineage mode:**
+
+By default, pages walk every parent of every commit. A history containing a merge then interleaves commits from different branches. Such a history cannot be imported.
+
+With `lineage=true`, `commits` holds only the branch's first-parent line. `merged_commits` holds the commits its merges brought in, as in [`POST /push-merges/*ledger`](#post-push-mergesledger). `next_cursor_id` is the next commit on the line. A commit that merges on two pages brought in appears on both pages.
+
+`limit` counts both lists together, so a merge's commits are bounded too. A page always holds at least one line commit, so paging always advances. One merge can therefore carry a page past `limit`.
+
+- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it. `merged_commits` leaves out what `base_id` already reaches, so pulling after a second merge of the same branch carries only what it gained in between.
+- A `base_id` that is not on the branch's first-parent line returns `409`. The histories have diverged.
+
+The mode is opt-in, so a client that does not request it keeps the default format. A server predating it ignores the parameters and returns the default format without `lineage`. That is how a client tells the two apart.
+
+**Responses:**
+
+- `200 OK`: Page of commits returned
+- `401 Unauthorized`: Missing or invalid storage token
+- `404 Not Found`: Storage proxy not enabled, ledger not found, or not authorized for this ledger
+- `409 Conflict`: in lineage mode, `base_id` is not on the branch's first-parent line
+
+**Pagination:**
+
+Commit CIDs in the immutable chain are stable cursors. New commits appended to the head do not affect backward pointers, so cursors remain valid across pages even when new commits arrive between requests.
+
+### POST /pack/*ledger
+
+Stream all missing CAS objects for a ledger in a single binary response. This is the primary transport for `fluree clone` and `fluree pull`, replacing multiple paginated `GET /commits` requests or per-object `GET /storage/objects` fetches with a single streaming request.
+
+**Requires replication-grade permissions** (`fluree.storage.*`). The storage proxy must be enabled on the server.
+
+**URL:**
+
+```
+POST /pack/<ledger...>
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/json
+Accept: application/x-fluree-pack
+Authorization: Bearer <token>   (requires fluree.storage.* claims)
+```
+
+**Request Body:**
+
+```json
+{
+  "protocol": "fluree-pack-v1",
+  "want": ["bafy...remoteHead"],
+  "have": ["bafy...localHead"],
+  "include_indexes": true,
+  "include_txns": true,
+  "want_index_root_id": "bafy...indexRoot",
+  "have_index_root_id": "bafy...localIndexRoot"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `protocol` | string | Yes | Must be `"fluree-pack-v1"` |
+| `want` | string[] | Yes | ContentId CIDs the client wants (typically the remote commit head) |
+| `have` | string[] | No | ContentId CIDs the client already has (typically the local commit head). Server stops walking the commit chain when it reaches a `have` CID. Empty for full clone. |
+| `want_index_root_id` | string | No | Index root CID the client wants (typically remote nameservice `index_head_id`). Required when `include_indexes=true`. |
+| `have_index_root_id` | string | No | Index root CID the client already has (typically local nameservice `index_head_id`). Used for index artifact diff. |
+| `include_indexes` | bool | Yes | Include index artifacts in the stream. When true, the stream contains commit + txn objects plus index root/branch/leaf/dict artifacts. |
+| `include_txns` | bool | Yes | Include original transaction blobs referenced by each commit. When false, only commits (and optionally index artifacts) are streamed — commit envelopes still reference their `txn` CIDs, but the client will not have the transaction payloads locally. The ledger state is fully reconstructable from commits + indexes; transactions are the original request payloads (e.g., JSON-LD insert/update requests). |
+
+**Response:**
+
+Binary stream using the `fluree-pack-v1` wire format (`Content-Type: application/x-fluree-pack`):
+
+```
+[Preamble: FPK1 + version(1)] [Header frame] [Data frames...] [End frame]
+```
+
+| Frame | Type byte | Content |
+|-------|-----------|---------|
+| Header | `0x00` | JSON metadata: protocol version, capabilities, `commit_count`, `index_artifact_count`, `estimated_total_bytes` |
+| Data | `0x01` | CID binary + raw object bytes (commit, txn blob, or index artifact) |
+| Error | `0x02` | UTF-8 error message (terminates stream) |
+| Manifest | `0x03` | JSON metadata for phase transitions (e.g. start of index phase) |
+| End | `0xFF` | End of stream (no payload) |
+
+Data frames are streamed in **oldest-first topological order** (parents before children), so the client can write objects to CAS as they arrive without buffering the entire stream.
+
+The Header frame includes an `estimated_total_bytes` field that the CLI uses to warn users before large transfers (~1 GiB or more). The estimate is ratio-based (derived from commit count) and may differ from actual transfer size. Set to `0` for commits-only requests.
+
+**Status Codes:**
+
+- `200 OK`: Binary pack stream
+- `401 Unauthorized`: Missing or invalid storage token
+- `404 Not Found`: Storage proxy not enabled, ledger not found, or not authorized for this ledger
+
+**Example:**
+
+```bash
+# Download all commits for a ledger (full clone)
+curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"protocol":"fluree-pack-v1","want":["bafy...head"],"have":[],"include_indexes":false,"include_txns":true}' \
+  --output pack.bin
+
+# Download commits without transaction payloads (smaller clone, read-only use)
+curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"protocol":"fluree-pack-v1","want":["bafy...head"],"have":[],"include_indexes":true,"include_txns":false,"want_index_root_id":"bafy...indexRoot"}' \
+  --output pack.bin
+
+# Download only missing commits (incremental pull)
+curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"protocol":"fluree-pack-v1","want":["bafy...remoteHead"],"have":["bafy...localHead"],"include_indexes":false,"include_txns":true}' \
+  --output pack.bin
+
+# Download commits + index artifacts (default for CLI pull/clone)
+curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"protocol":"fluree-pack-v1","want":["bafy...head"],"have":[],"include_indexes":true,"include_txns":true,"want_index_root_id":"bafy...indexRoot"}' \
+  --output pack.bin
+```
+
+### POST /import/*ledger
+
+Create a **new** ledger by restoring a `.flpack` archive — the inbound
+counterpart of `POST /pack/*ledger`. The request body is the raw `.flpack`
+stream (as produced by `fluree export <ledger> --format ledger` or
+`Fluree::archive_ledger`). The server streams the archive into storage — commits,
+transaction blobs, and any prebuilt index artifacts — then finalizes the commit
+and index heads from the archive's embedded nameservice manifest.
+
+The new ledger is named by the URL path and is **independent of the source
+ledger's name**, so the same archive can be restored under any name. Unlike
+`/push`, the archive is trusted byte-for-byte (every frame is SHA-256 verified)
+and not replayed, and the prebuilt index rides along — so the restored ledger is
+immediately queryable with no reindex.
+
+**Admin-protected** (same bracket as `/create` and `/drop`): the body carries
+prebuilt index artifacts the server did not produce, so this is an admin-grade
+operation. The archive is decoded frame-by-frame and never buffered whole, so
+multi-gigabyte archives restore without exhausting server memory.
+
+**URL:**
+
+```
+POST /import/<ledger...>
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/x-fluree-pack
+Authorization: Bearer <token>   (admin token when configured)
+```
+
+**Request Body:** the raw `.flpack` byte stream.
+
+**Response:** `201 Created` with a JSON summary:
+
+```json
+{
+  "ledger_id": "restored-db:main",
+  "commits": 12,
+  "txn_blobs": 12,
+  "index_artifacts": 34,
+  "commit_t": 12,
+  "index_t": 12
+}
+```
+
+`index_artifacts` is `0` and `index_t` is omitted for a commits-only archive
+(exported with `--no-indexes`); such a ledger replays from commits on first load.
+
+**Status codes:**
+
+- `201 Created`: ledger restored
+- `400 Bad Request`: malformed archive (bad preamble/frame, missing manifest, or a manifest head CID not present in the archive)
+- `409 Conflict`: a ledger with that name already exists
+- `401 Unauthorized`: missing or invalid admin token
+
+On any mid-stream failure the partially-created ledger is rolled back, so a
+failed import never leaves a live, half-ingested ledger behind.
+
+**Example:**
+
+```bash
+# Restore an archive into a brand-new ledger named "restored-db:main"
+curl -X POST "http://localhost:8090/v1/fluree/import/restored-db:main" \
+  -H "Content-Type: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @mydb.flpack
+```
+
+This is the transport behind `fluree create restored-db --remote origin --from mydb.flpack`.
+
+### Negotiated upload import (`/import-upload`)
+
+For clients that cannot send a large body to `POST /import` (e.g. behind a payload-capped gateway), an optional out-of-band upload handshake lets the client upload the `.flpack` directly to object storage, then have the server restore from it asynchronously. Servers advertise support in discovery (`GET /.well-known/fluree.json`):
+
+```jsonc
+"import": {
+  "modes": ["direct", "presigned-put", "multipart-put"],  // negotiated modes
+  "direct_max_bytes": 6291456,             // archives larger than this negotiate
+  "multipart_threshold_bytes": 5368709120, // ≥ this size → multipart (5 GiB PUT cap)
+  "multipart_part_size_bytes": 268435456   // target part size hint (≥ 5 MiB for S3)
+}
+```
+
+| Step | Endpoint | Result |
+|------|----------|--------|
+| Mint | `POST /import-upload` `{ledger, size?}` | single: `{ import_id, upload: { method, url, headers, expires_at_unix } }` — or multipart (when `size ≥ threshold`): `{ import_id, multipart: { upload_id, part_size_bytes, parts:[{part_number,url,headers}], expires_at_unix } }` |
+| Upload | `PUT <upload.url>` (single) **or** `PUT <part.url>` per part (multipart) | bytes staged (direct to object storage; **no bearer auth** — the URL is the capability). Each part PUT returns its `ETag`. |
+| Complete | `POST /import-upload/{import_id}/complete` | body: empty (single) or `{ parts:[{part_number, etag}] }` (multipart) → `202` `{ import_id, status:"running" }` — restore begins asynchronously |
+| Status | `GET /import-upload/{import_id}` | `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}` |
+
+Mint / complete / status are **admin-protected**; the blob/part `PUT`s are token-authorized via the minted URL. The server picks single-PUT vs multipart by the declared `size` (a single S3 PUT caps at 5 GiB). On `succeeded`, `result` is the same summary as `POST /import`. The Fluree server ships a reference backend behind `FLUREE_IMPORT_PRESIGN_ENABLED=true` (stages parts to local disk and concatenates them); production servers mint presigned object-store URLs and drive `CreateMultipartUpload`/`CompleteMultipartUpload`. See the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract) for the full implementer spec.
+
+This is the transport behind `fluree create … --remote … --from big.flpack` when the server is size-capped — the CLI negotiates automatically.
+
+#### Source uploads (server-side bulk import)
+
+The same handshake also accepts **raw source data** — the formats `fluree create --from` takes locally — and runs the chunked bulk-import pipeline server-side instead of a `.flpack` restore. Servers that support it advertise `"source-upload"` in `import.modes` plus an `import.source_formats` list (`ttl`, `nt`, `nq`, `trig`, `jsonld`, `json`, `jsonl`, `ndjson` — optionally `.gz`/`.zst` — and `csv`, `cypher`/`cyp`/`cql`, which are converted to JSON-LD shards on the server before import).
+
+Mint with two extra fields:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",       // default "flpack"
+  "filename": "dump.cypher",     // extension drives format detection
+  "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
+```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
+
+Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
+
+This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
+
+## Storage Proxy Endpoints
+
+These endpoints are intended for peer mode and `fluree clone`/`pull` workflows. They require the storage proxy to be enabled on the server and use replication-grade Bearer tokens (`fluree.storage.*` claims).
+
+### GET /storage/ns/:ledger-id
+
+Fetch the nameservice record for a ledger.
+
+**URL:**
+
+```
+GET /storage/ns/{ledger-id}
+```
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (requires fluree.storage.* claims)
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "name": "mydb",
+  "branch": "main",
+  "commit_head_id": "bafy...commitCid",
+  "commit_t": 42,
+  "index_head_id": "bafy...indexCid",
+  "index_t": 40,
+  "default_context": null,
+  "retracted": false,
+  "config_id": "bafy...configCid"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Canonical ledger ID (e.g., "mydb:main") |
+| `name` | Ledger name without branch (e.g., "mydb") |
+| `config_id` | CID of the `LedgerConfig` object (origin discovery), if set |
+
+**Status Codes:**
+
+- `200 OK`: Record found
+- `404 Not Found`: Storage proxy disabled, ledger not found, or not authorized
+
+### POST /storage/block
+
+Fetch a storage block (index branch or leaf) by CID. The server derives the storage address internally. Leaf blocks are always policy-filtered before return.
+
+Only replication-relevant content kinds are allowed (commits, txns, config, index roots/branches/leaves, dict blobs). Internal metadata kinds (GC records, stats sketches, graph source snapshots) are rejected with 404.
+
+**URL:**
+
+```
+POST /storage/block
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/json
+Authorization: Bearer <token>
+Accept: application/octet-stream | application/x-fluree-flakes | application/x-fluree-flakes+json
+```
+
+**Request Body:**
+
+Both fields are required:
+
+```json
+{
+  "cid": "bafy...branchOrLeafCid",
+  "ledger": "mydb:main"
+}
+```
+
+**Responses:**
+
+- `200 OK`: Block bytes (branches) or encoded flakes (leaves)
+- `400 Bad Request`: Invalid CID string
+- `404 Not Found`: Block not found, disallowed kind, or not authorized
+
+### GET /storage/objects/:cid
+
+Fetch a CAS (content-addressed storage) object by its content identifier. Returns the raw bytes of the stored object after verifying integrity.
+
+This is a **replication-grade** endpoint for `fluree clone`/`pull` workflows. The client knows the CID (from the nameservice record or the commit chain) and wants the raw bytes.
+
+**URL:**
+
+```
+GET /storage/objects/{cid}?ledger={ledger-id}
+```
+
+**Path Parameters:**
+
+- `cid`: CIDv1 string (base32-lower multibase, e.g., `"bafybeig..."`)
+
+**Query Parameters:**
+
+- `ledger` (required): Ledger ID (e.g., `"mydb:main"`). Required because storage paths are ledger-scoped.
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (requires fluree.storage.* claims)
+```
+
+**Kind Allowlist:**
+
+All replication-relevant content kinds are served:
+
+| Kind | Description |
+|------|-------------|
+| `commit` | Commit chain blobs |
+| `txn` | Transaction data blobs |
+| `config` | LedgerConfig origin discovery objects |
+| `index-root` | Binary index root (FIR6) |
+| `index-branch` | Index branch manifests |
+| `index-leaf` | Index leaf files |
+| `dict` | Dictionary artifacts (predicates, subjects, strings, etc.) |
+
+Only `GarbageRecord` (internal GC metadata) returns 404.
+
+**Response Headers:**
+
+- `Content-Type: application/octet-stream`
+- `X-Fluree-Content-Kind`: Content kind label (`commit`, `txn`, `config`, `index-root`, `index-branch`, `index-leaf`, `dict`)
+
+**Response Body:**
+
+Raw bytes of the stored object.
+
+**Integrity Verification:**
+
+The server verifies the hash of the stored bytes against the CID before returning. Commit blobs are format-sniffed:
+
+- **Commit-v2 blobs** (`FCV2` magic): Uses the canonical sub-range hash (SHA-256 over the payload excluding the trailing hash + signature block).
+- **All other blobs** (txn, config, future commit formats): Full-bytes SHA-256.
+
+If verification fails, the server returns `500 Internal Server Error` — this indicates storage corruption.
+
+**Status Codes:**
+
+- `200 OK`: Object found and integrity verified
+- `400 Bad Request`: Invalid CID string
+- `404 Not Found`: Object not found, disallowed kind, not authorized, or storage proxy disabled
+- `500 Internal Server Error`: Hash verification failed (storage corruption)
+
+**Example:**
+
+```bash
+# Fetch a commit blob by CID
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8090/v1/fluree/storage/objects/bafybeig...commitCid?ledger=mydb:main"
+
+# Fetch a config blob by CID
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8090/v1/fluree/storage/objects/bafybeig...configCid?ledger=mydb:main"
+
+# Fetch an index leaf by CID
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8090/v1/fluree/storage/objects/bafybeig...leafCid?ledger=mydb:main"
+```
+
+Single-range `Range: bytes=start-end` requests are honored with `206 Partial
+Content` (`Content-Range` included); the full object is verified against the
+CID before slicing. Unsupported Range forms fall back to a full `200`
+response; a start at or past the object length returns `416`.
+
+### GET /storage/credentials
+
+Mint STS credentials scoped to a ledger's S3 prefix, so an authorized peer
+reads index content **directly from S3** instead of proxying every object
+through this server. See [Remote mounts and serving
+tiers](../design/remote-mounts.md).
+
+**URL:**
+
+```
+GET /storage/credentials?ledger={ledger-id}
+```
+
+**Requirements (all must hold, else `404`):**
+
+- Server built with the `aws` feature and **single-bucket S3-backed storage**
+  (connection config)
+- `--storage-vend-enabled` and `--storage-vend-role-arn <arn>` configured
+- Bearer token with `fluree.storage.*` scope covering the ledger
+- The ledger's `f:serveBlocks` posture allows raw serving
+
+**Response Body** (200 OK):
+
+```json
+{
+  "access_key_id": "ASIA...",
+  "secret_access_key": "...",
+  "session_token": "...",
+  "expires_at_epoch_secs": 1751600000,
+  "bucket": "my-fluree-bucket",
+  "region": "us-east-1",
+  "key_prefix": "ledgers",
+  "scoped_prefix": "ledgers/mydb"
+}
+```
+
+The grant is an STS `AssumeRole` session narrowed by a session policy to
+`s3:GetObject` under the ledger's **name-level** prefix (covering all
+branches and the shared dictionary namespace) plus prefix-conditioned
+`s3:ListBucket`. TTL is `--storage-vend-ttl-secs` (default 900, the STS
+minimum).
+
+**Revocation caveat:** a minted grant stays valid until it expires — token
+revocations and `f:serveBlocks` changes take effect at grant expiry, so keep
+TTLs short.
+
+Consumers (CLI peer mode, `fluree-db-nameservice-sync::vended_s3`) probe this
+endpoint and fall back to proxied `/storage/objects` reads on `404`.
+
+## Nameservice Sync Endpoints
+
+Used by replication clients and peer instances to push ref updates, initialize
+ledgers, and fetch snapshots of all nameservice records. These are the
+server-side counterpart to the `fluree-db-nameservice-sync` crate.
+
+**Authorization:** All endpoints require a Bearer token with storage-proxy
+permissions. Per-alias endpoints verify the principal is authorized for that
+ledger. `/snapshot` filters results to the principal's authorized scope
+(`storage_all` returns everything; otherwise results are filtered to
+`storage_ledgers` and graph sources are excluded).
+
+**Availability:** These endpoints run on the transaction server, whose
+nameservice they read and advance. A query peer, in either storage mode,
+forwards them to its transaction server, as it does transactions.
+
+### POST /nameservice/refs/{alias}/commit
+
+Compare-and-set push for a ledger's commit-head ref.
+
+**Request Body:**
+
+```json
+{
+  "expected": { /* RefValue or null for initial creation */ },
+  "new":      { /* RefValue */ }
+}
+```
+
+**Response (200 OK — updated):**
+
+```json
+{ "status": "updated", "ref": { /* new RefValue */ } }
+```
+
+**Response (409 Conflict — CAS failed):**
+
+```json
+{ "status": "conflict", "actual": { /* current server-side RefValue */ } }
+```
+
+### POST /nameservice/refs/{alias}/index
+
+Compare-and-set push for a ledger's index-head ref. Same request/response shape
+as `/commit` above.
+
+### POST /nameservice/refs/{alias}/init
+
+Create a ledger entry in the nameservice if it does not already exist.
+Idempotent.
+
+**Response:**
+
+```json
+{ "created": true }   // new ledger entry was registered
+{ "created": false }  // already existed; no change
+```
+
+### GET /nameservice/snapshot
+
+Return a full snapshot of all ledger (`NsRecord`) and graph-source
+(`GraphSourceRecord`) records visible to the caller.
+
+**Response:**
+
+```json
+{
+  "ledgers":       [ /* NsRecord, … */ ],
+  "graph_sources": [ /* GraphSourceRecord, … */ ]
+}
+```
+
+**Status Codes:**
+- `200 OK` — snapshot returned
+- `401 Unauthorized` — missing/invalid storage-proxy token
+- `404 Not Found` — endpoint disabled (proxy mode)
+
+## Query Endpoints
+
+### POST /query
+
+Execute a query against one or more ledgers.
+
+**URL:**
+```
+POST /query
+GET  /query?query={urlencoded-sparql}   # SPARQL Protocol GET form
+```
+
+The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL queries via the `query` query parameter; the body forms below are preferred for larger queries and for JSON-LD. The same form is available on the ledger-scoped `/query/{ledger}` route.
+
+The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: application/x-www-form-urlencoded` with `query={sparql}` in the body, plus any of the parameters below. Parameters in the body and in the URL are combined; `query` may appear only once across both. A form-encoded `update=` sent here is refused — use `/update`.
+
+**Optional Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
+| `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger, where `urn:default` (the name [`/info`](#get-infoledger-id) lists the default graph under) names the default graph. |
+| `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
+| `$name` | RDF term, one per variable | — | SPARQL only. Binds the variable `name` for this request, as `$author=<http://example.org/le-guin>` or `$year=1969`. See [Parameters](../query/sparql.md#parameters). |
+
+When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`. A graph the ledger does not hold is a `404` with `@type` `err:db/GraphNotFound`.
+
+`$name` parameters are a Fluree extension — the SPARQL Protocol has no parameter binding — following the convention other SPARQL servers share. They are read from the same places as the dataset parameters (a client may send the `$` as `%24`), and each variable may be bound once. A value is one RDF term: a full IRI in angle brackets, a quoted literal with an optional `@language` or `^^<datatype>`, or a bare number or boolean; a prefixed name is a `400`, since no prefix applies. Each value replaces its variable after the query text is parsed, so binding a variable costs no extra parse. A name the query never mentions is a `400` (a misspelt variable would otherwise stay unbound and match everything), as is a `$name` parameter on a JSON-LD query, which takes its values in the query, or on a Cypher query, which sends `{"cypher": …, "params": …}` as its body; a `params` parameter is a `400` that names the `$name` form. `/explain` and `/stream/query` take `$name` bindings the same way. An AgentJson response cut by `Fluree-Max-Bytes` omits its `resume` query when the request binds variables, since that query is built from the text alone; its `message` says to re-send the bindings (see [Agent JSON](../query/output-formats.md#agent-json-format)). The update endpoints refuse bindings with a `400` rather than ignore them; an update carries its values in its text.
+
+**Request Headers:**
+```http
+Content-Type: application/json
+Accept: application/json
+Fluree-Min-T: 42  # optional read-after-write guarantee
+```
+
+Or for SPARQL:
+```http
+Content-Type: application/sparql-query
+Accept: application/sparql-results+json
+Fluree-Min-T: 42  # optional read-after-write guarantee
+```
+
+`Fluree-Min-T` makes the server refresh the referenced ledger(s) until they have reached at least that transaction time before executing the query. JSON-LD bodies can also send `opts.min-t`, `opts.min_t`, or `opts.minT`; body opts take precedence over the header.
+
+**Request Body (JSON-LD Query):**
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "from": "mydb:main",
+  "select": ["?name", "?age"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    { "@id": "?person", "ex:age": "?age" }
+  ],
+  "orderBy": ["?name"],
+  "limit": 100
+}
+```
+
+**Multi-ledger / dataset queries:** The connection-scoped `/query` route (no
+`{ledger}` in the path) accepts the full dataset `from` surface, not just a
+single ledger string:
+
+- `"from": ["a:main", "b:main"]` — union the listed ledgers as the default graph.
+- `"from": { "@id": "a:main@t:5" }` — a single source with time-travel / graph selectors.
+- `"fromNamed": { "alias": { "@id": "b:main" } }` — named graphs addressed by a
+  GRAPH pattern in the `where` (a query may use `fromNamed` with no `from`).
+
+The query is authorized against the first resolvable source for the bearer
+scope; per-ledger policy is then applied to each source during execution.
+
+**Request Body (SPARQL):**
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?age
+FROM <mydb:main>
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+}
+ORDER BY ?name
+LIMIT 100
+```
+
+**Response (JSON-LD Query):**
+
+```json
+[
+  { "name": "Alice", "age": 30 },
+  { "name": "Bob", "age": 25 }
+]
+```
+
+**Response (SPARQL):**
+
+```json
+{
+  "head": {
+    "vars": ["name", "age"]
+  },
+  "results": {
+    "bindings": [
+      {
+        "name": { "type": "literal", "value": "Alice" },
+        "age": { "type": "literal", "value": "30", "datatype": "http://www.w3.org/2001/XMLSchema#integer" }
+      }
+    ]
+  }
+}
+```
+
+**SPARQL output negotiation (`Accept` header):**
+
+The full byte-format negotiation below is available on the **ledger-scoped**
+[`POST /query/{ledger}`](#post-queryledger) route. The **connection-scoped**
+`POST /query` route (SPARQL with `FROM <ledger>`) returns pre-formatted JSON only
+— it supports the JSON family (JSON-LD, SPARQL-results JSON, AgentJson) but not the
+byte formats; Turtle, N-Triples, RDF/XML, TriG, N-Quads, SPARQL-results XML, and CSV/TSV
+require the ledger-scoped route (see the [connection-scoped note](#connection-scoped-sparql-output) below).
+
+| Query form | Default (no/`*/*`/`application/json`) | `application/ld+json` | `text/turtle` / `application/n-triples` / `application/rdf+xml` / `application/trig` / `application/n-quads` | `application/sparql-results+json` | `text/csv` / `text/tab-separated-values` | `application/sparql-results+xml` | `application/vnd.fluree.agent+json` |
+|---|---|---|---|---|---|---|---|
+| `SELECT` / `ASK` | SPARQL-results JSON | JSON-LD | **406** | SPARQL-results JSON | CSV / TSV | SPARQL-results XML | AgentJson |
+| `CONSTRUCT` / `DESCRIBE` | **JSON-LD** | JSON-LD | the requested format | JSON-LD | **406** | **406** | **406** |
+
+A `CONSTRUCT` / `DESCRIBE` produces an RDF graph, which has no solution/binding-table
+form. It is returned as **JSON-LD** (`Content-Type: application/ld+json`) unless
+`Accept` prefers one of the graph text formats: among `application/ld+json`,
+`application/json`, `text/turtle`, `application/n-triples`, `application/rdf+xml`,
+`application/trig` and `application/n-quads` the highest `q` wins (equal weights keep the
+header's order; `text/*` means Turtle). Turtle and TriG output declare the query's `PREFIX`es
+and use them. A `CONSTRUCT` whose template has `GRAPH` blocks produces a dataset, so it
+negotiates only among TriG, N-Quads and JSON-LD; an `Accept` that admits only Turtle,
+N-Triples or RDF/XML is a `406` (see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template)). The solution-table formats
+(SPARQL-results XML, CSV/TSV, AgentJson) are rejected with `406`. A `SELECT` / `ASK`
+defaults to SPARQL-results JSON and only switches to JSON-LD when `application/ld+json`
+is requested explicitly — a bare `application/json` keeps the SPARQL-results-JSON
+shape — and an `Accept` that admits only graph formats is rejected with `406`.
+
+<a name="connection-scoped-sparql-output"></a>
+> **Connection-scoped `POST /query` (SPARQL):** this route returns pre-formatted
+> JSON only. The JSON-family columns above apply (CONSTRUCT/DESCRIBE → JSON-LD;
+> SELECT/ASK → SPARQL-results JSON, or JSON-LD with `Accept: application/ld+json`;
+> AgentJson via `application/vnd.fluree.agent+json`, rejected `406` for graph
+> queries). CSV/TSV, Turtle, N-Triples, RDF/XML, TriG and N-Quads are rejected with `406`, and
+> `application/sparql-results+xml` is **not** negotiated here — use
+> `POST /query/{ledger}` for those byte formats.
+
+**Status Codes:**
+- `200 OK` - Query successful
+- `400 Bad Request` - Invalid query syntax
+- `401 Unauthorized` - Authentication required
+- `404 Not Found` - Ledger not found
+- `406 Not Acceptable` - Requested output format is not available for this query form (e.g. Turtle for a `SELECT`)
+- `413 Payload Too Large` - Query exceeds size limit
+- `500 Internal Server Error` - Server error
+- `503 Service Unavailable` - Query timeout or resource limit
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "mydb:main",
+    "select": ["?name"],
+    "where": [{ "@id": "?person", "ex:name": "?name" }]
+  }'
+```
+
+### POST /query/{ledger}
+
+Execute a query against a specific ledger (ledger-scoped).
+
+This endpoint is designed for **single-ledger** queries, but supports selecting **named graphs inside the ledger**.
+
+**URL:**
+```
+POST /query/{ledger}
+```
+
+**Default graph semantics:**
+- If the request does not specify a graph selector, the query runs against the ledger's **default graph**.
+- The built-in **txn-meta** graph can be selected as either:
+  - JSON-LD: `"from": "txn-meta"`, or
+  - SPARQL: `FROM <txn-meta>`
+
+**Named graph selection (within the same ledger):**
+
+- **JSON-LD**: you can use `"from"` to pick a graph in this ledger:
+  - `"from": "default"` → default graph
+  - `"from": "txn-meta"` → txn-meta graph
+  - `"from": "<graph IRI>"` → a user-defined named graph IRI within this ledger
+  - Structured form: `"from": { "@id": "<ledger>", "graph": "<graph selector>" }`
+
+- **SPARQL**: if the query includes `FROM` / `FROM NAMED`, the server interprets those IRIs as **graphs within this ledger** (not other ledgers):
+  - `FROM <default>` / `FROM <txn-meta>` / `FROM <graph IRI>` selects the default graph for triple patterns outside `GRAPH {}`.
+  - `FROM NAMED <graph IRI>` makes that named graph available via `GRAPH <graph IRI> { ... }`.
+
+**Other ledgers:**
+
+- A `from` string or object (`{"@id": …}`, or `{"id": …}`), and a SPARQL `FROM` / `FROM NAMED`, are read in `{ledger}`, in this order:
+  - `{ledger}`'s own address, in any spelling (`mydb`, `mydb:main`, `urn:fluree:mydb:main`), reads `{ledger}`.
+  - A graph keyword, or the IRI of one of `{ledger}`'s graphs, selects that graph.
+  - A reference that names another ledger is a `400 Bad Request` "Ledger mismatch" error.
+  - An IRI that names none of `{ledger}`'s graphs is a `404` "Graph not found".
+- A JSON-LD array `from`, or a `fromNamed`, may name other ledgers. It is the multi-ledger (union) form, the same as on `POST /query`, and each ledger it names is read under the caller's access rights.
+- `/stream/query/{ledger}` and `/explain/{ledger}` read `from` and `fromNamed` the same way.
+
+**Time pin in the path:**
+
+Add a time pin to the ledger in the path to read the whole ledger, default graph and named graphs, as it was at that point. The pin takes the same forms as a pinned `from` / `FROM` ledger reference:
+
+```
+POST /query/{ledger}@t:5
+POST /query/{ledger}@time:2025-01-15T00:00:00Z      (alias @iso:)
+POST /query/{ledger}@recorded:2025-01-15T00:00:00Z
+POST /query/{ledger}@commit:bafyreif...
+POST /query/{ledger}@t:latest
+```
+
+It works for `GET` and `POST`, and for JSON-LD, SPARQL and Cypher bodies. `GRAPH ?g { ... }` (JSON-LD `["graph", "?g", ...]`) enumerates the named graphs that existed at the pin, and `GRAPH <iri> { ... }` reads that graph as it was then. Graphs the body selects with `FROM` / `FROM NAMED` or `from` / `fromNamed` are read at the pin too.
+
+- A body that names its own time for this ledger (`FROM <mydb:main@t:5>`, `"from": "mydb:main@t:5"`, `"from": {"@id": "mydb:main", "t": 5}`) must agree with the path: the same `t`, the same timestamp, or the same commit. Any other time is a `400`, including a different form that happens to resolve to the same commit (a `t` against a timestamp).
+- A history query (a `to` key) names its own range and is a `400` on a pinned path.
+- A malformed pin (`mydb@t:abc`, `mydb@bogus:1`, `mydb@`) is a `400`, as is a pin together with a `#graph` fragment in the path.
+- `@t:N` waits for the ledger to reach `t=N`, as a pinned `from` does, and returns `408` if it doesn't in time.
+- A pinned read goes through the dataset path, which has no CSV/TSV output (`406`).
+
+```bash
+# SPARQL over the ledger as of t=5, named graphs included
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main@t:5" \
+  -H "Content-Type: application/sparql-query" \
+  -d 'SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }'
+```
+
+**Examples:**
+
+JSON-LD (query txn-meta):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "txn-meta",
+    "select": ["?commit", "?t"],
+    "where": [{ "@id": "?commit", "https://ns.flur.ee/db#t": "?t" }]
+  }'
+```
+
+JSON-LD (query a user-defined named graph by IRI):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "http://example.org/graphs/products",
+    "select": ["?name"],
+    "where": [{ "@id": "?p", "http://example.org/ns/name": "?name" }]
+  }'
+```
+
+SPARQL (select txn-meta as default graph):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/sparql-query" \
+  -d 'PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?commit ?t
+FROM <txn-meta>
+WHERE { ?commit f:t ?t }'
+```
+
+Cypher (`Content-Type: application/cypher` — ledger-scoped only, no `FROM`/dataset clause):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (p:Person) RETURN p.name'
+```
+
+Cypher responses default to `cypher-json`; request RDF JSON-LD with `Accept: application/ld+json`. The body may be raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the [Cypher reference](../query/cypher.md).
+
+### Service description
+
+A `GET` on `/query` or `/query/{ledger}` with no `query` parameter and no body returns the endpoint's [SPARQL Service Description](https://www.w3.org/TR/sparql11-service-description/): what a SPARQL client can discover about the endpoint without a trial query.
+
+```bash
+curl -H 'Accept: text/turtle' http://localhost:8090/v1/fluree/query/mydb:main
+```
+
+```turtle
+@prefix formats: <http://www.w3.org/ns/formats/> .
+@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
+@prefix sparql: <http://www.w3.org/ns/sparql#> .
+
+_:service a sd:Service ;
+    sd:defaultEntailmentRegime <http://www.w3.org/ns/entailment/Simple> ;
+    sd:endpoint <http://localhost:8090/v1/fluree/query/mydb:main> ;
+    sd:resultFormat formats:JSON-LD, formats:N-Triples, formats:RDF_XML, formats:SPARQL_Results_CSV, formats:SPARQL_Results_JSON, formats:SPARQL_Results_TSV, formats:SPARQL_Results_XML, formats:Turtle ;
+    sd:supportedLanguage sd:SPARQL11Query, sd:SPARQLQuery ;
+    sd:supportedVersion sparql:version-1.0, sparql:version-1.1, sparql:version-1.2, sparql:version-1.2-basic .
+```
+
+- **Format:** chosen by `Accept`: JSON-LD (the default), Turtle, N-Triples or RDF/XML. Any other `Accept` is a `406`.
+- **Endpoint IRI:** `sd:endpoint` is the URL the request addressed, taken from `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sets them, otherwise from `Host`.
+- **Auth:** the description sits behind the same authentication as the endpoint. With data auth required, a request without a credential is a `401`.
+- **Features:** a ledger's endpoint claims `sd:feature sd:UnionDefaultGraph` while the ledger's [`f:unionDefaultGraph`](../ledger-config/setting-groups.md#fquerydefaults--query-defaults) setting is on (and the caller's token may read the ledger); see [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). No other `sd:feature` is claimed: `/query` reads whatever default graph `FROM` names, and Fluree has no empty named graph.
+
+### History Queries via POST /query
+
+Query the history of entities using the standard `/query` endpoint with `from` and `to` keys specifying the time range.
+
+**Request Body:**
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "from": "mydb:main@t:1",
+  "to": "mydb:main@t:latest",
+  "select": ["?name", "?age", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
+    { "@id": "ex:alice", "ex:age": "?age" }
+  ],
+  "orderBy": "?t"
+}
+```
+
+The `@t` and `@op` annotations capture transaction metadata:
+- **@t** - Transaction time (integer) when the fact was asserted or retracted.
+- **@op** - Operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are not accepted.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
+
+**Response:**
+
+```json
+[
+  ["Alice", 30, 1, true],
+  ["Alice", 30, 5, false],
+  ["Alicia", 31, 5, true]
+]
+```
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": { "ex": "http://example.org/ns/" },
+    "from": "mydb:main@t:1",
+    "to": "mydb:main@t:latest",
+    "select": ["?name", "?t", "?op"],
+    "where": [
+      { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
+    ],
+    "orderBy": "?t"
+  }'
+```
+
+**SPARQL History Query:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -H "Content-Type: application/sparql-query" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?name ?t ?op
+FROM <mydb:main@t:1>
+TO <mydb:main@t:latest>
+WHERE {
+  << ex:alice ex:name ?name >> f:t ?t .
+  << ex:alice ex:name ?name >> f:op ?op .
+}
+ORDER BY ?t'
+```
+
+### POST /stream/query and /stream/query/{ledger}
+
+Stream SELECT results incrementally as newline-delimited JSON
+(`application/x-ndjson`) instead of buffering the whole result into one
+response body, with a heartbeat that keeps long-running queries alive past
+proxy idle timeouts. Same content-type negotiation as `/query` (JSON-LD or
+`application/sparql-query`). Two forms: ledger-scoped (ledger in the greedy
+path tail) and connection-scoped (`POST /stream/query`, no path ledger — the
+ledger(s) come from JSON-LD `from`/`fromNamed` or SPARQL `FROM`).
+
+```bash
+curl -N -X POST http://localhost:8090/v1/fluree/stream/query/my/ledger \
+  -H 'Content-Type: application/json' \
+  -d '{"@context":{"ex":"http://example.org/"},"select":["?name"],"where":{"@id":"?s","ex:name":"?name"}}'
+```
+
+The response is one self-describing JSON record per line (`head` → `row`* with
+interleaved `heartbeat`s → a terminal `end` or `error`). SELECT only; ASK,
+CONSTRUCT/DESCRIBE, `selectOne`, hydration, and history (JSON-LD `to` / SPARQL
+`FROM … TO …`) are rejected with `4xx`. Policy, `from`/`fromNamed`, SPARQL
+`FROM`, and multi-ledger queries (JSON-LD and SPARQL) are enforced identically
+to `/query`. A time pin in the ledger path (`/stream/query/{ledger}@t:5`) is a
+`400`; use [`/query/{ledger}@t:5`](#post-queryledger). See
+**[Streaming query (NDJSON)](streaming-query.md)** for the full record protocol,
+the terminal-record (truncation) contract, policy behavior, and client examples.
+
+### POST /multi-query
+
+Execute a bundle of independent JSON-LD and/or SPARQL queries in parallel against a single shared snapshot moment, with envelope-level `@context` / `opts` defaults that lift into each sub-query.
+
+**URL:**
+```
+POST /multi-query
+```
+
+**Request Headers:**
+```http
+Content-Type: application/json
+```
+
+**Request Body (envelope):**
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "asOf":     "2024-01-01T12:00:00Z",
+  "opts":     { "meta": true, "timeoutMs": 30000, "maxConcurrency": 8 },
+  "queries": {
+    "alice": {
+      "language": "jsonld",
+      "query": {
+        "from":   "myledger:main",
+        "select": ["?name"],
+        "where":  { "@id": "?p", "ex:name": "?name" }
+      }
+    },
+    "bob": {
+      "language": "sparql",
+      "query":    "SELECT ?name FROM <other:main> WHERE { ?p ex:name ?name }"
+    }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "status":  "ok",
+  "snapshot": {
+    "asOf":    "2024-01-01T12:00:00Z",
+    "ledgers": { "myledger:main": 1042, "other:main": 87 }
+  },
+  "results": { "alice": [...], "bob": {...} }
+}
+```
+
+(`errors` is omitted when no sub-query failed; `meta` is omitted when `opts.meta` is unset.) Clients branch on `body.status` (`"ok"` | `"partial"` | `"all_failed"`) rather than HTTP code for the aggregate outcome; per-alias errors and timeouts live inside `errors` when present.
+
+**Status Codes:**
+- `200 OK` — envelope parsed and executed; body's `status` reports the per-alias aggregate (including `all_failed`).
+- `400 Bad Request` — envelope validation failed (bounds, `asOf` collision, missing `from`, history query, envelope `max-fuel`, `maxConcurrency: 0`, malformed body).
+- `401 Unauthorized` — authentication required and missing.
+- `500 Internal Server Error` — envelope infra failed (snapshot resolution couldn't load a ledger; response exceeds the size cap during assembly).
+
+**Full reference:** see [Multi-query envelope](multi-query.md) for the complete envelope contract, merge rules, snapshot semantics, bounds table, examples, and the explicit list of current limitations (history queries, envelope-level fuel budget, response cap enforcement, SPARQL policy gap).
+
+### GET/POST /explain
+
+Return a query plan without executing the query. Accepts the same body formats and authentication as `/query` (JSON-LD, SPARQL via `application/sparql-query` or `?query=`, Cypher via `application/cypher`, and JWS/VC signed requests).
+
+**URL:**
+```
+GET  /explain[/{ledger...}]
+POST /explain[/{ledger...}]
+```
+
+**Behavior:**
+- JSON-LD body: returns the logical plan for the parsed query.
+- SPARQL body: returns the plan for the parsed SPARQL query. On the ledger-scoped endpoint (`/explain/{ledger}`) a `FROM` must name the path's ledger, optionally with a time pin (`FROM <mydb:main@t:5>`), and the plan is for that snapshot.
+- A time pin in the path (`/explain/{ledger}@t:5`) plans against that snapshot, with the same forms and rules as [`/query/{ledger}`](#post-queryledger). On a pinned path a SPARQL `FROM` must repeat the pin.
+- Cypher body (`Content-Type: application/cypher`): returns the plan for the lowered Cypher query. Accepts raw Cypher or the `{"cypher": "...", "params": {...}}` envelope — `$param` references are substituted before lowering, exactly like `/query`. Ledger-scoped endpoint only (the connection-scoped `/explain` returns 400 for Cypher).
+- SPARQL UPDATE is rejected (HTTP 400) — use `/update` for updates.
+- Same ledger-scope enforcement for Bearer tokens as `/query`.
+
+**Response:**
+
+A JSON object describing the logical / physical plan. Shape mirrors the query engine's internal plan representation; treat it as informational and non-stable across releases.
+
+**Status Codes:**
+- `200 OK` — plan returned
+- `400 Bad Request` — SPARQL UPDATE sent, a `FROM` naming another ledger, or a malformed or conflicting time pin
+- `401 Unauthorized` — authentication required and missing
+- `404 Not Found` — ledger not found or not authorized
+
+**Examples:**
+
+```bash
+# Explain a SPARQL query
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
+  -H "Content-Type: application/sparql-query" \
+  --data 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10'
+
+# Explain a JSON-LD query
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"select":["?s"],"where":{"@id":"?s"}}'
+
+# Explain a Cypher query (raw text or {"cypher": ..., "params": ...} envelope)
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (n:Person {id: 7}) RETURN n'
+```
+
+### POST/GET /graphql/{ledger...}
+
+Execute a GraphQL request against the schema derived from the ledger's own data.
+There is nothing to register first: any ledger with typed subjects has a schema.
+Requires the `graphql` build feature (on by default).
+
+**URL:**
+```
+POST /graphql/{ledger...}
+GET  /graphql/{ledger...}?query={urlencoded-graphql}
+```
+
+**Content types:**
+
+| Content-Type | Body |
+|--------------|------|
+| `application/json` | `{"query": "...", "variables": {...}, "operationName": "...", "extensions": {"explain": true}}` |
+| `application/graphql` | the document as the raw body |
+
+**Optional query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | — | The document, for the `GET` form GraphiQL and browser clients use. |
+| `variables` | string | — | A URL-encoded JSON object (`GET` form). |
+| `operationName` | string | — | Which operation to run, when the document defines several. |
+| `explain` | boolean | `false` | Return `extensions.explain`: the Fluree query or transaction each root field lowered to. |
+
+Identity and policy travel in headers, as they do for SPARQL and Cypher — a
+GraphQL request has no body `opts` block. A class or property the caller's
+policy denies is absent from introspection, not present-but-empty.
+
+**Mutations** are routed to the write path automatically, decided from the
+document (GraphQL sends everything over `POST`, so the method says nothing about
+intent). They require write authority *and* a `graphql:Schema` in the ledger that
+enables them; see [GraphQL](../query/graphql.md#curated-schemas-and-mutations).
+
+**Status codes.** A GraphQL error is part of the response body, not a transport
+failure: the endpoint returns **200** with an `errors` array, because that is
+what every standard client reads. Only a malformed request envelope (no `query`)
+is a `400`.
+
+```bash
+# Query
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons(limit: 10) { id name knows { id } } }"}'
+
+# The raw-document form
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/graphql" \
+  --data '{ persons_count }'
+
+# With the lowered JSON-LD query attached
+curl -X POST 'http://localhost:8090/v1/fluree/graphql/mydb?explain=true' \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons { id } }"}'
+
+# A mutation (needs f:graphqlEnableMutations on the ledger's graphql:Schema)
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { create_Person(input: {name: \"Alice\"}) { id } }"}'
+```
+
+### GET /graphql-schema/{ledger...}
+
+The derived schema as GraphQL SDL, including mutations when the ledger's
+`graphql:Schema` enables them.
+
+A separate path rather than a `/schema` suffix on the route above: the ledger
+segment is a greedy tail and ledger names may contain `/`.
+
+```bash
+curl http://localhost:8090/v1/fluree/graphql-schema/mydb
+```
+
+```graphql
+type Person {
+  id: ID!
+  name: [String!]
+  knows(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonNestedOrder): [Person!]
+}
+
+type Query {
+  person(id: ID!): Person
+  persons(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonOrder): [Person!]
+  persons_count(where: PersonFilter): Int!
+}
+```
+
+### GET/POST /validate/{ledger...}
+
+Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
+
+**URL:**
+```
+GET  /validate/{ledger...}
+POST /validate/{ledger...}
+```
+
+**Request body** (POST; all fields optional — an empty body validates the default graph against the attached shapes):
+
+```json
+{
+  "graph": "http://example.org/graphs/data",
+  "shapes": { "...JSON-LD shapes document..." },
+  "shapesGraph": "http://example.org/graphs/shapes",
+  "includeAttached": false
+}
+```
+
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
+- `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
+- `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
+- `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
+
+**Response** (negotiated via `Accept`):
+
+- Default / `application/json` — summary envelope:
+
+```json
+{
+  "conforms": false,
+  "violations": 1,
+  "warnings": 0,
+  "infos": 0,
+  "shapesChecked": 1,
+  "t": 3,
+  "results": [{
+    "focus_node": "http://example.org/ns/bob",
+    "result_path": "http://schema.org/name",
+    "source_shape": "http://example.org/ns/UserShape",
+    "source_constraint": "http://example.org/ns/name-ps",
+    "constraint_component": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+    "severity": "http://www.w3.org/ns/shacl#Violation",
+    "message": "Expected at least 1 value(s) but found 0"
+  }]
+}
+```
+
+- `application/ld+json` — a W3C `sh:ValidationReport` JSON-LD document.
+- `text/turtle` — the same report as Turtle.
+
+`t` is the ledger commit the report describes: the exact state (index plus unindexed commits) the shapes were evaluated against. A caller that pairs these results with other reads — record counts for a violation rate, say — should query at that `t` (`"from": "mydb:main@t:3"`) rather than at "latest", since a commit can land between the two requests. The W3C renderings carry the same value on the report node as `f:t` (`f` = `https://ns.flur.ee/db#`), because `sh:ValidationReport` has no slot for a ledger time.
+
+`result_path` is present only when the path is a single predicate; complex paths are omitted rather than misrepresented.
+
+**Auth:** same read gate as `/query` (Bearer `can_read` on the ledger). Note that validation reads the full graph — results are **not** policy-filtered, so access to this endpoint implies read access to the data it reports on.
+
+**Status Codes:**
+- `200 OK` — report returned (conforming or not; non-conformance is not an error)
+- `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
+- `401 Unauthorized` — authentication required and missing
+- `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
+
+**Examples:**
+
+```bash
+# Validate against the ledger's attached shapes
+curl http://localhost:8090/v1/fluree/validate/mydb
+
+# Trial ad-hoc Turtle shapes (replaces attached shapes)
+curl -X POST http://localhost:8090/v1/fluree/validate/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> . ..."}'
+
+# W3C report as Turtle
+curl http://localhost:8090/v1/fluree/validate/mydb -H "Accept: text/turtle"
+```
+
+## Nameservice Metadata
+
+The standalone server does not expose a general-purpose `POST /nameservice/query`
+endpoint. Use `GET /ledgers` to list ledgers and graph sources,
+`GET /info/{ledger-id}` for metadata about a single ledger or graph source, and
+`GET /nameservice/snapshot` for authenticated remote-sync snapshots.
+
+## Ledger Management Endpoints
+
+### GET /ledgers
+
+List ledgers and graph sources.
+
+Follows data auth like `/info` and `/exists`: when data auth is required, a Bearer token is
+required, and a request carrying a token lists only the ledgers and graph sources its
+`fluree.ledger.read.*` claims cover.
+
+**URL:**
+```
+GET /ledgers
+```
+
+**Response:**
+
+A flat array of ledgers and graph sources. Retracted entries are omitted.
+
+```json
+[
+  {"name": "mydb", "branch": "main", "type": "Ledger", "t": 5},
+  {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
+  {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
+   "dependencies": ["mydb:main"]},
+  {"name": "orders-db", "branch": "main", "type": "Iceberg", "t": 0,
+   "dependencies": ["mydb:main"]}
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Ledger or graph-source name, without the branch |
+| `branch` | Branch name |
+| `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
+| `t` | Commit `t` for a ledger; the index watermark for a graph source |
+| `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+
+`dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
+
+**Example:**
+
+```bash
+curl http://localhost:8090/v1/fluree/ledgers
+```
+
+For metadata about a specific ledger or graph source, use `GET /info/{ledger-id}`.
+To create a ledger, use `POST /create`.
+
+### POST /create
+
+Create a new ledger.
+
+**URL:**
+```
+POST /create
+```
+
+**Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb:main"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb:main",
+  "t": 0,
+  "commit_id": "bafybeig...commitT0"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Normalized ledger ID |
+| `t` | Transaction time (0 for new ledger) |
+| `commit_id` | ContentId of the initial commit |
+
+**Status Codes:**
+- `201 Created` - Ledger created successfully
+- `400 Bad Request` - Invalid request body
+- `401 Unauthorized` - Bearer token required (when admin auth enabled)
+- `409 Conflict` - Ledger already exists
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Create ledger (no auth required in default mode)
+curl -X POST http://localhost:8090/v1/fluree/create \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:main"}'
+
+# Create ledger with auth token (when admin auth enabled)
+curl -X POST http://localhost:8090/v1/fluree/create \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJ..." \
+  -d '{"ledger": "mydb:main"}'
+
+# Create with short ledger ID (auto-resolves to :main)
+curl -X POST http://localhost:8090/v1/fluree/create \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb"}'
+```
+
+### POST /drop
+
+Drop a whole ledger (every branch under the supplied name) or, as a
+fallback, a graph source with the same name.
+
+**URL:**
+```
+POST /drop
+```
+
+**Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb",
+  "hard": false
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). Any branch-qualified form (including `"mydb:main"`) is **rejected** with a `400` — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
+| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice records. Default: `false` (soft drop). |
+
+**Scope:**
+
+`/drop` operates on the **whole ledger** — every branch under the ledger name, including any retracted-but-not-purged branches. Branches are dropped leaf-first so that if the operation aborts mid-way the surviving state stays consistent (orphan parents, never dangling children). The cross-branch `@shared/dicts/` namespace is cleaned up at the very end.
+
+**Drop Modes:**
+
+- **Soft drop** (`hard: false`, default): Marks every branch as retracted in the nameservice and preserves storage artifacts. Aliases remain reserved; normal create/load paths treat the ledger as unavailable.
+- **Hard drop** (`hard: true`): Deletes managed storage artifacts for every branch and purges the nameservice records so the name can be reused. **This is irreversible for deleted artifacts.**
+
+If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped` and `files_deleted`.
+
+**Response:**
+
+```json
+{
+  "ledger_id": "mydb",
+  "status": "dropped",
+  "files_deleted": 73,
+  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Ledger name (or graph source ID if the graph-source fallback handled the request) |
+| `status` | string | Aggregate status across branches. One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
+| `files_deleted` | integer | Number of managed storage artifacts deleted (sum across branches + `@shared/dicts/` cleanup); omitted when zero |
+| `branches_dropped` | string[] | Per-branch `ledger_id`s that were dropped, in leaf-first order; omitted when empty |
+| `warnings` | string[] | Non-fatal cleanup warnings; omitted when empty |
+
+**Status Codes:**
+- `200 OK` - Drop successful (or already dropped/not found)
+- `400 Bad Request` - Invalid request body, or any branch-qualified ledger id was supplied
+- `401 Unauthorized` - Bearer token required (when admin auth enabled)
+- `500 Internal Server Error` - Branch enumeration failed, or another unrecoverable error
+
+**Drop Sequence:**
+
+1. Parses input. `"mydb"` is the canonical form; any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) returns a `400`.
+2. Enumerates every NsRecord under the ledger name (including retracted ones).
+3. Sorts branches leaf-first via the `source_branch` parent pointers.
+4. Cancels and waits for pending background indexing on each branch.
+5. For each branch (leaf-first): deletes managed storage artifacts (hard mode) and retracts (soft) or removes the NS record (hard). Hard mode uses the parent-aware drop path so child counts on surviving parents stay accurate even under partial failure.
+6. Hard mode only: wipes the cross-branch `{ledger_name}/@shared/dicts/` namespace.
+7. Disconnects every branch from the ledger cache.
+
+**Idempotency:**
+
+Safe to call multiple times:
+- Returns `"already_retracted"` when every branch was already retracted (hard mode still proceeds with cleanup for these).
+- Returns `"not_found"` without touching storage when no nameservice record exists for the ledger name. Truly orphaned artifacts with no nameservice pointer are **not** swept by `/drop`; that's a separate admin concern.
+
+**Examples:**
+
+```bash
+# Soft drop the whole "mydb" ledger
+curl -X POST http://localhost:8090/v1/fluree/drop \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb"}'
+
+# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
+curl -X POST http://localhost:8090/v1/fluree/drop \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "hard": true}'
+
+# Drop with auth token (when admin auth enabled)
+curl -X POST http://localhost:8090/v1/fluree/drop \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJ..." \
+  -d '{"ledger": "mydb", "hard": true}'
+
+# Backwards-compatible form (accepted with a warning; prefer the bare name)
+curl -X POST http://localhost:8090/v1/fluree/drop \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:main"}'
+```
+
+### GET /context/{ledger...}
+
+Get the default JSON-LD context for a ledger.
+
+**URL:**
+```
+GET /context/{ledger-id}
+```
+
+**Path Parameters:**
+- `ledger-id`: Ledger identifier (e.g., `mydb` or `mydb:main`)
+
+**Response:**
+
+```json
+{
+  "@context": {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "ex": "http://example.org/"
+  }
+}
+```
+
+If no default context has been set, `"@context"` is `null`.
+
+**Status Codes:**
+- `200 OK` - Context returned (may be `null`)
+- `404 Not Found` - Ledger does not exist
+
+**Example:**
+
+```bash
+curl http://localhost:8090/v1/fluree/context/mydb:main
+```
+
+### PUT /context/{ledger...}
+
+Replace the default JSON-LD context for a ledger.
+
+**URL:**
+```
+PUT /context/{ledger-id}
+```
+
+**Path Parameters:**
+- `ledger-id`: Ledger identifier (e.g., `mydb` or `mydb:main`)
+
+**Request Body:**
+
+A JSON object mapping prefixes to IRIs. Either a bare object or wrapped in `{"@context": {...}}`:
+
+```json
+{
+  "ex": "http://example.org/",
+  "foaf": "http://xmlns.com/foaf/0.1/",
+  "schema": "http://schema.org/"
+}
+```
+
+**Response (success):**
+
+```json
+{
+  "status": "updated"
+}
+```
+
+**Status Codes:**
+- `200 OK` - Context replaced successfully
+- `400 Bad Request` - Body is not a valid JSON object; or peer mode (writes not available)
+- `404 Not Found` - Ledger does not exist
+- `409 Conflict` - Concurrent update conflict (retry the request)
+
+**Concurrency:** The update uses compare-and-set semantics internally (up to 3 retries). A 409 means all retries were exhausted — this is rare and indicates heavy concurrent updates.
+
+**Cache invalidation:** After a successful update, the server invalidates the cached ledger state. Subsequent queries will use the new context.
+
+**Examples:**
+
+```bash
+# Set context
+curl -X PUT http://localhost:8090/v1/fluree/context/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"ex": "http://example.org/", "foaf": "http://xmlns.com/foaf/0.1/"}'
+
+# Wrapped form also accepted
+curl -X PUT http://localhost:8090/v1/fluree/context/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"@context": {"ex": "http://example.org/"}}'
+```
+
+### POST /branch
+
+Create a new branch for a ledger.
+
+**URL:**
+```
+POST /branch
+```
+
+**Authentication:** When admin auth is enabled (`--admin-auth-mode=required`), requires Bearer token from a trusted issuer. See [Admin Authentication](#admin-authentication).
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb",
+  "branch": "feature-x",
+  "source": "main",
+  "at": "t:5"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
+| `branch` | string | Yes | New branch name to create (e.g., "feature-x") |
+| `source` | string | No | Source branch to create from. Default: `"main"` |
+| `at` | string | No | Point on the source branch to start from, in the same spellings as the `at` of `POST /export/*ledger`: `t:<N>`, `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), `commit:<hex-prefix>`, `latest` / `t:latest`, or a bare transaction number, ISO-8601 timestamp, hex digest prefix or full CID. The branch starts at the commit a query at `@<at>` on the source would read, so `"time:2026-01-01T00:00:00Z"` branches from the data as of that instant. When omitted, the branch starts at the source's current HEAD. |
+
+**Response:**
+
+```json
+{
+  "ledger_id": "mydb:feature-x",
+  "branch": "feature-x",
+  "source": "main",
+  "t": 5
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Full ledger:branch identifier for the new branch |
+| `branch` | Branch name |
+| `source` | Source branch this was created from |
+| `t` | Transaction time of the commit at the branch point |
+
+**Status Codes:**
+- `201 Created` - Branch created successfully
+- `400 Bad Request` - Invalid request body (including malformed `at` value), the source branch has no commits yet, or `at` names no commit on it: a time before its first commit, a malformed timestamp, a transaction number below 1, or `snapshot:<id>` (a graph-source table snapshot)
+- `401 Unauthorized` - Bearer token required (when admin auth enabled)
+- `404 Not Found` - Source branch does not exist, or `at` names no commit, or one not reachable from source HEAD (`@type` `err:db/CommitNotFound`)
+- `409 Conflict` - Branch already exists
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Create branch from main (default source)
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "feature-x"}'
+
+# Create branch from a specific source branch
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "staging", "source": "dev"}'
+
+# Branch at a historical commit on main
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2", "at": "time:2026-07-01T00:00:00Z"}'
+```
+
+### GET /branch/{ledger-name}
+
+List all non-retracted branches for a ledger.
+
+**URL:**
+```
+GET /branch/{ledger-name}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "branch": "main",
+    "ledger_id": "mydb:main",
+    "t": 5
+  },
+  {
+    "branch": "feature-x",
+    "ledger_id": "mydb:feature-x",
+    "t": 5,
+    "source": "main"
+  }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `branch` | Branch name |
+| `ledger_id` | Full ledger:branch identifier |
+| `t` | Current transaction time on this branch |
+| `source` | Source branch (only present for branches created via `/branch`) |
+
+**Examples:**
+
+```bash
+curl http://localhost:8090/v1/fluree/branch/mydb
+```
+
+### POST /drop-branch
+
+Drop a branch from a ledger. Admin-protected.
+
+**URL:**
+```
+POST /drop-branch
+```
+
+**Request body:**
+
+```json
+{
+  "ledger": "mydb",
+  "branch": "feature-x"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
+| `branch` | string | Yes | Branch name to drop (e.g., "feature-x") |
+
+**Response body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:feature-x",
+  "status": "dropped",
+  "deferred": false,
+  "files_deleted": 5,
+  "cascaded": [],
+  "warnings": []
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Full ledger:branch identifier of the dropped branch |
+| `status` | string | Drop status (`"dropped"`, `"already_retracted"`, `"not_found"`) |
+| `deferred` | boolean | `true` if the branch has children — retracted but storage preserved |
+| `files_deleted` | integer | Number of storage artifacts removed; omitted when zero |
+| `cascaded` | string[] | List of ancestor branch ledger_ids that were cascade-dropped; omitted when empty |
+| `warnings` | string[] | Any non-fatal warnings during the drop; omitted when empty |
+
+**Behavior:**
+
+- **Cannot drop `main`**: Returns 400 Bad Request.
+- **Leaf branch** (no children): Fully drops — deletes storage artifacts, purges NsRecord, decrements parent's child count. If the parent was previously retracted and its child count reaches 0, the parent is cascade-dropped too.
+- **Branch with children** (`branches > 0`): Retracted (hidden from listings, rejects new transactions) but storage is preserved for children. When the last child is eventually dropped, the retracted parent is cascade-purged automatically.
+
+**Status codes:**
+
+- `200 OK` - Branch dropped (or deferred) successfully
+- `400 Bad Request` - Cannot drop the main branch
+- `404 Not Found` - Ledger or branch does not exist
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Drop a leaf branch
+curl -X POST http://localhost:8090/v1/fluree/drop-branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "feature-x"}'
+
+# Drop a branch with children (will be deferred)
+curl -X POST http://localhost:8090/v1/fluree/drop-branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "dev"}'
+```
+
+### POST /drop-graph
+
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
+
+**URL:**
+```
+POST /drop-graph
+```
+
+**Request body:**
+
+```json
+{
+  "ledger": "mydb:main",
+  "graph": "urn:example:org/payroll"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Full ledger identifier. A bare ledger name (`"mydb"`) is normalized to `"mydb:main"`. |
+| `graph` | string | Yes | Full **absolute** IRI of the named graph to drop. Must have a `<scheme>:<rest>` head (relative references like `payroll` are rejected) and contain no whitespace or RFC 3987-excluded characters. Leading/trailing whitespace is rejected, not trimmed. |
+
+**Response body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "graph_iri": "urn:example:org/payroll",
+  "retracted": 0,
+  "committed": true,
+  "t": 18
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
+| `graph_iri` | string | Graph IRI that was dropped (echoed) |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
+
+**Behavior:**
+
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
+- **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
+- **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
+
+**Status codes:**
+
+- `200 OK` - Drop succeeded
+- `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
+- `401`/`403` - Admin token required and absent/invalid
+- `404 Not Found` - Ledger or graph not found
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Drop a named graph on the default branch
+curl -X POST http://localhost:8090/v1/fluree/drop-graph \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "graph": "urn:example:org/payroll"}'
+
+# Drop on a non-default branch
+curl -X POST http://localhost:8090/v1/fluree/drop-graph \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:feature-x", "graph": "http://example.org/graphs/scratch"}'
+```
+
+### POST /rebase
+
+Rebase a branch onto its source branch's current HEAD. Admin-protected.
+
+**URL:**
+```
+POST /rebase
+```
+
+**Request body:**
+
+```json
+{
+  "ledger": "mydb",
+  "branch": "feature-x",
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
+| `branch` | string | Yes | Branch name to rebase (e.g., "feature-x") |
+| `strategy` | string | No | Conflict resolution strategy (default: "take-both"). Options: `take-both`, `abort`, `take-source`, `take-branch`, `skip` |
+
+**Response body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:feature-x",
+  "branch": "feature-x",
+  "fast_forward": false,
+  "replayed": 3,
+  "skipped": 0,
+  "conflicts": 1,
+  "failures": 0,
+  "total_commits": 3,
+  "source_head_t": 8
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Full ledger:branch identifier |
+| `branch` | string | Branch name |
+| `fast_forward` | bool | `true` if the branch had no unique commits |
+| `replayed` | number | Number of commits successfully replayed |
+| `skipped` | number | Number of commits skipped (Skip strategy) |
+| `conflicts` | number | Number of conflicts detected |
+| `failures` | number | Number of commits that failed validation |
+| `total_commits` | number | Total branch commits considered |
+| `source_head_t` | number | Transaction time of the source branch HEAD |
+
+**Conflict strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `take-both` | Replay as-is, both values coexist (multi-cardinality) |
+| `abort` | Fail on first conflict, no changes applied |
+| `take-source` | Drop branch's conflicting flakes (source wins) |
+| `take-branch` | Keep branch's flakes, retract source's conflicting values |
+| `skip` | Skip entire commit if any flakes conflict |
+
+**Status codes:**
+
+- `200 OK` - Rebase completed successfully
+- `400 Bad Request` - Cannot rebase main, invalid strategy, or missing branch point
+- `404 Not Found` - Ledger or branch does not exist
+- `409 Conflict` - Rebase aborted due to conflict (abort strategy), or refused by the target's config checks (a config group the rebase would split, a second value for a single-valued setting, or a write to another branch's config or txn-meta graph)
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Rebase with default strategy (take-both)
+curl -X POST http://localhost:8090/v1/fluree/rebase \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "feature-x"}'
+
+# Rebase with abort strategy (fail on conflicts)
+curl -X POST http://localhost:8090/v1/fluree/rebase \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "feature-x", "strategy": "abort"}'
+```
+
+### POST /merge
+
+Merge a source branch into a target branch. Admin-protected.
+
+A merge fast-forwards when the target's HEAD is on the source's line of first parents: Fluree copies the source's commits the target lacks into the target namespace and advances the target HEAD. Otherwise it performs a general merge: it folds each side's commits since the two branches diverged, resolves keys both sides changed according to the requested strategy, and creates a merge commit on the target branch.
+
+Each branch numbers its commits from its own fork point, so the two sides are compared by commit identity rather than by `t`. Any branch can be the source, `main` included, as long as `target` names where the changes go.
+
+**URL:**
+```
+POST /merge
+```
+
+**Request body:**
+
+```json
+{
+  "ledger": "mydb",
+  "source": "feature-x",
+  "target": "dev",
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Ledger name without branch suffix (e.g., "mydb") |
+| `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
+| `target` | string | No | Target branch to merge into (defaults to source's parent branch) |
+| `strategy` | string | No | Conflict resolution strategy for non-fast-forward merges. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch` |
+
+**Conflict strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `take-both` | Keep source flakes as-is, so both source and target values can coexist |
+| `abort` | Fail if conflicts are detected; no merge commit is created |
+| `take-source` | Source wins: keep source flakes and retract target's conflicting values |
+| `take-branch` | Target wins: drop source flakes for conflicting keys |
+
+`skip` is a rebase-only strategy and is not supported for non-fast-forward merges.
+
+**Response body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:dev",
+  "target": "dev",
+  "source": "feature-x",
+  "fast_forward": false,
+  "new_head_t": 8,
+  "commits_copied": 3,
+  "conflict_count": 1,
+  "strategy": "take-both"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Full ledger:branch identifier of the target |
+| `target` | string | Target branch name |
+| `source` | string | Source branch name |
+| `fast_forward` | bool | Whether this merge advanced the target directly to the source HEAD |
+| `new_head_t` | number | New commit HEAD transaction time of the target |
+| `commits_copied` | number | Number of commit blobs copied to the target namespace |
+| `conflict_count` | number | Number of overlapping `(s, p, g)` keys detected during a non-fast-forward merge |
+| `strategy` | string | Conflict strategy used for a non-fast-forward merge. Omitted for fast-forward merges |
+
+**Status codes:**
+
+- `200 OK` - Merge completed successfully
+- `400 Bad Request` - Source has no branch point (e.g., main), self-merge, unknown strategy, or unsupported merge strategy
+- `404 Not Found` - Ledger or branch does not exist
+- `409 Conflict` - Merge aborted due to conflicts when using the `abort` strategy, the target HEAD changed during commit publishing, or the merge is refused by the target's config checks (a config group the merge would split, a second value for a single-valued setting, a write to the source branch's own config or txn-meta graph, or a change to the target's own config or txn-meta graph from the source branch)
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Merge feature-x into its parent (inferred from branch point)
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "feature-x"}'
+
+# Merge dev into main (explicit target)
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "dev", "target": "main"}'
+
+# Non-fast-forward merge with source-winning conflict resolution
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "dev", "target": "main", "strategy": "take-source"}'
+```
+
+### GET /merge-preview/{ledger-name}
+
+Read-only preview of merging a source branch into a target branch. Returns the rich diff — ahead/behind commit summaries, conflict keys, and fast-forward eligibility — without mutating any nameservice or content store state.
+
+Bearer token required when `data_auth.mode = required`; reads are gated on `bearer.can_read(ledger)`.
+
+**URL:**
+```
+GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}&include_validation={bool}
+```
+
+**Path / Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `ledger` (path) | string | Yes | Ledger name (e.g., "mydb") |
+| `source` | string | Yes | Source branch to merge from (e.g., "feature-x") |
+| `target` | string | No | Target branch (defaults to the source's parent branch) |
+| `max_commits` | number | No | Cap on per-side commit summaries returned (default 500). Server clamps to a hard maximum of 5,000 — values above are silently lowered. Bounds response size, **not** divergence-walk cost (the unbounded `count` is still computed). |
+| `max_conflict_keys` | number | No | Cap on conflict keys returned (default 200). Server clamps to a hard maximum of 5,000. Bounds response size, **not** the conflict-delta walks. |
+| `include_conflicts` | bool | No | When false, skips the conflict computation (default true). Use this to make the preview cheap on diverged branches. |
+| `include_conflict_details` | bool | No | When true, includes source/target flake values for the returned conflict keys. Defaults to false. Details are computed after `max_conflict_keys` is applied. |
+| `strategy` | string | No | Strategy used to annotate conflict details. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch`. |
+| `include_changes` | bool | No | When true, includes the aggregate **netted** change set the merge would apply (source side, ancestor..source-head) as `changes`. Defaults to false. Costs one full commit load per commit in the source divergence; the walk is shared with the conflict computation when both are requested. |
+| `max_changes` | number | No | Cap on change entries returned, counted in **flakes** and cut at subject boundaries (default 500; server clamps to a hard maximum of 5,000). A single subject larger than the cap is returned whole. `0` is a valid "diff stats" mode: exact counts, no payload. Bounds response size, **not** the replay walk. |
+| `changes_after_subject` | string | No | Pagination cursor: return only subjects whose full IRI sorts strictly after this value. Pass the previous response's `changes.next_cursor`. Each page re-pays the full replay + netting cost. Requires `include_changes=true`. |
+| `include_validation` | bool | No | When true (the default), stages the strategy-resolved change set on the target and validates it against the target's configuration (SHACL shapes and uniqueness constraints) exactly as `POST /merge` would, reporting the outcome as `validation` and folding it into `mergeable`. Costs a target-state load plus the validation pass, plus the source replay when `include_changes` is false. Set false for count-only previews. |
+
+**Response body (200 OK):**
+
+```json
+{
+  "source": "feature-x",
+  "target": "main",
+  "ancestor": { "commit_id": "bafy...", "t": 5 },
+  "ahead": {
+    "count": 3,
+    "commits": [
+      { "t": 8, "commit_id": "bafy...", "time": "2026-04-25T12:00:00Z",
+        "asserts": 2, "retracts": 0, "flake_count": 2, "message": null }
+    ],
+    "truncated": false
+  },
+  "behind": { "count": 1, "commits": [...], "truncated": false },
+  "fast_forward": false,
+  "mergeable": true,
+  "validation": { "conforms": true },
+  "conflicts": {
+    "count": 1,
+    "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
+    "truncated": false,
+    "strategy": "take-source",
+    "details": [
+      {
+        "key": { "s": [100, "alice"], "p": [100, "status"], "g": null },
+        "source_values": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "target_values": [["ex:alice", "ex:status", "archived", "xsd:string", true]],
+        "resolution": {
+          "source_action": "kept",
+          "target_action": "retracted",
+          "outcome": "source-wins"
+        }
+      }
+    ]
+  },
+  "changes": {
+    "assert_count": 2,
+    "retract_count": 1,
+    "subject_count": 1,
+    "entries": [
+      {
+        "subject": "http://example.org/ns/alice",
+        "asserts": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "retracts": [["ex:alice", "ex:status", "archived", "xsd:string", false]]
+      }
+    ],
+    "truncated": false
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Source branch name |
+| `target` | string | Target branch name (resolved from default when not supplied) |
+| `ancestor` | object \| null | Common ancestor `{commit_id, t}`. `null` when both heads are absent |
+| `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
+| `behind` | object | Commits on target not on source |
+| `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
+| `mergeable` | bool | Whether the strategy and the shapes both accept the merge: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. Commit-time conditions such as novelty backpressure are outside it. With `include_validation=false` it is the strategy/conflict signal alone. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge validates: always for a merge that is not a fast-forward, and for a fast-forward when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings (config fields, or writes to a config or txn-meta graph of this ledger; an edge annotation's `f:reifies*` is not one). `{ "conforms": bool, "report"?: string }`, the same outcome `POST /merge` would produce for this strategy (a SHACL report, a uniqueness violation, or a refusal naming a config group the merge would split or give a second value); `report` is present only when `conforms` is false and is the message the merge would fail with. Any other fast-forward adopts its commits unvalidated and carries no `validation`. |
+| `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
+| `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
+
+Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first and include assert/retract counts plus an optional `message` extracted from `txn_meta` when an `f:message` string entry is present.
+
+When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
+
+**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. A merge on the source's line that brought the target in contributes only its resolution, so a branch that synced the target in does not report the target's own changes as its own. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
+
+- `assert_count` / `retract_count` / `subject_count` are exact across the full divergence, never truncated — a UI can render "showing X of Y".
+- `entries[]` groups net changes by subject, subjects ordered by full IRI. Each flake uses the same resolved tuple format as conflict details.
+- `truncated` is true when subjects were withheld by `max_changes` (or when `max_changes=0` suppressed the payload).
+- `next_cursor` (present only when truncated by the cap) is the last returned subject IRI; pass it as `changes_after_subject` to fetch the next page.
+
+**Status codes:**
+
+- `200 OK` — Preview computed successfully
+- `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
+- `401 Unauthorized` — Bearer token required
+- `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
+- `409 Conflict` — The source's namespace allocations conflict with the target's (`@type` `err:db/CommitConflict`)
+
+**Examples:**
+
+```bash
+# Default target (source's parent), defaults for caps and conflict computation
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=feature-x"
+
+# Counts only — skip the conflict walks for a faster response
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflicts=false"
+
+# Cap commit lists at 50 per side
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&max_commits=50"
+
+# Include value details and labels for a source-winning merge
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflict_details=true&strategy=take-source"
+
+# Aggregate net change set for a merge-request "Changes" panel
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true"
+
+# Cheap diff stats: exact net counts, no payload
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true&max_changes=0"
+
+# Next page of a large diff
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true&changes_after_subject=http%3A%2F%2Fexample.org%2Fns%2Falice"
+```
+
+### GET /info/{ledger-id}
+
+Get ledger metadata. Used by the CLI for `info`, `push`, `pull`, and `clone`.
+
+**URL:**
+```
+GET /info/{ledger-id}
+```
+
+**Path Parameters:**
+- `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
+
+**Response:**
+
+Returns comprehensive ledger metadata including namespace codes, property stats, and class counts. Always includes:
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "t": 42,
+  "commitId": "bafybeig...headCommitCid",
+  "indexId": "bafybeig...indexRootCid",
+  "namespaces": { ... },
+  "properties": { ... },
+  "classes": [ ... ]
+}
+```
+
+For a graph source (Iceberg, Delta, SQL), a class or property `count` is the exact number a native ledger loaded with the mapping's triples would report, or `null` where table metadata cannot prove it. A `null` count carries `count-upper-bound` when a bound is provable, and a `null` entry of `ref-classes` carries its bound under `ref-classes-upper-bound`:
+
+```json
+"classes": {
+  "ex:Customer": {
+    "count": null,
+    "count-upper-bound": 9000000,
+    "properties": {
+      "ex:placedBy": {
+        "count": null,
+        "count-upper-bound": 6000000,
+        "ref-classes": { "ex:Customer": null },
+        "ref-classes-upper-bound": { "ex:Customer": 6000000 }
+      }
+    }
+  }
+}
+```
+
+Earlier releases put the tables' row counts in `count`. A client that displays a count reads `count`, falls back to `count-upper-bound` ("at most N"), and shows a count with neither as unknown, never as 0. Most counts of a map with no declared key are `null`; see [Iceberg → `info`](../graph-sources/iceberg.md) for when a count is exact.
+
+When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger_id` | string | Yes | Canonical ledger ID |
+| `t` | integer | **Yes** | Current transaction time. Used by push/pull for head comparison. |
+| `commitId` | string | No | Head commit CID |
+| `indexId` | string | No | Head index root CID |
+
+> **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
+
+**Optional query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `realtime_property_details` | boolean | true | When `false`, use the lighter fast novelty-aware stats path instead of the default full lookup-backed path |
+| `include_property_datatypes` | boolean | true | Include datatype info for properties |
+| `include_property_estimates` | boolean | false | Include index-derived NDV/selectivity estimates for properties |
+
+**Status Codes:**
+- `200 OK` - Ledger found
+- `401 Unauthorized` - Authentication required
+- `404 Not Found` - Ledger not found
+
+**Examples:**
+
+```bash
+# Get ledger info
+curl "http://localhost:8090/v1/fluree/info/mydb:main"
+
+# With auth token
+curl "http://localhost:8090/v1/fluree/info/mydb:main" \
+  -H "Authorization: Bearer eyJ..."
+```
+
+### GET /exists/{ledger-id}
+
+Check if a ledger exists in the nameservice.
+
+**URL:**
+```
+GET /exists/{ledger-id}
+```
+
+**Path Parameters:**
+- `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb:main",
+  "exists": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger ID (echoed back) |
+| `exists` | boolean | Whether the ledger is registered in the nameservice |
+
+**Status Codes:**
+- `200 OK` - Check completed successfully (regardless of whether ledger exists)
+- `500 Internal Server Error` - Server error
+
+**Usage Notes:**
+
+This is a lightweight check that only queries the nameservice without loading the ledger data. Use this to:
+
+- Check if a ledger exists before attempting to load it
+- Implement conditional create-or-load logic
+- Validate ledger IDs in application code
+
+**Examples:**
+
+```bash
+# Check a ledger ID
+curl "http://localhost:8090/v1/fluree/exists/mydb:main"
+
+# Conditional create-or-load in shell
+if curl -s "http://localhost:8090/v1/fluree/exists/mydb" | jq -e '.exists == false' > /dev/null; then
+  curl -X POST http://localhost:8090/v1/fluree/create \
+    -H "Content-Type: application/json" \
+    -d '{"ledger": "mydb"}'
+fi
+```
+
+## System Endpoints
+
+### GET /health
+
+Health check endpoint for monitoring.
+
+**URL:**
+```
+GET /health
+```
+
+**Response:**
+
+```json
+{
+  "status": "healthy",
+  "version": "0.1.0",
+  "storage": "memory",
+  "uptime_ms": 123456
+}
+```
+
+**Status Codes:**
+- `200 OK` - System healthy
+- `503 Service Unavailable` - System unhealthy
+
+**Example:**
+
+```bash
+curl http://localhost:8090/health
+```
+
+### GET /stats
+
+Detailed server statistics.
+
+**URL:**
+```
+GET /stats
+```
+
+**Response:**
+
+```json
+{
+  "version": "0.1.0",
+  "uptime_ms": 123456789,
+  "storage": {
+    "mode": "memory",
+    "total_bytes": 12345678,
+    "ledgers": 5
+  },
+  "queries": {
+    "total": 1234,
+    "active": 3,
+    "average_duration_ms": 45
+  },
+  "transactions": {
+    "total": 567,
+    "average_duration_ms": 89
+  },
+  "indexing": {
+    "active": true,
+    "pending_ledgers": 2
+  }
+}
+```
+
+**Example:**
+
+```bash
+curl http://localhost:8090/v1/fluree/stats
+```
+
+## Events Endpoint
+
+### GET /events
+
+Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sources. Available on transaction servers only (not peers).
+
+**Query parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `all=true` | Subscribe to all ledgers and graph sources |
+| `ledger=<id>` | Subscribe to a specific ledger (repeatable) |
+| `graph-source=<id>` | Subscribe to a specific graph source (repeatable) |
+
+**Event types:**
+
+| Event | Description |
+|-------|-------------|
+| `ns-record` | A ledger or graph source was published/updated |
+| `ns-retracted` | A ledger or graph source was deleted |
+
+**Authentication:** Configurable via `--events-auth-mode none|optional|required`. See [Query peers and replication](../operations/query-peers.md) for full details including auth configuration, event payloads, and peer subscription setup.
+
+## Graph Source Endpoints
+
+> **Note:** BM25 indexes are created and synced over HTTP via the endpoints below. Vector index lifecycle management has no HTTP endpoint yet and is still managed via the Rust API (`VectorCreateConfig`, `create_vector_index`) — see [Vector Search](../indexing-and-search/vector-search.md).
+>
+> BM25 search **is** available in queries via the `f:graphSource` / `f:searchText` pattern in where clauses — see the query documentation for details.
+
+Graph source metadata can be discovered via `GET /ledgers` or `GET /info/{graph-source-id}`. Dropping a graph source of any type — BM25, vector, or Iceberg — goes through the shared `POST /drop`, so only creation and sync need family-specific endpoints.
+
+### POST {api_base_url}/iceberg/map
+
+Map an Iceberg table (or R2RML-mapped relational source backed by Iceberg) as a graph source. Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `iceberg` feature.
+
+**URL:**
+```
+POST {api_base_url}/iceberg/map
+```
+
+For the standalone server and Docker image defaults, this is:
+
+```bash
+POST http://localhost:8090/v1/fluree/iceberg/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "warehouse-orders",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "warehouse": "prod",
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://idp.example.com/token",
+      "client_id": "fluree",
+      "client_secret": { "env_var": "POLARIS_SECRET" }
+    }
+  },
+  "io": { "s3_region": "us-east-1" }
+}
+```
+
+The source's own fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `table` | string | Table identifier `namespace.table` (for `glue`, `<database>.<table>`). Optional: the `r2rml` mapping's `rr:tableName` entries name the tables |
+| `r2rml` | string | Inline R2RML mapping content, in Turtle (required). A request without it is a 400 and registers nothing. |
+| `r2rml_type` | string | Media type of `r2rml`; default `text/turtle`. JSON-LD mappings are refused (`R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`) |
+| `branch` | string | Branch name (default: `main`) |
+| `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
+| `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
+| `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+Every other field is the source's [connection](#iceberg-connection), which every Iceberg route (`map`, `catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) takes the same way.
+
+#### Iceberg connection
+
+A request gives its connection in one of two forms, never both:
+
+- **Structured** (recommended): `catalog` and `io` objects, exactly as the stored config spells them, so a config read back from a source can be sent again. The catalog's auth is `catalog.auth`, the storage identity is `io.storage_auth`. Every Google identity and storage identity is given this way.
+- **Flat** (legacy): the fields below, kept for existing callers.
+
+The structured `catalog` is one of:
+
+```json
+{ "type": "rest", "uri": "https://…", "warehouse": "prod", "auth": { … } }
+{ "type": "direct", "table_location": "s3://bucket/warehouse/ns/table" }
+{ "type": "glue", "region": "us-east-1", "catalog_id": "123456789012" }
+{ "type": "s3tables", "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics" }
+```
+
+A REST catalog's `auth` is one of:
+
+```json
+{ "type": "none" }
+{ "type": "bearer", "token": <secret> }
+{ "type": "oauth2_client_credentials", "token_url": "https://…", "client_id": "…", "client_secret": <secret>, "scope": "…", "audience": "…" }
+{ "type": "google_metadata", "scopes": "…" }
+{ "type": "google", "credentials": <google>, "scopes": "…", "quota_project": "…" }
+```
+
+where `<google>` is where the Google identity comes from:
+
+```json
+{ "source": "metadata" }
+{ "source": "application_default" }
+{ "source": "service_account", "key": { "env_var": "SA_KEY" } }
+{ "source": "external_account", "config": { …the configuration `gcloud iam workload-identity-pools create-cred-config … --aws` prints… } }
+```
+
+`metadata` is the GCE/GKE metadata server's service account and `application_default` the server's own application-default credentials; both are host identities, which the operator can refuse (see [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)). `quota_project` is the project requests bill to (`x-goog-user-project`). BigLake requires one for every identity (a missing one is `403` `err:catalog/QuotaProjectRequired`); the server infers none, so a request to a BigLake catalog names it (the CLI and the Python package default it to the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names). A catalog auth's quota project bills the catalog only: storage reads never send it. The `external_account` configuration (Workload Identity Federation from AWS) is not a secret.
+
+The structured `io`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `storage_auth` | object | Which identity reads the table's files: `{"type": "vended"}` (the REST catalog's per-table credentials, required), `{"type": "ambient"}` (the server's AWS credential chain), `{"type": "catalog"}` (the REST catalog's own Google identity reads `gs://`; what BigLake federation, `bq://`, needs, since it never vends), or `{"type": "google", "credentials": <google>, "quota_project": "…"}` (a Google identity of the source's own). Absent: what `vended_credentials` says. The server stores exactly what it is sent and never picks one for a warehouse; the CLI and the Python package do (`catalog` for `bq://`, `vended` for `bl://`), so an HTTP client wanting that names it |
+| `vended_credentials` | bool | The older form of `storage_auth` (`true`: `vended`, `false`: `ambient`); default `true` for a REST catalog. Set to agree with `storage_auth` when that is given; a contradicting value is refused |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 overrides for the table's file reads, in every mode. In `glue` / `s3tables`, `s3_region` defaults to the catalog's region |
+
+An explicit `null` is an absent field, in either form. The legacy untagged catalog a stored record may hold (`{"uri": …, "auth": …}` with no `type`, read as REST) is accepted, so a read-out of an old record can be sent back. A catalog that states its `type` is read as that type only: `{"type": "direct", "uri": …}` is refused for its missing `table_location`, never read as REST.
+
+A `<secret>` is a literal (stored with the source) or `{"env_var": "NAME"}`, an environment variable of the server that the operator lists in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) (the value is not stored). A service-account key is never a literal: it would be stored with the source. `{"secret_ref": …}` is accepted only by an embedded `Fluree` with a secret resolver, and `default_val`, `java_property` and a `google_metadata` `metadata_url` never.
+
+The flat fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables); case-insensitive |
+| `catalog_uri` | string | REST catalog URI (required in `rest` mode) |
+| `table_location` | string | Table location (required in `direct` mode): an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables)) |
+| `region` | string | AWS region of the Glue / S3 Tables API (`glue`, `s3tables`). Glue falls back to `s3_region`, then the server's AWS region chain; S3 Tables defaults to the ARN's region and refuses a contradicting `region`. Must be an AWS region code |
+| `catalog_id` | string | Glue catalog id for cross-account access (`glue`; default: the server identity's own account) |
+| `table_bucket_arn` | string | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required in `s3tables` mode) |
+| `auth_bearer` / `auth_bearer_env` | string | A static bearer token (does not refresh; a Google OAuth token expires after ~1h), or the name of a listed server environment variable holding it |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client credentials (refreshes). Needs the token URL and the secret; the client id defaults to empty (Snowflake Horizon) |
+| `auth_google_metadata`, `auth_google_scopes` | bool, string | The GCE/GKE metadata server's identity (stored as `google_metadata`) and its scopes (default `cloud-platform`) |
+| `warehouse` | string | Warehouse identifier |
+| `no_vended_credentials` | bool | Disable vended credentials (`rest` mode; `direct`, `glue` and `s3tables` never use them) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | | As in the structured `io` |
+
+Refused with `400` and `err:api/InvalidGraphSourceConfig`, the message naming the field: an unknown field (also inside `catalog` and `io`); flat and structured fields together; two ways to authenticate at once (a bearer beside OAuth2 or a Google identity, two Google sources); auth given only partly (an OAuth2 token URL without its secret, `auth_google_scopes` without `auth_google_metadata`); a literal and its `_env` together; an environment variable the operator does not list; a REST-only setting (auth, warehouse, vended credentials) in another mode. A storage identity the catalog cannot serve (`catalog` without a Google catalog identity, `vended` outside a REST catalog) and a malformed Google configuration are refused at registration with `400` (`err:system/ConfigError`, `err:auth/GoogleCredentialsInvalid`).
+
+Each Iceberg route ignores the fields that only another Iceberg route takes, so one body can be sent to browse, preview, verify, generate, validate and map in turn: `map`'s `name`, `table`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values` and `order_by`; browse's `depth`; preview's `namespace` and `tier`; generate's `tables`, `base_namespace`, `per_table_overrides`, `options` and `target_model_ledger_id`; validate's `snapshot`. A route reads the fields it takes itself (preview's `name` is the table's). A field no Iceberg route knows is refused on every route.
+
+BigLake federation with a Workload Identity Federation identity, which needs no stored secret:
+
+```json
+{
+  "name": "orders",
+  "table": "sales.orders",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+    "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
+    "auth": { "type": "google", "credentials": { "source": "external_account", "config": { "type": "external_account", "audience": "//iam.googleapis.com/projects/…", "…": "…" } } }
+  },
+  "io": { "storage_auth": { "type": "catalog" } }
+}
+```
+
+In `glue` and `s3tables` modes the catalog is called through the native AWS SDK, and both the catalog call and the S3 reads use the server's ambient AWS credential chain:
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "catalog_id": "123456789012",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle"
+}
+```
+
+For S3 Tables, send `"mode": "s3tables"` with `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `catalog_id` (and usually no `region`). See [Iceberg → Catalog Modes](../graph-sources/iceberg.md#catalog-modes).
+
+In `direct`, `glue` and `s3tables` modes the server reads with its own AWS identity, not the caller's, so anyone allowed to call this endpoint can map any table that identity can reach. Scope the server's IAM role (and its Lake Formation grants and bucket policies) to the tables it should serve; see [Iceberg → AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "warehouse-orders:main",
+  "table_identifier": "sales.orders",
+  "catalog_uri": "https://polaris.example.com/api/catalog",
+  "connection_tested": true,
+  "connection_check": {"outcome": "verified"},
+  "mapping_source": "r2rml-inline",
+  "triples_map_count": 3,
+  "table_count": 1,
+  "table_names": ["sales.orders"],
+  "mapping_validated": true
+}
+```
+
+**Status Codes:**
+- `201 Created` — graph source created
+- `400 Bad Request` — a [connection](#iceberg-connection) the server refuses, missing required fields (`r2rml` among them), or an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`)
+- `401/403` — admin auth required
+- `403 Forbidden` (`err:auth/HostIdentityRefused`) — a host identity the operator's policy refuses
+- `500 Internal Server Error` — the graph source could not be published
+
+`connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
+
+`diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map whose subjects neither an `f:key` nor the table's identifier fields prove unique, so its queries remove repeated solutions as they read: `{"severity": "advisory", "code": "keylessMap", "table": "sales.orders", "message": "TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, … If order_id identifies a row, declare `f:key ( \"order_id\" )` on its logical table, or make it the table's identifier field."}`. It is informational: the source is registered and answers correctly, but more slowly than a keyed map (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). It is reported only when every table loaded (`connection_check` `verified`).
+
+`connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
+
+| `outcome` | Meaning | Other fields |
+|---|---|---|
+| `verified` | Every mapped table loaded | |
+| `table_failed` | `table` did not load: the catalog answered that it has no such table, refused it, or answered with another error status; in `direct` mode, its metadata could not be read. `error` is the reason | `table`, `error` |
+| `catalog_unreachable` | The catalog did not answer for `table`: a refused connection, a timeout, a DNS or TLS failure, or a failure that carries no answer from the catalog. Catalog modes only | `table`, `error` |
+| `client_failed` | The client every load goes through could not be built (for example, a catalog credential that does not resolve), so no table was loaded | `error` |
+| `timed_out` | The check ran past `budget_secs` with `loaded` of `total` tables loaded. The tables may only be slow | `loaded`, `total`, `budget_secs` |
+| `no_tables` | The mapping could not be read, so it named no table to load | |
+
+See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
+
+### POST {api_base_url}/iceberg/catalog/verify
+
+Checks that a catalog connection's credentials (`rest`, `glue` or `s3tables` mode) can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. When the catalog returns no inline table metadata (AWS Glue and S3 Tables never do), the metadata file at `metadata_location` is read from storage first, with the same credentials. It is read-only and admin-protected.
+
+The body takes the [connection](#iceberg-connection), structured or flat, and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
+
+### Verify response
+
+`POST /iceberg/catalog/verify` and [`POST /delta/catalog/verify`](#post-api_base_urldeltacatalog-and-deltar2rml) answer with the same contract, and with the same field names wherever a field means the same thing. A client can decide pass or fail, and show the data-file check, the same way for either source.
+
+#### Status
+
+| Outcome | Status | Body |
+|---|---|---|
+| The table can be read | `200` | `"readable": true` |
+| The table cannot be read | `200` | `"readable": false`, the reason in `error` |
+| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode) |
+| The admin token is missing or invalid | `401` | An error |
+
+"Cannot be read" covers every reason that belongs to the table rather than to the request:
+- the catalog would not load or place it, or refused this principal;
+- it vended no credentials while the source requires them;
+- storage refused, or no longer holds, a metadata or data file;
+- (Delta only) the catalog placed it where the reader does not read, such as Google Cloud Storage.
+
+None of these is an HTTP error status; in particular a table-level refusal is never a `403`. The `error` text is the catalog's or the store's own wording, meant to be shown to a person, not parsed.
+
+#### Fields
+
+| Field | Type | Null when | Sources | Meaning |
+|---|---|---|---|---|
+| `readable` | boolean | never | both | Whether a query could read the table |
+| `error` | string | `readable` is `true` | both | Why the table cannot be read |
+| `data_file_count` | integer | the table could not be read | both | Data files in the table's current version (Iceberg: its current snapshot) |
+| `probed_data_file` | string | no file was probed | both | The data file whose read storage let through |
+| `probed_data_file_bytes` | integer | no file was probed | both | That file's size in bytes |
+| `data_probe_skipped` | boolean | never | both | `true` when the table has no data file to probe; `false` when one was probed, or the table could not be read |
+| `skip_reason` | string | `data_probe_skipped` is `false` | both | Why no data file was probed |
+| `full_name` | string | never | Delta | The table's Unity Catalog name (`catalog.schema.table`) |
+| `location` | string | the table could not be read | Delta | Where Unity Catalog places the table |
+| `version` | integer | the table could not be read | Delta | The table's current Delta version |
+| `credential_source` | string | the probe failed before deciding | Iceberg | `"vended"` (issued by the catalog) or `"ambient"` (the server's own credentials) |
+| `metadata_location` | string | the catalog would not load the table | Iceberg | The table's current metadata file |
+
+A field of the other source type is absent, not `null`.
+
+#### Examples
+
+A readable Iceberg table:
+
+```json
+{
+  "readable": true,
+  "error": null,
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_file_count": 4,
+  "probed_data_file": "s3://bucket/warehouse/orders/data/part-0.parquet",
+  "probed_data_file_bytes": 2048,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+An Iceberg table whose storage refused the probe:
+
+```json
+{
+  "readable": false,
+  "error": "Storage access denied for s3://bucket/warehouse/orders/data/part-0.parquet (region us-east-1): AccessDenied",
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+A readable Delta table:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": true,
+  "location": "s3://bucket/unity/tables/7f3c…",
+  "version": 42,
+  "data_file_count": 12,
+  "probed_data_file": "s3://bucket/unity/tables/7f3c…/part-00000-….snappy.parquet",
+  "probed_data_file_bytes": 1048576,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": null
+}
+```
+
+A Delta table Unity Catalog will not let this principal read:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": false,
+  "location": null,
+  "version": null,
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": "Unity Catalog, table 'main.sales.orders': User does not have SELECT on Table 'main.sales.orders'. (403 Forbidden)"
+}
+```
+
+### POST {api_base_url}/bm25/create
+
+Create a BM25 full-text search index over a ledger. Admin-protected — requires the admin Bearer token when an admin token is configured. Runs the index build synchronously and returns when the snapshot is committed; for a large corpus it may run for some time, so configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
+
+**URL:**
+```
+POST {api_base_url}/bm25/create
+```
+
+For the standalone server and Docker image defaults, this is:
+
+```bash
+POST http://localhost:8090/v1/fluree/bm25/create
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "docsearch",
+  "ledger": "docs:main",
+  "branch": "main",
+  "query": {
+    "@context": { "ex": "http://example.org/" },
+    "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?t" }],
+    "select": { "?x": ["@id", "ex:title"] }
+  },
+  "k1": 1.2,
+  "b": 0.75
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph-source name for the index, no `:` (required). The alias is `<name>:<branch>`. |
+| `ledger` | string | Source ledger alias to index (required) |
+| `query` | object | Indexing query (FQL / JSON-LD) selecting the documents and text properties to index (required). Must select `@id`. |
+| `branch` | string | Branch for the index graph source (default: `main`) |
+| `k1` | number | Term-frequency saturation (default: `1.2`) |
+| `b` | number | Document-length normalization, `0..=1` (default: `0.75`) |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "docsearch:main",
+  "doc_count": 2,
+  "term_count": 37,
+  "index_t": 3,
+  "index_id": "…"
+}
+```
+
+**Status Codes:**
+- `201 Created` — index created
+- `400 Bad Request` — invalid config (empty or `:`-bearing name, non-positive `k1`, `b` outside `0..=1`, query with no `select`), or an index already exists at that alias
+- `401/403` — admin auth required
+- `404 Not Found` — source ledger does not exist
+
+See also the CLI equivalent: [fluree bm25 create](../cli/bm25.md#fluree-bm25-create).
+
+### POST {api_base_url}/bm25/sync
+
+Bring a BM25 index up to date with its source ledger. Incremental where possible — only re-indexing the subjects changed since the index's stored watermark — falling back to a full rebuild when it must. A no-op when the index is already current. Admin-protected, synchronous, and forwarded to the transaction server in peer mode, like `create` above.
+
+**URL:**
+```
+POST {api_base_url}/bm25/sync
+POST {api_base_url}/bm25/sync?t={t}
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `t` | integer | Source-ledger commit `t` to sync **through**. Omit to sync through the source's current head. Must be `>= 1`. |
+
+**Request Body:**
+
+```json
+{
+  "index": "docsearch:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | string | Index graph-source alias to sync (required) |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "docsearch:main",
+  "upserted": 1,
+  "removed": 0,
+  "affected_subjects": 1,
+  "old_watermark": 3,
+  "new_watermark": 4,
+  "was_full_resync": false
+}
+```
+
+An already-current index returns `200` with `upserted`/`removed` of `0` and an unchanged watermark.
+
+**Status Codes:**
+- `200 OK` — sync completed (including the no-op case)
+- `400 Bad Request` — `t` is unparseable or less than `1`
+- `401/403` — admin auth required
+- `404 Not Found` — no such index
+- `500 Internal Server Error` — two request errors land here today; see the note below
+
+Two errors that are the caller's fault currently come back as `500` with `"@type": "err:system/InternalError"`: syncing an index that has been dropped (`Cannot sync retracted graph source: …`), and asking for a `t` beyond the source ledger's head (`Target t=… is beyond current head t=…`). Neither succeeds on retry. Until the mapping is corrected to 4xx, match on the message before deciding whether to retry a `500` from this endpoint.
+
+By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
+
+See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
+
+### POST {api_base_url}/delta/map
+
+Map Delta Lake tables as an R2RML graph source. Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `delta` feature. See [Delta Lake tables](../graph-sources/delta.md).
+
+**URL:**
+```
+POST {api_base_url}/delta/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "sales",
+  "root": "s3://lake/Tables",
+  "tables": { "orders": "s3://lake/raw/orders_v2" },
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "s3_region": "us-east-1"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `root` | string | Directory the mapping's table names resolve beneath: `dbo.orders` → `<root>/dbo/orders`. `s3://…`, `abfss://<container>@<account>.dfs.core.windows.net/…`, the OneLake `abfss://` form, or a local path under the server's local-root allowlist. Required unless every mapped table has a `tables` entry. |
+| `tables` | object | Explicit table name → table location; wins over `root` |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` logical tables only. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`) |
+| `branch` | string | Branch name (default: `main`) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's environment or role. |
+| `azure_tenant_id`, `azure_client_id` | string | Microsoft Entra service principal for `abfss://` locations. Omit all Azure fields to use the server's ambient Azure credentials. |
+| `azure_client_secret_env` / `azure_client_secret` | string | The principal's secret: the name of a server environment variable holding it (not stored), or a literal (stored with the graph source). Exactly one, with the two fields above. |
+| `unity_uri` | string | Databricks workspace URL. Tables without a `tables` entry are then named in Unity Catalog (`catalog.schema.table`), which places each and issues, and renews, its credentials. Excludes `root`. Guarded against internal hosts |
+| `unity_catalog`, `unity_schema` | string | Complete a mapped table name of fewer than three parts |
+| `oauth2_client_id`, `oauth2_client_secret_env` / `oauth2_client_secret` | string | A Databricks service principal: its application id, and its OAuth secret as the name of a server environment variable (not stored; must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) or a literal (stored) |
+| `auth_bearer_env` / `auth_bearer` | string | A Databricks token in place of a service principal, under the same rule. It does not renew |
+| `oauth2_token_url`, `oauth2_scope`, `oauth2_audience` | string | Default to the workspace's own token endpoint, `all-apis` and none |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `delete_column`, `delete_values` | string, array | Materialization: the column and values that mark a row as deleted, as on `/iceberg/map`. With either this or `order_by`, a key's latest change replaces its subject whole; a change feed's deletes retract in either mode. See [Delta → Materialization](../graph-sources/delta.md#materialization). |
+| `order_by` | string | Materialization: an integer, date or timestamp column that orders one key's rows within a table version, and the rows the table still holds for a key a delete touched |
+
+The catalog and storage fields may instead be given structured, as the stored config spells them: `unity` (`{"uri", "catalog", "schema", "auth"}`, its `auth` a bearer or OAuth2 client credentials as on [`iceberg/map`](#iceberg-connection), an OAuth2 `auth` with no `scope` asking for `all-apis` as the flat form does) and `io` (`{"s3_region", "s3_endpoint", "s3_path_style", "azure"}`, `azure` being `{"type": "client_secret", "tenant_id", "client_id", "client_secret"}`). Not both forms at once. Every environment variable a request names, `azure_client_secret_env` included, must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. An unknown field, a catalog field without `unity_uri`, a partial Azure principal and two ways to authenticate are refused with `400` (`err:api/InvalidGraphSourceConfig`).
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "sales:main",
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["dbo.customers", "orders"],
+  "mapping_validated": true,
+  "table_versions": { "dbo.customers": 12, "orders": 847 }
+}
+```
+
+`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map no `f:key` proves subject-unique (a Delta table reports no key of its own), naming the map and the `f:key` that would prove it; queries over such a map remove repeated solutions as they read (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
+
+See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
+
+### POST {api_base_url}/delta/catalog/* and /delta/r2rml/*
+
+Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
+
+Every body takes the Unity connection fields of `delta/map`, flat or as a structured `unity`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`, `oauth2_audience`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. `catalog/preview` and `catalog/verify` also take the S3 options (`s3_region`, `s3_endpoint`, `s3_path_style`, or a structured `io`), but no Azure principal: Unity issues the table's credentials. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+
+So that one body can be sent to each route in turn, each Delta route ignores the fields that only another Delta route takes: `delta/map`'s `name`, `root`, `tables`, `r2rml`, `r2rml_type`, `branch`, `model`, `default_allow`, `delete_column`, `delete_values` and `order_by`; browse's `depth`; preview's and verify's `table`; generate's `base_namespace`, `per_table_overrides` and `options`. A route reads the fields it takes itself (generate's `tables` is a list of names, map's an object). `catalog/browse` and `r2rml/generate` read only Unity's record of a table, never its files, so they also ignore the storage options (`s3_*`, `azure_*`, `io`). `catalog/preview` and `catalog/verify` refuse an Azure principal (`400`, naming `azure`), since Unity issues the table's credentials and the principal would not be the identity the table is read as. A field no Delta route knows is refused on every route.
+
+| Endpoint | Further fields | Answer |
+|---|---|---|
+| `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
+| `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | A [verify response](#verify-response) |
+| `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
+| `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
+
+**Browse** lists the metastore's catalogs when no `unity_catalog` is given, a catalog's schemas (and, at `depth: "tables"`, their tables) when one is, and a schema's tables when `unity_schema` is given too. A catalog-wide listing leaves out `information_schema`.
+
+```json
+{
+  "catalogs": [],
+  "schemas": ["main.sales"],
+  "tables": [
+    { "full_name": "main.sales.orders", "kind": "MANAGED", "format": "DELTA",
+      "comment": null, "access_rule": null, "unreadable": null },
+    { "full_name": "main.sales.recent", "kind": "VIEW", "format": null,
+      "comment": null, "access_rule": null, "unreadable": "is a VIEW, not a Delta table" }
+  ]
+}
+```
+
+`unreadable` says why this reader cannot read the object at all. `access_rule` is `row filter` (or, in a preview, `column mask`): Unity may issue no credentials for such a table, which `verify` settles.
+
+**Preview** columns carry `name`, `position`, `type_text` (Unity's spelling), `xsd_type` (the datatype a generated mapping gives the column), `mappable` (false for a nested or semi-structured type), `nullable`, `comment` and `masked`.
+
+**Verify** answers with a [verify response](#verify-response), the same contract and field names as Iceberg's: a table that cannot be read is `200` with `"readable": false` and the reason in `error`; only a request that cannot be made is an error.
+
+**Generate** request:
+
+```json
+{
+  "unity_uri": "https://<workspace>.cloud.databricks.com",
+  "auth_bearer_env": "DATABRICKS_TOKEN",
+  "tables": ["main.sales.orders", "main.sales.customers"],
+  "base_namespace": "https://example.org/sales#",
+  "per_table_overrides": [
+    { "table": "main.sales.orders", "subject_key": ["order_id", "line"], "class_name": "Purchase" }
+  ],
+  "options": { "emit_fk_joins": true, "subject_strategy": "auto" }
+}
+```
+
+An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns. A generated mapping declares no `f:key`, and a Delta table reports no key of its own, so `generate` and `validate` give a `keylessMap` advisory for each triples map no declared key proves subject-unique: its queries remove repeated solutions as they read. Add the `f:key` the advisory names where the subject's columns identify a row (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). `iceberg/r2rml/generate` does the same, counting the tables' identifier fields as keys.
+
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+
+See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
+
+### POST {api_base_url}/sql/map
+
+Map tables behind a SQL endpoint as an R2RML graph source. The endpoint speaks the Trino client protocol (Trino, Starburst, PrestoDB, or a `fluree-sql-bridge` sidecar). Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `sql` feature (on by default). See [SQL graph sources](../graph-sources/sql.md).
+
+**URL:**
+```
+POST {api_base_url}/sql/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "orders-db",
+  "endpoint": "https://trino.example.com:8443",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "dialect": "trino",
+  "protocol": "trino",
+  "catalog": "hive",
+  "schema": "sales",
+  "user": "fluree",
+  "auth_bearer": "…",
+  "session": { "query_max_run_time": "5m" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `endpoint` | string | Statement endpoint base URL (required); `/v1/statement` is appended. Loopback/private hosts are allowed; the link-local/metadata range is refused. |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` and `rr:sqlQuery` logical tables are both accepted. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
+| `branch` | string | Branch name (default: `main`) |
+| `dialect` | string | `trino` (default), `postgres`, `mysql`, `sqlite` — the engine behind a bridge |
+| `protocol` | string | `trino` (default, `X-Trino-*` headers) or `presto` |
+| `catalog`, `schema` | string | Defaults for unqualified table names |
+| `user` | string | Protocol user header (default `fluree`) |
+| `auth` | object | The endpoint's auth, structured as on [`iceberg/map`](#iceberg-connection): a bearer, OAuth2 client credentials, or a Google identity (`{"type": "google", …}`). In place of the flat fields below, not beside them |
+| `auth_bearer` / `auth_bearer_env` | string | Static bearer token, or the name of a server environment variable holding it (listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret` / `oauth2_client_secret_env`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes): needs the token URL and the secret. `oauth2_token_url` is guarded against internal hosts |
+| `session` | object | Session properties sent as `X-Trino-Session` |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `allow_duplicate_subjects` | bool | Skip the duplicate-subject probe: no table is refused, and queries answer with set semantics wherever no key declared in the mapping proves a map's subjects unique. Without it, the pushdown lane refuses statements over tables the probe finds repeated. See [Repeated rows and subject keys](../graph-sources/sql.md#repeated-rows-and-subject-keys). |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "orders-db:main",
+  "endpoint": "https://trino.example.com:8443",
+  "connection_tested": true,
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["sales.customers", "sales.orders"],
+  "mapping_validated": true,
+  "mapping_warnings": ["table 'sales.order_lines': subject key (order_id) is not unique; …"]
+}
+```
+
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map that neither the key the probe verified nor an `f:key` proves subject-unique, so its statements carry `DISTINCT` or decline to the per-scan lane (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Nothing is reported when the endpoint was unreachable.
+
+**Status Codes:**
+- `201 Created` — graph source created
+- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping. Auth given two ways or only partly, an unknown field and an unlisted environment variable are `err:api/InvalidGraphSourceConfig`
+- `401 Unauthorized` — admin token required
+
+---
+
+### POST {api_base_url}/iceberg/materialize
+
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). The source may be an Iceberg or a Delta graph source; a Delta source is read through its change data feed (see [Delta → Materialization](../graph-sources/delta.md#materialization)). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+
+**Request Body:**
+
+```json
+{ "source": "orders:main", "target": "orders-native:main", "force_full": false }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Source graph source id to read (required) |
+| `target` | string | Target native ledger to write (required; created if absent). May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`) resolved per source row, fanning the job out into one native ledger per partition value. A placeholder-free value is a single target (unchanged). |
+| `force_full` | bool | Ignore the watermark and re-read the whole table (default `false`) |
+
+**Response:**
+
+```json
+{
+  "source": "orders:main",
+  "target": "orders-native:main",
+  "from_snapshot_id": null,
+  "to_snapshot_id": 5648190075564901028,
+  "incremental": false,
+  "committed": true,
+  "rows_read": 1200,
+  "subjects_upserted": 1200,
+  "subjects_retracted": 0
+}
+```
+
+`committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per `(source, target, table)` in the shared `fluree_materialize_state:main` state ledger, not in the target).
+
+The source is read with the same credentials a query of it would use, on full and incremental reads alike (and so by `track`): a REST source with vended credentials on whose catalog vends none is refused with `err:catalog/CredentialsNotVended` rather than read with the server's own AWS identity.
+
+**Status Codes:** `200 OK`; `400` invalid request / config; `401/403` admin auth; `500` scan or commit failure.
+
+### POST {api_base_url}/iceberg/track
+
+Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. The source may be an Iceberg or a Delta graph source. Admin-protected; `iceberg` feature only.
+
+**Request Body:**
+
+```json
+{ "source": "orders:main", "target": "orders-native:main", "poll_interval_secs": 300 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Graph-source id to read. Required. |
+| `target` | string | Native ledger to keep materialized. Required. May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`), fanning the job out into one native ledger per partition value. |
+| `poll_interval_secs` | number | This job's own re-sync cadence, in seconds. Optional — defaults to the worker's configured interval (30s). Must be > 0. Each tracked job runs on its own timer. |
+
+**Response:** `{ "source", "target", "tracked": true, "poll_interval_secs": 300, "tracked_jobs": 1, "initial": { …materialize response… } }`
+
+Tracked jobs are persisted in the `fluree_materialize_state:main` state ledger alongside the watermarks and restored when the worker starts, so a restart resumes tracking by itself — incrementally, from the watermark. The worker runs on write nodes only.
+
+### POST {api_base_url}/iceberg/untrack
+
+Stop tracking a `source → target` pair (already-materialized data is left in place). Body: `{ "source", "target" }`. Response: `{ "source", "target", "removed": true, "tracked_jobs": 0 }`.
+
+### GET {api_base_url}/iceberg/tracking
+
+List the tracking worker's jobs and cumulative stats.
+
+```json
+{
+  "running": true,
+  "jobs": [ { "source": "orders:main", "target": "orders-native:main", "poll_interval_secs": 300 } ],
+  "stats": { "polls": 12, "syncs_committed": 1, "syncs_noop": 11, "syncs_failed": 0, "tracked_jobs": 1 }
+}
+```
+## Admin Endpoints
+
+### POST /reindex
+
+Trigger a full manual reindex for a ledger. Walks the entire commit chain and rebuilds the binary index from scratch using the server's configured indexer settings. Admin-protected — requires the admin Bearer token when admin auth is enabled.
+
+This endpoint runs the reindex synchronously and returns when the new root is committed. For large ledgers it may run for many minutes; configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
+
+**URL:**
+```
+POST /reindex
+```
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger alias (`name` or `name:branch`). Required. |
+| `opts`   | object | Reserved for future per-request indexer overrides. Currently accepted but ignored. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/reindex \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb:main"}'
+```
+
+**Response:**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "index_t": 42,
+  "root_id": "fluree:cid:bafy…",
+  "stats": {
+    "flake_count": 184273,
+    "leaf_count": 614,
+    "branch_count": 23,
+    "total_bytes": 47185920
+  },
+  "fuel": 1734.0
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger_id` | Ledger alias the reindex was run against |
+| `index_t` | Transaction time the new index was built at (matches the head commit) |
+| `root_id` | ContentId of the newly written index root |
+| `stats.flake_count` | Total flakes in the rebuilt index |
+| `stats.leaf_count` | Number of leaf nodes written |
+| `stats.branch_count` | Number of branch nodes written |
+| `stats.total_bytes` | Bytes written to storage during the reindex |
+| `fuel` | Total decimal fuel charged for the reindex's CAS writes (1.000 per write + 1.000 per re-encoded leaflet in FLI3 leaves). `0.0` if the index was already current. See [Tracking and Fuel](../query/tracking-and-fuel.md#indexing-fuel) for the full schedule. |
+
+**Status Codes:**
+- `200 OK` — reindex complete
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `500 Internal Server Error` — reindex failed
+
+When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
+
+### POST /sweep
+
+Reclaim index artifacts that no index chain references. Admin-protected — requires the admin Bearer token when admin auth is enabled.
+
+The binary index garbage collector reclaims artifacts by *name*: each index root's garbage manifest lists what the previous version replaced, so the collector can only reach artifacts some manifest records, and only branch-local ones — it leaves the ledger-wide dictionary namespace to the sweep, which is the only operation that accounts for every branch at once. Artifacts orphaned another way — most commonly by a reindex published by Fluree 4.1.4 or earlier, which severed the prev-index chain and left everything older unreachable — are invisible to it. A sweep finds those by the opposite method: it enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder.
+
+A sweep covers **every branch** of a ledger, so `ledger` names the ledger without a branch suffix. Dictionary blobs are shared across a ledger's branches, so a sweep scoped to one branch could release dictionaries a sibling branch still reads. Retracted-but-not-purged branches are included in the reachable set, so a soft-dropped branch stays recoverable.
+
+Only index artifacts are considered — every branch's `index/` prefix plus the ledger's shared dictionary namespace. Commits, transactions, and config blobs are never touched: they are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced.
+
+Index builds for the ledger are held off for the duration, and the sweep runs synchronously. For large ledgers it walks every branch's index chain and expands each root, so it may run for many minutes; configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
+
+> **Single-process deployments only.** The hold that keeps index builds from writing during a sweep excludes the server's own indexer. An external or second-process indexer writing to the same storage is not excluded, and its in-flight artifacts — written before the root that references them — would be indistinguishable from orphans. Do not run a sweep against storage a separate indexer writes to.
+
+**URL:**
+```
+POST /sweep
+```
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger **name**, without a branch suffix. Required. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/sweep \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb"}'
+```
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb",
+  "reclaimed": 2847,
+  "failures": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Ledger the sweep ran against |
+| `reclaimed` | Number of orphaned artifacts released |
+| `failures` | Artifacts that could not be released, each with `address` and `error`. Reported rather than fatal — they stay in storage and the next sweep retries them. |
+
+**Status Codes:**
+- `200 OK` — sweep complete (including when nothing was reclaimed)
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `409 Conflict` — another maintenance operation holds one of the ledger's branches
+- `500 Internal Server Error` — sweep failed, or the storage backend cannot enumerate a prefix
+
+A sweep aborts without deleting anything if any index root cannot be read or expanded, or any prefix cannot be listed. An incomplete picture of what is reachable would classify live artifacts as orphans, so partial information is treated as a reason to stop rather than proceed.
+
+When sweeping through the Rust API instead, see `Fluree::sweep_index_storage`. From the CLI, use `fluree sweep <ledger>`.
+
+### POST /sweep/plan
+
+Report what [`POST /sweep`](#post-sweep) would reclaim, without deleting anything. Same request body, same admin protection, same exclusive hold — the report reflects a quiesced ledger.
+
+**URL:**
+```
+POST /sweep/plan
+```
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb",
+  "orphan_count": 2847,
+  "scanned": 5216,
+  "live": 2369,
+  "orphans": [
+    "fluree:file://mydb/main/index/roots/3f2a….fir6",
+    "fluree:file://mydb/@shared/dicts/9c1b….dict"
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Ledger the plan was computed for |
+| `orphan_count` | Number of artifacts that would be released |
+| `scanned` | Artifacts examined across every swept prefix |
+| `live` | Distinct artifacts reachable from a live index chain |
+| `orphans` | Every address that would be released, in full, so the set can be audited before running the destructive form |
+
+From the CLI, use `fluree sweep <ledger> --dry-run`.
+
+### POST /export/*ledger
+
+Return ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). Server-side equivalent of `fluree export`.
+
+**Auth bracket: admin-protected** — same middleware as `/create`, `/drop`, `/reindex`, and the branch admin endpoints. Today's implementation reads from the binary index without per-flake policy filtering, so it does not live in the data-read bracket alongside `/query` and `/show`. Adding policy-filtered streaming export would let it move to read-auth in the future.
+
+**URL:**
+
+```
+POST /export/<ledger...>
+```
+
+**Request Body:**
+
+```json
+{
+  "format": "turtle",
+  "all_graphs": false,
+  "graph": "http://example.org/people",
+  "context": { "ex": "http://example.org/" },
+  "at": "t:42"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `format` | string | No | `"turtle"` | One of `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
+| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
+| `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object or `{"@context": {…}}`. |
+| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
+
+An empty body is treated as all-default (Turtle export at HEAD).
+
+**Response Headers:**
+
+| Format | Content-Type |
+|--------|--------------|
+| Turtle | `text/turtle; charset=utf-8` |
+| N-Triples | `application/n-triples; charset=utf-8` |
+| N-Quads | `application/n-quads; charset=utf-8` |
+| TriG | `application/trig; charset=utf-8` |
+| JSON-LD | `application/ld+json; charset=utf-8` |
+
+**Response Body (200 OK):**
+
+The raw RDF for the requested format. The reference server today buffers the full export in memory before responding; implementations are free to stream chunked bodies, and clients MUST be prepared to read until EOF.
+
+**Status Codes:**
+
+- `200 OK` — export complete
+- `400 Bad Request` — unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed (`ApiError::Config`)
+- `401` / `403` — admin token required and absent/invalid
+- `404 Not Found` — ledger does not exist
+- `5xx` — storage / nameservice / encoding errors
+
+**Peer mode:** Forwards to the transactor.
+
+## Admin Authentication
+
+Administrative endpoints (`/create`, `/drop`, `/reindex`, branch operations, and Iceberg mapping when enabled) can be protected with Bearer token authentication.
+
+### Configuration
+
+Enable admin authentication with CLI flags:
+
+```bash
+# Production: require trusted tokens
+fluree server run -- \
+  --admin-auth-mode=required \
+  --admin-auth-trusted-issuer=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
+
+# Development: no authentication (default)
+fluree server run -- --admin-auth-mode=none
+```
+
+**Environment Variables:**
+- `FLUREE_ADMIN_AUTH_MODE`: `none` (default) or `required`
+- `FLUREE_ADMIN_AUTH_TRUSTED_ISSUERS`: Comma-separated list of trusted did:key identifiers
+
+### Token Format
+
+Admin tokens use the same JWS format as other Fluree tokens. Required claims:
+
+```json
+{
+  "iss": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+  "exp": 1705932000,
+  "sub": "admin@example.com"
+}
+```
+
+| Claim | Required | Description |
+|-------|----------|-------------|
+| `iss` | Yes | Issuer did:key (must be in trusted issuers list) |
+| `exp` | Yes | Expiration timestamp (Unix seconds) |
+| `sub` | No | Subject identifier |
+| `fluree.identity` | No | Identity for audit logging |
+
+### Making Authenticated Requests
+
+Include the token in the Authorization header:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/create \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGciOiJFZERTQSIsImp3ayI6ey..." \
+  -d '{"ledger": "mydb:main"}'
+```
+
+### Issuer Trust
+
+Tokens must be signed by a trusted issuer. Configure trusted issuers:
+
+```bash
+# Single issuer
+--admin-auth-trusted-issuer=did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
+
+# Multiple issuers
+--admin-auth-trusted-issuer=did:key:z6Mk... \
+--admin-auth-trusted-issuer=did:key:z6Mn...
+
+# Fallback to events auth issuers
+--events-auth-trusted-issuer=did:key:z6Mk...
+```
+
+If no admin-specific issuers are configured, admin auth falls back to `--events-auth-trusted-issuer`.
+
+### Response Codes
+
+- `401 Unauthorized`: Missing or invalid Bearer token
+- `401 Unauthorized`: Token expired
+- `401 Unauthorized`: Untrusted issuer
+
+## Error Responses
+
+All endpoints may return error responses in this format (and should return `Content-Type: application/json`):
+
+```json
+{
+  "error": "Human-readable error message",
+  "status": 409,
+  "@type": "err:db/Conflict",
+  "cause": {
+    "error": "Optional nested error detail",
+    "status": 409,
+    "@type": "err:db/SomeInnerError"
+  }
+}
+```
+
+See [Errors and Status Codes](errors.md) for complete error reference.
+
+## CLI Compatibility Requirements
+
+This section summarizes the contract that third-party server implementations (e.g., Solo) must follow to be compatible with the Fluree CLI (`fluree-db-cli`). The CLI discovers the API base URL via `fluree remote add` and constructs endpoint URLs as `{base_url}/{operation}/{ledger}`.
+
+### Required endpoints
+
+| Endpoint | CLI commands |
+|----------|-------------|
+| `GET /info/{ledger}` | `info`, `push`, `pull`, `clone` |
+| `GET /show/{ledger}?commit=<ref>` | `show --remote` |
+| `POST /query/{ledger}` | `query` (JSON-LD, SPARQL, and Cypher) |
+| `POST /insert/{ledger}` | `insert` |
+| `POST /upsert/{ledger}` | `upsert` |
+| `GET /exists/{ledger}` | `clone` (pre-create check) |
+| `GET /context/{ledger}` | `context get` |
+| `PUT /context/{ledger}` | `context set` |
+| `GET /ledgers` | `list --remote` |
+
+For sync workflows (`clone`/`push`/`pull`), these additional endpoints are needed:
+
+| Endpoint | CLI commands | Notes |
+|----------|-------------|-------|
+| `POST /push/{ledger}` | `push`, `publish` | Required for push |
+| `POST /push-merges/{ledger}` | `push`, `publish` | Required to push a history containing a merge. Advertise it in discovery. |
+| `GET /commits/{ledger}` | `clone`, `pull` | Paginated export fallback. Implement `lineage` mode to serve a history containing a merge. |
+| `POST /pack/{ledger}` | `clone`, `pull` | Preferred bulk transport; CLI falls back to `/commits` on 404/405/501 |
+| `GET /storage/ns/{ledger}` | `clone`, `pull` | Pack preflight (head CID discovery) |
+
+### Critical response field: `t`
+
+The `GET /info/{ledger}` response **must** include a `t` field (integer) representing the current transaction time. This field is used by the CLI for:
+
+- **push**: Comparing `local_t` vs `remote_t` to determine what commits to send and detect divergence
+- **pull**: Comparing `remote_t` vs `local_t` to determine if new commits are available
+- **clone**: Guarding against cloning empty ledgers (`t == 0`) and displaying progress
+
+Omitting `t` from the info response will cause `push` and `pull` to fail with `"remote ledger-info response missing 't'"`.
+
+### Transaction response format
+
+The `/insert` and `/upsert` endpoints should return a JSON object. The CLI displays the full response as pretty-printed JSON. Common fields include `t`, `tx-id`, and `commit.hash`, but the exact shape is not prescribed — the CLI does not parse individual fields from transaction responses.
+
+### Authentication
+
+All endpoints accept `Authorization: Bearer <token>`. On `401`, the CLI attempts a single token refresh (if OIDC is configured) and retries. See [Auth contract](../design/auth-contract.md) for the full authentication lifecycle.
+
+### Error responses
+
+Error bodies should be JSON with an `error` or `message` field. The CLI extracts the first available string from `message` or `error` for display. Plain-text error bodies are also accepted.
+
+## Related Documentation
+
+- [Overview](overview.md) - API overview and principles
+- [Headers](headers.md) - HTTP headers and content types
+- [Signed Requests](signed-requests.md) - Authentication
+- [Errors](errors.md) - Error codes and troubleshooting

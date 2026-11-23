@@ -1,0 +1,42 @@
+//! IO module for Iceberg data file reading.
+//!
+//! This module provides:
+//! - [`batch`] - Columnar batch format for efficient data access
+//! - [`storage`] - Storage abstraction for S3 and other backends
+//! - [`parquet`] - Range-read Parquet file reader
+//! - [`send_parquet`] - Send-safe Parquet reader for AWS SDK integration
+//! - [`chunk_reader`] - Range-backed ChunkReader for large files (>64MB)
+
+pub mod batch;
+#[cfg(feature = "aws")]
+pub mod chunk_reader;
+pub mod file_storage;
+#[cfg(feature = "aws")]
+pub mod gcs;
+pub mod location;
+pub mod parquet;
+#[cfg(feature = "aws")]
+pub mod scope;
+#[cfg(feature = "aws")]
+pub mod send_parquet;
+pub mod storage;
+
+/// Arrow-based Parquet decode path (native projection / pruning / row filtering)
+/// — the single decode path for the Send reader.
+#[cfg(feature = "aws")]
+pub(crate) mod arrow_reader;
+
+pub use batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+pub use file_storage::FileIcebergStorage;
+pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage, SendIcebergStorage};
+
+#[cfg(feature = "aws")]
+pub use chunk_reader::RangeBackedChunkReader;
+#[cfg(feature = "aws")]
+pub use gcs::GcsIcebergStorage;
+#[cfg(feature = "aws")]
+pub use scope::StorageScope;
+#[cfg(feature = "aws")]
+pub use send_parquet::SendParquetReader;
+#[cfg(feature = "aws")]
+pub use storage::{IcebergStorageBackend, S3IcebergStorage};

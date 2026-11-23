@@ -1,0 +1,827 @@
+//! SPARQL 1.1 Query Results XML format (`application/sparql-results+xml`)
+//!
+//! Implements SELECT/ASK results in the W3C XML format:
+//! - Root element: `<sparql xmlns="http://www.w3.org/2005/sparql-results#">`
+//! - `<head>` contains `<variable name="..."/>`
+//! - SELECT results: `<results><result>...`
+//! - ASK results: `<boolean>true|false</boolean>`
+//!
+//! Note: CONSTRUCT/DESCRIBE return RDF graphs and are not representable in this format.
+
+use crate::QueryResult;
+
+use super::config::FormatterConfig;
+use super::datatype::may_omit_datatype;
+use super::iri::IriCompactor;
+use super::xml_escape::{escape_attr_into, escape_text_into};
+use super::{materialize, FormatError, Result};
+
+use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_db_query::binding::Binding;
+use fluree_db_query::VarId;
+
+const SPARQL_XML_NS: &str = "http://www.w3.org/2005/sparql-results#";
+
+/// Format query results as SPARQL Results XML.
+///
+/// Writes directly into one pre-sized output buffer: no per-cell `String`, no
+/// per-row hash map, and no binding clones on the common (non-grouped) path.
+/// Encoded subject/predicate refs are resolved inline (no materialize
+/// re-encode round-trip); only grouped rows fall back to cartesian expansion.
+/// A value repeated down a column is decoded and escaped once (see
+/// [`CellWriter`]).
+pub fn format(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    _config: &FormatterConfig,
+) -> Result<String> {
+    // CONSTRUCT/DESCRIBE produce graphs (handled by JSON-LD/Turtle etc.), not result sets.
+    if result.output.construct_template().is_some() {
+        return Err(FormatError::InvalidBinding(
+            "SPARQL Results XML is only valid for SELECT/ASK queries (not CONSTRUCT/DESCRIBE)"
+                .to_string(),
+        ));
+    }
+
+    if result.output.is_ask() {
+        let has_solution = result.batches.iter().any(|b| !b.is_empty());
+        return Ok(format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><sparql xmlns="{ns}"><head></head><boolean>{val}</boolean></sparql>"#,
+            ns = SPARQL_XML_NS,
+            val = if has_solution { "true" } else { "false" }
+        ));
+    }
+
+    // Build head.vars from select list (without ? prefix).
+    // For wildcard, use the operator schema (all variables).
+    // Fall back to VarRegistry when batches are empty.
+    let head_vars: Vec<VarId> = if result.output.is_wildcard() {
+        result
+            .batches
+            .first()
+            .map(|b| {
+                b.schema()
+                    .iter()
+                    .copied()
+                    .filter(|&vid| !super::is_internal_var_name(result.vars.name(vid)))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                result
+                    .vars
+                    .iter()
+                    .filter(|(name, _)| !super::is_internal_var_name(name))
+                    .map(|(_, id)| id)
+                    .collect()
+            })
+    } else {
+        result.output.projected_vars_or_empty()
+    };
+
+    // Order head vars lexicographically by variable name (without '?') for stability.
+    let mut head_pairs: Vec<(String, VarId)> = head_vars
+        .iter()
+        .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
+        .collect();
+    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let head_names: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
+    let head_vars: Vec<VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();
+
+    let select_one = result.output.is_select_one();
+    let mut cells = CellWriter::new(result, compactor, head_vars.len());
+
+    // Pre-size: rows × cols × an estimated per-cell width, plus envelope slack.
+    let est = (result.row_count() + 1)
+        .saturating_mul(head_vars.len().max(1))
+        .saturating_mul(96)
+        .saturating_add(128);
+    let mut out = String::with_capacity(est);
+    out.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    out.push_str(r#"<sparql xmlns=""#);
+    out.push_str(SPARQL_XML_NS);
+    out.push_str(r#"">"#);
+
+    // head
+    out.push_str("<head>");
+    for name in &head_names {
+        out.push_str(r#"<variable name=""#);
+        escape_attr_into(name, &mut out);
+        out.push_str(r#""/>"#);
+    }
+    out.push_str("</head>");
+
+    // results
+    out.push_str("<results>");
+
+    'outer: for batch in &result.batches {
+        // Map each head var to its column index in this batch once per batch
+        // (None = absent → treated as Unbound and omitted).
+        let schema = batch.schema();
+        let cols: Vec<Option<usize>> = head_vars
+            .iter()
+            .map(|&v| schema.iter().position(|&sv| sv == v))
+            .collect();
+
+        for row_idx in 0..batch.len() {
+            // Stream the row straight into the buffer.
+            out.push_str("<result>");
+            for (k, &col) in cols.iter().enumerate() {
+                if let Some(col) = col {
+                    let binding = batch.get_by_col(row_idx, col);
+                    cells.write_cell(&mut out, k, binding, &head_names[k])?;
+                }
+            }
+            out.push_str("</result>");
+            if select_one {
+                break 'outer;
+            }
+        }
+    }
+
+    out.push_str("</results>");
+    out.push_str("</sparql>");
+    Ok(out)
+}
+
+/// The encoded identity of a rendered term: everything its text depends on.
+/// (`t`/`op` never reach SELECT/ASK output.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TermKey {
+    Lit {
+        o_kind: u8,
+        o_key: u64,
+        p_id: u32,
+        dt_id: u16,
+        lang_id: u16,
+        i_val: i32,
+        arena_g_id: fluree_db_core::GraphId,
+    },
+    Subject(u64),
+    Predicate(u32),
+}
+
+impl TermKey {
+    fn of(binding: &Binding) -> Option<Self> {
+        match *binding {
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                i_val,
+                arena_g_id,
+                ..
+            } => Some(Self::Lit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                i_val,
+                arena_g_id,
+            }),
+            Binding::EncodedSid { s_id, .. } => Some(Self::Subject(s_id)),
+            Binding::EncodedPid { p_id } => Some(Self::Predicate(p_id)),
+            _ => None,
+        }
+    }
+}
+
+/// Writes binding cells for one response.
+///
+/// The rows of a join repeat the values on its one side — one product's label
+/// and comment on every one of its feature rows — so each column remembers the
+/// encoded value it last rendered and where its text sits in the output; the
+/// next row's cell, when it holds the same value, copies that text instead of
+/// decoding and escaping it again. One comparison per cell, nothing hashed or
+/// allocated. Datatype attributes are decoded once per datatype rather than
+/// once per literal.
+struct CellWriter<'a> {
+    result: &'a QueryResult,
+    compactor: &'a IriCompactor,
+    gv: Option<&'a BinaryGraphView>,
+    columns: usize,
+    /// Per column: the encoded value last rendered, and its text in the output
+    /// (allocated at the first encoded value).
+    last: Vec<Option<(TermKey, std::ops::Range<usize>)>>,
+    /// Datatype → its `datatype` attribute value, or `None` when omitted.
+    datatypes: Vec<(Sid, Option<Box<str>>)>,
+}
+
+impl<'a> CellWriter<'a> {
+    fn new(result: &'a QueryResult, compactor: &'a IriCompactor, columns: usize) -> Self {
+        Self {
+            result,
+            compactor,
+            gv: result.binary_graph.as_ref(),
+            columns,
+            last: Vec::new(),
+            datatypes: Vec::new(),
+        }
+    }
+
+    /// Write `<binding name="…">term</binding>` for column `column`, or nothing
+    /// for Unbound/Poisoned (omitted per the SPARQL Results spec).
+    fn write_cell(
+        &mut self,
+        out: &mut String,
+        column: usize,
+        binding: &Binding,
+        name: &str,
+    ) -> Result<()> {
+        if matches!(binding, Binding::Unbound | Binding::Poisoned) {
+            return Ok(());
+        }
+        out.push_str(r#"<binding name=""#);
+        escape_attr_into(name, out);
+        out.push_str(r#"">"#);
+        match TermKey::of(binding) {
+            Some(key) => {
+                if self.last.is_empty() {
+                    self.last = vec![None; self.columns];
+                }
+                match &self.last[column] {
+                    Some((last_key, span)) if *last_key == key => {
+                        out.extend_from_within(span.clone());
+                    }
+                    _ => {
+                        let start = out.len();
+                        self.write_term(out, binding)?;
+                        self.last[column] = Some((key, start..out.len()));
+                    }
+                }
+            }
+            None => self.write_term(out, binding)?,
+        }
+        out.push_str("</binding>");
+        Ok(())
+    }
+
+    /// Write the `<uri>`/`<bnode>`/`<literal>` term for a (non-unbound) binding.
+    fn write_term(&mut self, out: &mut String, binding: &Binding) -> Result<()> {
+        match binding {
+            Binding::Sid { sid, .. } => write_sid_ref(out, self.compactor, sid)?,
+            Binding::IriMatch { iri, .. } => write_iri_ref(out, iri.as_ref()),
+            Binding::Iri(iri) => write_iri_ref(out, iri.as_ref()),
+            Binding::Lit { val, dtc, .. } => self.write_literal(out, val, dtc)?,
+
+            // Encoded subject/predicate refs resolve directly to their full
+            // IRI — no materialize re-encode round-trip (XML never compacts
+            // node IRIs).
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+                let gv = self.gv.ok_or_else(|| {
+                    FormatError::InvalidBinding(
+                        "Encountered encoded binding during SPARQL XML formatting but \
+                         QueryResult has no binary_graph"
+                            .to_string(),
+                    )
+                })?;
+                write_encoded_ref(out, binding, gv)?;
+            }
+            // Encoded literals: decode via the shared materializer (its value
+            // decode is not a wasted round-trip), then write the concrete value.
+            Binding::EncodedLit { .. } => {
+                let materialized = materialize::materialize_binding(self.result, binding)?;
+                self.write_term(out, &materialized)?;
+            }
+
+            Binding::Grouped(_) => return Err(super::sparql::grouped_cell_error()),
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                return Err(FormatError::InvalidBinding(
+                    "SPARQL results have no path/list type (Cypher-only)".to_string(),
+                ));
+            }
+            // Skipped by the caller; unreachable here.
+            Binding::Unbound | Binding::Poisoned => {}
+        }
+        Ok(())
+    }
+
+    /// Write a `<literal>` element with lang/datatype attributes and value text.
+    fn write_literal(
+        &mut self,
+        out: &mut String,
+        val: &FlakeValue,
+        dtc: &DatatypeConstraint,
+    ) -> Result<()> {
+        out.push_str("<literal");
+        if let Some(lang) = dtc.lang_tag() {
+            // A language tag short-circuits the datatype, so don't decode it at
+            // all (avoids a spurious decode error per lang literal).
+            out.push_str(r#" xml:lang=""#);
+            escape_attr_into(lang, out);
+            out.push('"');
+        } else if let Some(dt_attr) = self.datatype_attr(dtc.datatype())? {
+            out.push_str(r#" datatype=""#);
+            out.push_str(dt_attr);
+            out.push('"');
+        }
+        out.push('>');
+        write_literal_value(out, val)?;
+        out.push_str("</literal>");
+        Ok(())
+    }
+
+    /// The escaped `datatype` attribute value for `dt`, or `None` when it may
+    /// be omitted. `<literal>` content is text, so nothing about the datatype
+    /// survives into the serialized form — under the W3C profile only
+    /// `xsd:string` may go untagged (issue #45 (b), same rule as the SRJ writer).
+    fn datatype_attr(&mut self, dt: &Sid) -> Result<Option<&str>> {
+        let at = match self.datatypes.iter().position(|(sid, _)| sid == dt) {
+            Some(at) => at,
+            None => {
+                let dt_iri = self.compactor.decode_sid(dt)?;
+                let attr = (!may_omit_datatype(&dt_iri, self.compactor.emits_absolute_iris()))
+                    .then(|| {
+                        let mut escaped = String::with_capacity(dt_iri.len());
+                        escape_attr_into(&dt_iri, &mut escaped);
+                        escaped.into_boxed_str()
+                    });
+                self.datatypes.push((dt.clone(), attr));
+                self.datatypes.len() - 1
+            }
+        };
+        Ok(self.datatypes[at].1.as_deref())
+    }
+}
+
+/// Write a `Sid` reference, streaming `prefix` + `name` without `decode_sid`'s
+/// intermediate `format!` allocation for the common registered-namespace case.
+fn write_sid_ref(out: &mut String, compactor: &IriCompactor, sid: &Sid) -> Result<()> {
+    match compactor.namespace_prefix(sid)? {
+        // The BLANK_NODE namespace is registered with the `"_:"` prefix, so a
+        // blank node arrives here as `Some("_:")` (not via the EMPTY `None`
+        // branch). Frame it as `<bnode>` with the bare label, matching
+        // `decode_sid` + `starts_with("_:")` in the pre-rewrite formatter.
+        Some("_:") => {
+            out.push_str("<bnode>");
+            escape_text_into(sid.name.as_ref(), out);
+            out.push_str("</bnode>");
+        }
+        Some(prefix) => {
+            // Any other registered prefix is an absolute IRI, so the joined form
+            // is never a blank node — emit `<uri>` directly.
+            out.push_str("<uri>");
+            escape_text_into(prefix, out);
+            escape_text_into(sid.name.as_ref(), out);
+            out.push_str("</uri>");
+        }
+        // EMPTY / OVERFLOW: the name is the verbatim IRI (possibly a `_:` label).
+        None => write_iri_ref(out, sid.name.as_ref()),
+    }
+    Ok(())
+}
+
+/// Write a full IRI string as `<uri>` (or `<bnode>` when it is a `_:` label).
+fn write_iri_ref(out: &mut String, iri: &str) {
+    if let Some(label) = iri.strip_prefix("_:") {
+        out.push_str("<bnode>");
+        escape_text_into(label, out);
+        out.push_str("</bnode>");
+    } else {
+        out.push_str("<uri>");
+        escape_text_into(iri, out);
+        out.push_str("</uri>");
+    }
+}
+
+/// Resolve an `EncodedSid`/`EncodedPid` to its full IRI and write it.
+fn write_encoded_ref(out: &mut String, binding: &Binding, gv: &BinaryGraphView) -> Result<()> {
+    match binding {
+        Binding::EncodedSid { s_id, .. } => {
+            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
+                FormatError::InvalidBinding(format!(
+                    "Failed to resolve subject IRI for s_id {s_id}: {e}"
+                ))
+            })?;
+            write_iri_ref(out, &iri);
+        }
+        Binding::EncodedPid { p_id } => {
+            let iri = gv.store().resolve_predicate_iri(*p_id).ok_or_else(|| {
+                FormatError::InvalidBinding(format!(
+                    "Failed to resolve predicate IRI for p_id {p_id}"
+                ))
+            })?;
+            write_iri_ref(out, iri);
+        }
+        _ => unreachable!("write_encoded_ref only handles EncodedSid/EncodedPid"),
+    }
+    Ok(())
+}
+
+/// Write a literal's lexical value as element text.
+fn write_literal_value(out: &mut String, val: &FlakeValue) -> Result<()> {
+    match val {
+        FlakeValue::String(v) => escape_text_into(v, out),
+        FlakeValue::Long(n) => {
+            let mut buf = itoa::Buffer::new();
+            out.push_str(buf.format(*n));
+        }
+        FlakeValue::Double(d) => write_double(out, *d),
+        FlakeValue::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+        FlakeValue::Vector(v) => {
+            let value = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
+            escape_text_into(&value, out);
+        }
+        FlakeValue::Json(json_str) => escape_text_into(json_str, out),
+        FlakeValue::Ref(_) => {
+            return Err(FormatError::InvalidBinding(
+                "Lit cannot contain Ref - expected Binding::Sid".to_string(),
+            ));
+        }
+        // Temporal / other scalar values: use Display + keep datatype.
+        other => escape_text_into(&other.to_string(), out),
+    }
+    Ok(())
+}
+
+/// Write an `xsd:double` lexical value in W3C canonical form (`1.0E6`),
+/// preserving the special-value spellings (`NaN`, `INF`, `-INF`).
+fn write_double(out: &mut String, d: f64) {
+    fluree_graph_ir::push_canonical_xsd_double(out, d);
+}
+
+fn strip_question_mark(var_name: &str) -> String {
+    var_name.strip_prefix('?').unwrap_or(var_name).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use fluree_db_core::Sid;
+    use fluree_db_query::binding::Batch;
+    use fluree_db_query::var_registry::VarRegistry;
+
+    fn make_test_compactor() -> IriCompactor {
+        use std::collections::HashMap;
+        let mut namespaces = HashMap::new();
+        namespaces.insert(100, "http://example.org/".to_string());
+        namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
+        // BLANK_NODE (code 10) is registered with the "_:" prefix in production
+        // (default_namespace_codes); mirror that so blank-node Sids resolve.
+        namespaces.insert(fluree_vocab::namespaces::BLANK_NODE, "_:".to_string());
+        // `format_results_string` builds the XML compactor with the W3C profile
+        // (`FormatterConfig::sparql_xml().absolute_iris`); mirror it, or these
+        // tests measure a render path production never takes.
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces)).with_absolute_iris(true)
+    }
+
+    /// The pre-#45 profile, for asserting that a rule is actually flag-driven.
+    fn make_loose_compactor() -> IriCompactor {
+        make_test_compactor().with_absolute_iris(false)
+    }
+
+    fn make_test_result() -> QueryResult {
+        QueryResult {
+            vars: VarRegistry::new(),
+            t: Some(0),
+            novelty: None,
+            context: fluree_graph_json_ld::ParsedContext::default(),
+            orig_context: None,
+            output: fluree_db_query::ir::QueryOutput::select_all(vec![]),
+            batches: vec![],
+            binary_graph: None,
+            from_graph_source: false,
+            advisories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_ask_true() {
+        let compactor = make_test_compactor();
+        let mut result = make_test_result();
+        result.output = fluree_db_query::ir::QueryOutput::Ask;
+        result.batches = vec![Batch::single_empty()];
+
+        let xml = format(&result, &compactor, &FormatterConfig::sparql_xml()).unwrap();
+        assert!(xml.contains("<boolean>true</boolean>"), "{xml}");
+        assert!(xml.contains(SPARQL_XML_NS), "{xml}");
+    }
+
+    #[test]
+    fn format_select_single_uri_binding() {
+        let compactor = make_test_compactor();
+        let mut result = make_test_result();
+
+        let s_var = result.vars.get_or_insert("?s");
+        result.output = fluree_db_query::ir::QueryOutput::select_all(vec![s_var]);
+
+        let schema = std::sync::Arc::from(vec![s_var].into_boxed_slice());
+        let sid = Sid::new(100, "alice");
+        let batch = Batch::single_row(schema, vec![Binding::sid(sid)]).unwrap();
+        result.batches = vec![batch];
+
+        let xml = format(&result, &compactor, &FormatterConfig::sparql_xml()).unwrap();
+        assert!(xml.contains(r#"<variable name="s"/>"#), "{xml}");
+        assert!(xml.contains(r#"<binding name="s">"#), "{xml}");
+        assert!(xml.contains("<uri>http://example.org/alice</uri>"), "{xml}");
+    }
+
+    // ------------------------------------------------------------------
+    // Direct-write rewrite coverage (previously untested invariants).
+    // ------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    fn make_result(var_names: &[&str], rows: Vec<Vec<Binding>>) -> QueryResult {
+        let mut vars = VarRegistry::new();
+        let var_ids: Vec<fluree_db_query::VarId> =
+            var_names.iter().map(|&n| vars.get_or_insert(n)).collect();
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); var_ids.len()];
+        for row in rows {
+            for (col, b) in row.into_iter().enumerate() {
+                columns[col].push(b);
+            }
+        }
+        let batch = Batch::new(Arc::from(var_ids.clone().into_boxed_slice()), columns).unwrap();
+        QueryResult {
+            vars,
+            t: Some(0),
+            novelty: None,
+            context: fluree_graph_json_ld::ParsedContext::default(),
+            orig_context: None,
+            output: fluree_db_query::ir::QueryOutput::select_all(var_ids),
+            batches: vec![batch],
+            binary_graph: None,
+            from_graph_source: false,
+            advisories: Vec::new(),
+        }
+    }
+
+    fn fmt(result: &QueryResult, compactor: &IriCompactor) -> String {
+        format(result, compactor, &FormatterConfig::sparql_xml()).unwrap()
+    }
+
+    #[test]
+    fn inferable_datatype_omitted_string() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::String("Alice".to_string()),
+                Sid::new(2, "string"),
+            )]],
+        );
+        let xml = fmt(&r, &c);
+        // A literal with no datatype and no xml:lang IS an xsd:string, so
+        // omitting the tag here is exact, not lossy — the one omission the W3C
+        // profile keeps.
+        assert!(xml.contains("<literal>Alice</literal>"), "{xml}");
+    }
+
+    /// Issue #45 (b), XML half. This test previously pinned the OPPOSITE: XML
+    /// dropped the datatype for every "inferable" type, so an `xsd:long` came
+    /// back as a bare `<literal>42</literal>` — a plain literal, which is
+    /// `xsd:string`, not the term the query produced. `<literal>` content is
+    /// text; nothing is inferable from it.
+    #[test]
+    fn w3c_profile_keeps_datatype_on_inferable_types() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::Long(42),
+                Sid::new(2, "long"),
+            )]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(
+            xml.contains(
+                r#"<literal datatype="http://www.w3.org/2001/XMLSchema#long">42</literal>"#
+            ),
+            "{xml}"
+        );
+
+        // A string-backed literal with an inferable type — the STRDT shape — is
+        // the same rule.
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::String("2".to_string()),
+                Sid::new(2, "integer"),
+            )]],
+        );
+        assert!(
+            fmt(&r, &c).contains(
+                r#"<literal datatype="http://www.w3.org/2001/XMLSchema#integer">2</literal>"#
+            ),
+            "{}",
+            fmt(&r, &c)
+        );
+
+        // ...and it is flag-driven, not unconditional: the loose profile still
+        // omits, so this test measures the profile rather than a constant.
+        assert!(
+            fmt(&r, &make_loose_compactor()).contains("<literal>2</literal>"),
+            "loose profile should still omit"
+        );
+    }
+
+    #[test]
+    fn non_inferable_datatype_present_date() {
+        let c = make_test_compactor();
+        // xsd:date is NOT inferable → the datatype attribute must be emitted.
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::String("2024-01-15".to_string()),
+                Sid::new(2, "date"),
+            )]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(
+            xml.contains(
+                r#"<literal datatype="http://www.w3.org/2001/XMLSchema#date">2024-01-15</literal>"#
+            ),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn language_tag_wins_over_datatype() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit_lang(
+                FlakeValue::String("Bonjour".to_string()),
+                "fr",
+            )]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(
+            xml.contains(r#"<literal xml:lang="fr">Bonjour</literal>"#),
+            "{xml}"
+        );
+        assert!(!xml.contains("datatype="), "{xml}");
+    }
+
+    #[test]
+    fn blank_node_stripped_and_framed() {
+        let c = make_test_compactor();
+        // EMPTY namespace (code 0) carries the verbatim IRI, here a `_:` label.
+        let r = make_result(&["?v"], vec![vec![Binding::sid(Sid::new(0, "_:b1"))]]);
+        let xml = fmt(&r, &c);
+        assert!(xml.contains("<bnode>b1</bnode>"), "{xml}");
+        assert!(!xml.contains("<uri>"), "{xml}");
+    }
+
+    #[test]
+    fn blank_node_registered_namespace_code() {
+        // The real encoding: a blank node lands in the registered BLANK_NODE
+        // namespace (prefix "_:"), so `namespace_prefix` returns Some("_:").
+        // This must still frame as <bnode>, not <uri>.
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::sid(Sid::new(
+                fluree_vocab::namespaces::BLANK_NODE,
+                "b1",
+            ))]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(xml.contains("<bnode>b1</bnode>"), "{xml}");
+        assert!(!xml.contains("<uri>"), "{xml}");
+    }
+
+    #[test]
+    fn double_special_values() {
+        let c = make_test_compactor();
+        for (d, expected) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+        ] {
+            let r = make_result(
+                &["?v"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            let xml = fmt(&r, &c);
+            assert!(xml.contains(&format!(">{expected}</literal>")), "{xml}");
+        }
+    }
+
+    /// Finite doubles serialize in the W3C canonical `xsd:double` lexical form
+    /// (issue #1445): `1.0E6`, not Rust-Display `1000000`.
+    #[test]
+    fn double_canonical_form() {
+        let c = make_test_compactor();
+        for (d, expected) in [
+            (1_000_000.0, "1.0E6"),
+            (1e30, "1.0E30"),
+            (0.001, "1.0E-3"),
+            (-3.0, "-3.0E0"),
+            (3.125, "3.125E0"),
+        ] {
+            let r = make_result(
+                &["?v"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            let xml = fmt(&r, &c);
+            assert!(xml.contains(&format!(">{expected}</literal>")), "{xml}");
+        }
+    }
+
+    #[test]
+    fn unbound_binding_is_omitted() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?a", "?b"],
+            vec![vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(xml.contains(r#"<binding name="a">"#), "{xml}");
+        // Unbound ?b must not produce a <binding> element.
+        assert!(!xml.contains(r#"<binding name="b">"#), "{xml}");
+    }
+
+    #[test]
+    fn head_vars_sorted_lexicographically() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?zebra", "?apple"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "z")),
+                Binding::sid(Sid::new(100, "a")),
+            ]],
+        );
+        let xml = fmt(&r, &c);
+        let apple = xml.find(r#"<variable name="apple"/>"#).unwrap();
+        let zebra = xml.find(r#"<variable name="zebra"/>"#).unwrap();
+        assert!(apple < zebra, "head vars must be sorted: {xml}");
+    }
+
+    #[test]
+    fn xml_special_chars_escaped_in_value() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::String("a & b < c > d".to_string()),
+                Sid::new(2, "string"),
+            )]],
+        );
+        let xml = fmt(&r, &c);
+        assert!(xml.contains("a &amp; b &lt; c &gt; d"), "{xml}");
+    }
+
+    /// A per-group list has no SPARQL-results form: the XML writer refuses it
+    /// rather than expanding it into one `<result>` per element.
+    #[test]
+    fn grouped_cell_is_a_format_error() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?a", "?b"],
+            vec![vec![
+                Binding::Grouped(vec![
+                    Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
+                ]),
+                Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+            ]],
+        );
+        assert!(format(&r, &c, &FormatterConfig::sparql_xml()).is_err());
+    }
+
+    #[test]
+    fn select_one_emits_single_result() {
+        let c = make_test_compactor();
+        let mut r = make_result(
+            &["?s"],
+            vec![
+                vec![Binding::sid(Sid::new(100, "a"))],
+                vec![Binding::sid(Sid::new(100, "b"))],
+                vec![Binding::sid(Sid::new(100, "c"))],
+            ],
+        );
+        let s_var = r.vars.get_or_insert("?s");
+        r.output = fluree_db_query::ir::QueryOutput::select_one(vec![s_var]);
+        let xml = fmt(&r, &c);
+        assert_eq!(xml.matches("<result>").count(), 1, "{xml}");
+        assert!(xml.contains("<uri>http://example.org/a</uri>"), "{xml}");
+    }
+
+    #[test]
+    fn iri_binding_full_iri_no_compaction() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?g"],
+            vec![vec![Binding::Iri(Arc::from("http://example.org/graph1"))]],
+        );
+        let xml = fmt(&r, &c);
+        // XML uses the full IRI (no @vocab/@base compaction).
+        assert!(
+            xml.contains("<uri>http://example.org/graph1</uri>"),
+            "{xml}"
+        );
+    }
+}

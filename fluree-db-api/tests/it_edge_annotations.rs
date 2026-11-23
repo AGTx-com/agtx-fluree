@@ -1,0 +1,7053 @@
+//! Edge annotations — broader M1b integration tests.
+//!
+//! Pins the user-facing contracts that the M1 design doc commits to:
+//!
+//! - **Parallel annotations** on the same `(s, p, o)` edge produce one
+//!   row per annotation occurrence — Cypher fidelity.
+//! - **Multiplicity contract**: a bare `?s ?p ?o` triple pattern
+//!   returns a single row regardless of how many annotations are
+//!   attached to that edge.
+//! - **Annotation-rooted lookup** (`@reifies`) finds the edge from
+//!   metadata; the base-edge triple in the expansion gives the
+//!   visibility check for free.
+//! - **Named-graph round-trip**: an annotated edge in a named graph
+//!   stays paired with its annotation across query boundaries —
+//!   regression coverage for the M1a `f:reifiesGraph` fix.
+//!
+//! See `docs/concepts/edge-annotations.md` for the user-facing
+//! surface contract and `docs/design/edge-annotations.md` for the
+//! storage internals.
+//!
+//! Tests deliberately scope themselves to single-graph queries (or
+//! `Pattern::Graph`-wrapped patterns) to stay within the correctness
+//! envelope of the IR-level expansion in
+//! `fluree-db-query/src/execute/where_plan.rs::expand_edge_annotation_patterns`.
+
+use crate::support;
+
+use crate::support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
+use fluree_db_api::FlureeBuilder;
+use serde_json::{json, Value as JsonValue};
+
+fn ctx() -> JsonValue {
+    json!({
+        "ex": "http://example.org/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    })
+}
+
+/// Match a row column against the compact or expanded form of an IRI,
+/// in either bare-string or `{"@id": "..."}` shape. Mirrors the helper
+/// in `it_edge_annotations_parse.rs` so the broader tests stay robust
+/// to formatter changes.
+fn iri_matches(value: &JsonValue, compact: &str, expanded: &str) -> bool {
+    [compact, expanded].iter().any(|expect| {
+        value.as_str() == Some(*expect)
+            || value.get("@id").and_then(|v| v.as_str()) == Some(*expect)
+    })
+}
+
+async fn seed_single_annotation(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    (fluree, committed.ledger)
+}
+
+#[tokio::test]
+async fn parallel_annotations_on_one_edge_return_one_row_per_occurrence() {
+    // Cypher fidelity: two distinct annotations on the same (s, p, o)
+    // edge must produce two rows under the inline-form query, with
+    // the role binding distinguishing them. This is the multiplicity
+    // contract for `Pattern::EdgeAnnotation`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:parallel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Insert two parallel annotations on the same edge. Each annotation
+    // has an explicit @id so they can be told apart on retract paths
+    // later (and so neither is anonymous).
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/2020",
+                        "ex:role": "Engineer"
+                    }
+                }
+            },
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/2024",
+                        "ex:role": "Manager"
+                    }
+                }
+            }
+        ]
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("parallel-annotation query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "two parallel annotations must produce two rows, got: {arr:#?}"
+    );
+
+    // Pull out the ?role bindings (each row is a single-column tuple
+    // because select is `["?role"]`).
+    let roles: std::collections::BTreeSet<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first().and_then(|v| v.as_str()))
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        roles,
+        ["Engineer", "Manager"]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    );
+}
+
+#[tokio::test]
+async fn annotation_lowers_with_top_level_ledger_key_in_body() {
+    // Regression: when the target ledger is supplied in the request *body*
+    // (HTTP body-ledger form: `{"ledger": "...", "@context": ..., "@graph": [...]}`)
+    // rather than the URL path, the stray top-level `ledger` key must not
+    // disturb `@annotation` lowering. Previously `is_envelope` rejected any
+    // document carrying a `ledger` key, so the envelope was misclassified as
+    // a node-map, `@graph` was skipped, and `@annotation` survived raw —
+    // expanding into a dangling literal predicate with no reification bundle
+    // and zero queryable annotations.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:body-ledger";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "ledger": ledger_id,
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }
+        ]
+    });
+    let committed = fluree
+        .upsert(ledger0, &txn)
+        .await
+        .expect("upsert with body-ledger key");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("body-ledger annotation query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "body-ledger annotation must reify and be queryable, got: {arr:#?}"
+    );
+    assert_eq!(
+        arr[0]
+            .as_array()
+            .and_then(|cols| cols.first())
+            .and_then(|v| v.as_str()),
+        Some("Engineer")
+    );
+}
+
+#[tokio::test]
+async fn single_object_body_ledger_insert_lowers_annotation_and_drops_routing_key() {
+    // Single-object form (no `@graph`) with the ledger in the body. Two
+    // guarantees: (1) the `@annotation` reifies even though the stray
+    // `ledger` key trips the envelope/wrapper detectors, and (2) the
+    // `ledger` routing key is stripped before expansion so it never leaks
+    // as a `<ex:alice> ledger "..."` predicate — including the rewrap path
+    // where annotation lowering buries the original node inside `@graph`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:single-object-body-ledger";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "ledger": ledger_id,
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .upsert(ledger0, &txn)
+        .await
+        .expect("single-object body-ledger upsert");
+
+    let ann_query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "?role" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &ann_query)
+        .await
+        .expect("annotation query");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "single-object body-ledger annotation must reify, got: {rows:#?}"
+    );
+
+    // No stray routing-key predicate leaked onto the subject.
+    let pred_query = json!({
+        "@context": ctx(),
+        "select": ["?p", "?o"],
+        "where": { "@id": "ex:alice", "?p": "?o" }
+    });
+    let preds = support::query_jsonld_formatted(&fluree, &committed.ledger, &pred_query)
+        .await
+        .expect("predicate query");
+    let leaked = preds
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .any(|cols| {
+            let pred = cols.first().and_then(JsonValue::as_str).unwrap_or_default();
+            let obj = cols.get(1).and_then(JsonValue::as_str).unwrap_or_default();
+            pred.contains("ledger") || obj == ledger_id
+        });
+    assert!(
+        !leaked,
+        "routing `ledger` key must not leak as a predicate, got: {preds:#?}"
+    );
+}
+
+/// Collect the `?role` column of an inline-annotation query into a sorted set.
+async fn annotation_roles(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+) -> std::collections::BTreeSet<String> {
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "?role" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(fluree, ledger, &query)
+        .await
+        .expect("annotation role query");
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .filter_map(|cols| cols.first().and_then(JsonValue::as_str))
+        .map(String::from)
+        .collect()
+}
+
+#[tokio::test]
+async fn update_insert_clause_mints_annotation_constant() {
+    // Minting a brand-new annotated edge through an UPDATE `insert` clause
+    // (constant template, gated by a matching WHERE). Both the base edge and
+    // its reified annotation must persist — previously the inline `@annotation`
+    // caused the whole insert clause to silently no-op.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-const";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("update insert with inline annotation");
+
+    // Base edge landed.
+    let base_q = json!({
+        "@context": ctx(),
+        "select": ["?o"],
+        "where": { "@id": "ex:alice", "ex:worksFor": "?o" }
+    });
+    let base = support::query_jsonld_formatted(&fluree, &committed.ledger, &base_q)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base.as_array().map(Vec::len),
+        Some(1),
+        "base edge must land, got: {base:#?}"
+    );
+
+    // Annotation reified.
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_mints_annotation_for_where_bound_edges() {
+    // Annotate every edge matched by WHERE: the reification bundle references
+    // the WHERE-bound subject/object per solution, and each binding mints a
+    // distinct annotation (no blank-node collision across solutions).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-where-bound";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:globex" } }
+        ]
+    });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed two edges");
+
+    // Re-assert each matched edge with an annotation tying it to its object.
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "?p", "ex:worksFor": "?o" },
+        "insert": {
+            "@id": "?p",
+            "ex:worksFor": { "@id": "?o", "@annotation": { "ex:role": "Staff" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("where-bound annotated update");
+
+    // Both edges carry a "Staff" annotation → one row per annotated edge.
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "Staff" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("annotated-edge query");
+    let pairs: std::collections::BTreeSet<(String, String)> = rows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .filter_map(|cols| {
+            Some((
+                cols.first()?.as_str()?.to_string(),
+                cols.get(1)?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("ex:alice".to_string(), "ex:acme".to_string()),
+            ("ex:bob".to_string(), "ex:globex".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        "each WHERE-bound edge must mint its own annotation, got: {rows:#?}"
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_anonymous_annotation_reifies() {
+    // Anonymous (blank-node) annotation minted through an update insert clause.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-anon";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("anonymous annotated update");
+
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_delete_and_insert_annotation_in_one_txn() {
+    // Interaction: the delete-clause annotation pre-pass and the insert-clause
+    // lowering must coexist in one update. Retract the old annotation metadata
+    // (by the annotation's @id) while minting a fresh annotated edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-delete-and-insert";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+        }
+    });
+    let seeded = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed annotated edge");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:emp/alice-acme", "ex:role": "?r" },
+        "delete": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" },
+        "insert": {
+            "@id": "ex:bob",
+            "ex:worksFor": { "@id": "ex:globex", "@annotation": { "ex:role": "Manager" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("combined delete + insert annotation update");
+
+    // Old "Engineer" metadata gone, new "Manager" annotation minted.
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Manager"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_explicit_id_annotation_reifies() {
+    // Explicit-`@id` annotation minted through an update insert clause.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-explicit-id";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/alice", "ex:role": "Engineer" }
+            }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("explicit-id annotated update");
+
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_parallel_annotations_reify() {
+    // Two parallel annotations on one edge, minted in a single update insert
+    // clause as repeated nodes (the array `@annotation: [...]` form is
+    // rejected on every surface; parallels are expressed as repeated edges).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-parallel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": [
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme", "@annotation": { "@id": "ex:e1", "ex:role": "Engineer" } } },
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme", "@annotation": { "@id": "ex:e2", "ex:role": "Manager" } } }
+        ]
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("parallel annotated update");
+
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer", "Manager"]
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_literal_valued_edge_reifies() {
+    // Annotating a literal-valued edge (typed literal) through an update
+    // insert clause: base value + reified annotation both land.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-literal";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:age": {
+                "@value": "42",
+                "@type": "xsd:integer",
+                "@annotation": { "ex:src": "hr" }
+            }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("literal-valued annotated update");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?src"],
+        "where": {
+            "@id": "?p",
+            "ex:age": {
+                "@value": "42",
+                "@type": "xsd:integer",
+                "@annotation": { "ex:src": "?src" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("literal-edge annotation query");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "literal-edge annotation must reify, got: {arr:#?}"
+    );
+    assert_eq!(
+        arr[0]
+            .as_array()
+            .and_then(|c| c.first())
+            .and_then(JsonValue::as_str),
+        Some("hr")
+    );
+}
+
+#[tokio::test]
+async fn update_anonymous_annotation_metadata_via_where_binding() {
+    // The only way to edit an *anonymous* annotation (no user `@id`) is to bind
+    // its subject through the inline `@annotation` WHERE form, then delete /
+    // insert its properties by that bound variable. The bundle is preserved
+    // (new metadata survives), so the edited role is reachable.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-anon-metadata";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+    });
+    let seeded = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed anon annotation");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": {
+            "@id": "?p",
+            "ex:worksFor": { "@id": "?o", "@annotation": { "@id": "?ann", "ex:role": "Engineer" } }
+        },
+        "delete": { "@id": "?ann", "ex:role": "Engineer" },
+        "insert": { "@id": "?ann", "ex:role": "Manager" }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("anonymous-annotation metadata edit");
+
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Manager"].iter().map(ToString::to_string).collect(),
+        "anonymous annotation metadata must be editable via WHERE binding"
+    );
+}
+
+#[tokio::test]
+async fn update_delete_by_selector_retracts_anonymous_annotation() {
+    // Selector delete (an `@annotation` block with a body property and no
+    // `@id`) must retract an anonymous annotation, leaving zero annotations.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-delete-selector-anon";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+    });
+    let seeded = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed anon annotation");
+
+    let update = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("selector delete of anonymous annotation");
+
+    assert!(
+        annotation_roles(&fluree, &committed.ledger)
+            .await
+            .is_empty(),
+        "selector delete must retract the anonymous annotation"
+    );
+}
+
+#[tokio::test]
+async fn bare_triple_pattern_returns_one_row_per_edge_regardless_of_annotations() {
+    // Multiplicity contract: the `Pattern::Triple(?s, ex:worksFor, ?o)`
+    // surface returns one row per *edge*, even when multiple
+    // annotations exist for that edge. Annotations only affect
+    // cardinality through the `@annotation` / `@reifies` IR variants.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:bare-multiplicity";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Two annotations on the same edge.
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+            }},
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+            }}
+        ]
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    // Bare triple pattern — no @annotation block, no `@reifies`.
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("bare triple query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "bare triple cardinality must be 1 per edge regardless of annotations, got: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row tuple");
+    assert!(iri_matches(&row[0], "ex:alice", "http://example.org/alice"));
+    assert!(iri_matches(&row[1], "ex:acme", "http://example.org/acme"));
+}
+
+#[tokio::test]
+async fn select_distinct_collapses_parallel_annotations_when_projecting_edge_only() {
+    // Even when the WHERE clause uses `@annotation` (which produces
+    // per-occurrence cardinality), `selectDistinct` over edge-only
+    // projection columns (?person, ?org) collapses to one row.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:select-distinct";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+            }},
+            { "@id": "ex:alice", "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+            }}
+        ]
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "selectDistinct": ["?person", "?org"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("selectDistinct query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "selectDistinct over (?person, ?org) collapses parallel annotations: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn annotation_rooted_query_finds_matching_edge() {
+    // `@reifies`: filter by annotation metadata, return the edge it
+    // reifies. Smoke test — broader visibility-check coverage lives
+    // in `it_edge_annotations_parse.rs`.
+    let (fluree, ledger) = seed_single_annotation("it/edge-annotations:reifies-roundtrip").await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("@reifies query");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(&row[0], "ex:alice", "http://example.org/alice"));
+    assert!(iri_matches(&row[1], "ex:acme", "http://example.org/acme"));
+}
+
+/// An annotated edge whose key `@vocab` resolves links to its annotation:
+/// the reifier names the predicate the edge is written under, not the key
+/// as written. An annotation-rooted query finds the edge, and a delete of
+/// the annotated edge retracts the annotation with it.
+#[tokio::test]
+async fn an_annotation_on_a_vocab_key_links_to_its_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:vocab-key";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let vocab = json!({"@vocab": "http://example.org/"});
+    let txn = json!({
+        "@context": vocab,
+        "@id": "http://example.org/alice",
+        "knows": {
+            "@id": "http://example.org/bob",
+            "@annotation": {"confidence": 0.9}
+        }
+    });
+    let ledger = fluree.insert(ledger0, &txn).await.expect("insert").ledger;
+
+    let rooted = json!({
+        "@context": vocab,
+        "select": ["?s", "?o"],
+        "where": {"confidence": 0.9, "@reifies": {"@id": "?s", "knows": {"@id": "?o"}}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &rooted)
+        .await
+        .expect("@reifies query");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+
+    let delete = json!({
+        "@context": vocab,
+        "delete": {
+            "@id": "http://example.org/alice",
+            "knows": {"@id": "http://example.org/bob", "@annotation": {"confidence": 0.9}}
+        }
+    });
+    let ledger = fluree.update(ledger, &delete).await.expect("delete").ledger;
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &rooted)
+        .await
+        .expect("@reifies query after delete");
+    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows}");
+}
+
+#[tokio::test]
+async fn annotation_rooted_query_returns_no_rows_when_metadata_doesnt_match() {
+    // Negative case: filtering by a role that no annotation carries
+    // must produce zero rows. Pins that the body patterns actually
+    // join — a bug here would mean the f:reifies* lookup is short-
+    // circuiting before reading metadata.
+    let (fluree, ledger) = seed_single_annotation("it/edge-annotations:reifies-no-match").await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Salesperson",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("@reifies negative query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "expected zero rows when the role doesn't match, got: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn retracting_base_edge_cascades_f_reifies_bundle() {
+    // M1b cascade: when a base edge is retracted, the `f:reifies*`
+    // bundle pointing at it must be retracted in the same
+    // transaction so the durable encoding doesn't keep orphaned
+    // attachment pointers.
+    //
+    // The naïve "post-delete @reifies returns zero rows" check is
+    // ambiguous: the base-edge triple emitted by the M1b expansion
+    // *also* drops the row when the edge isn't currently asserted,
+    // so zero rows after delete tells us nothing about whether the
+    // f:reifies* bundle was retracted or merely orphaned.
+    //
+    // The discriminating test: after the cascade-eligible delete,
+    // re-insert *just* the base edge (no `@annotation` block). This
+    // re-asserts the visibility-check edge but does not re-emit any
+    // f:reifies* facts. So:
+    //   - if cascade fired, the f:reifies* facts are retracted,
+    //     re-inserting the edge doesn't bring them back, and
+    //     `@reifies` returns zero rows.
+    //   - if cascade didn't fire, the f:reifies* facts are still
+    //     asserted from the original insert, the visibility check
+    //     now passes, and `@reifies` returns the original
+    //     annotation — proving the bundle was orphaned, not cleaned.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-base-retract";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // 1. Insert an annotated edge.
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("annotated insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+        }
+    });
+
+    // Sanity: the annotation is reachable via @reifies before delete.
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q)
+        .await
+        .expect("pre-cascade query");
+    assert_eq!(
+        pre.as_array().expect("array").len(),
+        1,
+        "@reifies should find the annotation before cascade: {pre:#?}"
+    );
+
+    // 2. Retract the base edge via SPARQL-style update. The
+    //    transactor's cascade pass should retract the corresponding
+    //    `f:reifies*` bundle automatically.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("base-edge delete");
+
+    // 3. Re-insert *only* the base edge. No `@annotation` block,
+    //    so no f:reifies* assertions are emitted by the lowering.
+    let reinsert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": { "@id": "ex:acme" }
+    });
+    let after_reinsert = fluree
+        .insert(after_delete.ledger, &reinsert)
+        .await
+        .expect("plain re-insert");
+
+    // 4. The base edge is now currently asserted again (visibility
+    //    check passes), so any zero-row result must come from the
+    //    f:reifies* facts being retracted — the cascade contract.
+    let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+        .await
+        .expect("post-cascade-and-reinsert query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "after cascade + plain re-insert, @reifies must return zero rows \
+         (proving the f:reifies* bundle was retracted, not just orphaned). got: {arr:#?}"
+    );
+
+    // Cross-check: a bare-triple query for the re-inserted edge
+    // must return one row, confirming the visibility-check side of
+    // the proof — the edge IS currently asserted, so zero rows
+    // above isn't a visibility miss.
+    let bare = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+    });
+    let bare_rows = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &bare)
+        .await
+        .expect("bare triple query after re-insert");
+    assert_eq!(
+        bare_rows.as_array().expect("array").len(),
+        1,
+        "the re-inserted base edge must be currently asserted (cross-check)"
+    );
+}
+
+#[tokio::test]
+async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
+    // M1b round-trip: when subject expansion materializes a base edge
+    // that has an annotation attached, the rendered value must carry
+    // an `@annotation` key whose body is the annotation's
+    // user-property view (with `f:reifies*` filtered out, which the
+    // wildcard-hydration filter already handles).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:expand-annotation";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    // Wildcard hydrate the base subject. The `ex:worksFor` value
+    // should expand to a node-map carrying both `@id` (the org) and
+    // an `@annotation` key with the annotation's body.
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("annotated subject expansion");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "single subject row, got: {arr:#?}");
+
+    let person = arr[0].as_object().expect("hydrated person object");
+    let works_for = person
+        .get("ex:worksFor")
+        .or_else(|| person.get("http://example.org/worksFor"))
+        .expect("ex:worksFor must be present");
+
+    // The value is a single object (one annotation, one edge) — pull
+    // it out regardless of single-vs-array shape.
+    let edge_obj = works_for
+        .as_object()
+        .or_else(|| {
+            works_for
+                .as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
+        .expect("worksFor value must be a node object: {works_for:#?}");
+
+    assert!(
+        iri_matches(
+            edge_obj.get("@id").unwrap_or(&JsonValue::Null),
+            "ex:acme",
+            "http://example.org/acme",
+        ),
+        "edge object @id should be ex:acme, got: {edge_obj:#?}"
+    );
+
+    let ann = edge_obj
+        .get("@annotation")
+        .expect("@annotation key must be injected for annotated edge");
+    let ann_obj = ann
+        .as_object()
+        .or_else(|| {
+            ann.as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
+        .expect("@annotation value must be an object or single-element array");
+
+    assert_eq!(
+        ann_obj
+            .get("ex:role")
+            .or_else(|| ann_obj.get("http://example.org/role"))
+            .and_then(|v| v.as_str()),
+        Some("Engineer"),
+        "annotation body must surface ex:role: {ann_obj:#?}"
+    );
+    // System facts must still be filtered.
+    for k in ann_obj.keys() {
+        assert!(
+            !k.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak into @annotation body: {k}"
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn first_annotation_through_incremental_index_flips_has_annotations() {
+    // Regression: when a ledger is first reindexed via the
+    // incremental path AFTER receiving its first annotation,
+    // `IndexRoot.has_annotations` must flip to `true`. Otherwise
+    // post-reindex (when the novelty bit drains) the cascade
+    // fast-path would skip the scan and leave dangling
+    // `f:reifies*` flakes for any later retract.
+    //
+    // Test path:
+    //   1. Insert plain (non-annotated) data, reindex → indexed
+    //      root has `has_annotations = false`.
+    //   2. Insert annotated edge → novelty bit fires.
+    //   3. Reindex (incremental path clones the old root) →
+    //      indexed root MUST flip `has_annotations` to `true`.
+    //   4. Retract the base edge → the cascade gate must NOT
+    //      short-circuit (it skips only when both snapshot and
+    //      novelty annotation flags are false).
+    //   5. Re-insert the base edge alone, query @reifies → zero
+    //      rows (cascade actually fired and retracted the bundle).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:incremental-flips-flag";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            // Step 1: plain insert → indexed root with no annotations.
+            let plain = json!({
+                "@context": ctx(),
+                "@id": "ex:bob",
+                "ex:name": "Bob"
+            });
+            let after_plain = fluree.insert(ledger0, &plain).await.expect("plain insert");
+            support::trigger_index_and_wait(&handle, ledger_id, after_plain.receipt.t).await;
+
+            // Step 2: insert an annotated edge.
+            let after_plain_reload = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after plain reindex");
+            let annotated = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_annotated = fluree
+                .insert(after_plain_reload, &annotated)
+                .await
+                .expect("annotated insert");
+
+            // Step 3: reindex → incremental path clones the old
+            // root and must OR-update `has_annotations` from the
+            // newly-added `f:reifies*` predicates.
+            support::trigger_index_and_wait(&handle, ledger_id, after_annotated.receipt.t).await;
+            let post_reindex = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after annotated reindex");
+            assert!(
+                post_reindex.snapshot.has_annotations,
+                "incremental indexing of the first annotation must flip \
+                 IndexRoot.has_annotations to true (otherwise the cascade \
+                 fast-path would skip post-reindex retracts)"
+            );
+
+            // Step 4: retract the base edge. The cascade gate sees
+            // `snapshot.has_annotations = true` so the scan runs.
+            let delete = json!({
+                "@context": ctx(),
+                "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+            });
+            let after_delete = fluree
+                .update(post_reindex, &delete)
+                .await
+                .expect("base-edge delete");
+
+            // Step 5: re-insert just the base edge, query @reifies
+            // — must return zero rows (proving cascade actually ran
+            // post-reindex).
+            let reinsert = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            });
+            let after_reinsert = fluree
+                .insert(after_delete.ledger, &reinsert)
+                .await
+                .expect("plain re-insert");
+
+            let q = json!({
+                "@context": ctx(),
+                "select": ["?person", "?org"],
+                "where": {
+                    "ex:role": "Engineer",
+                    "@reifies": {
+                        "@id": "?person",
+                        "ex:worksFor": { "@id": "?org" }
+                    }
+                }
+            });
+            let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+                .await
+                .expect("post-cascade @reifies query");
+            let arr = post.as_array().expect("array");
+            assert!(
+                arr.is_empty(),
+                "post-incremental-reindex retract must cascade (proving the \
+                 sticky bit flipped on incremental rebuild): {arr:#?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
+    // M2 indexed-readpath proof for the cascade path: insert an
+    // annotated edge, force a reindex (drains novelty into base),
+    // retract the base edge, and verify the f:reifies* bundle is
+    // also retracted. With the M1b novelty-only cascade this would
+    // fail post-index (the overlay's `attachments` map is empty
+    // after novelty drains).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:cascade-after-reindex";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            let txn = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+            // Drain novelty into base via reindex.
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            let reloaded = fluree.ledger(ledger_id).await.expect("reload");
+
+            // Retract the base edge. With the M1b novelty-only
+            // cascade this would not fire because
+            // `ledger.novelty.attachments` is empty post-index.
+            let delete = json!({
+                "@context": ctx(),
+                "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+            });
+            let after_delete = fluree.update(reloaded, &delete).await.expect("delete");
+
+            // Re-insert just the base edge (no @annotation block)
+            // and verify the discriminating cascade test:
+            //   - if cascade fired, @reifies returns 0 rows.
+            //   - if it didn't, the still-indexed f:reifies* facts
+            //     would join with the re-inserted base edge and
+            //     surface the original annotation.
+            let reinsert = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            });
+            let after_reinsert = fluree
+                .insert(after_delete.ledger, &reinsert)
+                .await
+                .expect("plain re-insert");
+
+            let q = json!({
+                "@context": ctx(),
+                "select": ["?person", "?org"],
+                "where": {
+                    "ex:role": "Engineer",
+                    "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+                }
+            });
+            let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+                .await
+                .expect("post-cascade-and-reinsert query");
+            let arr = post.as_array().expect("array");
+            assert!(
+                arr.is_empty(),
+                "cascade must fire for indexed annotations on base-edge retract; \
+                 got rows: {arr:#?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn subject_expansion_finds_annotation_after_reindex() {
+    // M2 indexed-readpath proof: insert an annotated edge, force a
+    // full reindex (which drains novelty into base storage), reload
+    // the ledger so the snapshot is fresh, and verify the hydrator
+    // still emits `@annotation` blocks. With the M1b novelty-only
+    // approach this test would have failed (downcast finds an empty
+    // overlay post-index); the M2 scan-based lookup goes through
+    // `db.range` which reads novelty + base, so it finds the
+    // f:reifies* facts in their indexed location.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:indexed-readpath";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            // Insert an annotated edge. The lowering produces
+            // f:reifies* flakes that land in the novelty overlay.
+            let txn = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_insert = fluree
+                .insert(ledger0, &txn)
+                .await
+                .expect("annotated insert");
+
+            // Force a full reindex so the f:reifies* flakes roll
+            // from novelty into base storage.
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+
+            // Reload the ledger to pick up the post-index snapshot.
+            let reloaded = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload ledger after index");
+
+            // Wildcard-hydrate the base subject. The expansion
+            // should reach the indexed f:reifies* facts via
+            // `db.range` and surface them under `@annotation`.
+            let query = json!({
+                "@context": ctx(),
+                "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+                "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+            });
+            let rows = support::query_jsonld_formatted(&fluree, &reloaded, &query)
+                .await
+                .expect("post-reindex annotated subject expansion");
+            let arr = rows.as_array().expect("array");
+            assert_eq!(arr.len(), 1, "single subject row, got: {arr:#?}");
+
+            let person = arr[0].as_object().expect("person object");
+            let works_for = person
+                .get("ex:worksFor")
+                .or_else(|| person.get("http://example.org/worksFor"))
+                .expect("ex:worksFor must be present after reindex");
+            let edge_obj = works_for
+                .as_object()
+                .or_else(|| {
+                    works_for
+                        .as_array()
+                        .and_then(|a| a.first().and_then(|v| v.as_object()))
+                })
+                .expect("worksFor value must be a node object");
+            let ann = edge_obj
+                .get("@annotation")
+                .expect("@annotation must survive reindex (M2 scan-based lookup)");
+            let ann_obj = ann
+                .as_object()
+                .or_else(|| {
+                    ann.as_array()
+                        .and_then(|a| a.first().and_then(|v| v.as_object()))
+                })
+                .expect("@annotation body must be an object");
+            assert_eq!(
+                ann_obj
+                    .get("ex:role")
+                    .or_else(|| ann_obj.get("http://example.org/role"))
+                    .and_then(|v| v.as_str()),
+                Some("Engineer"),
+                "annotation body must surface ex:role after reindex: {ann_obj:#?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
+    // Negative case: a plain (un-annotated) edge must not carry an
+    // `@annotation` key in its expanded form. Pins the
+    // has_annotations gate / empty-iter path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:expand-no-annotation";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:bob",
+        "ex:worksFor": {"@id": "ex:acme"}
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("plain insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("plain subject expansion");
+    let arr = rows.as_array().expect("array");
+    let person = arr[0].as_object().unwrap();
+    let works_for = person
+        .get("ex:worksFor")
+        .or_else(|| person.get("http://example.org/worksFor"))
+        .unwrap();
+    let edge_obj = works_for
+        .as_object()
+        .or_else(|| {
+            works_for
+                .as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
+        .unwrap();
+    assert!(
+        edge_obj.get("@annotation").is_none(),
+        "plain edge must not carry @annotation: {edge_obj:#?}"
+    );
+}
+
+#[tokio::test]
+async fn cascade_cleans_up_anonymous_annotation_metadata() {
+    // RDF-mode cleanup contract: when the cascade retracts the
+    // `f:reifies*` bundle for an anonymous (blank-node) annotation,
+    // it must also retract the annotation's body metadata. Without
+    // this, the body flakes (`_:fluree_ann_0 ex:role "Engineer"`)
+    // remain in the graph as orphaned RDF — unreachable through
+    // `@reifies` (the bundle is gone) but still discoverable via
+    // a `?s ex:role "Engineer"` scan.
+    //
+    // Explicit-IRI annotations are deliberately NOT cleaned up in
+    // RDF mode — they're user-addressable subjects that may have
+    // independent meaning. The opt-in `lpgEdgeLifecycle` flag
+    // would extend cleanup to those; not in scope here.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-anonymous-metadata";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Insert with an *anonymous* annotation (no @id on the
+    // annotation block — the lowering mints a blank-node SID).
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Sanity: the role is queryable before the cascade.
+    let q_role = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": { "ex:role": "?role" }
+    });
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q_role)
+        .await
+        .expect("pre-cascade role query");
+    assert_eq!(
+        pre.as_array().expect("array").len(),
+        1,
+        "ex:role should be present before cascade: {pre:#?}"
+    );
+
+    // Retract the base edge — cascade fires.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
+
+    // After the cascade, no row should match `?s ex:role ?role` —
+    // the anonymous annotation's body metadata is gone too.
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_role)
+        .await
+        .expect("post-cascade role query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "anonymous annotation's metadata must be cleaned up by RDF-mode cascade; \
+         got: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn retracting_all_annotation_metadata_cleans_bundle_too() {
+    // When a user retracts every asserted user-property flake of
+    // an annotation subject in a single transaction, the cascade
+    // should also retract the `f:reifies*` bundle pointing at the
+    // (still-asserted) base edge. Without this auto-cleanup, the
+    // bundle stays asserted as an orphan: an inline `@annotation`
+    // query would still surface the annotation subject (because
+    // `f:reifiesSubject/Predicate/Object` still pin it to the
+    // base edge), even though the user clearly intended to delete
+    // the whole annotation.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-retract-cleans-bundle";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Sanity: inline `@annotation` finds the annotation subject before
+    // we do anything else.
+    let q_ann = json!({
+        "@context": ctx(),
+        "select": ["?ann"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "@id": "?ann" }
+            }
+        }
+    });
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q_ann)
+        .await
+        .expect("pre-cleanup ?ann query");
+    assert_eq!(pre.as_array().expect("array").len(), 1);
+
+    // Retract all of the annotation subject's user metadata
+    // (here: just the single `ex:role` flake) without touching the
+    // base edge.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("metadata-only retract");
+
+    // The bundle should also be gone — inline `@annotation` no
+    // longer finds the orphaned annotation.
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_ann)
+        .await
+        .expect("post-cleanup ?ann query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "after metadata retract, the bundle must be cleaned too; got: {arr:#?}"
+    );
+
+    // The base edge itself should still be queryable — the cleanup
+    // is annotation-scoped, not edge-scoped.
+    let q_bare = json!({
+        "@context": ctx(),
+        "select": ["?o"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?o" } }
+    });
+    let bare = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_bare)
+        .await
+        .expect("base-edge query post-cleanup");
+    assert_eq!(
+        bare.as_array().expect("array").len(),
+        1,
+        "the base edge must survive metadata-only retract: {bare:#?}"
+    );
+}
+
+#[tokio::test]
+async fn replacing_annotation_metadata_in_one_txn_keeps_bundle() {
+    // Same-transaction metadata replacement: delete the only
+    // existing user-property fact AND insert a new one in a single
+    // SPARQL UPDATE. The user's intent is "update the metadata,"
+    // not "remove the annotation." The orphan-cleanup pass must
+    // see the surviving same-txn assertion and NOT cascade the
+    // bundle. Otherwise the new metadata lands as ordinary RDF
+    // but loses its edge attachment.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-replacement";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Replace `ex:role "Engineer"` with `ex:role "Manager"` in
+    // a single update — the only existing metadata is being
+    // retracted, but a new metadata fact is being asserted in
+    // the same txn.
+    let update = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        },
+        "insert": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Manager"
+        }
+    });
+    let after_update = fluree
+        .update(after_insert.ledger, &update)
+        .await
+        .expect("metadata replacement");
+
+    // The annotation must still be findable via @reifies — the
+    // bundle is preserved because the post-transaction metadata
+    // set is non-empty (`ex:role "Manager"` survives).
+    let q_reifies = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org", "?role"],
+        "where": {
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_update.ledger, &q_reifies)
+        .await
+        .expect("@reifies query post-replacement");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "metadata replacement must preserve the bundle so the new role is reachable: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert_eq!(row[2].as_str(), Some("Manager"));
+}
+
+#[tokio::test]
+async fn retracting_partial_annotation_metadata_keeps_bundle() {
+    // Counterpart: if the user retracts ONLY SOME metadata flakes
+    // (leaving others asserted), the annotation is still meaningful
+    // and the bundle must NOT be cascaded. The auto-cleanup only
+    // fires when the annotation subject is left with zero asserted
+    // body metadata.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-retract-partial";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer",
+                "ex:since": "2020"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Retract only `ex:role`; leave `ex:since` asserted.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
+
+    // The annotation should still be findable via @reifies, since
+    // `ex:since` (and the bundle) are still asserted.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "@id": "?ann" }
+            }
+        }
+    });
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-partial-retract ?ann query");
+    let arr = post.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "partial metadata retract must NOT cascade the bundle: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn cascade_lpg_mode_cleans_explicit_iri_metadata_too() {
+    // LPG mode (`opts.lpgEdgeLifecycle: true`) extends cascade
+    // cleanup to explicit-IRI annotations, matching Cypher's
+    // relationship lifecycle. Compare against
+    // `cascade_keeps_explicit_iri_annotation_metadata` (default
+    // RDF mode), which preserves the metadata.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-lpg-cleans-explicit";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Retract the base edge with `lpgEdgeLifecycle: true`.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "opts": { "lpgEdgeLifecycle": true }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
+
+    // The explicit-IRI annotation's role must be GONE (LPG semantics).
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": { "@id": "?ann", "ex:role": "?role" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-cascade explicit-IRI role query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "LPG mode must clean explicit-IRI annotation metadata too: got {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn cascade_keeps_explicit_iri_annotation_metadata() {
+    // Counterpart: explicit-IRI annotation subjects are NOT
+    // cleaned up by the default RDF-mode cascade. The bundle
+    // disappears (so `@reifies` returns nothing) but the body
+    // metadata stays queryable as ordinary RDF on the named
+    // subject.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-explicit-keeps-metadata";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
+
+    // The explicit-IRI annotation's role is still queryable.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": { "@id": "?ann", "ex:role": "?role" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-cascade explicit-IRI role query");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "explicit-IRI annotation's metadata must survive RDF-mode cascade: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(
+        &row[0],
+        "ex:emp/alice-acme",
+        "http://example.org/emp/alice-acme",
+    ));
+    assert_eq!(row[1].as_str(), Some("Engineer"));
+}
+
+#[tokio::test]
+async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
+    // Annotation bundles are emitted in the reified edge's graph,
+    // so a variable-predicate scan scoped to a named graph would
+    // expose `f:reifies*` flakes there too. The filter must apply
+    // to every graph, not only the default graph.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:variable-predicate-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("named-graph annotated insert");
+
+    // Scope the variable-predicate scan to the named graph via the
+    // dataset alias.
+    let named_graph_alias = format!("{ledger_id}#http://example.org/hr-graph");
+    let query = json!({
+        "@context": ctx(),
+        "from": &named_graph_alias,
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+    });
+
+    // `query_connection` is the dataset-aware path; pair with a
+    // formatter against the post-insert snapshot.
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph variable-predicate query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let json = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let arr = json.as_array().expect("array");
+
+    // Collect predicate bindings and assert no `f:reifies*` leaks.
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+    for p in &predicates {
+        assert!(
+            !p.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak from named-graph variable-predicate scan: {p} \
+             (full bindings: {predicates:?})"
+        );
+    }
+    // The user-authored predicate should still be visible.
+    assert!(
+        predicates
+            .iter()
+            .any(|p| p == "http://example.org/role" || p == "ex:role"),
+        "user-authored ex:role must be visible in named-graph scan: {predicates:?}"
+    );
+
+    // Drop unused suppression: the test is the assertion.
+    drop(committed);
+}
+
+#[tokio::test]
+async fn variable_predicate_scan_hides_f_reifies() {
+    // A triple pattern with a variable predicate (`?s ?p ?o`) used
+    // to surface `f:reifies*` system flakes from the annotation
+    // subject's overlay rows. The scan-layer filter in
+    // `flakes_to_bindings` skips Fluree-system-namespace predicates
+    // when the user's predicate slot is a variable, mirroring the
+    // existing filter on the binary-cursor path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:variable-predicate-no-leak";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    // Bind ?p to every predicate the annotation subject carries.
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("variable-predicate query");
+    let arr = rows.as_array().expect("array");
+
+    // Collect the predicate bindings as strings.
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+
+    // No `f:reifies*` predicate may leak.
+    for p in &predicates {
+        assert!(
+            !p.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak through variable-predicate scan: {p} \
+             (full bindings: {predicates:?})"
+        );
+        assert!(
+            !p.starts_with("f:reifies"),
+            "compact f:reifies* form must not leak: {p}"
+        );
+    }
+    // The user-authored `ex:role` must still be visible.
+    assert!(
+        predicates
+            .iter()
+            .any(|p| p == "http://example.org/role" || p == "ex:role"),
+        "user-authored ex:role must be visible: {predicates:?}"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_does_not_relax_direct_mention_firewall() {
+    // Contract: `opts.includeSystemFacts: true` only relaxes the
+    // variable-predicate scan filter. Direct mention of an
+    // `f:reifies*` IRI in a query is rejected at parse time
+    // regardless of the flag. The parser firewall is the
+    // contract-level boundary.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-include-direct-still-rejected";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let direct_query = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "select": ["?ann"],
+        "where": { "@id": "?ann", "f:reifiesPredicate": "?p" },
+        "opts": { "includeSystemFacts": true }
+    });
+
+    let result = support::query_jsonld_formatted(&fluree, &ledger, &direct_query).await;
+    let err = result.expect_err("direct f:reifies* mention must be rejected even with opt-in");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("system-controlled") && msg.contains("reifiesPredicate"),
+        "expected system-controlled rejection regardless of includeSystemFacts; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_surfaces_f_reifies() {
+    // The `opts.includeSystemFacts: true` escape disables the
+    // variable-predicate filter so debug / inspection callers can see
+    // the underlying `f:reifies*` system facts. Without the flag, the
+    // filter hides them (covered by `variable_predicate_scan_hides_f_reifies`).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-include-system-facts";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" },
+        "opts": { "includeSystemFacts": true }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("opts.includeSystemFacts query");
+    let arr = rows.as_array().expect("array");
+
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+
+    // With the escape, all three required `f:reifies*` predicates are
+    // visible from the annotation subject.
+    let leaked_reifies: Vec<&String> = predicates
+        .iter()
+        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
+        .collect();
+    assert!(
+        leaked_reifies.len() >= 3,
+        "opts.includeSystemFacts: true must surface the f:reifies* bundle \
+         (got predicates: {predicates:?})"
+    );
+}
+
+/// SPARQL twin of `opts_include_system_facts_surfaces_f_reifies`.
+#[tokio::test]
+async fn pragma_include_system_facts_surfaces_f_reifies() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/edge-annotations:pragma-include-system-facts");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = "SELECT ?p WHERE { <http://example.org/emp/alice-acme> ?p ?o }";
+    let reifies = |rows: &JsonValue| {
+        rows.to_string()
+            .matches("https://ns.flur.ee/db#reifies")
+            .count()
+    };
+
+    let hidden = support::query_sparql_formatted(&fluree, &committed.ledger, query)
+        .await
+        .expect("query without the pragma");
+    assert_eq!(reifies(&hidden), 0, "hidden without the pragma: {hidden}");
+
+    let shown = support::query_sparql_formatted(
+        &fluree,
+        &committed.ledger,
+        &format!("# PRAGMA include-system-facts: true\n{query}"),
+    )
+    .await
+    .expect("query with the pragma");
+    assert!(
+        reifies(&shown) >= 3,
+        "the pragma must surface the f:reifies* bundle: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_propagates_through_dataset_path() {
+    // The dataset/connection query path
+    // (`view::dataset_query::execute_dataset_with_r2rml`) builds its
+    // own `ContextConfig` separate from the single-graph view path.
+    // Both must thread `executable.query.include_system_facts` so the
+    // opt-in works whichever path the api dispatcher picks.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-dataset-path";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" },
+        "opts": { "includeSystemFacts": true }
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("dataset-path query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let arr = json.as_array().expect("array");
+
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+    let leaked: Vec<&String> = predicates
+        .iter()
+        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
+        .collect();
+    assert!(
+        leaked.len() >= 3,
+        "dataset-path query must propagate opts.includeSystemFacts to the scan operator \
+         (got predicates: {predicates:?})"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_works_for_ask_queries() {
+    // ASK queries return from the parser before `parse_options()`
+    // runs, so `opts.includeSystemFacts` has to be parsed inline on
+    // that branch. Without that, an ASK against an annotation
+    // subject's `?p`-shape would always answer false even with the
+    // opt-in set.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-ask";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    // Ask whether the annotation subject has *any* predicate. With
+    // the filter on (default) this still answers true via the
+    // ex:role flake. Pin the discriminating shape: ask via a SID-
+    // bound predicate of `f:reifiesSubject`-via-variable that only
+    // matches when the f:reifies* row passes the scan filter.
+    let q_default = json!({
+        "@context": ctx(),
+        "ask": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": { "@id": "ex:alice" }
+        }]
+    });
+    let resp_default = fluree
+        .query(&support::graphdb_from_ledger(&ledger), &q_default)
+        .await
+        .expect("ask default");
+    let json_default: JsonValue = resp_default
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld default");
+    assert_eq!(
+        json_default,
+        JsonValue::Bool(false),
+        "without includeSystemFacts, ASK over a hidden f:reifies* row must answer false: {json_default}"
+    );
+
+    // With the opt-in, the ASK now returns true because the scan
+    // filter is bypassed and the f:reifiesSubject row binds.
+    let q_opt = json!({
+        "@context": ctx(),
+        "ask": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": { "@id": "ex:alice" }
+        }],
+        "opts": { "includeSystemFacts": true }
+    });
+    let resp_opt = fluree
+        .query(&support::graphdb_from_ledger(&ledger), &q_opt)
+        .await
+        .expect("ask opt");
+    let json_opt: JsonValue = resp_opt.to_jsonld(&ledger.snapshot).expect("to_jsonld opt");
+    assert_eq!(
+        json_opt,
+        JsonValue::Bool(true),
+        "ASK + opts.includeSystemFacts must surface f:reifies* rows: {json_opt}"
+    );
+}
+
+#[tokio::test]
+async fn history_query_surfaces_f_reifies_events() {
+    // History-range queries dispatch through `BinaryHistoryScanOperator`,
+    // not `BinaryScanOperator`. The history operator has no
+    // variable-predicate filter for `f:reifies*` because attachment
+    // lifecycle events are part of the ledger's history and the
+    // history-range surface is the documented inspection path for
+    // them. This test pins the carve-out: a history scan over the
+    // annotation subject sees its `f:reifies*` events without any
+    // opt-in.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:history-surfaces-reifies";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    // History-range query over the annotation subject. `from`/`to`
+    // dispatches through `view::dataset_query` which selects
+    // `BinaryHistoryScanOperator` instead of the normal
+    // `BinaryScanOperator`.
+    let query = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?p", "?o"],
+        "where": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": {"@value": "?o"}
+        }]
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("history range query");
+    let json = result
+        .to_jsonld(&committed.ledger.snapshot)
+        .expect("to_jsonld");
+
+    // At least one `f:reifies*` predicate IRI must appear in the
+    // bound-?p column — the history operator does not apply the
+    // variable-predicate filter.
+    let json_str = serde_json::to_string(&json).expect("serialize history rows");
+    assert!(
+        json_str.contains("reifies"),
+        "history-range query must surface f:reifies* events for inspection \
+         (payload: {json_str})"
+    );
+}
+
+#[tokio::test]
+async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
+    // Annotation subjects minted by the M1a transactor lowering carry
+    // `f:reifies*` system facts in addition to the user-authored body
+    // properties. Wildcard subject hydration (`select: {"?s": ["*"]}`)
+    // expands all properties of a subject, which would otherwise leak
+    // these system facts to the user.
+    //
+    // The hydration-layer filter in `format/hydration.rs` skips any
+    // predicate where `is_reserved_reifies_predicate(&p)` returns
+    // true. This test pins that contract: the wildcard projection
+    // sees the user's `ex:role` but not any `f:reifies*` predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-hides-reifies";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over annotation subject");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "wildcard hydration should find the annotation subject"
+    );
+
+    // The user's `ex:role` is visible.
+    let node = arr[0]
+        .as_object()
+        .expect("hydrated node should be an object");
+    let role_visible = node
+        .get("ex:role")
+        .or_else(|| node.get("http://example.org/role"))
+        .is_some();
+    assert!(
+        role_visible,
+        "user-authored ex:role must remain visible under wildcard hydration: {node:#?}"
+    );
+
+    // No `f:reifies*` predicate may appear under any namespace form
+    // (full IRI or compact alias). The hydration formatter compacts
+    // through the query's `@context`, but we don't declare an `f:`
+    // alias in our test ctx, so any leak would surface as the
+    // expanded IRI.
+    for key in node.keys() {
+        assert!(
+            !key.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* predicate '{key}' must not leak through wildcard hydration"
+        );
+        assert!(
+            !key.starts_with("f:reifies"),
+            "compact f:reifies* form '{key}' must not leak"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wildcard_subject_hydration_hides_anonymous_annotation_sids() {
+    // Anonymous (blank-node) annotation subjects are LPG-style
+    // internal occurrence ids per the design contract. When a
+    // wildcard subject hydration query happens to bind a row's
+    // subject variable to such an anonymous SID — typically because
+    // the user matched on a body property like `ex:role` —
+    // expanding it would leak the bnode identifier as a top-level
+    // result. The hydration filter at the top of `format_subject`
+    // returns Null for anonymous annotation subjects so the row
+    // surfaces as `null` rather than `{"@id": "_:bnode_x", ...}`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-hides-anon-anns";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Anonymous annotation: no `@id` → blank-node SID minted by
+    // the transactor.
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("anonymous annotation insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over anonymous annotation");
+    let arr = rows.as_array().expect("array");
+
+    // Single-column hydration drops `null` rows entirely, so a
+    // hidden anonymous annotation surfaces as an empty array
+    // rather than `[null]`. The contract is: no blank-node `@id`
+    // leaks through the result, regardless of array length.
+    let serialized = serde_json::to_string(&rows).expect("serialize");
+    assert!(
+        !serialized.contains("_:") && !serialized.contains("\"@id\""),
+        "anonymous annotation subject must not leak its blank-node @id: {serialized}"
+    );
+    assert_eq!(
+        arr.len(),
+        0,
+        "hidden anonymous annotation should drop the row entirely (got {arr:#?})"
+    );
+}
+
+#[tokio::test]
+async fn wildcard_subject_hydration_keeps_explicit_iri_annotations_visible() {
+    // Counterpart to the anonymous-hide test. Explicit-IRI
+    // annotation subjects are ordinary user-named resources — the
+    // user wrote the `@id` so they want to see it. The hydration
+    // filter only triggers on blank-node SIDs, so explicit IRIs
+    // pass through unchanged.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-keeps-explicit-anns";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("explicit annotation insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over explicit annotation");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    let node = arr[0].as_object().expect("hydrated node");
+    let id = node.get("@id").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        id == "ex:emp/A" || id == "http://example.org/emp/A",
+        "explicit-IRI annotation @id must remain visible: {node:#?}"
+    );
+}
+
+#[tokio::test]
+async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
+    // Regression: cascade retract bundles must carry the same
+    // `g = Some(graph_sid)` as the original named-graph assertion.
+    // A default-graph retract would not match named-graph
+    // assertions in Fluree's flake identity model, leaving the
+    // annotation orphaned in the named graph.
+    //
+    // We can't directly inspect the flake graph from the public
+    // API, but we *can* observe the retract via the
+    // `AttachmentNovelty` overlay: if the cascade emitted retracts
+    // in the named graph, the overlay's observer would record
+    // them, and `current_annotations_for_at` would return zero
+    // for the edge after the retract. If the retracts went to the
+    // default graph, the named-graph assertion would still be
+    // active in the overlay.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("named-graph annotated insert");
+
+    // Direct retract — no WHERE binding needed since the IRIs are
+    // explicit. The named-graph selector tells the transactor to
+    // emit the retract flake in the named graph.
+    let insert_t = after_insert.ledger.t();
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "@graph": "ex:hr-graph",
+            "ex:worksFor": { "@id": "ex:acme" }
+        }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("named-graph base delete");
+    assert!(
+        after_delete.ledger.t() > insert_t,
+        "delete must produce a new t (precondition for cascade test)"
+    );
+
+    // Re-insert just the base edge in the same named graph.
+    let reinsert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": { "@id": "ex:acme" }
+    });
+    let after_reinsert = fluree
+        .insert(after_delete.ledger, &reinsert)
+        .await
+        .expect("named-graph base re-insert");
+
+    // After the cascade, the AttachmentNovelty observer should
+    // have recorded both the named-graph assertion AND a matching
+    // named-graph retract. With the named-graph fix, both events
+    // share the same `EdgeKey { g: Some(graph_a), ... }` so the
+    // forward map's latest event for that key is a retract (op=false).
+    //
+    // Without the fix, the assertion is keyed by `g=Some(graph_a)`
+    // but the retract would be keyed by `g=None` (different
+    // EdgeKey), so the named-graph forward rows would still show
+    // the annotation as currently asserted.
+    //
+    // We don't reconstruct the EdgeKey directly — we walk the
+    // forward map and assert that *no* named-graph edge has any
+    // currently-attached annotation.
+    let attachments = &after_reinsert.ledger.novelty.attachments;
+    let as_of = after_reinsert.ledger.t();
+    let mut leaked_named_graph_attachments: Vec<String> = Vec::new();
+    for (edge_key, _rows) in attachments.iter_forward() {
+        if edge_key.g.is_none() {
+            continue; // default-graph edge — not what this test guards
+        }
+        let live: Vec<fluree_db_core::Sid> = attachments
+            .current_annotations_for_at(edge_key, as_of)
+            .collect();
+        if !live.is_empty() {
+            leaked_named_graph_attachments.push(format!("{edge_key:?} -> {live:?}"));
+        }
+    }
+    assert!(
+        leaked_named_graph_attachments.is_empty(),
+        "after named-graph cascade, no named-graph edge should have currently-attached \
+         annotations; got: {leaked_named_graph_attachments:#?}"
+    );
+}
+
+#[tokio::test]
+async fn annotation_in_named_graph_insert_succeeds() {
+    // Regression coverage for the M1a `f:reifiesGraph` fix on the
+    // *write* path. An annotated edge in a named graph must be
+    // accepted by the transactor, with the lowering emitting
+    // `f:reifiesGraph` on the synthetic annotation sibling and
+    // pinning the sibling's own `@graph` to the same named graph.
+    //
+    // Full round-trip query coverage for named graphs needs the
+    // `from` / `fromNamed` dataset wiring (see `it_named_graphs.rs`)
+    // and pairs naturally with the cross-graph custom operator
+    // tracked in the M1b plan TODO list. This test scopes itself to
+    // the lowering-side guarantee.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:named-graph-insert";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("M1a fix: named-graph annotation insert must succeed end-to-end");
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
+    // Two parallel annotations on the same edge:
+    //   ex:emp/A → role=Engineer
+    //   ex:emp/B → role=Manager
+    // A delete with `@annotation: { @id: ex:emp/A }` must retract
+    // only A's f:reifies* bundle. B and the base edge survive
+    // unchanged. This is the design's "Delete by Annotation Id"
+    // shape — exactly that occurrence, not the base edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                        }
+                    },
+                    {
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("insert two parallel annotations");
+
+    let r2 = fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/A" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("delete by annotation id");
+    assert_eq!(
+        r2.receipt.flake_count, 3,
+        "exactly three f:reifies* retracts (subject/predicate/object)"
+    );
+
+    // Surviving annotations: only B should appear in `@reifies`
+    // queries because A's bundle is gone.
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &r2.ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(
+        arr.len(),
+        1,
+        "only ex:emp/B should survive @reifies probe: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(&row[0], "ex:emp/B", "http://example.org/emp/B"));
+    assert_eq!(row[1].as_str(), Some("Manager"));
+
+    // Base edge survives — a bare triple query still finds it.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &r2.ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must still be asserted after annotation-only delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body() {
+    // Cypher relationship-delete semantics: in LPG mode
+    // (`opts.lpgEdgeLifecycle: true`), a by-id retract of an
+    // explicit-IRI annotation should also retract the body, not
+    // just the f:reifies* bundle. Default RDF mode preserves the
+    // body — covered by
+    // `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-lpg-cleans-body";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/alice-acme" }
+                    }
+                },
+                "opts": { "lpgEdgeLifecycle": true }
+            }),
+        )
+        .await
+        .expect("by-id delete with lpgEdgeLifecycle");
+
+    // Body must be GONE — both ex:role and ex:since.
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("post-delete body query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "LPG mode by-id retract must clean explicit-IRI annotation body: got {arr:#?}"
+    );
+
+    // Base edge still survives — by-id retract targets the
+    // annotation occurrence, not the edge it reifies.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a by-id annotation retract even in LPG mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
+    // Per the design contract, deleting an explicit-IRI annotation
+    // by @id retracts only the f:reifies* bundle in default RDF
+    // mode — the user-named body metadata stays as ordinary RDF.
+    // The LPG-mode counterpart
+    // (`delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body`)
+    // pins the opt-in cleanup path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-rdf-body";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger.clone(),
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/alice-acme" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("delete by id (RDF mode)");
+
+    // The body should still be queryable as ordinary RDF — the
+    // user-named `ex:emp/alice-acme` resource has its `ex:role`
+    // and `ex:since` predicates preserved.
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("body query");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "explicit-IRI annotation body must remain queryable after by-id retract in RDF mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_named_graph_retracts_in_correct_graph() {
+    // Regression: when an annotated edge lives in a named graph, the
+    // f:reifies* assertion flakes carry `g = Some(graph_sid)` and
+    // the synthetic annotation node also lives in that named graph.
+    // The by-id retract pre-pass must thread the @graph through to
+    // the synthesized retract template — otherwise the retract
+    // flakes land in the default graph (`g = None`), Fluree's
+    // flake identity includes `g`, and the retract fails to cancel
+    // the named-graph assertion (annotation stays asserted, query
+    // continues to surface it).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph annotated insert");
+
+    let r2 = fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "@graph": "ex:hr-graph",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/A" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph by-id delete");
+    // Three retract flakes for the bundle (subject/predicate/object).
+    // f:reifiesGraph is also retracted because the synthesized
+    // template carries it explicitly to match the original
+    // assertion's identity. So flake_count = 4: subject + predicate
+    // + object + reifiesGraph.
+    assert_eq!(
+        r2.receipt.flake_count, 4,
+        "named-graph by-id retract must cancel all four reifies* flakes \
+         emitted at insert time (subject/predicate/object + reifiesGraph)"
+    );
+
+    // The annotation should no longer surface via @reifies. If the
+    // graph wasn't threaded, the retract flakes would have landed
+    // in the default graph and the named-graph assertion would
+    // still exist — this query would still find ex:emp/A.
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#http://example.org/hr-graph"),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph @reifies query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "named-graph annotation must be retracted; found survivors: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_retracts_matching_occurrence() {
+    // Selector form: `@annotation: { ex:role: "Engineer" }` (no @id)
+    // names the *kind* of annotation to retract. The pre-pass mints a
+    // fresh variable, synthesizes a WHERE pattern that constrains it
+    // to every live annotation matching the body and reifying the
+    // named edge, and emits a by-variable delete template. The
+    // standard UPDATE machinery binds and retracts.
+    //
+    // Setup: two parallel annotations on the same edge — Engineer
+    // (with two body fields) and Manager. The selector retract must
+    // cancel exactly the Engineer occurrence, leaving Manager and
+    // the base edge intact.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-basic";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    { "@id": "ex:alice",
+                      "ex:worksFor": {
+                          "@id": "ex:acme",
+                          "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                      }},
+                    { "@id": "ex:alice",
+                      "ex:worksFor": {
+                          "@id": "ex:acme",
+                          "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                      }}
+                ]
+            }),
+        )
+        .await
+        .expect("insert two parallel annotations");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("selector-form retract");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(
+        arr.len(),
+        1,
+        "only the Manager annotation should survive: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(&row[0], "ex:emp/B", "http://example.org/emp/B"));
+    assert_eq!(row[1].as_str(), Some("Manager"));
+
+    // Base edge survives — selector retract targets the annotation
+    // occurrence, not the edge it reifies.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a selector annotation retract"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_lpg_mode_cleans_explicit_iri_body() {
+    // Cypher-style relationship delete by metadata match. In LPG
+    // mode the selector retract also cleans the explicit-IRI
+    // annotation's body, not just the f:reifies* bundle.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-lpg";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                },
+                "opts": { "lpgEdgeLifecycle": true }
+            }),
+        )
+        .await
+        .expect("selector retract with lpgEdgeLifecycle");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("post-delete body query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "LPG-mode selector retract must clean the explicit-IRI annotation body: {arr:#?}"
+    );
+
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a selector annotation retract even in LPG mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_named_graph_retracts_in_correct_graph() {
+    // Regression: the synthesized WHERE pattern and delete template
+    // must thread the named graph through `f:reifiesGraph` (plus
+    // their own `@graph` selectors), or the selector retract binds
+    // nothing / fires in the wrong graph and the named-graph
+    // assertion survives.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "@graph": "ex:hr-graph",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph selector retract");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#http://example.org/hr-graph"),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph @reifies query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "named-graph annotation must be retracted by selector; found survivors: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_avoids_user_var_collision() {
+    // Regression: the pre-pass mints `?_fluree_del_ann_<N>` for
+    // selector retracts. If the user happens to reference the same
+    // internal variable in their own `where` clause, naive minting
+    // would collide and the selector retract would over-constrain
+    // against the user's bindings instead of binding fresh. The
+    // mint counter is seeded past any user-visible occurrence so
+    // the synthesized variable is always fresh.
+    //
+    // Setup: annotate one edge with role=Engineer. Issue an UPDATE
+    // whose user-provided `where` and `delete` use the colliding
+    // name `?_fluree_del_ann_0` to bind something *unrelated*
+    // (alice's plain `ex:name` triple) so the user's variable maps
+    // to a literal. The selector retract must still find the
+    // annotation and retract it; if the counter collided, the
+    // synthesized WHERE would unify the annotation SID against the
+    // literal "Alice" and bind nothing.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-var-collision";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:name": "Alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "where": { "@id": "ex:alice", "ex:name": "?_fluree_del_ann_0" },
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("selector retract with colliding user var");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert!(
+        arr.is_empty(),
+        "selector retract must run even when user already uses our \
+         internal variable prefix: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn multi_source_default_pairs_annotations_per_source_graph() {
+    // Architectural-fix coverage: under multi-source default-graph
+    // queries (`from: [g1, g2]`), each base-edge match must pair
+    // only with annotations from the SAME source graph — N+M rows,
+    // not N×M.
+    //
+    // Scenario: the same `(s, p, o)` edge is asserted in two named
+    // graphs (g1, g2) with two different annotations. A query
+    // unions both graphs into the default graph and asks for the
+    // edge plus its annotation role *without* a `Pattern::Graph`
+    // wrapper. Before the fix the expansion's f:reifies* lookups
+    // fanned across both sources via `DatasetOperator` and produced
+    // an N×M cross-product (4 rows for the 2×2 case). The fix wraps
+    // each expanded triple chain in `Pattern::DefaultGraphSource`,
+    // which iterates dataset.default_graphs() and runs the inner
+    // subplan once per source — correlating base edge with its
+    // own-source annotations only.
+    //
+    // The previous bug-pinning test asserted 4 rows; this is the
+    // flipped correctness test it became.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cross-graph-misjoin";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": [
+            format!("{ledger_id}#http://example.org/graph-A"),
+            format!("{ledger_id}#http://example.org/graph-B"),
+        ],
+        "select": ["?role", "?ann"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "?ann", "ex:role": "?role" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("multi-source default query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+
+    // Correctness: exactly one row per (base-edge, own-source
+    // annotation) pair — Engineer/ex:emp/A from graph-A and
+    // Manager/ex:emp/B from graph-B, no cross-pairs.
+    assert_eq!(
+        arr.len(),
+        2,
+        "must produce exactly N+M rows (one per source's annotation), \
+         not the pre-fix N×M cross-product. Got: {arr:#?}"
+    );
+
+    // Verify the row content is the per-source pairing, not any
+    // accidental misjoin with the right total.
+    let pairs: std::collections::HashSet<(String, String)> = arr
+        .iter()
+        .map(|row| {
+            let row = row.as_array().expect("row");
+            let role = row[0].as_str().expect("role").to_string();
+            let ann = row[1].as_str().expect("ann").to_string();
+            (role, ann)
+        })
+        .collect();
+    assert!(
+        pairs.contains(&("Engineer".to_string(), "ex:emp/A".to_string())),
+        "missing graph-A pair (Engineer, ex:emp/A) in: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("Manager".to_string(), "ex:emp/B".to_string())),
+        "missing graph-B pair (Manager, ex:emp/B) in: {pairs:?}"
+    );
+}
+
+#[tokio::test]
+async fn multi_source_default_wildcard_does_not_panic_on_synthetic_var() {
+    // Regression: an earlier shape of the per-source-correlation fix
+    // exposed a planner-minted graph variable in the operator schema
+    // without registering it with `VarRegistry`. Wildcard formatters
+    // call `vars.name(var_id)`, which would panic for an unregistered
+    // VarId. The fix removed the synthetic var entirely — per-source
+    // correlation comes from the context switch, not a join key.
+    //
+    // This test exercises the wildcard path against the same
+    // multi-source default-graph annotated dataset to pin the
+    // contract: wildcard select must not panic and must surface only
+    // user-visible bindings.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:multi-source-wildcard";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": [
+            format!("{ledger_id}#http://example.org/graph-A"),
+            format!("{ledger_id}#http://example.org/graph-B"),
+        ],
+        "select": "*",
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "?ann", "ex:role": "?role" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("wildcard select must not panic on synthetic var name lookup");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "wildcard must still produce one row per source's annotation: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
+    // Positive coverage: when the user wraps a multi-source query in
+    // `Pattern::Graph` (here via JSON-LD's named-graph access form),
+    // the executor iterates one graph at a time and the expanded
+    // f:reifies* triples scope per iteration. Each annotation pairs
+    // only with its own graph's edge — no cross-graph misjoin.
+    //
+    // This is the workaround documented on the bug pinning test.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:graph-wrapped-correct";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    // Single-graph query against graph A: two iterations would have
+    // produced 2 rows under the bug. Scoping to one graph gives the
+    // correct 1 row. Repeat for graph B as a sanity check.
+    for (graph_alias, expected_role, expected_ann) in [
+        ("ex:graph-A", "Engineer", "ex:emp/A"),
+        ("ex:graph-B", "Manager", "ex:emp/B"),
+    ] {
+        let q = json!({
+            "@context": ctx(),
+            "from": format!("{ledger_id}#http://example.org/{}",
+                graph_alias.strip_prefix("ex:").unwrap()),
+            "select": ["?role", "?ann"],
+            "where": {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "?ann", "ex:role": "?role" }
+                }
+            }
+        });
+        let result = fluree
+            .query_connection(&q)
+            .await
+            .unwrap_or_else(|e| panic!("query for {graph_alias}: {e:?}"));
+        let ledger = fluree.ledger(ledger_id).await.expect("reload");
+        let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+        let arr = json.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "single-graph scope must produce exactly one row for {graph_alias}: {arr:#?}"
+        );
+        let row = arr[0].as_array().expect("row");
+        assert_eq!(
+            row[0].as_str(),
+            Some(expected_role),
+            "role binding for {graph_alias}"
+        );
+        assert!(
+            iri_matches(
+                &row[1],
+                expected_ann,
+                &format!(
+                    "http://example.org/{}",
+                    expected_ann.strip_prefix("ex:").unwrap()
+                ),
+            ),
+            "annotation IRI for {graph_alias}: {row:#?}"
+        );
+    }
+}
+
+// =====================================================================
+// EdgeKey round-trip gate tests — literal-object annotations
+// =====================================================================
+//
+// Contract: every writer of a reifies bundle (insert sibling, in this
+// case) must produce flakes whose decoded `EdgeKey::from_reifies_facts`
+// equals the `EdgeKey::from_flake` of the base edge. If these two
+// disagree, hydration / cascade / by-selector retract all silently fail
+// to find each other.
+//
+// These tests exercise the full JSON-LD expansion → staging → flake
+// pipeline and decode the resulting bundle. They are the load-bearing
+// contract that protects against future drift between writer and
+// decoder.
+
+async fn edgekey_roundtrip_for_literal(
+    predicate_compact: &str,
+    predicate_full: &str,
+    literal_value: JsonValue,
+    test_label: &str,
+) {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = format!("it-edge-annotations-edgekey-roundtrip-{test_label}");
+    let ledger0 = genesis_ledger(&fluree, &ledger_id);
+
+    let mut literal_with_ann = literal_value
+        .as_object()
+        .expect("literal value must be an object")
+        .clone();
+    literal_with_ann.insert(
+        "@annotation".to_string(),
+        json!({ "ex:source": "hr-system" }),
+    );
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        predicate_compact: JsonValue::Object(literal_with_ann),
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = &committed.ledger;
+
+    let alice_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("encode alice IRI");
+    let predicate_sid = ledger
+        .snapshot
+        .encode_iri(predicate_full)
+        .expect("encode predicate IRI");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    // 1. Base-edge flake.
+    let base_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(alice_sid.clone(), predicate_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan base edge flake");
+    assert_eq!(
+        base_flakes.len(),
+        1,
+        "[{test_label}] expected exactly one base flake; got {base_flakes:#?}"
+    );
+    let base_flake = &base_flakes[0];
+    let base_edge_key = EdgeKey::from_flake(base_flake);
+
+    // 2. Locate the annotation subject via POST f:reifiesSubject → alice.
+    let ann_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(
+            reifies_subject_pid.clone(),
+            FlakeValue::Ref(alice_sid.clone()),
+        ),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+    assert_eq!(
+        ann_pointers.len(),
+        1,
+        "[{test_label}] expected exactly one annotation; got {ann_pointers:#?}"
+    );
+    let ann_sid = ann_pointers[0].s.clone();
+
+    // 3. Full bundle for that annotation subject.
+    let ann_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject(ann_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan annotation subject flakes");
+    let bundle: Vec<_> = ann_flakes
+        .iter()
+        .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+        .cloned()
+        .collect();
+    assert!(
+        !bundle.is_empty(),
+        "[{test_label}] annotation subject must carry an f:reifies* bundle; \
+         got flakes: {ann_flakes:#?}"
+    );
+    let decoded_key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
+        panic!(
+            "[{test_label}] decode failed: {e:?}; bundle: {bundle:#?}, base flake: {base_flake:?}"
+        )
+    });
+
+    // 4. The contract — decoded EdgeKey from the synthesized sibling
+    //    must equal the base edge's EdgeKey. Mismatch here is the
+    //    silent-failure mode that loses annotations.
+    assert_eq!(
+        decoded_key, base_edge_key,
+        "[{test_label}] decoded EdgeKey diverges from base-edge EdgeKey; \
+         base_flake: {base_flake:?}, bundle: {bundle:#?}"
+    );
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_plain_string_literal_annotation() {
+    edgekey_roundtrip_for_literal(
+        "ex:name",
+        "http://example.org/name",
+        json!({ "@value": "Alice" }),
+        "plain-string",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_typed_literal_annotation() {
+    edgekey_roundtrip_for_literal(
+        "ex:joinedAt",
+        "http://example.org/joinedAt",
+        json!({ "@value": "2024-01-01", "@type": "xsd:date" }),
+        "typed-literal",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_language_tagged_literal_annotation() {
+    // The motivating regression: without explicit f:reifiesLang
+    // emission, the decoded EdgeKey would have `lang = None` while
+    // the base flake's EdgeKey has `lang = Some("fr")`, and every
+    // downstream lookup for the annotation would silently miss.
+    edgekey_roundtrip_for_literal(
+        "ex:label",
+        "http://example.org/label",
+        json!({ "@value": "chat", "@language": "fr" }),
+        "lang-tagged",
+    )
+    .await;
+}
+
+// =====================================================================
+// Turtle-star ↔ JSON-LD @annotation flake-equivalence gate tests
+// =====================================================================
+//
+// Contract (PR-W15): Turtle-star asserting forms (`<< s p o ~ r >>`,
+// `{| … |}`) must produce BIT-IDENTICAL `f:reifies*` flakes to the
+// JSON-LD `@annotation` lowering — same predicates, same object
+// values/datatypes/metadata, same "no f:reifiesDatatype" shape — so
+// cascade retracts, hydration, and the annotation arena treat both
+// surfaces as one. Both surfaces are inserted into the SAME ledger
+// (JSON-LD first, Turtle second) and their bundles compared per
+// transaction time, which keeps Sid identity comparable.
+
+/// All `f:reifies*` bundles for annotations reifying edges whose
+/// subject is `base_subject_iri`, grouped by `(ann_sid, t)`.
+async fn reifies_bundles_for_subject(
+    ledger: &MemoryLedger,
+    base_subject_iri: &str,
+) -> Vec<((fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>)> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+    use std::collections::BTreeMap;
+
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(base_subject_iri)
+        .expect("encode base subject IRI");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+
+    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
+        BTreeMap::new();
+    for ptr in &pointers {
+        let ann_sid = ptr.s.clone();
+        let ann_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan annotation subject flakes");
+        for f in ann_flakes {
+            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
+                bundles.entry((ann_sid.clone(), f.t)).or_default().push(f);
+            }
+        }
+    }
+    bundles.into_iter().collect()
+}
+
+/// Normalize a bundle to its time/subject-agnostic body:
+/// sorted `(predicate, object, datatype, meta)` rows.
+fn bundle_body(
+    bundle: &[fluree_db_core::Flake],
+) -> Vec<(
+    fluree_db_core::Sid,
+    fluree_db_core::FlakeValue,
+    fluree_db_core::Sid,
+    Option<fluree_db_core::FlakeMeta>,
+)> {
+    let mut body: Vec<_> = bundle
+        .iter()
+        .map(|f| (f.p.clone(), f.o.clone(), f.dt.clone(), f.m.clone()))
+        .collect();
+    body.sort_by_key(|row| format!("{row:?}"));
+    body
+}
+
+/// Shared driver: insert the JSON-LD form, then the Turtle-star form,
+/// into one ledger; assert the two bundles' bodies are identical and
+/// both decode to the base edge's EdgeKey.
+async fn assert_turtle_star_matches_jsonld(
+    ledger_id: &str,
+    jsonld_txn: serde_json::Value,
+    turtle: &str,
+    base_subject_iri: &str,
+    base_predicate_iri: &str,
+) {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD @annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star insert");
+    let ledger = &turtle_committed.ledger;
+    let t_turtle = ledger.t();
+    assert!(t_turtle > t_jsonld);
+
+    // Base edge (asserted by both surfaces; EdgeKey is t-agnostic).
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(base_subject_iri)
+        .expect("encode subject");
+    let predicate_sid = ledger
+        .snapshot
+        .encode_iri(base_predicate_iri)
+        .expect("encode predicate");
+    let base_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(subject_sid, predicate_sid),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan base edge");
+    assert!(!base_flakes.is_empty(), "base edge must exist");
+    let base_key = EdgeKey::from_flake(&base_flakes[0]);
+
+    let bundles = reifies_bundles_for_subject(ledger, base_subject_iri).await;
+    let jsonld_bundles: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .collect();
+    let turtle_bundles: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_turtle)
+        .collect();
+    assert_eq!(
+        jsonld_bundles.len(),
+        turtle_bundles.len(),
+        "each surface must produce the same number of reifier bundles: {bundles:#?}"
+    );
+    assert!(!jsonld_bundles.is_empty(), "expected at least one bundle");
+
+    // Pairwise body equality (bundles sorted by body for stable pairing).
+    let mut jl: Vec<_> = jsonld_bundles.iter().map(|(_, b)| bundle_body(b)).collect();
+    let mut tt: Vec<_> = turtle_bundles.iter().map(|(_, b)| bundle_body(b)).collect();
+    jl.sort();
+    tt.sort();
+    assert_eq!(
+        jl, tt,
+        "Turtle-star bundle bodies must be bit-identical to the JSON-LD \
+         @annotation bodies (same predicates/objects/datatypes/meta, no \
+         f:reifiesDatatype)"
+    );
+
+    // Every bundle decodes to the base edge's EdgeKey.
+    for ((ann, _), bundle) in &bundles {
+        let decoded = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        assert_eq!(
+            decoded, base_key,
+            "bundle for {ann:?} reifies the base edge"
+        );
+    }
+}
+
+#[tokio::test]
+async fn turtle_star_annotation_block_matches_jsonld_annotation() {
+    // `{| … |}` (anonymous reifier) ↔ `@annotation` (minted
+    // `_:fluree_ann_N`): identical bundle bodies, distinct blank anns.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:annotation-block",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:worksFor ex:acme {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
+    // `~ ex:r_tt` ↔ `@annotation {"@id": "ex:r_jl"}`: a NAMED reifier
+    // becomes the annotation subject verbatim (no minting) on both
+    // surfaces. Uses two parallel edges (ex:alice / ex:bob) because
+    // re-asserting the identical (edge, reifier) bundle in a later txn
+    // is an idempotent no-op — the engine drops the duplicate flakes —
+    // so the same pair can't be exercised twice in one ledger. Bundle
+    // bodies are compared with the f:reifiesSubject row normalized.
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:named-reifier");
+
+    let jsonld_txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:r_jl" }
+        }
+    });
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD named-annotation insert");
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         ex:bob ex:worksFor ex:acme ~ ex:r_tt .\n";
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star named-reifier insert");
+    let ledger = &turtle_committed.ledger;
+
+    let r_jl = ledger
+        .snapshot
+        .encode_iri("http://example.org/r_jl")
+        .expect("encode r_jl");
+    let r_tt = ledger
+        .snapshot
+        .encode_iri("http://example.org/r_tt")
+        .expect("encode r_tt");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    let jl_bundles = reifies_bundles_for_subject(ledger, "http://example.org/alice").await;
+    let tt_bundles = reifies_bundles_for_subject(ledger, "http://example.org/bob").await;
+    assert_eq!(jl_bundles.len(), 1, "{jl_bundles:#?}");
+    assert_eq!(tt_bundles.len(), 1, "{tt_bundles:#?}");
+
+    // The named reifier IS the annotation subject — no minted blank node.
+    assert_eq!(jl_bundles[0].0 .0, r_jl);
+    assert_eq!(tt_bundles[0].0 .0, r_tt);
+
+    // Bodies are identical once the (deliberately different) base
+    // subjects are normalized away.
+    let normalize = |bundle: &[fluree_db_core::Flake]| {
+        let mut body = bundle_body(bundle);
+        for row in &mut body {
+            if row.0 == reifies_subject_pid {
+                row.1 = FlakeValue::String("<base-subject>".to_string());
+            }
+        }
+        body.sort_by_key(|row| format!("{row:?}"));
+        body
+    };
+    assert_eq!(
+        normalize(&jl_bundles[0].1),
+        normalize(&tt_bundles[0].1),
+        "named-reifier bundle bodies must match modulo the base subject"
+    );
+
+    // Each decodes to its own base edge.
+    for (bundle, subject_iri) in [
+        (&jl_bundles[0].1, "http://example.org/alice"),
+        (&tt_bundles[0].1, "http://example.org/bob"),
+    ] {
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        let expected_subject = ledger.snapshot.encode_iri(subject_iri).expect("encode");
+        assert_eq!(decoded.s, expected_subject);
+    }
+}
+
+#[tokio::test]
+async fn turtle_star_reified_triple_matches_jsonld_annotation() {
+    // Subject-position `<< … >>` with reifier properties ↔ `@annotation`
+    // with a body: the reifier carries the same ordinary property and the
+    // same bundle.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:reified-triple",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         << ex:alice ex:worksFor ex:acme >> ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_rdf_reifies_triple_term_matches_jsonld_annotation() {
+    // The RDF 1.2 spelling every asserting form desugars to, and the only
+    // star construct N-Triples has: `r rdf:reifies <<( s p o )>>` plus the
+    // reifier's own property.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:rdf-reifies-triple-term",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:r rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .\n\
+         ex:r ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+/// TriG-star inside a `GRAPH { }` block ↔ JSON-LD `@graph` + `@annotation`:
+/// same named-graph bundle (f:reifiesGraph present, flakes in the graph),
+/// and the annotation is visible to a named-graph-scoped query.
+#[tokio::test]
+async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+    use std::collections::BTreeMap;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star:named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let graph_iri = "http://example.org/hr-graph";
+
+    let jsonld_committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:q": { "@id": "ex:z" } }
+                }
+            }),
+        )
+        .await
+        .expect("JSON-LD named-graph @annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let trig = "@prefix ex: <http://example.org/> .\n\
+                GRAPH ex:hr-graph { ex:alice ex:worksFor ex:acme {| ex:q ex:z |} . }\n";
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(trig)
+        .commit()
+        .await
+        .expect("TriG-star upsert inside a GRAPH block");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let t_trig = ledger.t();
+    assert!(t_trig > t_jsonld);
+
+    // Both bundles live in the named graph: scan under its g_id.
+    let g_id = ledger
+        .snapshot
+        .graph_registry
+        .assigned_graph_id(graph_iri)
+        .expect("named graph registered");
+    let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("subject sid");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("f:reifiesSubject sid");
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid.clone())),
+        RangeOptions::new().with_to_t(t_trig),
+    )
+    .await
+    .expect("scan named-graph f:reifiesSubject pointers");
+    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
+        BTreeMap::new();
+    for ptr in &pointers {
+        let ann_flakes = range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ptr.s.clone()),
+            RangeOptions::new().with_to_t(t_trig),
+        )
+        .await
+        .expect("scan annotation subject");
+        for f in ann_flakes {
+            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
+                bundles.entry((ptr.s.clone(), f.t)).or_default().push(f);
+            }
+        }
+    }
+    let mut jl: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    let mut tt: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_trig)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    assert_eq!(
+        jl.len(),
+        1,
+        "one JSON-LD bundle in the named graph: {bundles:#?}"
+    );
+    assert_eq!(
+        tt.len(),
+        1,
+        "one TriG-star bundle in the named graph: {bundles:#?}"
+    );
+    jl.sort();
+    tt.sort();
+    assert_eq!(
+        jl, tt,
+        "TriG-star bundle must be bit-identical to the JSON-LD @graph/@annotation bundle"
+    );
+    for ((ann, _), bundle) in &bundles {
+        let key = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        assert_eq!(
+            key.g.as_ref(),
+            Some(&graph_sid),
+            "bundle for {ann:?} is graph-anchored"
+        );
+        assert_eq!(key.s, subject_sid);
+    }
+
+    // User-visible: a query scoped to the named graph hydrates both.
+    let query = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#{graph_iri}"),
+        "select": ["?q"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:q": "?q" } }
+        }
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph annotation query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per annotation (JSON-LD + TriG): {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn turtle_star_lang_tagged_literal_matches_jsonld_annotation() {
+    // Language-tagged base object: both surfaces must emit f:reifiesLang
+    // and carry m.lang on the f:reifiesObject flake (BUGS-2 symmetry).
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:lang-literal",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:label \"chat\"@fr {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/label",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_typed_literal_matches_jsonld_annotation() {
+    // Typed-literal base object: bundle object flake preserves the
+    // declared datatype on both surfaces.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:typed-literal",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:joinedAt": {
+                "@value": "2024-01-01",
+                "@type": "xsd:date",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:alice ex:joinedAt \"2024-01-01\"^^xsd:date {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/joinedAt",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
+    // THE required repeated-anonymous equivalence case (roadmap §1.1-10):
+    // annotating the same edge twice anonymously mints two DISTINCT
+    // reifiers on BOTH surfaces (JSON-LD mints `_:fluree_ann_0/_1`;
+    // Turtle must never dedup by EdgeKey), each with a complete bundle
+    // decoding to the same base EdgeKey. W3C `pattern-3-nomatch` depends
+    // on exactly this behavior.
+    use fluree_db_core::edge::EdgeKey;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:repeated-anon");
+
+    let jsonld_txn = json!({
+        "@context": ctx(),
+        "@id": "ex:s",
+        "ex:p": [
+            { "@id": "ex:o", "@annotation": { "ex:q": "one" } },
+            { "@id": "ex:o", "@annotation": { "ex:q": "two" } }
+        ]
+    });
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD repeated-annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:o {| ex:q \"one\" |} .\n\
+         ex:s ex:p ex:o {| ex:q \"two\" |} .\n";
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star repeated-annotation insert");
+    let ledger = &turtle_committed.ledger;
+    let t_turtle = ledger.t();
+
+    let bundles = reifies_bundles_for_subject(ledger, "http://example.org/s").await;
+    let jsonld_anns: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .map(|((ann, _), b)| (ann.clone(), b))
+        .collect();
+    let turtle_anns: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_turtle)
+        .map(|((ann, _), b)| (ann.clone(), b))
+        .collect();
+
+    // Two distinct reifiers per surface.
+    assert_eq!(jsonld_anns.len(), 2, "JSON-LD mints one ann per occurrence");
+    assert_eq!(turtle_anns.len(), 2, "Turtle mints one ann per occurrence");
+    assert_ne!(jsonld_anns[0].0, jsonld_anns[1].0);
+    assert_ne!(
+        turtle_anns[0].0, turtle_anns[1].0,
+        "anonymous Turtle reifiers must be fresh per occurrence — never \
+         deduped by EdgeKey"
+    );
+
+    // Every bundle decodes to the same base EdgeKey, and the bundle-body
+    // multisets match across surfaces.
+    let mut keys = Vec::new();
+    for (ann, bundle) in jsonld_anns.iter().chain(turtle_anns.iter()) {
+        let key = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        keys.push(key);
+    }
+    assert!(
+        keys.windows(2).all(|w| w[0] == w[1]),
+        "all four bundles reify the same base edge"
+    );
+    let mut jl: Vec<_> = jsonld_anns.iter().map(|(_, b)| bundle_body(b)).collect();
+    let mut tt: Vec<_> = turtle_anns.iter().map(|(_, b)| bundle_body(b)).collect();
+    jl.sort();
+    tt.sort();
+    assert_eq!(jl, tt, "bundle bodies must match across surfaces");
+}
+
+#[tokio::test]
+async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
+    // PR-1454 review regression: anonymous mints (bare `{| … |}` reifiers
+    // and `[]` nodes) used the generic `b{N}` label scheme, whose
+    // skolemized Sid is identical to a user-written `_:b{N}` in the same
+    // transaction — `_:b1` here silently absorbed the reifier bundle, the
+    // annotation body, and the `[]` node's properties. Anonymous mints now
+    // use the `-b{N}` namespace, which no user label can lex into.
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:anon-user-label-collision");
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         _:b1 ex:name \"Bob\" .\n\
+         ex:a ex:b ex:c {| ex:source \"hr-system\" |} .\n\
+         ex:s2 ex:q [ ex:r \"y\" ] .\n";
+    let committed = fluree
+        .insert_turtle(ledger0, turtle)
+        .await
+        .expect("Turtle-star insert mixing user label with anonymous mints");
+    let ledger = &committed.ledger;
+
+    let name_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("encode ex:name");
+    let bob_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(name_pid.clone(), FlakeValue::String("Bob".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for Bob's node");
+    assert_eq!(bob_pointers.len(), 1, "exactly one ex:name \"Bob\" fact");
+    let bob_sid = bob_pointers[0].s.clone();
+
+    // Bob's node carries ex:name and NOTHING else — no ex:source, no
+    // f:reifies* bundle, no `[]` properties.
+    let bob_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject(bob_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan Bob's subject");
+    assert_eq!(
+        bob_flakes.len(),
+        1,
+        "user `_:b1` must not absorb system-minted facts; got {bob_flakes:?}"
+    );
+    assert_eq!(bob_flakes[0].p, name_pid, "Bob's only fact is ex:name");
+
+    // The annotation bundle exists, on its own fresh reifier node.
+    let bundles = reifies_bundles_for_subject(ledger, "http://example.org/a").await;
+    assert_eq!(bundles.len(), 1, "one anonymous reifier bundle for ex:a");
+    let ((ann_sid, _), _) = bundles.first().map(|(k, v)| (k.clone(), v)).unwrap();
+    assert_ne!(ann_sid, bob_sid, "reifier node distinct from user `_:b1`");
+
+    // The `[]` node is likewise its own node (the pre-existing collision
+    // this fix closes for free).
+    let r_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/r")
+        .expect("encode ex:r");
+    let anon_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(r_pid, FlakeValue::String("y".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for the `[]` node");
+    assert_eq!(anon_pointers.len(), 1, "exactly one ex:r \"y\" fact");
+    assert_ne!(
+        anon_pointers[0].s, bob_sid,
+        "`[]` node distinct from user `_:b1`"
+    );
+}
+
+// =====================================================================
+// Delete-path end-to-end coverage for literal-object annotations
+// =====================================================================
+
+/// Insert an annotated literal, then retract by annotation @id, and
+/// verify the f:reifiesSubject pointer no longer resolves. Mirrors the
+/// "live cancels assert" cascade contract enforced in the M1b cascade
+/// tests, but for literal-object annotations.
+#[tokio::test]
+async fn delete_by_id_retracts_literal_annotation_bundle() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-by-id";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:name": {
+            "@value": "Alice",
+            "@annotation": { "@id": "ex:ann-1", "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 1, "annotation must be present pre-delete");
+
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "@id": "ex:ann-1" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert!(
+        post.is_empty(),
+        "annotation must be retracted post-delete: got {post:#?}"
+    );
+}
+
+/// Hydration: wildcard subject expansion on a subject whose literal
+/// edge carries an annotation must surface the annotation under
+/// `@annotation`, with the literal promoted to JSON-LD value-object
+/// form so it can carry the sibling key.
+#[tokio::test]
+async fn subject_expansion_promotes_annotated_literal_to_value_object() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-hydrate-plain";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:name": {
+            "@value": "Alice",
+            "@annotation": { "@id": "ex:ann-hr", "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["*"] },
+        "where": { "@id": "?s", "ex:name": "?n" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion");
+
+    // Locate the alice node in the formatted result.
+    let arr = result.as_array().expect("result is array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let name_val = alice
+        .get("ex:name")
+        .or_else(|| alice.get("http://example.org/name"))
+        .expect("ex:name present");
+
+    // ex:name must be in value-object form (since it carries an annotation).
+    let obj = name_val.as_object().unwrap_or_else(|| {
+        panic!("annotated literal must hydrate as a value-object, got {name_val:#?}")
+    });
+    assert_eq!(obj.get("@value"), Some(&json!("Alice")));
+    let ann = obj
+        .get("@annotation")
+        .expect("@annotation key must be present");
+    let ann_obj = ann.as_object().expect("single annotation → bare object");
+    assert_eq!(
+        ann_obj
+            .get("ex:source")
+            .or_else(|| ann_obj.get("http://example.org/source")),
+        Some(&json!("hr"))
+    );
+}
+
+/// Regression: a virtual literal projection that selects only `@type`
+/// on an annotated literal must produce a well-formed value-object —
+/// the renderer forces `@value` inclusion when annotations are present
+/// so promotion doesn't wrap the projection skeleton as if it were a
+/// JSON payload.
+#[tokio::test]
+async fn subject_expansion_virtual_projection_on_annotated_literal_includes_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-virtual-projection";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:joinedAt": {
+            "@value": "2024-01-01",
+            "@type": "xsd:date",
+            "@annotation": { "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    // Subject expansion with a virtual literal projection on
+    // `ex:joinedAt` that picks ONLY `@type` (no `@value`).
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["@id", { "ex:joinedAt": ["@type"] }] },
+        "where": { "@id": "?s", "ex:joinedAt": "?j" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion with virtual projection");
+
+    let arr = result.as_array().expect("result array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let joined = alice
+        .get("ex:joinedAt")
+        .or_else(|| alice.get("http://example.org/joinedAt"))
+        .expect("ex:joinedAt present");
+    let obj = joined.as_object().expect("value-object form");
+
+    // The base contract: `@type` is present (the projection asked for
+    // it), `@value` is present (forced because of the annotation),
+    // and `@annotation` is attached. Crucially, `@value` must be the
+    // actual literal value — NOT a wrapped projection skeleton like
+    // `{"@value": {"@type": "..."}}` which would be the bug.
+    assert_eq!(obj.get("@value"), Some(&json!("2024-01-01")));
+    assert_eq!(obj.get("@type"), Some(&json!("xsd:date")));
+    assert!(obj.contains_key("@annotation"));
+}
+
+/// Same as above for a language-tagged literal. The promoted value-
+/// object must preserve `@language` (the typed-literal renderer
+/// already produces value-object form for language-tagged strings, so
+/// the promotion helper's "already value-object, no rewrap" branch
+/// fires).
+#[tokio::test]
+async fn subject_expansion_promotes_annotated_lang_tagged_literal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-hydrate-lang";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "@id": "ex:ann-fr", "ex:source": "lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["*"] },
+        "where": { "@id": "?s", "ex:label": "?l" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion");
+
+    let arr = result.as_array().expect("result is array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let label_val = alice
+        .get("ex:label")
+        .or_else(|| alice.get("http://example.org/label"))
+        .expect("ex:label present");
+    let obj = label_val.as_object().unwrap_or_else(|| {
+        panic!("annotated lang literal must hydrate as a value-object, got {label_val:#?}")
+    });
+    assert_eq!(obj.get("@value"), Some(&json!("chat")));
+    assert_eq!(obj.get("@language"), Some(&json!("fr")));
+    assert!(obj.contains_key("@annotation"));
+}
+
+/// Selector-form delete: retract the annotation matching a selector
+/// body without specifying its @id. Exercises the new shape-aware
+/// WHERE template generation that emits `f:reifiesObject` as a literal
+/// value-object payload (instead of a `{"@id": ...}` ref).
+///
+/// Two parallel annotations on the same literal-object edge with
+/// different selector bodies; selector-form delete must retract only
+/// the matching one.
+#[tokio::test]
+async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-selector";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Two parallel annotations on the same literal edge, distinguished
+    // by selector body.
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice",
+              "ex:name": {
+                  "@value": "Alice",
+                  "@annotation": { "@id": "ex:ann-hr", "ex:source": "hr" }
+              }},
+            { "@id": "ex:alice",
+              "ex:name": {
+                  "@value": "Alice",
+                  "@annotation": { "@id": "ex:ann-payroll", "ex:source": "payroll" }
+              }}
+        ]
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert two");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 2, "two annotations present pre-delete");
+
+    // Selector-form delete: retract the annotation whose body says
+    // `ex:source == "hr"`. The pre-pass mints a WHERE variable bound
+    // to all annotations on (ex:alice, ex:name, "Alice") whose body
+    // matches the selector.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "ex:source": "hr" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    // One annotation must remain (the payroll one).
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert_eq!(
+        post.len(),
+        1,
+        "exactly one annotation must survive selector delete (the payroll one); got {post:#?}"
+    );
+    // The surviving annotation must be ex:ann-payroll.
+    let surviving_sid = &post[0].s;
+    let payroll_sid = r2
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/ann-payroll")
+        .unwrap();
+    assert_eq!(surviving_sid, &payroll_sid);
+}
+
+/// Same as above but for a language-tagged literal — the load-bearing
+/// case that motivates `f:reifiesLang` emission on the delete template.
+/// Without `f:reifiesLang`, the retract bundle would decode to an
+/// EdgeKey with `lang = None`, failing to cancel the assertion whose
+/// EdgeKey has `lang = Some("fr")`.
+#[tokio::test]
+async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-lang";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "@id": "ex:ann-fr", "ex:source": "lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 1);
+
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "@id": "ex:ann-fr" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert!(
+        post.is_empty(),
+        "lang-tagged annotation must be retracted post-delete: got {post:#?}"
+    );
+}
+
+// =====================================================================
+// Regression-coverage tests for corner-case contracts
+// =====================================================================
+
+/// Two annotations with the **same lexical string but different
+/// language tags** must not cross-match when an annotation-rooted
+/// query constrains the base edge's object by language.
+///
+/// The disambiguator chain:
+/// - The SPARQL/JSON-LD lower step stamps
+///   `dtc = LangTag("<tag>")` onto the IR triple for a
+///   language-tagged literal object.
+/// - `expand_edge_annotation_patterns` clones that `dtc` onto the
+///   synthesized `f:reifiesObject` lookup triple. (Earlier
+///   diagnoses speculated the writer dropped the language tag onto
+///   a sibling `f:reifiesLang` predicate; the sanity-check
+///   assertions below confirm the language IS stored on the
+///   `f:reifiesObject` flake's `m.lang` — `dt=rdf:langString`,
+///   `m.lang=Some(<tag>)` — so the dtc clone is the right
+///   disambiguator.)
+/// - `binary_scan::flakes_to_bindings` applies the `LangTag` dtc
+///   filter (`binary_scan.rs:753-763`) to reject flakes whose
+///   `m.lang` doesn't match.
+/// - **And critically**, `collect_var_stats` walks into
+///   `Pattern::DefaultGraphSource` so the `?ann` variable that
+///   bridges the wrapper (inside the f:reifies* chain) AND a
+///   sibling triple outside is counted as a join var. Without that
+///   walk, the sibling scan emits-mask drops `?ann` and the
+///   wrapper's inner subplan joins independently — yielding the
+///   cartesian product over `?src` that this regression originally
+///   exhibited.
+#[tokio::test]
+async fn cross_language_annotation_does_not_cross_match() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-cross-language";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Two annotations on different subjects, same predicate, same
+    // lexical object value, different `@language` tags. Each
+    // annotation carries a distinct body source so the test can
+    // confirm which one matched. Using distinct subjects rather than
+    // a parallel array on one subject avoids any list/list-merge
+    // semantics in the JSON-LD parser and keeps the test focused on
+    // the dtc-propagation behavior in `f:reifiesObject`.
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:doc1",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "fr",
+                    "@annotation": { "@id": "ex:ann-fr", "ex:source": "fr-src" }
+                }
+            },
+            {
+                "@id": "ex:doc2",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "en",
+                    "@annotation": { "@id": "ex:ann-en", "ex:source": "en-src" }
+                }
+            }
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    // Sanity check: both annotation bundles landed. We scan
+    // `f:reifiesObject` flakes for `ex:doc1` annotations.
+    let bare = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?src"],
+        "where": {
+            "@id": "?ann",
+            "ex:source": "?src"
+        }
+    });
+    let bare_rows = support::query_jsonld_formatted(&fluree, &ledger, &bare)
+        .await
+        .expect("bare body query");
+    assert_eq!(
+        bare_rows.as_array().map(std::vec::Vec::len),
+        Some(2),
+        "both annotation bodies must be inserted; got: {bare_rows:#?}"
+    );
+
+    // Confirm both `f:reifiesLang` flakes landed (one per annotation).
+    // We scan directly because the user-facing query path filters
+    // system predicates from variable-predicate output.
+    {
+        use fluree_db_core::comparator::IndexType;
+        use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+        use fluree_vocab::reifies_iris;
+        let reifies_lang_pid = ledger
+            .snapshot
+            .encode_iri(reifies_iris::LANG)
+            .expect("encode f:reifiesLang");
+        let lang_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_predicate(reifies_lang_pid),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan f:reifiesLang");
+        assert_eq!(lang_flakes.len(), 2, "expected two f:reifiesLang flakes");
+
+        // ALSO scan the f:reifiesObject flakes to verify whether the
+        // language tag IS stored on the per-flake `m.lang` (in which
+        // case the existing `edge.dtc` clone IS the right
+        // disambiguator and the bug is elsewhere) or NOT stored there
+        // (in which case the new `f:reifiesLang` constraint triple is
+        // necessary). This tells us which IR shape is internally
+        // consistent.
+        let reifies_obj_pid = ledger
+            .snapshot
+            .encode_iri(reifies_iris::OBJECT)
+            .expect("encode f:reifiesObject");
+        let obj_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_predicate(reifies_obj_pid),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan f:reifiesObject");
+        assert_eq!(obj_flakes.len(), 2, "expected two f:reifiesObject flakes");
+
+        // The where_plan expansion treats `edge.dtc = LangTag(...)`
+        // on the synthesized f:reifiesObject lookup as the per-
+        // language disambiguator. That depends on the writer
+        // storing the language tag on the flake's `m.lang`. Assert
+        // the exact wire layout the IR relies on so a future writer
+        // refactor can't silently move the language tag off the
+        // f:reifiesObject flake without flipping this test red.
+        let rdf_lang_string_sid = ledger
+            .snapshot
+            .encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+            .expect("encode rdf:langString");
+        for f in &obj_flakes {
+            assert_eq!(
+                f.o,
+                fluree_db_core::value::FlakeValue::String("chat".to_string()),
+                "f:reifiesObject object must be the lexical string \"chat\"; got {:?}",
+                f.o
+            );
+            assert_eq!(
+                f.dt, rdf_lang_string_sid,
+                "f:reifiesObject dt must be rdf:langString for lang-tagged literal; got {:?}",
+                f.dt
+            );
+            assert!(
+                f.m.as_ref()
+                    .and_then(|m| m.lang.as_ref())
+                    .is_some_and(|l| l == "fr" || l == "en"),
+                "f:reifiesObject must carry m.lang in {{fr,en}}; got {:?}",
+                f.m
+            );
+        }
+        let langs: std::collections::HashSet<String> = obj_flakes
+            .iter()
+            .filter_map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+            .collect();
+        assert_eq!(
+            langs,
+            ["fr".to_string(), "en".to_string()].into_iter().collect(),
+            "f:reifiesObject m.lang values must be exactly {{fr, en}}"
+        );
+    }
+
+    // SPARQL gives an unambiguous syntax for language-tagged literal
+    // matching (`"chat"@fr`). We use the RDF 1.2 `@reifies` form so
+    // the test exercises the same `expand_edge_annotation_patterns`
+    // dtc-propagation code path that JSON-LD inline queries use.
+    let sparql_fr = r#"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex:  <http://example.org/>
+        SELECT ?src WHERE {
+          ?ann rdf:reifies <<( ?doc ex:label "chat"@fr )>> .
+          ?ann ex:source ?src .
+        }
+    "#;
+    let result_fr = support::query_sparql(&fluree, &ledger, sparql_fr)
+        .await
+        .expect("cross-language SPARQL query (fr)");
+    let bindings_fr = result_fr
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .clone();
+    assert_eq!(
+        bindings_fr.len(),
+        1,
+        "cross-language annotation must not cross-match; got bindings: {bindings_fr:#?}"
+    );
+    assert_eq!(
+        bindings_fr[0]["src"]["value"].as_str(),
+        Some("fr-src"),
+        "fr-tagged annotation body must be the only match, got: {:?}",
+        bindings_fr[0]["src"]
+    );
+
+    // Mirror query with the English tag to prove the other side too.
+    let sparql_en = r#"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex:  <http://example.org/>
+        SELECT ?src WHERE {
+          ?ann rdf:reifies <<( ?doc ex:label "chat"@en )>> .
+          ?ann ex:source ?src .
+        }
+    "#;
+    let result_en = support::query_sparql(&fluree, &ledger, sparql_en)
+        .await
+        .expect("cross-language SPARQL query (en)");
+    let bindings_en = result_en
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .clone();
+    assert_eq!(bindings_en.len(), 1, "got: {bindings_en:#?}");
+    assert_eq!(bindings_en[0]["src"]["value"].as_str(), Some("en-src"));
+}
+
+/// A file-backed ledger with an annotated edge must survive a full
+/// process restart (drop the `Fluree` handle entirely, rebuild from
+/// the same path) and still answer annotation queries from the
+/// rehydrated commit chain. Pins restart-from-commits behavior for
+/// annotated ledgers.
+#[tokio::test]
+async fn annotations_survive_restart_from_commits() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/edge-annotations:restart-from-commits";
+
+    // ---------- Session 1: insert ----------
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("build");
+        let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+        let insert = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": {
+                    "@id": "ex:emp-2024",
+                    "ex:role": "Engineer",
+                    "ex:since": "2024"
+                }
+            }
+        });
+        fluree.insert(ledger0, &insert).await.expect("seed insert");
+        // Explicitly drop the Fluree handle so the next session loads
+        // from the persisted commit chain rather than reusing the
+        // in-memory `LedgerManager` cache.
+        drop(fluree);
+    }
+
+    // ---------- Session 2: rebuild + query ----------
+    let fluree2 = FlureeBuilder::file(&path).build().expect("rebuild");
+    let ledger = fluree2
+        .ledger(ledger_id)
+        .await
+        .expect("load ledger after restart");
+
+    // Inline annotation query: confirms the f:reifies* bundle replayed
+    // from commits into novelty, the base edge is queryable, and the
+    // annotation body is reachable through `@annotation`.
+    let inline = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org", "?role", "?since"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role", "ex:since": "?since" }
+            }
+        }
+    });
+    let inline_rows = support::query_jsonld_formatted(&fluree2, &ledger, &inline)
+        .await
+        .expect("inline annotation query after restart");
+    let rows = inline_rows.as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one annotation must replay; got: {rows:#?}"
+    );
+    let row = rows[0].as_array().expect("row tuple");
+    assert!(iri_matches(&row[0], "ex:alice", "http://example.org/alice"));
+    assert!(iri_matches(&row[1], "ex:acme", "http://example.org/acme"));
+    assert_eq!(row[2].as_str(), Some("Engineer"));
+    assert_eq!(row[3].as_str(), Some("2024"));
+
+    // Annotation-rooted query via `@reifies` — proves the reverse
+    // attachment lookup also survives restart.
+    let reifies = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let reifies_rows = support::query_jsonld_formatted(&fluree2, &ledger, &reifies)
+        .await
+        .expect("reifies query after restart");
+    let rows = reifies_rows.as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "got: {rows:#?}");
+}
+
+/// Policy visibility independence: when a policy hides the base
+/// edge's predicate, an annotation-rooted query that asks for the
+/// reified base edge must return zero rows — the annotation's
+/// body facts alone must not leak the hidden edge's existence.
+///
+/// Pins the design contract: annotation query rows require
+/// visibility of both the base edge and the matched annotation
+/// facts. See `docs/concepts/edge-annotations.md` and
+/// `docs/design/edge-annotations.md`.
+///
+/// Mechanism: the IR-level expansion emits a `Pattern::Triple` for
+/// the base edge in addition to the `f:reifies*` lookups. The
+/// standard scan applies the policy filter to that triple, so a
+/// hidden base edge zeroes the row out before the body is even
+/// evaluated.
+#[tokio::test]
+async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:policy-hides-base";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Insert the annotated edge.
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp-A", "ex:role": "Engineer" }
+        }
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    // Sanity check: with no policy in effect, the annotation-rooted
+    // query returns the row.
+    let reifies_query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let baseline = support::query_jsonld_formatted(&fluree, &ledger, &reifies_query)
+        .await
+        .expect("baseline (root) query");
+    assert_eq!(
+        baseline.as_array().map(std::vec::Vec::len),
+        Some(1),
+        "baseline (root, no policy) must return one row; got: {baseline:#?}"
+    );
+
+    // Policy: deny `ex:worksFor` for everyone. The `f:query` requires
+    // an `?$identity` binding that the connection never supplies, so
+    // the required policy never matches and `ex:worksFor` is hidden
+    // wholesale. Other predicates (`ex:role`) inherit `default-allow`.
+    let policy_query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "opts": {
+            "default-allow": true,
+            "policy": [{
+                "@id": "ex:hide-worksFor",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+                "f:action": "f:view",
+                "f:query": serde_json::to_string(&json!({
+                    "where": {
+                        "@id": "?$identity",
+                        "@type": "http://example.org/NeverMatches"
+                    }
+                })).unwrap()
+            }]
+        },
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+
+    let with_policy = fluree
+        .query_connection(&policy_query)
+        .await
+        .expect("policy query");
+    let rows = with_policy.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        rows,
+        json!([]),
+        "annotation-rooted query must return zero rows when policy hides \
+         the reified base edge — annotation metadata alone must not leak \
+         the hidden edge's existence; got: {rows:#?}"
+    );
+
+    // Counterpart: a query that asks ONLY for the annotation body
+    // (no `@reifies`, no base-edge triple) should still see the
+    // metadata, because `ex:role` is unaffected by the policy.
+    let body_only_query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "opts": {
+            "default-allow": true,
+            "policy": [{
+                "@id": "ex:hide-worksFor",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+                "f:action": "f:view",
+                "f:query": serde_json::to_string(&json!({
+                    "where": {
+                        "@id": "?$identity",
+                        "@type": "http://example.org/NeverMatches"
+                    }
+                })).unwrap()
+            }]
+        },
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role"
+        }
+    });
+    let body_only = fluree
+        .query_connection(&body_only_query)
+        .await
+        .expect("body-only query");
+    let body_rows = body_only
+        .to_jsonld(&ledger.snapshot)
+        .expect("body-only to_jsonld");
+    let arr = body_rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "body predicate `ex:role` is allowed under the policy — the body \
+         alone must still be queryable; got: {body_rows:#?}"
+    );
+}
+
+// =====================================================================
+// #1467 — reification-aware COPY/MOVE/ADD re-homing (named-source cases)
+// =====================================================================
+//
+// Named-source annotations (named→named, named→default) can only be
+// seeded via the JSON-LD `@graph` + `@annotation` surface — SPARQL
+// UPDATE rejects annotation tails inside a `GRAPH` block. The
+// default→named case (SPARQL-seedable) lives in `it_named_graphs.rs`;
+// the indexed round-trip lives in `it_edge_annotations_indexed.rs`.
+//
+// The load-bearing gate is `support::decode_annotations_for_subject`,
+// which decodes the re-homed bundle through the exact reader path
+// (`EdgeKey::from_reifies_facts`) and panics on the GraphMismatch /
+// Duplicate that would silently drop the annotation.
+
+/// Seed one annotated edge `ex:alice ex:worksFor ex:acme` in named graph
+/// `graph_iri`, reified by explicit `@id` `reifier_id` carrying `ex:role`.
+async fn seed_named_annotation(
+    fluree: &MemoryFluree,
+    ledger: MemoryLedger,
+    graph_iri: &str,
+    reifier_id: &str,
+    role: &str,
+) -> MemoryLedger {
+    seed_named_annotation_for_edge(
+        fluree, ledger, graph_iri, "ex:alice", "ex:acme", reifier_id, role,
+    )
+    .await
+}
+
+/// Seed one annotated edge `subject ex:worksFor object` in named graph
+/// `graph_iri`, reified by explicit `@id` `reifier_id` carrying `ex:role`.
+async fn seed_named_annotation_for_edge(
+    fluree: &MemoryFluree,
+    ledger: MemoryLedger,
+    graph_iri: &str,
+    subject: &str,
+    object: &str,
+    reifier_id: &str,
+    role: &str,
+) -> MemoryLedger {
+    let txn = json!({
+        "@context": ctx(),
+        "@id": subject,
+        "@graph": graph_iri,
+        "ex:worksFor": {
+            "@id": object,
+            "@annotation": { "@id": reifier_id, "ex:role": role }
+        }
+    });
+    fluree
+        .insert(ledger, &txn)
+        .await
+        .expect("seed named-graph annotation")
+        .ledger
+}
+
+/// Lower + stage a SPARQL graph-management op, returning the new ledger.
+/// Lowering borrows the snapshot before `stage_owned` consumes the ledger.
+async fn run_graph_mgmt(fluree: &MemoryFluree, ledger: MemoryLedger, sparql: &str) -> MemoryLedger {
+    let txn = lower_graph_mgmt(&ledger.snapshot, sparql);
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("stage graph-management op")
+        .ledger
+}
+
+/// Like [`run_graph_mgmt`] but returns the staging `Result` mapped to its
+/// error string — for the negative (rejection) tests.
+async fn try_run_graph_mgmt(
+    fluree: &MemoryFluree,
+    ledger: MemoryLedger,
+    sparql: &str,
+) -> std::result::Result<MemoryLedger, String> {
+    let txn = lower_graph_mgmt(&ledger.snapshot, sparql);
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .map(|r| r.ledger)
+        .map_err(|e| e.to_string())
+}
+
+/// Pull the annotation body's `ex:role` out of a subject-expansion
+/// hydration row. Tolerates compact-vs-expanded keys and bare-object
+/// vs single-element-array shapes (both formatter-legal).
+fn extract_role_from_hydration(rows: &JsonValue) -> Option<String> {
+    let arr = rows.as_array()?;
+    let first = arr.first()?.as_object()?;
+    let works_for = first
+        .get("ex:worksFor")
+        .or_else(|| first.get("http://example.org/worksFor"))?;
+    let edge_obj = works_for.as_object().or_else(|| {
+        works_for
+            .as_array()
+            .and_then(|a| a.first().and_then(|v| v.as_object()))
+    })?;
+    let ann = edge_obj.get("@annotation")?;
+    let ann_obj = ann.as_object().or_else(|| {
+        ann.as_array()
+            .and_then(|a| a.first().and_then(|v| v.as_object()))
+    })?;
+    ann_obj
+        .get("ex:role")
+        .or_else(|| ann_obj.get("http://example.org/role"))?
+        .as_str()
+        .map(String::from)
+}
+
+fn lower_graph_mgmt(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    sparql: &str,
+) -> fluree_db_transact::Txn {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    assert!(
+        !parsed.has_errors(),
+        "SPARQL parse errors: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(snapshot);
+    fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL graph-management to Txn IR")
+}
+
+/// The `ex:role` of the annotation on `subject ex:worksFor object` in named
+/// graph `graph_iri`, via the SPARQL annotation-tail query surface.
+async fn sparql_role_in_named_graph(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    graph_iri: &str,
+    subject: &str,
+    object: &str,
+) -> Option<String> {
+    let inner = format!("{subject} ex:worksFor {object} {{| ex:role ?role |}}");
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?role WHERE {{ GRAPH <{graph_iri}> {{ {inner} }} }}"
+    );
+    sparql_role(fluree, ledger, &sparql).await
+}
+
+async fn sparql_role(fluree: &MemoryFluree, ledger: &MemoryLedger, sparql: &str) -> Option<String> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("annotation-tail query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .and_then(|b| b.first())
+        .and_then(|row| row["role"]["value"].as_str())
+        .map(String::from)
+}
+
+fn graph_id(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::GraphId {
+    ledger
+        .snapshot
+        .graph_registry
+        .assigned_graph_id(iri)
+        .unwrap_or_else(|| panic!("graph {iri} must be registered"))
+}
+
+fn graph_sid(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::Sid {
+    ledger.snapshot.encode_iri(iri).expect("encode graph IRI")
+}
+
+#[tokio::test]
+async fn transfer_named_to_named_rewrites_reifies_graph_anchor() {
+    // COPY <g1> TO <g2>: the anchor's OBJECT (which names the edge's graph)
+    // must move to g2 alongside its flake-level `g`, so from_reifies_facts
+    // decodes `g == g2`. On wave-3 this was rejected outright.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:xfer-named-to-named";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO <{g2}>")).await;
+
+    let dest = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(dest.len(), 1, "one re-homed annotation in dest g2");
+    assert_eq!(
+        dest[0].g,
+        Some(graph_sid(&ledger, g2)),
+        "named→named must re-home the f:reifiesGraph anchor OBJECT to the dest graph"
+    );
+
+    // COPY leaves the source annotation intact, still anchored at g1.
+    let src = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g1),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(src.len(), 1, "COPY keeps the source annotation");
+    assert_eq!(
+        src[0].g,
+        Some(graph_sid(&ledger, g1)),
+        "source stays anchored at g1"
+    );
+
+    // Surface parity: annotation-tail query in each graph returns the role.
+    assert_eq!(
+        sparql_role_in_named_graph(&fluree, &ledger, g2, "ex:alice", "ex:acme")
+            .await
+            .as_deref(),
+        Some("Engineer")
+    );
+    assert_eq!(
+        sparql_role_in_named_graph(&fluree, &ledger, g1, "ex:alice", "ex:acme")
+            .await
+            .as_deref(),
+        Some("Engineer")
+    );
+}
+
+#[tokio::test]
+async fn transfer_named_to_named_move_rehomes_and_clears_source() {
+    // MOVE <g1> TO <g2>: dest gets the re-homed annotation (anchor→g2) and the
+    // source g1 is emptied. `clear_src` iterates the ORIGINAL src flakes, so it
+    // retracts the source bundle cleanly and never touches the re-homed dest.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:xfer-named-to-named-move";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("MOVE <{g1}> TO <{g2}>")).await;
+
+    let dest = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(dest.len(), 1, "MOVE re-homes the annotation to g2");
+    assert_eq!(
+        dest[0].g,
+        Some(graph_sid(&ledger, g2)),
+        "anchored at the dest graph"
+    );
+    assert_eq!(
+        sparql_role_in_named_graph(&fluree, &ledger, g2, "ex:alice", "ex:acme")
+            .await
+            .as_deref(),
+        Some("Engineer")
+    );
+
+    // Source g1 is emptied — no annotation left behind.
+    let src = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g1),
+        "http://example.org/alice",
+    )
+    .await;
+    assert!(src.is_empty(), "MOVE must clear the source annotation");
+}
+
+#[tokio::test]
+async fn transfer_named_to_default_drops_reifies_graph_anchor() {
+    // COPY <g1> TO DEFAULT: the default graph carries no anchor, so the
+    // anchor flake must be DROPPED — otherwise from_reifies_facts decodes
+    // `g == g1 != None` (GraphMismatch) and the annotation is silently lost.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:xfer-named-to-default";
+    let g1 = "http://example.org/g1";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO DEFAULT")).await;
+
+    let dest =
+        support::decode_annotations_for_subject(&ledger, 0, "http://example.org/alice").await;
+    assert_eq!(
+        dest.len(),
+        1,
+        "one re-homed annotation in the default graph"
+    );
+    assert_eq!(
+        dest[0].g, None,
+        "named→default must drop the f:reifiesGraph anchor"
+    );
+
+    // Surface parity: SPARQL annotation-tail (default) + JSON-LD subject-
+    // expansion hydration, which itself runs through from_reifies_facts.
+    let default_role_sparql = sparql_role(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?role WHERE { ex:alice ex:worksFor ex:acme {| ex:role ?role |} }",
+    )
+    .await;
+    assert_eq!(default_role_sparql.as_deref(), Some("Engineer"));
+
+    let hydration_query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &hydration_query)
+        .await
+        .expect("hydration query");
+    assert_eq!(
+        extract_role_from_hydration(&rows).as_deref(),
+        Some("Engineer"),
+        "hydration path (from_reifies_facts) must surface the re-homed annotation"
+    );
+}
+
+#[tokio::test]
+async fn add_across_graphs_with_reifier_collision_errors() {
+    // Same explicit reifier @id reifying DIFFERENT edges in two graphs.
+    // ADD merges the bundles onto one subject → a second f:reifiesSubject →
+    // from_reifies_facts returns Duplicate → BOTH annotations silently drop.
+    // The fix detects this and fails loud (COPY/MOVE are immune; see below).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:add-reifier-collision";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation_for_edge(
+        &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+    )
+    .await;
+    let ledger = seed_named_annotation_for_edge(
+        &fluree,
+        ledger,
+        g2,
+        "ex:bob",
+        "ex:globex",
+        "ex:r1",
+        "Manager",
+    )
+    .await;
+
+    let err = try_run_graph_mgmt(&fluree, ledger.clone(), &format!("ADD <{g1}> TO <{g2}>"))
+        .await
+        .expect_err("ADD with a cross-graph reifier collision must be rejected");
+    assert!(
+        err.contains("reifier") && err.contains("r1"),
+        "expected a reifier-collision rejection naming the reifier, got: {err}"
+    );
+
+    // The rejected ADD is atomic: dest g2's pre-existing ex:r1 annotation
+    // (reifying bob→globex) is untouched and still decodes cleanly.
+    let g2_ann = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/bob",
+    )
+    .await;
+    assert_eq!(
+        g2_ann.len(),
+        1,
+        "dest's pre-existing annotation must survive the rejected ADD"
+    );
+}
+
+#[tokio::test]
+async fn copy_and_move_over_reifier_collision_succeed() {
+    // The SAME colliding setup as the ADD test, but COPY/MOVE clear the dest
+    // first, so ex:r1 ends up reifying only the source edge in g2 — no
+    // Duplicate, no false trigger. Proves the collision guard is ADD-scoped.
+    for verb in ["COPY", "MOVE"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/edge-annotations:{}-collision-ok", verb.to_lowercase());
+        let g1 = "http://example.org/g1";
+        let g2 = "http://example.org/g2";
+        let ledger0 = genesis_ledger(&fluree, &ledger_id);
+        let ledger = seed_named_annotation_for_edge(
+            &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+        )
+        .await;
+        let ledger = seed_named_annotation_for_edge(
+            &fluree,
+            ledger,
+            g2,
+            "ex:bob",
+            "ex:globex",
+            "ex:r1",
+            "Manager",
+        )
+        .await;
+
+        let ledger = run_graph_mgmt(&fluree, ledger, &format!("{verb} <{g1}> TO <{g2}>")).await;
+
+        // g2's ex:r1 now reifies alice→acme (from the source), decoding cleanly.
+        let g2_alice = support::decode_annotations_for_subject(
+            &ledger,
+            graph_id(&ledger, g2),
+            "http://example.org/alice",
+        )
+        .await;
+        assert_eq!(
+            g2_alice.len(),
+            1,
+            "{verb}: src's ex:r1 reifies alice→acme in dest"
+        );
+        assert_eq!(
+            g2_alice[0].g,
+            Some(graph_sid(&ledger, g2)),
+            "{verb}: anchored at g2"
+        );
+
+        // The colliding bob→globex bundle was cleared by clear_dest.
+        let g2_bob = support::decode_annotations_for_subject(
+            &ledger,
+            graph_id(&ledger, g2),
+            "http://example.org/bob",
+        )
+        .await;
+        assert!(
+            g2_bob.is_empty(),
+            "{verb}: clear_dest retracts the colliding dest bundle"
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_onto_identical_annotation_tolerates_same_t_churn() {
+    // g2 already holds the byte-identical annotation g1 carries (same
+    // reifier @id, same edge, same graph anchor). COPY g1→g2 must keep
+    // exactly one annotation without a same-`t` retract+re-assert churn:
+    // clear_dest keys on the RE-HOMED source contents, so the already-
+    // correct dest anchor is left in place, not retracted.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:copy-identical-churn";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+    let ledger = seed_named_annotation(&fluree, ledger, g2, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO <{g2}>")).await;
+
+    let dest = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(
+        dest.len(),
+        1,
+        "identical-annotation COPY keeps exactly one annotation"
+    );
+    assert_eq!(dest[0].g, Some(graph_sid(&ledger, g2)));
+    assert_eq!(
+        sparql_role_in_named_graph(&fluree, &ledger, g2, "ex:alice", "ex:acme")
+            .await
+            .as_deref(),
+        Some("Engineer")
+    );
+}
+
+/// The collision guard's FALSE-POSITIVE boundary (#1483 review): the SAME
+/// explicit reifier reifying the SAME edge in source and dest must NOT trip
+/// the ADD rejection — equal edge signatures dedup cleanly against the dest
+/// bundle (no second f:reifiesSubject, no Duplicate).
+#[tokio::test]
+async fn add_same_edge_same_reifier_succeeds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:add-same-edge-ok";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // Identical edge + reifier + payload in BOTH graphs.
+    let ledger = seed_named_annotation_for_edge(
+        &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+    )
+    .await;
+    let ledger = seed_named_annotation_for_edge(
+        &fluree, ledger, g2, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+    )
+    .await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("ADD <{g1}> TO <{g2}>")).await;
+
+    // Exactly ONE cleanly-decodable annotation in the dest — merged, not
+    // duplicated, not dropped.
+    let g2_ann = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(
+        g2_ann.len(),
+        1,
+        "same-edge same-reifier ADD must merge cleanly (guard false-positive)"
+    );
+    // Source untouched by ADD.
+    let g1_ann = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g1),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(g1_ann.len(), 1, "ADD keeps the source annotation");
+}
+
+/// named→default MOVE and ADD (#1483 review: only COPY was covered for this
+/// direction): both must drop the f:reifiesGraph anchor on the re-homed copy;
+/// MOVE additionally retracts the source, ADD leaves it.
+#[tokio::test]
+async fn transfer_named_to_default_move_and_add() {
+    for verb in ["MOVE", "ADD"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/edge-annotations:xfer-n2d-{}", verb.to_lowercase());
+        let g1 = "http://example.org/g1";
+        let ledger0 = genesis_ledger(&fluree, &ledger_id);
+        let ledger =
+            seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+        let ledger = run_graph_mgmt(&fluree, ledger, &format!("{verb} <{g1}> TO DEFAULT")).await;
+
+        let dest =
+            support::decode_annotations_for_subject(&ledger, 0, "http://example.org/alice").await;
+        assert_eq!(dest.len(), 1, "{verb}: one re-homed default annotation");
+        assert_eq!(
+            dest[0].g, None,
+            "{verb} named→default must drop the f:reifiesGraph anchor"
+        );
+
+        let src = support::decode_annotations_for_subject(
+            &ledger,
+            graph_id(&ledger, g1),
+            "http://example.org/alice",
+        )
+        .await;
+        match verb {
+            "MOVE" => assert_eq!(src.len(), 0, "MOVE retracts the source annotation"),
+            _ => assert_eq!(src.len(), 1, "ADD keeps the source annotation"),
+        }
+    }
+}
+
+/// Multi-hop re-homing composes (#1483 review): COPY <a> TO <b> then
+/// COPY <b> TO <c> rewrites the anchor at each hop, so all three graphs hold
+/// an independently-decodable annotation naming THEIR OWN graph.
+#[tokio::test]
+async fn multi_hop_copy_rehomes_anchor_each_hop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:multi-hop";
+    let ga = "http://example.org/ga";
+    let gb = "http://example.org/gb";
+    let gc = "http://example.org/gc";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, ga, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{ga}> TO <{gb}>")).await;
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{gb}> TO <{gc}>")).await;
+
+    for g in [ga, gb, gc] {
+        let g_id = graph_id(&ledger, g);
+        let anns =
+            support::decode_annotations_for_subject(&ledger, g_id, "http://example.org/alice")
+                .await;
+        assert_eq!(
+            anns.len(),
+            1,
+            "graph {g} must hold one decodable annotation"
+        );
+        assert_eq!(
+            anns[0].g,
+            Some(graph_sid(&ledger, g)),
+            "the hop-{g} anchor must name its own graph (re-homed per hop)"
+        );
+    }
+}
+
+/// Reviewer question (#1483): after `COPY <g1> TO <g2>` with an EXPLICIT
+/// reifier `@id`, the same reifier subject carries a full `f:reifies*` bundle
+/// in TWO graphs. The attachment indexer is proven graph-scoped
+/// (`transfer_named_to_named_survives_reindex`); this pins that the READ
+/// surfaces are too — a reader that assembled the bundle by subject ACROSS
+/// graphs would hit `from_reifies_facts`'s `Duplicate` and silently drop the
+/// annotation from BOTH graphs.
+#[tokio::test]
+async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cross-graph-reads";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // Explicit reifier @id — the shape the question is about.
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO <{g2}>")).await;
+
+    // SPARQL annotation-tail surface, scoped per graph: both must decode.
+    for g in [g1, g2] {
+        assert_eq!(
+            sparql_role_in_named_graph(&fluree, &ledger, g, "ex:alice", "ex:acme")
+                .await
+                .as_deref(),
+            Some("Engineer"),
+            "SPARQL {{| |}} read in {g} must survive the cross-graph twin bundle"
+        );
+    }
+
+    // JSON-LD hydration surface (@annotation emission during subject
+    // expansion), scoped per graph via the composite graph selector on a
+    // GraphDb view (`fluree.db("ledger#graph")`).
+    for g in [g1, g2] {
+        let db = fluree
+            .db(&format!("{ledger_id}#{g}"))
+            .await
+            .expect("composite-scoped GraphDb");
+        let q = json!({
+            "@context": ctx(),
+            "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+            "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+        });
+        let result = fluree.query(&db, &q).await.expect("scoped hydration query");
+        let rows = result
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("format");
+        assert_eq!(
+            extract_role_from_hydration(&rows).as_deref(),
+            Some("Engineer"),
+            "hydration in {g} must surface the annotation (not Duplicate-drop it): {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn count_shapes_read_only_the_reifies_lookups_they_need() {
+    // Without a sealed arena the wrapper runs the generic `f:reifies*`
+    // chain, which drops the base-edge check and every lookup whose
+    // position nothing reads (`elide_redundant_chain`). The answers must
+    // not move: a plain subject that merely carries the body predicate
+    // (`ex:carol ex:source`) is not a reifier, endpoints that are read
+    // still bind, and a constant endpoint still constrains.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:elided-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:source": "hr" }
+                },
+                "ex:score": {
+                    "@value": 42,
+                    "@annotation": { "ex:source": "exam" }
+                }
+            },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:carol", "ex:source": "manual" }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let count = |sparql: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let rows = support::query_sparql_formatted(fluree, ledger, sparql)
+                .await
+                .expect("count query");
+            rows.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|row| row.as_array())
+                .and_then(|cols| cols.first())
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(|| panic!("count row: {rows}"))
+        }
+    };
+
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }"
+        )
+        .await,
+        2,
+        "two reified edges; ex:carol's ex:source is not an annotation"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        1,
+        "only alice's worksFor edge is reified"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ex:bob ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        0,
+        "bob's edge exists but carries no annotation"
+    );
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o ?src WHERE { << ?s ex:worksFor ?o >> ex:source ?src }",
+    )
+    .await
+    .expect("projected query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let cols = arr[0].as_array().expect("row");
+    assert!(
+        iri_matches(&cols[0], "ex:alice", "http://example.org/alice"),
+        "subject still binds when read: {rows}"
+    );
+    assert!(
+        iri_matches(&cols[1], "ex:acme", "http://example.org/acme"),
+        "object still binds when read: {rows}"
+    );
+    assert_eq!(cols[2].as_str(), Some("hr"), "{rows}");
+}
+
+/// An annotated `ex:worksFor` edge plus two annotated `ex:knows` edges, one of
+/// them a self-loop, for the elided-chain tests below.
+async fn seed_elided_chain_edges(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:source": "hr" }
+        },
+        "ex:knows": [
+            { "@id": "ex:alice", "@annotation": { "ex:source": "self" } },
+            { "@id": "ex:bob", "@annotation": { "ex:source": "crm" } }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    (fluree, committed.ledger)
+}
+
+/// SPARQL solutions as one `var -> lexical value` map per row.
+async fn sparql_solutions(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    sparql: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .expect("binding row")
+                .iter()
+                .map(|(var, term)| {
+                    let value = term["value"].as_str().expect("term value");
+                    (var.clone(), value.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn wildcard_select_binds_the_quoted_triple_variables() {
+    // `SELECT *` has no projection-pushdown set, so the chain elision reads
+    // its needed variables off the WHERE walk, which has to see into the
+    // quoted triple. When it did not, the triple's own variables counted as
+    // unread, their `f:reifies*` lookups were dropped, and the rows came back
+    // without them (W3C sparql12 eval-triple-terms basic-4, basic-5,
+    // pattern-7, pattern-8).
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-wildcard").await;
+
+    // basic-4: a variable predicate inside the quoted triple.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ?p ex:acme >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("p").map(String::as_str),
+        Some("http://example.org/worksFor"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[0].get("q").map(String::as_str),
+        Some("http://example.org/source"),
+        "{rows:#?}"
+    );
+
+    // basic-5: a variable object.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ex:worksFor ?o >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("o").map(String::as_str),
+        Some("http://example.org/acme"),
+        "{rows:#?}"
+    );
+
+    // Every position a variable, ordered by the body's.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT * WHERE { << ?s ?p ?o >> ex:source ?src } ORDER BY ?src",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    for var in ["s", "p", "o", "src"] {
+        assert!(
+            rows.iter().all(|row| row.contains_key(var)),
+            "?{var} unbound: {rows:#?}"
+        );
+    }
+    let objects: Vec<&str> = rows.iter().map(|row| row["o"].as_str()).collect();
+    assert_eq!(
+        objects,
+        [
+            "http://example.org/bob",
+            "http://example.org/acme",
+            "http://example.org/alice"
+        ]
+    );
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "*",
+            "where": {
+                "@id": "?s",
+                "ex:worksFor": {
+                    "@id": "?o",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld wildcard query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let row = arr[0].as_object().expect("wildcard row object");
+    assert!(
+        row.get("?s")
+            .is_some_and(|v| iri_matches(v, "ex:alice", "http://example.org/alice")),
+        "?s unbound: {rows}"
+    );
+    assert!(
+        row.get("?o")
+            .is_some_and(|v| iri_matches(v, "ex:acme", "http://example.org/acme")),
+        "?o unbound: {rows}"
+    );
+    assert_eq!(row.get("?src").and_then(JsonValue::as_str), Some("hr"));
+}
+
+#[tokio::test]
+async fn a_repeated_quoted_triple_variable_still_equates_its_positions() {
+    // `<< ?s ex:knows ?s >>` with nothing reading ?s: the elided chain drops
+    // the base edge, so the subject and object lookups joining on ?s are all
+    // that keeps alice-knows-bob from matching.
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-self-loop").await;
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await
+    .expect("self-loop count");
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(1),
+        "only alice knows herself: {rows}"
+    );
+
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["src"], "self");
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": ["?src"],
+            "where": {
+                "@id": "?s",
+                "ex:knows": {
+                    "@id": "?s",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld self-loop query");
+    assert_eq!(rows, json!([["self"]]), "only alice knows herself");
+}
+
+#[tokio::test]
+async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() {
+    // `add_same_edge_same_reifier_succeeds` establishes that this state is
+    // legal and that graph management produces it: `COPY <g1> TO <g2>`
+    // duplicates annotated edges, reifier IRIs included. It reaches that state
+    // through two transactions.
+    //
+    // Writing it in ONE transaction used to be refused. The single-target
+    // invariant grouped a transaction's `f:reifies*` flakes by reifier alone,
+    // so both graphs' bundles folded into one, and a bundle that names two
+    // graphs fails `EdgeKey::from_reifies_facts`'s graph-uniformity check
+    // before it reaches any duplicate check — reported as "multi-target",
+    // which it is not. Two transactions were free to do what one could not.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:same-reifier-two-graphs-one-txn";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@graph": g1,
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": {"@id": "ex:r1", "ex:role": "Engineer"}
+                        }
+                    },
+                    {
+                        "@id": "ex:alice",
+                        "@graph": g2,
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": {"@id": "ex:r1", "ex:role": "Engineer"}
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("one reifier, one edge, two graphs, one transaction");
+
+    for g in [g1, g2] {
+        let anns = support::decode_annotations_for_subject(
+            &committed.ledger,
+            graph_id(&committed.ledger, g),
+            "http://example.org/alice",
+        )
+        .await;
+        assert_eq!(anns.len(), 1, "graph {g} must carry its own bundle");
+    }
+}
+
+#[tokio::test]
+async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
+    // The single-target invariant runs on `stage_flakes`, which put it on the
+    // push path. `insert_turtle` and the permissive bulk-import sink did not
+    // enforce it before this work, so a commit written by an older build can
+    // hold a reifier on two edges. Refusing that on push would strand the
+    // ledger permanently — there is no way forward short of rewriting history
+    // — to prevent data that is already written.
+    //
+    // Authoring still refuses it, which is the case where refusing changes the
+    // outcome. This drives both sides of that distinction through the same
+    // flakes, so the difference is the option and nothing else.
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:replayed-commit";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let sid = |ns: u16, name: &str| Sid::new(ns, name);
+    let reifies = |local: &str| {
+        Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            Box::leak(local.to_string().into_boxed_str()) as &'static str,
+        )
+    };
+    let ns = 100u16;
+    // One reifier, two different subjects: a bundle that cannot decode.
+    let assert_reifies = |object: Sid| {
+        Flake::new(
+            sid(ns, "claim1"),
+            reifies(fluree_vocab::db::REIFIES_SUBJECT),
+            FlakeValue::Ref(object),
+            Sid::new(0, "@id"),
+            1,
+            true,
+            None,
+        )
+    };
+    let flakes = vec![
+        assert_reifies(sid(ns, "alice")),
+        assert_reifies(sid(ns, "carol")),
+    ];
+
+    let authored = fluree_db_transact::stage_flakes(
+        ledger0.clone(),
+        flakes.clone(),
+        fluree_db_transact::StageOptions::new(),
+    )
+    .await;
+    let err = match authored {
+        Err(e) => e,
+        Ok(_) => panic!("authoring a two-target reifier must be refused"),
+    };
+    assert!(
+        err.to_string().contains("claim1"),
+        "the refusal must name the reifier: {err}"
+    );
+
+    let replayed = fluree_db_transact::stage_flakes(
+        ledger0,
+        flakes,
+        fluree_db_transact::StageOptions::new().replaying_commit(),
+    )
+    .await;
+    assert!(
+        replayed.is_ok(),
+        "replaying an already-authored commit must apply, not strand the ledger"
+    );
+}
+
+// ===========================================================================
+// Annotation-form DELETE: the full spelling matrix (issue #1861)
+//
+// Two separate rules combine into a result that surprises people, and the
+// docs used to describe each one only in isolation:
+//
+//   1. The annotation form ASSERTS the base triple. RDF 1.2 Turtle §2.11.1
+//      defines `s p o ~ :r {| … |}` as "both reify and assert" the triple, and
+//      SPARQL 1.2 Update §3.1.2 routes `DELETE DATA`'s QuadData through the
+//      same production. So the annotation form of a delete is a base-edge
+//      retraction. This is spec-mandated, not a Fluree choice.
+//   2. Retracting a base edge cascades to EVERY reifier attached to it, not
+//      just the one named. This one IS a Fluree choice — neither spec entails
+//      it — and it is why sibling claims lose their attachment.
+//
+// The rows below are measured, not assumed. `docs/concepts/edge-annotations.md`
+// quotes this table; if a row changes here, that section is wrong.
+// ===========================================================================
+
+/// The issue's seed: one edge, two independent claims about it.
+const ANNOTATION_MATRIX_SEED: &str = r"@prefix : <http://example.org/> .
+:alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .
+:alice :knows :bob ~ :claim2 {| :confidence 0.6 ; :source :sourceB |} .
+";
+
+/// What survives a write, counted the way a user would check.
+#[derive(Debug, PartialEq, Eq)]
+struct Survivors {
+    /// Rows for `:alice :knows ?o` — 0 means the base edge is gone.
+    base: usize,
+    /// Body properties still on `:claim1` (the `f:reifies*` bundle is hidden).
+    claim1_body: usize,
+    /// Body properties still on `:claim2`.
+    claim2_body: usize,
+    /// Reifiers still attached to `:alice :knows :bob`.
+    attached: usize,
+    /// Rows for `:alice :knows :carol` — 1 means the object was rewritten.
+    new_object: usize,
+}
+
+async fn annotation_matrix_survivors(fluree: &MemoryFluree, ledger_id: &str) -> Survivors {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let count = |q: &'static str| {
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .ok()
+                .and_then(|v| v.to_jsonld(&ledger.snapshot).ok())
+                .and_then(|v| v.as_array().map(Vec::len))
+                .unwrap_or(0)
+        }
+    };
+    Survivors {
+        base: count("PREFIX : <http://example.org/> SELECT ?o WHERE { :alice :knows ?o }").await,
+        claim1_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim1 ?p ?v }")
+            .await,
+        claim2_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim2 ?p ?v }")
+            .await,
+        attached: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?c WHERE { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+        )
+        .await,
+        new_object: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?o WHERE { :alice :knows ?o . FILTER(?o = :carol) }",
+        )
+        .await,
+    }
+}
+
+/// How a row's write is spelled.
+enum MatrixOp {
+    Sparql(&'static str),
+    /// A Turtle `upsert` — not a delete at all, but it retracts the old edge.
+    UpsertTurtle(&'static str),
+    /// The JSON-LD `@annotation` delete.
+    JsonLdAnnotation,
+}
+
+/// Every spelling of "remove this annotated edge", and what each one leaves.
+///
+/// Rows 2, 7 and 10 are the ones issue #1861 does not mention, and two of
+/// them change what the documentation has to say:
+///
+/// - **Row 10** (`~ :claim1` with no block) reads as "detach claim1" and is
+///   the worst outcome in the table: the edge goes, BOTH claims are detached,
+///   and BOTH bodies are left standing as well-formed-looking orphans.
+/// - **Row 7** is an `upsert`, with no delete written anywhere, and it fires
+///   the identical cascade.
+#[tokio::test]
+async fn annotation_form_delete_matrix() {
+    let rows: Vec<(&str, MatrixOp, Option<Survivors>)> = vec![
+        // Row 1 — the issue's own spelling. The named claim's body goes with
+        // the edge; the sibling's body is orphaned.
+        (
+            "explicit reifier + body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 2 — a variable reifier matches EVERY reifier on the edge and
+        // strips exactly the properties the block names, from all of them.
+        // The result is not "claim1 withdrawn" but "both claims gutted".
+        (
+            "DELETE WHERE with a variable reifier",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE WHERE \
+                 { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 1,
+                claim2_body: 1,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 3 — the ONLY spelling that means "detach exactly this claim".
+        // The edge stands, both bodies stand, and claim2 stays attached.
+        (
+            "JSON-LD @annotation delete",
+            MatrixOp::JsonLdAnnotation,
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 4 — property-level retraction: what a reader usually means by
+        // "withdraw claim1". Pass 2 then retires the now-empty reifier.
+        (
+            "property-level retraction of the claim body",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :claim1 :confidence 0.8 ; :source :sourceA }",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 6 — the baseline: deleting the bare edge detaches both claims.
+        (
+            "bare base edge",
+            MatrixOp::Sparql("PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob }"),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 7 — an upsert that changes the object. No delete is written and
+        // the same cascade fires.
+        (
+            "upsert changing the object",
+            MatrixOp::UpsertTurtle(
+                "@prefix : <http://example.org/> .\n\
+                 :alice :knows :carol ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .\n",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 1,
+            }),
+        ),
+        // Row 8 — refused. An anonymous block would introduce a blank node,
+        // which SPARQL 1.2 Update §3.1.2 forbids in DELETE DATA.
+        (
+            "anonymous annotation block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob {| :confidence 0.8 |} }",
+            ),
+            None,
+        ),
+        // Row 10 — the sharpest footgun, and absent from the issue. Reads as
+        // "detach claim1"; removes the edge and orphans both bodies.
+        (
+            "bare reifier, no body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+    ];
+
+    for (label, op, expected) in rows {
+        let fluree = FlureeBuilder::memory().build_memory();
+        // Labels carry `@` (as in `@annotation`), which ledger ids reserve.
+        let ledger_id = format!("ann-matrix/{}:main", label.replace([' ', '@'], "-"));
+        let seeded = fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed the annotated edge");
+        assert_eq!(seeded.ledger.t(), 1, "[{label}] seed must commit");
+
+        let graph = fluree.graph(&ledger_id);
+        let jsonld = json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": {
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}
+            }
+        });
+        let result = match op {
+            MatrixOp::Sparql(q) => graph.transact().sparql_update(q).commit().await,
+            MatrixOp::UpsertTurtle(t) => graph.transact().upsert_turtle(t).commit().await,
+            MatrixOp::JsonLdAnnotation => graph.transact().update(&jsonld).commit().await,
+        };
+
+        match expected {
+            None => {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("[{label}] must be refused"));
+                assert!(
+                    err.to_string().contains("anonymous annotation block"),
+                    "[{label}] expected the anonymous-block refusal, got: {err}"
+                );
+            }
+            Some(want) => {
+                result.unwrap_or_else(|e| panic!("[{label}] must commit: {e}"));
+                let got = annotation_matrix_survivors(&fluree, &ledger_id).await;
+                assert_eq!(got, want, "[{label}] survivor set changed");
+            }
+        }
+    }
+}
+
+/// The half of the matrix that is spec-mandated, stated on its own so a
+/// regression names the right cause.
+///
+/// `~ :r {| … |}` and the bare `~ :r` tail both expand to include the base
+/// triple (RDF 1.2 Turtle §2.11.1; SPARQL 1.2 Update §3.1.2 admits the
+/// production into `DELETE DATA`). A store that kept the edge here would be
+/// the one diverging from spec.
+#[tokio::test]
+async fn annotation_form_delete_retracts_the_base_edge_in_both_spellings() {
+    for (label, q) in [
+        (
+            "with a body block",
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        ),
+        (
+            "bare reifier",
+            "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("ann-base/{}:main", label.replace(' ', "-"));
+        fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .sparql_update(q)
+            .commit()
+            .await
+            .expect("delete");
+        assert_eq!(
+            annotation_matrix_survivors(&fluree, &ledger_id).await.base,
+            0,
+            "[{label}] the annotation form asserts the base triple, so deleting \
+             it must retract the base edge"
+        );
+    }
+}
+
+/// The half that is Fluree's own semantics: the cascade reaches reifiers the
+/// delete never named.
+///
+/// Pinned separately and explicitly because nothing in RDF 1.2 or SPARQL 1.2
+/// entails it — SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point,
+/// that deleting a reifying triple leaves the asserted triple alone. A reader
+/// who checks the spec and finds Fluree deleting more will otherwise conclude
+/// there is a second bug.
+#[tokio::test]
+async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "ann-sibling-cascade:main";
+    fluree
+        .insert_turtle(genesis_ledger(&fluree, ledger_id), ANNOTATION_MATRIX_SEED)
+        .await
+        .expect("seed");
+
+    let before = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(before.attached, 2, "both claims start attached to the edge");
+
+    // Names :claim1 and nothing else.
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        )
+        .commit()
+        .await
+        .expect("delete");
+
+    let after = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(
+        after.attached, 0,
+        ":claim2 is detached though it was never named"
+    );
+    assert_eq!(
+        after.claim2_body, 2,
+        ":claim2's body survives its attachment — this is the orphan state the \
+         docs must warn about"
+    );
+}
+
+// =============================================================================
+// Annotation deletes address the edge's graph; reverse-defined terms
+// =============================================================================
+
+/// The annotations reifying `(s, p, o)` in `graph` (or the default graph),
+/// by `@reifies`, which joins the edge itself.
+async fn reifiers_of(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    graph: Option<&str>,
+    s: &str,
+    p: &str,
+    o: &str,
+) -> Vec<JsonValue> {
+    let from = match graph {
+        Some(g) => format!("{ledger_id}#{g}"),
+        None => ledger_id.to_string(),
+    };
+    let q = json!({
+        "@context": ctx(), "from": from, "select": ["?ann"],
+        "where": {"@id": "?ann", "@reifies": {"@id": s, p: {"@id": o}}}
+    });
+    let result = fluree.query_connection(&q).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// An edge is in its subject's graph, whatever `@graph` its object node
+/// carries, and so is its annotation: deleting the annotated edge with the
+/// same document (by `@id`, or by selector) retracts the annotation there.
+#[tokio::test]
+async fn annotated_edge_delete_addresses_the_edge_graph_not_the_object_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, annotation) in [
+        json!({"@id": "ex:ann", "ex:since": 2020}),
+        json!({"ex:since": 2020}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-object-graph-{i}:main");
+        let node = |annotation: JsonValue| json!({"@id": "ex:a", "ex:knows": {"@id": "ex:b", "@graph": "ex:g2", "@annotation": annotation}});
+        let mut doc = node(json!({"@id": "ex:ann", "ex:since": 2020}));
+        doc["@context"] = ctx();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "the annotation is beside its edge, in the default graph"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx(), "delete": node(annotation)}),
+            )
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "case {i}: the annotation is retracted from the edge's graph"
+        );
+    }
+}
+
+/// A selector-form annotation delete names its graph as any `where` and
+/// template does: `"default"`, a `fromNamed` alias, a compact IRI.
+#[tokio::test]
+async fn selector_annotation_delete_resolves_its_graph_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (graph_name, stored_in, from_named)) in [
+        ("default", None, None),
+        (
+            "two",
+            Some("http://example.org/g2"),
+            Some(json!([{"alias": "two", "graph": "ex:g2"}])),
+        ),
+        ("ex:g2", Some("http://example.org/g2"), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-selector-graph-{i}:main");
+        let mut node = json!({"@context": ctx(), "@id": "ex:a",
+            "ex:knows": {"@id": "ex:b", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}});
+        if stored_in.is_some() {
+            node["@graph"] = json!("ex:g2");
+        }
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &node)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "{graph_name}: inserted"
+        );
+        let mut delete = json!({"@context": ctx(), "delete": {"@id": "ex:a", "@graph": graph_name,
+            "ex:knows": {"@id": "ex:b", "@annotation": {"ex:since": 2020}}}});
+        if let Some(from_named) = from_named {
+            delete["fromNamed"] = from_named;
+        }
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &delete)
+            .await
+            .expect("selector delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "{graph_name}: the selector delete retracts the annotation"
+        );
+    }
+}
+
+/// An annotation on an edge stated through a term defined with `@reverse`
+/// (or under the `@reverse` keyword) reifies the edge as stored, `mom
+/// ex:child kid`, and the same document deletes it.
+#[tokio::test]
+async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut reverse_ctx = ctx();
+    reverse_ctx["childOf"] = json!({"@reverse": "ex:child"});
+    reverse_ctx["parent"] = json!({"@reverse": "ex:child", "@type": "@id"});
+    for (i, node) in [
+        json!({"@id": "ex:kid", "childOf": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "parent": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-reverse-{i}:main");
+        let mut doc = node.clone();
+        doc["@context"] = reverse_ctx.clone();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid").await.len(),
+            1,
+            "case {i}: the annotation reifies the stored edge"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &json!({"@context": reverse_ctx, "delete": node}))
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid")
+                .await
+                .is_empty(),
+            "case {i}: the same document deletes it"
+        );
+    }
+}

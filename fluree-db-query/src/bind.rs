@@ -1,0 +1,504 @@
+//! BIND operator - evaluates expression and binds result to variable
+//!
+//! The BindOperator evaluates a filter expression and binds the result
+//! to a variable with clobber prevention:
+//!
+//! - If variable is Unbound: bind the computed value
+//! - If variable has the SAME value: pass through (compatible)
+//! - If variable has a DIFFERENT value: drop the row (clobber prevention)
+//!
+//! Evaluation errors produce `Binding::Unbound` (NOT `Binding::Poisoned`).
+//! Poisoned is reserved strictly for OPTIONAL semantics.
+//!
+//! For example, `BIND(?x + 10 AS ?y)` evaluates the expression for each input row and binds the result to `?y`.
+
+use crate::binding::{Batch, Binding, RowAccess};
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::eval::{passes_filters, PreparedBoolExpression};
+use crate::ir::Expression;
+use crate::operator::{
+    compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
+};
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use std::sync::Arc;
+
+/// BIND operator - evaluates expression and binds to variable
+///
+/// Implements SPARQL BIND semantics with clobber prevention:
+/// - New variable: bind computed value
+/// - Same value: pass through
+/// - Different value: drop row
+pub struct BindOperator {
+    /// Child operator providing input solutions
+    child: BoxedOperator,
+    /// Variable to bind the result to
+    var: VarId,
+    /// Expression to evaluate
+    expr: Expression,
+    /// Inline filters evaluated after computing the BIND value.
+    /// Rows that fail any filter are dropped before materialization,
+    /// eliminating the overhead of a separate FilterOperator.
+    filters: Vec<PreparedBoolExpression>,
+    /// Output schema (child schema with var added if new)
+    in_schema: Arc<[VarId]>,
+    /// Position of var in output schema
+    var_position: usize,
+    /// Whether this is a new variable (not in child schema)
+    is_new_var: bool,
+    /// Operator state
+    state: OperatorState,
+    /// Variables required by downstream operators; if set, output is trimmed.
+    out_schema: Option<Arc<[VarId]>>,
+    /// Term normalization for the clobber check, built at open: a bound value
+    /// and the computed one can be one term in two forms.
+    norm: Option<crate::object_binding::EqualityNorm>,
+    /// True when `expr` contains an `EXISTS { ... }` subexpression, which must
+    /// be resolved per-row (seeded with the row's bindings) before the value
+    /// is computed — projection/BIND counterpart to the FilterOperator path.
+    /// The common case (no EXISTS) keeps the fast synchronous eval.
+    has_exists: bool,
+    /// True when `expr` contains a Cypher metadata read (`labels`/`properties`/
+    /// member access, …). Under an active non-root policy these are resolved
+    /// per-row through the policy-filtered async path before the value is
+    /// computed; without a policy the synchronous fast path is used unchanged.
+    has_metadata: bool,
+    /// Temporal context for any per-row EXISTS resolution. Defaults to
+    /// current-state; EXISTS inside a BIND of a history query is out of scope.
+    planning: crate::temporal_mode::PlanningContext,
+}
+
+impl BindOperator {
+    /// Create a new BIND operator
+    ///
+    /// # Arguments
+    ///
+    /// * `child` - Child operator providing input solutions
+    /// * `var` - Variable to bind the computed value to
+    /// * `expr` - Expression to evaluate
+    /// * `filters` - Inline filter expressions evaluated after computing the
+    ///   BIND value; rows failing any filter are dropped before materialization
+    pub fn new(
+        child: BoxedOperator,
+        var: VarId,
+        expr: Expression,
+        filters: Vec<Expression>,
+    ) -> Self {
+        let child_schema = child.schema();
+
+        // Check if var already exists in child schema
+        let existing_pos = child_schema.iter().position(|&v| v == var);
+
+        let (schema, var_position, is_new_var): (Arc<[VarId]>, usize, bool) = match existing_pos {
+            Some(pos) => {
+                // Variable exists - schema stays the same
+                (
+                    Arc::from(child_schema.to_vec().into_boxed_slice()),
+                    pos,
+                    false,
+                )
+            }
+            None => {
+                // New variable - add to schema
+                let mut new_schema = child_schema.to_vec();
+                let pos = new_schema.len();
+                new_schema.push(var);
+                (Arc::from(new_schema.into_boxed_slice()), pos, true)
+            }
+        };
+
+        let has_exists = crate::filter::contains_exists(&expr);
+        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
+
+        Self {
+            child,
+            var,
+            expr,
+            filters: filters
+                .into_iter()
+                .map(PreparedBoolExpression::new)
+                .collect(),
+            in_schema: schema,
+            var_position,
+            is_new_var,
+            state: OperatorState::Created,
+            out_schema: None,
+            norm: None,
+            has_exists,
+            has_metadata,
+            planning: crate::temporal_mode::PlanningContext::current(),
+        }
+    }
+
+    /// Set the temporal context used when resolving a per-row `EXISTS` inside
+    /// the bound expression. Only meaningful when `expr` contains EXISTS.
+    pub fn with_planning(mut self, planning: crate::temporal_mode::PlanningContext) -> Self {
+        self.planning = planning;
+        self
+    }
+
+    /// Trim output to only the specified downstream variables.
+    pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
+        self.out_schema = compute_trimmed_vars(&self.in_schema, downstream_vars);
+        self
+    }
+
+    /// `BIND(?x AS ?y)` where `?x` holds a store id binds that id, without
+    /// its history metadata, as evaluating would. Evaluated, the id decodes
+    /// to a `Sid`, which every keyed operator downstream (DISTINCT, joins,
+    /// GROUP BY) looks up in the subject dictionary again, once per row.
+    /// An eager caller wants decoded terms, so it still evaluates.
+    fn copied_store_id(&self, row: &impl RowAccess, ctx: &ExecutionContext<'_>) -> Option<Binding> {
+        let Expression::Var(source) = self.expr else {
+            return None;
+        };
+        if ctx.eager_materialization {
+            return None;
+        }
+        match row.get(source)? {
+            Binding::EncodedSid { s_id, .. } => Some(Binding::EncodedSid {
+                s_id: *s_id,
+                t: None,
+                op: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for BindOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+    fn schema(&self) -> &[VarId] {
+        effective_schema(&self.out_schema, &self.in_schema)
+    }
+
+    fn set_row_budget(&mut self, budget: usize) {
+        // Categorically sound (BIND is 1:1 row-preserving and order-preserving);
+        // switch-gated for differential hygiene, not soundness. Forwarding lets a
+        // top-of-tree LIMIT budget reach a scan sitting under a BIND (e.g. a
+        // `?s ?p ?o . BIND(... AS ?v)` UNION branch — F17/q029).
+        if crate::r2rml::union_budget_enabled() {
+            self.child.set_row_budget(budget);
+        }
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.child.open(ctx).await?;
+        self.norm = crate::object_binding::equality_norm(ctx);
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+
+        loop {
+            // Get next batch from child
+            let input_batch = match self.child.next_batch(ctx).await? {
+                Some(b) => b,
+                None => {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                }
+            };
+
+            if input_batch.is_empty() {
+                continue;
+            }
+
+            let child_num_cols = self.child.schema().len();
+            let num_output_cols = self.in_schema.len();
+
+            // Build output columns
+            let mut output_columns: Vec<Vec<Binding>> = (0..num_output_cols)
+                .map(|_| Vec::with_capacity(input_batch.len()))
+                .collect();
+
+            // Reusable buffer for filter evaluation (avoids per-row allocation)
+            let filter_row_cap = if self.filters.is_empty() {
+                0
+            } else {
+                num_output_cols
+            };
+            let mut filter_row = Vec::with_capacity(filter_row_cap);
+
+            // Process each row
+            for row_idx in 0..input_batch.len() {
+                // Resolve any EXISTS subexpression against this row first (it
+                // needs the row's bindings to correlate); otherwise evaluate
+                // the expression directly. `Cow` keeps the no-EXISTS path
+                // allocation-free.
+                let expr: std::borrow::Cow<'_, Expression> = if self.has_exists {
+                    std::borrow::Cow::Owned(
+                        crate::filter::resolve_row_exists(
+                            &self.expr,
+                            &input_batch,
+                            row_idx,
+                            ctx,
+                            &self.planning,
+                        )
+                        .await?,
+                    )
+                } else {
+                    std::borrow::Cow::Borrowed(&self.expr)
+                };
+
+                let row_view = input_batch.row_view(row_idx).unwrap();
+
+                // Under an active non-root policy, resolve Cypher metadata reads
+                // through the policy-filtered async path before evaluating; the
+                // synchronous readers are fail-closed there.
+                let expr: std::borrow::Cow<'_, Expression> = if self.has_metadata
+                    && !ctx.allow_unfiltered()
+                {
+                    std::borrow::Cow::Owned(
+                        crate::eval::metadata_resolve::resolve_row_metadata(&expr, &row_view, ctx)
+                            .await?,
+                    )
+                } else {
+                    expr
+                };
+
+                // Evaluate expression. Non-strict mode still propagates fatal
+                // execution issues such as dictionary lookup failures.
+                let computed = if let Some(copied) = self.copied_store_id(&row_view, ctx) {
+                    copied
+                } else if ctx.strict_bind_errors {
+                    expr.try_eval_to_binding(&row_view, Some(ctx))?
+                } else {
+                    expr.try_eval_to_binding_non_strict(&row_view, Some(ctx))?
+                };
+
+                // Check clobber prevention if variable already exists
+                let keep_row = if self.is_new_var {
+                    // New variable - always keep
+                    true
+                } else {
+                    // Existing variable - check compatibility
+                    let existing = row_view.get(self.var);
+                    match existing {
+                        Some(Binding::Unbound) | None => true, // Unbound - can bind
+                        Some(existing_val) => {
+                            // Check if same term, whichever form each carries it in
+                            matches!(computed, Binding::Unbound)
+                                || crate::object_binding::same_term(
+                                    existing_val,
+                                    &computed,
+                                    &self.norm,
+                                )?
+                        }
+                    }
+                };
+
+                if !keep_row {
+                    // Clobber detected - drop this row
+                    continue;
+                }
+
+                // Evaluate inline filters against a row that includes the BIND output
+                if !self.filters.is_empty() {
+                    filter_row.clear();
+                    for col in 0..child_num_cols {
+                        filter_row.push(input_batch.get_by_col(row_idx, col).clone());
+                    }
+                    if self.is_new_var {
+                        filter_row.push(computed.clone());
+                    } else {
+                        filter_row[self.var_position] = computed.clone();
+                    }
+                    if !passes_filters(&self.filters, &self.in_schema, &filter_row, Some(ctx))? {
+                        continue;
+                    }
+                }
+
+                // Copy child columns
+                for (col_idx, output_col) in
+                    output_columns.iter_mut().enumerate().take(child_num_cols)
+                {
+                    let binding = input_batch.get_by_col(row_idx, col_idx).clone();
+                    output_col.push(binding);
+                }
+
+                // Add bound value
+                if self.is_new_var {
+                    // New column at the end
+                    output_columns[self.var_position].push(computed);
+                } else {
+                    // Existing variable:
+                    // - If computed is Unbound (e.g. eval error), do NOT clobber an existing bound value.
+                    // - Otherwise, overwrite the existing column for this row with the computed value.
+                    if matches!(computed, Binding::Unbound) {
+                        // Keep the existing value we already pushed.
+                    } else {
+                        // Replace the last pushed value for this column.
+                        output_columns[self.var_position].pop();
+                        output_columns[self.var_position].push(computed);
+                    }
+                }
+            }
+
+            // Check if any rows remain after filtering
+            if output_columns
+                .first()
+                .map(std::vec::Vec::is_empty)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
+            let batch = Batch::new(self.in_schema.clone(), output_columns)?;
+            return Ok(trim_batch(&self.out_schema, batch));
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        // Some rows may be dropped due to clobber prevention
+        // Estimate same as child (upper bound)
+        self.child.estimated_rows()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::Batch;
+    use fluree_db_core::value::FlakeValue;
+
+    #[test]
+    fn test_bind_operator_new_var_schema() {
+        // Child has ?a, BIND adds ?b
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let child = Box::new(TestEmptyWithSchema {
+            schema: child_schema,
+        });
+
+        let expr = Expression::Const(FlakeValue::Long(42));
+        let op = BindOperator::new(child, VarId(1), expr, vec![]);
+
+        // Output schema should be [?a, ?b]
+        assert_eq!(op.schema().len(), 2);
+        assert_eq!(op.schema()[0], VarId(0));
+        assert_eq!(op.schema()[1], VarId(1));
+        assert!(op.is_new_var);
+    }
+
+    #[test]
+    fn test_bind_operator_existing_var_schema() {
+        // Child has ?a ?b, BIND to ?a (existing)
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let child = Box::new(TestEmptyWithSchema {
+            schema: child_schema,
+        });
+
+        let expr = Expression::Const(FlakeValue::Long(42));
+        let op = BindOperator::new(child, VarId(0), expr, vec![]);
+
+        // Schema should stay [?a, ?b]
+        assert_eq!(op.schema().len(), 2);
+        assert_eq!(op.schema()[0], VarId(0));
+        assert_eq!(op.schema()[1], VarId(1));
+        assert!(!op.is_new_var);
+        assert_eq!(op.var_position, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_of_a_var_holding_a_store_id_copies_the_id() {
+        // Copied, the id needs no dictionary to bind; evaluated, it would.
+        // History metadata stays with the source, as evaluating leaves it.
+        // An eager caller still gets it evaluated: this context has no store
+        // to decode it with, so that reads as unbound.
+        async fn bound(eager: bool) -> Vec<Binding> {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+            let rows = vec![Binding::EncodedSid {
+                s_id: 42,
+                t: Some(3),
+                op: Some(true),
+            }];
+            let child = Box::new(OneBatch {
+                batch: Some(Batch::new(Arc::clone(&schema), vec![rows]).unwrap()),
+                schema,
+            });
+            let mut op = BindOperator::new(child, VarId(1), Expression::Var(VarId(0)), vec![]);
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = crate::var_registry::VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.eager_materialization = eager;
+            op.open(&ctx).await.unwrap();
+            let batch = op.next_batch(&ctx).await.unwrap().expect("one row");
+            batch.column(VarId(1)).unwrap().to_vec()
+        }
+
+        let copied = bound(false).await;
+        assert!(
+            matches!(
+                copied.as_slice(),
+                [Binding::EncodedSid {
+                    s_id: 42,
+                    t: None,
+                    op: None
+                }]
+            ),
+            "{copied:?}"
+        );
+        let evaluated = bound(true).await;
+        assert!(
+            matches!(evaluated.as_slice(), [Binding::Unbound]),
+            "{evaluated:?}"
+        );
+    }
+
+    struct OneBatch {
+        batch: Option<Batch>,
+        schema: Arc<[VarId]>,
+    }
+
+    #[async_trait]
+    impl Operator for OneBatch {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(self.batch.take())
+        }
+
+        fn close(&mut self) {}
+    }
+
+    // Helper struct for testing
+    struct TestEmptyWithSchema {
+        schema: Arc<[VarId]>,
+    }
+
+    #[async_trait]
+    impl Operator for TestEmptyWithSchema {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(None)
+        }
+
+        fn close(&mut self) {}
+    }
+}

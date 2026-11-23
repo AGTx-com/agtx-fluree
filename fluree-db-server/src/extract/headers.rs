@@ -1,0 +1,1118 @@
+//! Fluree-specific HTTP headers extractor
+
+use axum::extract::FromRequestParts;
+use axum::http::header::HeaderMap;
+use axum::http::request::Parts;
+use serde_json::Value as JsonValue;
+
+use crate::error::{Result, ServerError};
+
+/// Case-insensitive ASCII substring search that does not allocate.
+///
+/// Used on the request hot path for content-type sniffing, where the previous
+/// `to_ascii_lowercase()` heap-allocated on every request. `haystack` is a short
+/// header value and `needle` a fixed literal, so the windowed scan is cheap.
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// A serialization of an RDF graph: a SPARQL CONSTRUCT / DESCRIBE result, or a
+/// Graph Store `GET`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphFormat {
+    JsonLd,
+    Turtle,
+    NTriples,
+    RdfXml,
+    TriG,
+    NQuads,
+}
+
+impl GraphFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "JSON-LD",
+            GraphFormat::Turtle => "Turtle",
+            GraphFormat::NTriples => "N-Triples",
+            GraphFormat::RdfXml => "RDF/XML",
+            GraphFormat::TriG => "TriG",
+            GraphFormat::NQuads => "N-Quads",
+        }
+    }
+
+    pub fn media_type(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "application/ld+json",
+            GraphFormat::Turtle => "text/turtle",
+            GraphFormat::NTriples => "application/n-triples",
+            GraphFormat::RdfXml => "application/rdf+xml",
+            GraphFormat::TriG => "application/trig",
+            GraphFormat::NQuads => "application/n-quads",
+        }
+    }
+
+    /// The response `Content-Type`.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            GraphFormat::JsonLd => "application/ld+json; charset=utf-8",
+            GraphFormat::Turtle => "text/turtle; charset=utf-8",
+            GraphFormat::NTriples => "application/n-triples; charset=utf-8",
+            GraphFormat::RdfXml => "application/rdf+xml; charset=utf-8",
+            GraphFormat::TriG => "application/trig; charset=utf-8",
+            GraphFormat::NQuads => "application/n-quads; charset=utf-8",
+        }
+    }
+
+    /// Every format, for negotiating a CONSTRUCT / DESCRIBE result.
+    pub const ALL: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+        GraphFormat::TriG,
+        GraphFormat::NQuads,
+    ];
+
+    /// The formats that can express named graphs, for a CONSTRUCT whose
+    /// template writes into them.
+    pub const DATASET: &'static [GraphFormat] =
+        &[GraphFormat::JsonLd, GraphFormat::TriG, GraphFormat::NQuads];
+
+    /// The formats for one graph: a Graph Store `GET`.
+    pub const SINGLE_GRAPH: &'static [GraphFormat] = &[
+        GraphFormat::JsonLd,
+        GraphFormat::Turtle,
+        GraphFormat::NTriples,
+        GraphFormat::RdfXml,
+    ];
+
+    pub fn formatter(self) -> fluree_db_api::FormatterConfig {
+        match self {
+            GraphFormat::JsonLd => fluree_db_api::FormatterConfig::jsonld(),
+            GraphFormat::Turtle => fluree_db_api::FormatterConfig::turtle(),
+            GraphFormat::NTriples => fluree_db_api::FormatterConfig::ntriples(),
+            GraphFormat::RdfXml => fluree_db_api::FormatterConfig::rdf_xml(),
+            GraphFormat::TriG => fluree_db_api::FormatterConfig::trig(),
+            GraphFormat::NQuads => fluree_db_api::FormatterConfig::nquads(),
+        }
+    }
+
+    /// The format a media type names. `application/turtle` and
+    /// `application/x-turtle` are pre-registration Turtle types some SPARQL
+    /// clients still send.
+    fn from_media_type(media: &str) -> Option<Self> {
+        const TYPES: &[(&str, GraphFormat)] = &[
+            ("application/ld+json", GraphFormat::JsonLd),
+            ("application/json", GraphFormat::JsonLd),
+            ("text/turtle", GraphFormat::Turtle),
+            ("application/turtle", GraphFormat::Turtle),
+            ("application/x-turtle", GraphFormat::Turtle),
+            ("application/n-triples", GraphFormat::NTriples),
+            ("application/rdf+xml", GraphFormat::RdfXml),
+            ("application/trig", GraphFormat::TriG),
+            ("application/n-quads", GraphFormat::NQuads),
+        ];
+        TYPES
+            .iter()
+            .find(|(t, _)| media.eq_ignore_ascii_case(t))
+            .map(|(_, f)| *f)
+    }
+}
+
+/// `(q, media type)` for each range in an `Accept` value, weight-zero ranges
+/// dropped, highest `q` first. Within a weight, a type beats `type/*`, which
+/// beats `*/*` (the more specific range is the client's real preference);
+/// otherwise the header's order is kept.
+fn media_ranges(accept: &str) -> impl Iterator<Item = (f32, &str)> {
+    let mut ranges: Vec<(f32, &str)> = accept
+        .split(',')
+        .filter_map(|range| {
+            let mut parts = range.split(';').map(str::trim);
+            let media = parts.next().filter(|m| !m.is_empty())?;
+            let q = parts
+                .find_map(|p| p.strip_prefix("q="))
+                .map_or(1.0, |q| q.parse().unwrap_or(0.0));
+            Some((q, media))
+        })
+        .filter(|(q, _)| *q > 0.0)
+        .collect();
+    let specificity = |media: &str| match media {
+        "*/*" => 0,
+        m if m.ends_with("/*") => 1,
+        _ => 2,
+    };
+    ranges.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| specificity(b.1).cmp(&specificity(a.1)))
+    });
+    ranges.into_iter()
+}
+
+/// The graph format an `Accept` value prefers among `allowed`: the highest-`q`
+/// media range an allowed format satisfies. `*/*` and `application/*` are
+/// JSON-LD, `text/*` is Turtle, and no `Accept` at all is JSON-LD. `None`
+/// when nothing allowed matches.
+pub fn negotiate_graph_format(
+    accept: Option<&str>,
+    allowed: &[GraphFormat],
+) -> Option<GraphFormat> {
+    let Some(accept) = accept.filter(|a| !a.trim().is_empty()) else {
+        return Some(GraphFormat::JsonLd).filter(|f| allowed.contains(f));
+    };
+    media_ranges(accept).find_map(|(_, media)| {
+        GraphFormat::from_media_type(media)
+            .or_else(|| {
+                if media == "*/*" || media.eq_ignore_ascii_case("application/*") {
+                    Some(GraphFormat::JsonLd)
+                } else if media.eq_ignore_ascii_case("text/*") {
+                    Some(GraphFormat::Turtle)
+                } else {
+                    None
+                }
+            })
+            .filter(|f| allowed.contains(f))
+    })
+}
+
+/// Fluree-specific HTTP headers
+///
+/// These headers allow clients to specify query options, ledger selection,
+/// identity, and policy without modifying the request body.
+#[derive(Debug, Clone)]
+pub struct FlureeHeaders {
+    /// Raw HTTP headers (for telemetry/tracing)
+    pub raw: HeaderMap,
+
+    /// Host-verified policy selection. Never populated by HTTP header parsing.
+    pub policy_authorization: Option<super::CredentialPolicy>,
+
+    /// The auth-layer-verified caller identity, set by
+    /// [`crate::routes::policy_auth::bind_authorization`] from the signed
+    /// credential DID or the verified bearer's identity. Never populated by
+    /// HTTP header parsing: `fluree-identity` is policy evaluation context and
+    /// lands in [`Self::identity`], which a caller may set and which override
+    /// control must never trust. This is the value `f:overrideControl`
+    /// (`f:IdentityRestricted`) gates on.
+    pub server_identity: Option<fluree_db_core::VerifiedIdentity>,
+
+    /// Ledger alias from header (lower precedence than path)
+    pub ledger: Option<String>,
+
+    /// Query identity (DID)
+    pub identity: Option<String>,
+
+    /// Policy document as JSON
+    pub policy: Option<JsonValue>,
+
+    /// Policy class IRIs. Multiple `fluree-policy-class` headers (or a single
+    /// header with comma-separated values) accumulate into this Vec.
+    pub policy_class: Vec<String>,
+
+    /// Policy values as JSON
+    pub policy_values: Option<JsonValue>,
+
+    /// Default-allow flag — when true, permit access in the absence of matching
+    /// policy rules. Delivered via the `fluree-default-allow` header.
+    ///
+    /// Tri-state, mirroring `GovernanceOptions::default_allow`: `None` when the
+    /// header is absent, so the ledger's configured `f:defaultAllow` applies;
+    /// `Some(v)` when the caller sent it, which overrides config.
+    pub default_allow: Option<bool>,
+
+    /// Enable all metadata tracking
+    pub track_meta: bool,
+
+    /// Track query fuel consumption
+    pub track_fuel: bool,
+
+    /// Track execution time
+    pub track_time: bool,
+
+    /// Track policy enforcement (per-policy executed/allowed counts and
+    /// whether policy governed the request).
+    pub track_policy: bool,
+
+    /// Maximum fuel limit (decimal). Internally converted to micro-fuel.
+    pub max_fuel: Option<f64>,
+
+    /// Minimum ledger `t` the request must observe before executing.
+    pub min_t: Option<i64>,
+
+    /// Content-Type header value
+    pub content_type: Option<String>,
+
+    /// Accept header value (for content negotiation)
+    pub accept: Option<String>,
+
+    /// Read lists as their RDF cells, so a CONSTRUCT writes each back as the
+    /// list. Never populated by HTTP header parsing: set only by the Graph
+    /// Store `GET` ([`crate::routes::graph_store`]), whose output must round
+    /// trip. Every query a client sends reads a list's members as values.
+    pub rdf_list_view: bool,
+}
+
+impl Default for FlureeHeaders {
+    fn default() -> Self {
+        Self {
+            raw: HeaderMap::new(),
+            policy_authorization: None,
+            server_identity: None,
+            ledger: None,
+            identity: None,
+            policy: None,
+            policy_class: Vec::new(),
+            policy_values: None,
+            default_allow: None,
+            track_meta: false,
+            track_fuel: false,
+            track_time: false,
+            track_policy: false,
+            max_fuel: None,
+            min_t: None,
+            content_type: None,
+            accept: None,
+            rdf_list_view: false,
+        }
+    }
+}
+
+impl FlureeHeaders {
+    /// Header names
+    pub const LEDGER: &'static str = "fluree-ledger";
+    pub const IDENTITY: &'static str = "fluree-identity";
+    pub const POLICY: &'static str = "fluree-policy";
+    pub const POLICY_CLASS: &'static str = "fluree-policy-class";
+    pub const POLICY_VALUES: &'static str = "fluree-policy-values";
+    pub const DEFAULT_ALLOW: &'static str = "fluree-default-allow";
+    pub const TRACK_META: &'static str = "fluree-track-meta";
+    pub const TRACK_FUEL: &'static str = "fluree-track-fuel";
+    pub const TRACK_TIME: &'static str = "fluree-track-time";
+    pub const TRACK_POLICY: &'static str = "fluree-track-policy";
+    pub const MAX_FUEL: &'static str = "fluree-max-fuel";
+    pub const MIN_T: &'static str = "fluree-min-t";
+    pub const CACHE: &'static str = "fluree-cache";
+
+    /// Parse headers from a HeaderMap
+    pub fn from_headers(headers: &HeaderMap) -> Result<Self> {
+        let mut fluree_headers = Self {
+            raw: headers.clone(),
+            ..Default::default()
+        };
+
+        // String headers
+        if let Some(val) = get_header_str(headers, Self::LEDGER) {
+            fluree_headers.ledger = Some(val.to_string());
+        }
+
+        if let Some(val) = get_header_str(headers, Self::IDENTITY) {
+            fluree_headers.identity = Some(val.to_string());
+        }
+
+        // Accumulate every `fluree-policy-class` header value, splitting any
+        // single value on commas to support both `H: a, b` and repeated `H`.
+        for hv in headers.get_all(Self::POLICY_CLASS) {
+            if let Ok(s) = hv.to_str() {
+                for part in s.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        fluree_headers.policy_class.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        // JSON headers
+        if let Some(val) = get_header_str(headers, Self::POLICY) {
+            fluree_headers.policy = Some(serde_json::from_str(val).map_err(|e| {
+                ServerError::invalid_header(format!("{} is not valid JSON: {}", Self::POLICY, e))
+            })?);
+        }
+
+        if let Some(val) = get_header_str(headers, Self::POLICY_VALUES) {
+            fluree_headers.policy_values = Some(serde_json::from_str(val).map_err(|e| {
+                ServerError::invalid_header(format!(
+                    "{} is not valid JSON: {}",
+                    Self::POLICY_VALUES,
+                    e
+                ))
+            })?);
+        }
+
+        // Boolean headers (presence or "true" value)
+        fluree_headers.default_allow = header_bool_opt(headers, Self::DEFAULT_ALLOW);
+        fluree_headers.track_meta = is_header_truthy(headers, Self::TRACK_META);
+        fluree_headers.track_fuel =
+            fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_FUEL);
+        fluree_headers.track_time =
+            fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_TIME);
+        fluree_headers.track_policy =
+            fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_POLICY);
+
+        // Numeric headers (decimal allowed)
+        if let Some(val) = get_header_str(headers, Self::MAX_FUEL) {
+            fluree_headers.max_fuel = Some(val.parse().map_err(|_| {
+                ServerError::invalid_header(format!("{} must be a number", Self::MAX_FUEL))
+            })?);
+        }
+
+        if let Some(val) = get_header_str(headers, Self::MIN_T) {
+            let min_t: i64 = val.parse().map_err(|_| {
+                ServerError::invalid_header(format!("{} must be an integer", Self::MIN_T))
+            })?;
+            if min_t < 0 {
+                return Err(ServerError::invalid_header(format!(
+                    "{} must be non-negative",
+                    Self::MIN_T
+                )));
+            }
+            fluree_headers.min_t = Some(min_t);
+        }
+
+        // Content-Type
+        if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) {
+            if let Ok(ct_str) = ct.to_str() {
+                fluree_headers.content_type = Some(ct_str.to_string());
+            }
+        }
+
+        // Accept
+        if let Some(accept) = headers.get(axum::http::header::ACCEPT) {
+            if let Ok(accept_str) = accept.to_str() {
+                fluree_headers.accept = Some(accept_str.to_string());
+            }
+        }
+
+        Ok(fluree_headers)
+    }
+
+    /// Lay a SPARQL request's `# PRAGMA` options over the header values.
+    ///
+    /// A pragma is the request body's own option, so it wins over the header
+    /// that names the same thing — as a JSON-LD body's `opts` do — with three
+    /// exceptions, because the headers may be an application's while the text
+    /// is its end user's. `meta` adds to the tracking the headers ask for but
+    /// never removes it. `max-fuel` takes the tighter of the two caps. And
+    /// under a bound credential a policy pragma may only repeat the selection
+    /// the headers make (or narrow `default-allow`).
+    ///
+    /// Call after [`crate::routes::policy_auth::bind_authorization`]: the policy
+    /// selection lands in the same fields a caller's headers do, and
+    /// `bound_governance` then holds it to the bound credential exactly as it
+    /// holds a header.
+    pub fn with_sparql_pragmas(mut self, pragmas: &fluree_db_sparql::Pragmas) -> Result<Self> {
+        if self.policy_authorization.is_some() {
+            crate::extract::validate_pragma_selection(
+                &fluree_db_api::GovernanceOptions::from_sparql_pragmas(pragmas),
+                &self.policy_selection()?,
+            )?;
+        }
+        if let Some(meta) = pragmas.meta {
+            self.track_time |= meta.time;
+            self.track_fuel |= meta.fuel;
+            self.track_policy |= meta.policy;
+        }
+        if let Some(max_fuel) = pragmas.max_fuel {
+            self.max_fuel = Some(self.max_fuel.map_or(max_fuel, |cap| cap.min(max_fuel)));
+        }
+        if pragmas.min_t.is_some() {
+            self.min_t = pragmas.min_t;
+        }
+        if pragmas.identity.is_some() {
+            self.identity = pragmas.identity.clone();
+        }
+        if let Some(classes) = &pragmas.policy_class {
+            self.policy_class = classes.clone();
+        }
+        if let Some(values) = &pragmas.policy_values {
+            self.policy_values = Some(JsonValue::Object(values.clone()));
+        }
+        if pragmas.default_allow.is_some() {
+            self.default_allow = pragmas.default_allow;
+        }
+        Ok(self)
+    }
+
+    /// [`Self::with_sparql_pragmas`] for request text; a malformed pragma is a 400.
+    pub fn with_sparql_request_pragmas(self, sparql: &str) -> Result<Self> {
+        let pragmas =
+            fluree_db_sparql::request_pragmas(sparql).map_err(ServerError::bad_request)?;
+        self.with_sparql_pragmas(&pragmas)
+    }
+
+    /// Check if tracking is enabled (any tracking header or max-fuel limit)
+    pub fn has_tracking(&self) -> bool {
+        self.track_meta
+            || self.track_fuel
+            || self.track_time
+            || self.track_policy
+            || self.max_fuel.is_some()
+    }
+
+    /// Build `TrackingOptions` from header values.
+    ///
+    /// Used for SPARQL queries where tracking options can't come from a JSON
+    /// body — they must come from HTTP headers instead.
+    pub fn to_tracking_options(&self) -> fluree_db_core::tracking::TrackingOptions {
+        fluree_db_core::tracking::TrackingOptions {
+            track_time: self.track_meta || self.track_time,
+            track_fuel: self.track_meta || self.track_fuel || self.max_fuel.is_some(),
+            track_policy: self.track_meta || self.track_policy,
+            max_fuel: self.max_fuel.map(fluree_db_core::tracking::fuel_to_micro),
+        }
+    }
+
+    /// Check if this is a SPARQL query based on Content-Type
+    pub fn is_sparql_query(&self) -> bool {
+        self.content_type
+            .as_ref()
+            .map(|ct| ct.contains("application/sparql-query"))
+            .unwrap_or(false)
+    }
+
+    /// Check if this is a SPARQL update based on Content-Type
+    pub fn is_sparql_update(&self) -> bool {
+        self.content_type
+            .as_ref()
+            .map(|ct| ct.contains("application/sparql-update"))
+            .unwrap_or(false)
+    }
+
+    /// Check if this is an openCypher request based on Content-Type.
+    ///
+    /// Matches `application/cypher` or `application/opencypher`
+    /// (case-insensitive). Used by both the query and update routes —
+    /// Cypher is a single surface whose read/write is determined by the
+    /// statement, but the endpoints stay split (query vs update) for parity
+    /// with SPARQL.
+    pub fn is_cypher_query(&self) -> bool {
+        // No allocation: this runs on every query/transact request (the Cypher
+        // check precedes the JSON-LD/SPARQL dispatch), so it must not tax the
+        // standard RDF hot path the way `to_ascii_lowercase()` did. Matches the
+        // same two media types as before, case-insensitively, via a borrowed
+        // scan instead of a lowercased copy.
+        self.content_type
+            .as_ref()
+            .map(|ct| {
+                ascii_contains_ignore_case(ct, "application/cypher")
+                    || ascii_contains_ignore_case(ct, "application/opencypher")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Check if the client explicitly requests TSV output via Accept header.
+    ///
+    /// Matches `text/tab-separated-values` or `text/tsv` (case-insensitive).
+    /// Does NOT match `*/*` — TSV must be explicitly requested.
+    pub fn wants_tsv(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| {
+                let lower = a.to_ascii_lowercase();
+                lower.contains("text/tab-separated-values") || lower.contains("text/tsv")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Check if the client explicitly requests CSV output via Accept header.
+    ///
+    /// Matches `text/csv` (case-insensitive).
+    /// Does NOT match `*/*` — CSV must be explicitly requested.
+    pub fn wants_csv(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| a.to_ascii_lowercase().contains("text/csv"))
+            .unwrap_or(false)
+    }
+
+    /// Check if the client explicitly requests SPARQL Results XML output via Accept header.
+    ///
+    /// Matches `application/sparql-results+xml` (case-insensitive).
+    /// Does NOT match `*/*` — XML must be explicitly requested.
+    pub fn wants_sparql_results_xml(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| {
+                a.to_ascii_lowercase()
+                    .contains("application/sparql-results+xml")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Check if the client explicitly requests AgentJson output via Accept header.
+    ///
+    /// Matches `application/vnd.fluree.agent+json` (case-insensitive).
+    /// Does NOT match `*/*` — AgentJson must be explicitly requested.
+    pub fn wants_agent_json(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| {
+                a.to_ascii_lowercase()
+                    .contains("application/vnd.fluree.agent+json")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether `Fluree-Cache: true` asks for the query-result cache.
+    pub fn wants_result_cache(&self) -> bool {
+        get_header_str(&self.raw, Self::CACHE)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    }
+
+    /// Get the max-bytes value from the `Fluree-Max-Bytes` header.
+    ///
+    /// Used by AgentJson format to set the byte budget for response truncation.
+    pub fn max_bytes(&self) -> Option<usize> {
+        get_header_str(&self.raw, "fluree-max-bytes").and_then(|v| v.parse().ok())
+    }
+
+    /// The graph serialization `Accept` prefers among `allowed`; see
+    /// [`negotiate_graph_format`].
+    pub fn graph_format(&self, allowed: &[GraphFormat]) -> Option<GraphFormat> {
+        negotiate_graph_format(self.accept.as_deref(), allowed)
+    }
+
+    /// Whether every media range `Accept` admits is a graph-only serialization
+    /// (Turtle, N-Triples, RDF/XML): a request no solution table can satisfy.
+    pub fn accepts_only_graph_formats(&self) -> bool {
+        let mut ranges = media_ranges(self.accept.as_deref().unwrap_or_default()).peekable();
+        ranges.peek().is_some()
+            && ranges.all(|(_, media)| {
+                GraphFormat::from_media_type(media).is_some_and(|f| f != GraphFormat::JsonLd)
+            })
+    }
+
+    /// Check if the client explicitly requests JSON-LD output via Accept header.
+    ///
+    /// Matches `application/ld+json` (case-insensitive) only. Bare
+    /// `application/json` is intentionally NOT matched: it is the most common
+    /// default Accept value, and treating it as a JSON-LD request would silently
+    /// flip every existing SELECT client from SPARQL-results-JSON to JSON-LD.
+    /// SPARQL CONSTRUCT/DESCRIBE already render as JSON-LD regardless of Accept
+    /// (the formatter coerces graph results — see issue #1274); this helper lets
+    /// a SELECT query *opt in* to JSON-LD via the unambiguous media type.
+    /// Does NOT match `*/*` — JSON-LD must be explicitly requested.
+    pub fn wants_jsonld(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| a.to_ascii_lowercase().contains("application/ld+json"))
+            .unwrap_or(false)
+    }
+
+    /// Check if this is a JWT/JWS based on Content-Type
+    pub fn is_jwt(&self) -> bool {
+        self.content_type
+            .as_ref()
+            .map(|ct| ct.contains("application/jwt"))
+            .unwrap_or(false)
+    }
+
+    /// The policy selection these headers make, before credential
+    /// authorization resolves it.
+    pub(crate) fn policy_selection(&self) -> Result<fluree_db_api::GovernanceOptions> {
+        Ok(fluree_db_api::GovernanceOptions {
+            identity: self.identity.clone(),
+            policy_class: (!self.policy_class.is_empty()).then(|| self.policy_class.clone()),
+            policy: self.policy.clone(),
+            policy_values: self.policy_values_map()?,
+            default_allow: self.default_allow,
+            // Deliberately absent: this is the caller's *selection*, and the
+            // verified identity is not selectable. `bound_governance` stamps it
+            // after authorization resolution.
+            server_identity: None,
+        })
+    }
+
+    /// Convert policy_values to a HashMap for credential API
+    ///
+    /// Returns None if no policy values are set, or an error if they're not a valid JSON object.
+    pub fn policy_values_map(
+        &self,
+    ) -> Result<Option<std::collections::HashMap<String, JsonValue>>> {
+        match &self.policy_values {
+            None => Ok(None),
+            Some(JsonValue::Object(obj)) => {
+                let map: std::collections::HashMap<String, JsonValue> =
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                Ok(Some(map))
+            }
+            Some(_) => Err(ServerError::invalid_header(
+                "policy-values must be a JSON object",
+            )),
+        }
+    }
+
+    /// Inject header values into query opts JSON
+    ///
+    /// Header values serve as defaults - they don't override explicit body values.
+    pub fn inject_into_opts(&self, opts: &mut serde_json::Map<String, JsonValue>) {
+        // Only inject if not already present in opts
+        if self.identity.is_some() && !opts.contains_key("identity") {
+            opts.insert(
+                "identity".to_string(),
+                JsonValue::String(self.identity.clone().unwrap()),
+            );
+        }
+
+        if self.policy.is_some() && !opts.contains_key("policy") {
+            opts.insert("policy".to_string(), self.policy.clone().unwrap());
+        }
+
+        if !self.policy_class.is_empty()
+            && !["policy-class", "policy_class", "policyClass"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
+            opts.insert(
+                "policy-class".to_string(),
+                JsonValue::Array(
+                    self.policy_class
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            );
+        }
+
+        if self.policy_values.is_some()
+            && !["policy-values", "policy_values", "policyValues"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
+            opts.insert(
+                "policy-values".to_string(),
+                self.policy_values.clone().unwrap(),
+            );
+        }
+
+        if let Some(default_allow) = self.default_allow {
+            if !opts.contains_key("default-allow")
+                && !opts.contains_key("default_allow")
+                && !opts.contains_key("defaultAllow")
+            {
+                opts.insert("default-allow".to_string(), JsonValue::Bool(default_allow));
+            }
+        }
+
+        if let Some(max_fuel) = self.max_fuel {
+            if !opts.contains_key("max-fuel") {
+                if let Some(n) = serde_json::Number::from_f64(max_fuel) {
+                    opts.insert("max-fuel".to_string(), JsonValue::Number(n));
+                }
+            }
+        }
+
+        if self.wants_result_cache() && !opts.contains_key("cache") {
+            opts.insert("cache".to_string(), JsonValue::Bool(true));
+        }
+
+        // Inject tracking options into meta if any tracking is enabled via headers
+        // (only if meta is not already present in opts)
+        if self.has_tracking() && !opts.contains_key("meta") {
+            if self.track_meta {
+                // track-meta enables all tracking
+                opts.insert("meta".to_string(), JsonValue::Bool(true));
+            } else {
+                // Selective tracking via individual flags
+                let mut meta = serde_json::Map::new();
+                if self.track_time {
+                    meta.insert("time".to_string(), JsonValue::Bool(true));
+                }
+                if self.track_fuel {
+                    meta.insert("fuel".to_string(), JsonValue::Bool(true));
+                }
+                if self.track_policy {
+                    meta.insert("policy".to_string(), JsonValue::Bool(true));
+                }
+                if !meta.is_empty() {
+                    opts.insert("meta".to_string(), JsonValue::Object(meta));
+                }
+            }
+        }
+    }
+}
+
+/// Get a header value as a string slice
+fn get_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Check if a header is present and truthy
+fn is_header_truthy(headers: &HeaderMap, name: &str) -> bool {
+    match get_header_str(headers, name) {
+        Some(v) => v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty(),
+        None => false,
+    }
+}
+
+/// Tri-state read of a boolean header: `None` when absent, `Some(truthy)` when
+/// present. Used where "the caller didn't say" must stay distinct from "the
+/// caller said false".
+///
+/// Truthiness is byte-for-byte [`is_header_truthy`]'s: `true`, `1`, **or empty**.
+/// The empty case is deliberate and shared with every other boolean Fluree
+/// header — `fluree-track-meta:` with no value means "on" — so a bare
+/// `fluree-default-allow:` reads as `Some(true)`, not as absent and not as
+/// false. Only a present, non-empty, unrecognized value (`0`, `no`, `nonsense`)
+/// reads as `Some(false)`.
+fn header_bool_opt(headers: &HeaderMap, name: &str) -> Option<bool> {
+    get_header_str(headers, name)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty())
+}
+
+/// Axum extractor implementation
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for FlureeHeaders
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        FlureeHeaders::from_headers(&parts.headers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{negotiate_graph_format, FlureeHeaders, GraphFormat, JsonValue};
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn graph_format_negotiation_follows_q() {
+        let n = |a| negotiate_graph_format(a, GraphFormat::ALL);
+        assert_eq!(n(None), Some(GraphFormat::JsonLd));
+        assert_eq!(n(Some("*/*")), Some(GraphFormat::JsonLd));
+        assert_eq!(n(Some("text/turtle")), Some(GraphFormat::Turtle));
+        assert_eq!(
+            n(Some("Application/N-Triples")),
+            Some(GraphFormat::NTriples)
+        );
+        assert_eq!(n(Some("text/*")), Some(GraphFormat::Turtle));
+        assert_eq!(
+            n(Some("application/ld+json;q=0.5, text/turtle, */*;q=0.1")),
+            Some(GraphFormat::Turtle)
+        );
+        assert_eq!(
+            n(Some("text/turtle;q=0.5, application/rdf+xml;q=0.9")),
+            Some(GraphFormat::RdfXml)
+        );
+        assert_eq!(
+            n(Some("application/n-triples, text/turtle")),
+            Some(GraphFormat::NTriples),
+            "equal weights keep the header's order"
+        );
+        assert_eq!(
+            n(Some("*/*, text/turtle")),
+            Some(GraphFormat::Turtle),
+            "a type beats a wildcard at equal weight"
+        );
+        assert_eq!(
+            n(Some("text/*, application/rdf+xml")),
+            Some(GraphFormat::RdfXml)
+        );
+        assert_eq!(n(Some("application/sparql-results+json")), None);
+        assert_eq!(n(Some("text/turtle;q=0")), None);
+        assert_eq!(n(Some("application/trig")), Some(GraphFormat::TriG));
+
+        // A format outside `allowed` is skipped, not chosen.
+        let dataset = |a| negotiate_graph_format(Some(a), GraphFormat::DATASET);
+        assert_eq!(
+            dataset("text/turtle, application/n-quads;q=0.5"),
+            Some(GraphFormat::NQuads)
+        );
+        assert_eq!(dataset("text/turtle"), None);
+        assert_eq!(dataset("text/*"), None);
+        assert_eq!(
+            negotiate_graph_format(None, &[GraphFormat::Turtle]),
+            None,
+            "the no-Accept default is still subject to `allowed`"
+        );
+    }
+
+    #[test]
+    fn graph_only_accept() {
+        let only = |accept: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("accept", accept.parse().unwrap());
+            FlureeHeaders::from_headers(&headers)
+                .unwrap()
+                .accepts_only_graph_formats()
+        };
+        assert!(only("text/turtle"));
+        assert!(only("text/turtle, application/rdf+xml;q=0.5"));
+        assert!(!only("text/turtle, application/sparql-results+json;q=0.1"));
+        assert!(!only("text/turtle, */*;q=0.1"));
+        assert!(!only("application/ld+json"));
+    }
+
+    #[test]
+    fn parses_min_t_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::MIN_T, "42".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert_eq!(parsed.min_t, Some(42));
+    }
+
+    /// `fluree-track-policy` on its own must make the request tracked, ask the
+    /// engine for policy stats, and survive the header→opts injection. Before
+    /// this was parsed, the CLI's `--track-policy` was a no-op over HTTP.
+    #[test]
+    fn track_policy_header_enables_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_POLICY, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.has_tracking(), "policy alone must count as tracking");
+
+        let opts = parsed.to_tracking_options();
+        assert!(opts.track_policy);
+        assert!(!opts.track_fuel, "policy must not drag in fuel");
+        assert!(!opts.track_time, "policy must not drag in time");
+
+        let mut body_opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut body_opts);
+        assert_eq!(
+            body_opts.get("meta"),
+            Some(&serde_json::json!({"policy": true})),
+            "selective injection must carry policy through to the body opts"
+        );
+    }
+
+    /// The omnibus header still implies policy tracking.
+    #[test]
+    fn track_meta_header_implies_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_META, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.to_tracking_options().track_policy);
+    }
+
+    #[test]
+    fn rejects_negative_min_t_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::MIN_T, "-1".parse().unwrap());
+
+        let err = FlureeHeaders::from_headers(&headers).unwrap_err();
+
+        assert!(err.to_string().contains("fluree-min-t"));
+    }
+
+    fn default_allow_for(value: Option<&str>) -> Option<bool> {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = value {
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, v.parse().unwrap());
+        }
+        FlureeHeaders::from_headers(&headers).unwrap().default_allow
+    }
+
+    /// The header is tri-state: absent leaves the ledger's `f:defaultAllow`
+    /// free to apply, present is an override in whichever direction it names.
+    #[test]
+    fn default_allow_header_is_tri_state() {
+        assert_eq!(default_allow_for(None), None);
+        assert_eq!(default_allow_for(Some("true")), Some(true));
+        assert_eq!(default_allow_for(Some("1")), Some(true));
+        assert_eq!(default_allow_for(Some("")), Some(true));
+        assert_eq!(default_allow_for(Some("false")), Some(false));
+        assert_eq!(
+            default_allow_for(Some("nonsense")),
+            Some(false),
+            "unrecognized values fail closed rather than reading as absent"
+        );
+    }
+
+    /// Header injection carries the caller's explicit `false` into body opts, so
+    /// it stays distinguishable from "never said" downstream.
+    #[test]
+    fn injects_explicit_default_allow_into_opts() {
+        for (header, expected) in [("true", true), ("false", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, header.parse().unwrap());
+            let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+            let mut opts = serde_json::Map::new();
+            parsed.inject_into_opts(&mut opts);
+
+            assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(expected)));
+        }
+
+        // Absent header injects nothing at all.
+        let parsed = FlureeHeaders::from_headers(&HeaderMap::new()).unwrap();
+        let mut opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut opts);
+        assert!(!opts.contains_key("default-allow"));
+    }
+
+    /// Body opts still win over headers.
+    #[test]
+    fn body_opts_default_allow_beats_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::DEFAULT_ALLOW, "true".parse().unwrap());
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        let mut opts = serde_json::Map::new();
+        opts.insert("default-allow".to_string(), JsonValue::Bool(false));
+        parsed.inject_into_opts(&mut opts);
+
+        assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
+    }
+
+    /// Every pragma the parser accepts reaches each translator that carries
+    /// its option: these headers, the API's policy selection and tracking, and
+    /// a multi-query alias's opts. A pragma this table does not list fails the
+    /// test, so a new one cannot be wired into one translator and missed in
+    /// another.
+    #[test]
+    fn every_pragma_reaches_its_translators() {
+        type Check = fn(&FlureeHeaders) -> bool;
+        // (sample value, update form, header check, selects policy, tracks, alias opts key)
+        for name in fluree_db_sparql::pragma_names() {
+            let (value, update, header, policy, tracks, opts_key): (
+                &str,
+                bool,
+                Option<Check>,
+                bool,
+                bool,
+                Option<&str>,
+            ) = match name {
+                // Applied where the request is lowered (query IR, `TxnOpts`)
+                // or by the update route, not by these translators.
+                "reasoning" => ("rdfs", false, None, false, false, None),
+                "reasoning-max-facts" | "reasoning-max-seconds" | "reasoning-max-memory-mb" => {
+                    ("10", false, None, false, false, None)
+                }
+                "reasoning-time" => ("2026-01-01T00:00:00Z", false, None, false, false, None),
+                "include-system-facts" | "union-default-graph" => {
+                    ("true", false, None, false, false, None)
+                }
+                "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),
+                "validation-mode" => ("warn", true, None, false, false, None),
+                "unique-properties" => ("<urn:p>", true, None, false, false, None),
+                "min-t" => (
+                    "1",
+                    false,
+                    Some(|h| h.min_t == Some(1)),
+                    false,
+                    false,
+                    Some("min-t"),
+                ),
+                "meta" => (
+                    "time",
+                    false,
+                    Some(|h| h.track_time),
+                    false,
+                    true,
+                    Some("meta"),
+                ),
+                "max-fuel" => (
+                    "10",
+                    false,
+                    Some(|h| h.max_fuel == Some(10.0)),
+                    false,
+                    true,
+                    Some("max-fuel"),
+                ),
+                "identity" => (
+                    "<urn:id>",
+                    false,
+                    Some(|h| h.identity.is_some()),
+                    true,
+                    false,
+                    Some("identity"),
+                ),
+                "policy-class" => (
+                    "<urn:class>",
+                    false,
+                    Some(|h| !h.policy_class.is_empty()),
+                    true,
+                    false,
+                    Some("policy-class"),
+                ),
+                "policy-values" => (
+                    r#"{"?$x": 1}"#,
+                    false,
+                    Some(|h| h.policy_values.is_some()),
+                    true,
+                    false,
+                    Some("policy-values"),
+                ),
+                "default-allow" => (
+                    "true",
+                    false,
+                    Some(|h| h.default_allow == Some(true)),
+                    true,
+                    false,
+                    Some("default-allow"),
+                ),
+                other => panic!(
+                    "pragma `{other}` is new: apply it in FlureeHeaders::with_sparql_pragmas, \
+                     GovernanceOptions::from_sparql_pragmas, sparql_pragma_tracking and \
+                     sparql_pragma_opts wherever its JSON-LD `opts` twin applies, then list it here"
+                ),
+            };
+            let body = if update {
+                "INSERT DATA { <urn:s> <urn:p> 1 }"
+            } else {
+                "SELECT * WHERE { }"
+            };
+            let sparql = format!("# PRAGMA {name}: {value}\n{body}");
+            let pragmas = fluree_db_sparql::request_pragmas(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_ne!(
+                pragmas,
+                Default::default(),
+                "{name}: the sample selects nothing"
+            );
+
+            let headers = FlureeHeaders::default()
+                .with_sparql_pragmas(&pragmas)
+                .unwrap();
+            match header {
+                Some(check) => assert!(check(&headers), "{name}: headers {headers:?}"),
+                None => assert_eq!(
+                    format!("{headers:?}"),
+                    format!("{:?}", FlureeHeaders::default()),
+                    "{name}: no header carries it"
+                ),
+            }
+            assert_eq!(
+                fluree_db_api::GovernanceOptions::from_sparql_pragmas(&pragmas)
+                    .has_any_policy_inputs(),
+                policy,
+                "{name}: policy selection"
+            );
+            let tracking = fluree_db_api::sparql_pragma_tracking(&pragmas);
+            assert_eq!(tracking.any_enabled(), tracks, "{name}: tracking");
+            let opts = fluree_db_api::query::multi::sparql_pragma_opts(&sparql)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let keys: Vec<&String> = opts
+                .as_ref()
+                .and_then(JsonValue::as_object)
+                .map(|o| o.keys().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                keys,
+                opts_key.into_iter().collect::<Vec<_>>(),
+                "{name}: alias opts"
+            );
+        }
+    }
+}

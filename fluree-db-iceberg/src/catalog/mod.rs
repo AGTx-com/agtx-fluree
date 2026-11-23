@@ -1,0 +1,130 @@
+//! Iceberg catalog client module.
+//!
+//! This module provides the [`CatalogClient`] trait and implementations for
+//! interacting with Iceberg REST catalogs (primarily Polaris).
+
+pub mod direct;
+mod rest;
+mod table_identifier;
+
+pub use direct::DirectCatalogClient;
+pub use direct::{
+    match_warehouse_namespace_dir, match_warehouse_table_dir, warehouse_dir_name,
+    warehouse_table_dir_candidates,
+};
+pub use rest::{RestCatalogClient, RestCatalogConfig};
+pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, TableIdentifier};
+
+#[cfg(feature = "aws")]
+pub use direct::SendDirectCatalogClient;
+
+#[cfg(feature = "aws")]
+mod aws_sdk;
+#[cfg(feature = "aws")]
+pub use aws_sdk::{GlueSdkCatalogClient, S3TablesSdkCatalogClient};
+
+use crate::credential::VendedCredentials;
+use crate::error::Result;
+use async_trait::async_trait;
+use std::collections::HashMap;
+
+/// Name the table a catalog refused access to (a denial, or Google's missing
+/// quota project). A refusal is raised where only the request is known (a REST
+/// path, an SDK operation), so each `load_table` relabels it with the table it
+/// was loading; any other error passes through.
+pub(crate) fn name_denied_table(
+    err: crate::IcebergError,
+    table_id: &TableIdentifier,
+) -> crate::IcebergError {
+    match err {
+        crate::IcebergError::CatalogAccessDenied { message, .. } => {
+            crate::IcebergError::CatalogAccessDenied {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+                message,
+            }
+        }
+        crate::IcebergError::CatalogQuotaProjectRequired { .. } => {
+            crate::IcebergError::CatalogQuotaProjectRequired {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Response from loading a table, including optional vended credentials.
+#[derive(Debug)]
+pub struct LoadTableResponse {
+    /// S3/file path to the table metadata JSON file
+    pub metadata_location: String,
+    /// Full config map from REST response (for debugging/extension)
+    pub config: HashMap<String, serde_json::Value>,
+    /// Vended storage credentials (if catalog supports credential delegation)
+    pub credentials: Option<VendedCredentials>,
+    /// The parsed inline `metadata` object the REST `loadTable` response carries,
+    /// when present and parseable. Retained so callers (e.g. metadata preview)
+    /// can read the full table schema/snapshot without a second S3 fetch of the
+    /// metadata JSON. `None` for Direct mode (no inline metadata) or when the
+    /// catalog omits it.
+    pub metadata: Option<crate::metadata::TableMetadata>,
+}
+
+/// Iceberg catalog client trait.
+///
+/// Provides table discovery and metadata loading from a catalog.
+///
+/// Note: `Send + Sync` bounds are intentionally NOT required at the trait level
+/// to keep the core runtime/WASM-friendly. Apply bounds at integration points
+/// as needed.
+#[async_trait(?Send)]
+pub trait CatalogClient: std::fmt::Debug {
+    /// List all namespaces in the catalog.
+    async fn list_namespaces(&self) -> Result<Vec<String>>;
+
+    /// List all tables in a namespace.
+    async fn list_tables(&self, namespace: &str) -> Result<Vec<String>>;
+
+    /// Load table information including metadata location and optional credentials.
+    ///
+    /// If `request_credentials` is true, includes the X-Iceberg-Access-Delegation header
+    /// to request vended credentials from the catalog.
+    async fn load_table(
+        &self,
+        table_id: &TableIdentifier,
+        request_credentials: bool,
+    ) -> Result<LoadTableResponse>;
+}
+
+/// Send-safe catalog client trait.
+///
+/// This trait mirrors [`CatalogClient`] but requires `Send + Sync` and produces
+/// `Send` futures. Use this for server-side code that needs to spawn tasks.
+#[async_trait]
+pub trait SendCatalogClient: std::fmt::Debug + Send + Sync {
+    /// List all namespaces in the catalog.
+    async fn list_namespaces(&self) -> Result<Vec<String>>;
+
+    /// List all tables in a namespace.
+    async fn list_tables(&self, namespace: &str) -> Result<Vec<String>>;
+
+    /// Load table information including metadata location and optional credentials.
+    async fn load_table(
+        &self,
+        table_id: &TableIdentifier,
+        request_credentials: bool,
+    ) -> Result<LoadTableResponse>;
+
+    /// The table's storage credentials, vended again (to renew ones about to
+    /// expire), matched against `metadata_location` as at `loadTable`.
+    ///
+    /// The default asks for a fresh `loadTable` with credential delegation; a
+    /// REST catalog asks its per-table credentials endpoint first.
+    async fn load_credentials(
+        &self,
+        table_id: &TableIdentifier,
+        metadata_location: &str,
+    ) -> Result<Option<VendedCredentials>> {
+        let _ = metadata_location;
+        Ok(self.load_table(table_id, true).await?.credentials)
+    }
+}

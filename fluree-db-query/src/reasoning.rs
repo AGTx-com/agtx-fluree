@@ -1,0 +1,261 @@
+//! OWL2-RL reasoning integration for query execution
+//!
+//! This module provides helpers for integrating OWL2-RL materialization
+//! with query execution, including overlay composition for derived facts.
+
+use fluree_db_core::overlay::compose_content_version;
+use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
+use fluree_db_reasoner::{DerivedFactsOverlay, ReasoningCache};
+use std::sync::Arc;
+
+/// Overlay that combines a base overlay with derived facts from OWL2-RL reasoning.
+///
+/// This implements `OverlayProvider` by merging flakes from both sources,
+/// allowing queries to see both base data and materialized entailments.
+pub struct ReasoningOverlay<'a> {
+    /// Base overlay (e.g., novelty)
+    base: &'a dyn OverlayProvider,
+    /// Derived facts from OWL2-RL reasoning
+    derived: Arc<DerivedFactsOverlay>,
+    /// Combined epoch for cache invalidation
+    epoch: u64,
+    /// Composed content version (see [`compose_content_version`]); `None`
+    /// when the base cannot vouch for its own.
+    content_version: Option<u64>,
+}
+
+impl<'a> ReasoningOverlay<'a> {
+    /// Create a new reasoning overlay combining base and derived facts.
+    pub fn new(base: &'a dyn OverlayProvider, derived: Arc<DerivedFactsOverlay>) -> Self {
+        let content_version = match (base.content_version(), derived.content_version()) {
+            (Some(b), Some(d)) => Some(compose_content_version(&[b, d])),
+            _ => None,
+        };
+        // Combine the base epoch with the materialization's process-unique
+        // instance id, and tag the high bit so the combined value can never
+        // collide with a plain novelty epoch (a small counter). The derived
+        // EPOCH alone is insufficient: it equals the base epoch at
+        // materialization time (0 ↔ 0 on a freshly indexed ledger), and two
+        // materializations under different rule configs share it — epoch-keyed
+        // caches (overlay translation, cursor batches) would alias them.
+        let epoch = 0x8000_0000_0000_0000u64
+            | (base
+                .epoch()
+                .wrapping_mul(1_000_003)
+                .wrapping_add(derived.instance_id())
+                & 0x7FFF_FFFF_FFFF_FFFF);
+        Self {
+            base,
+            derived,
+            epoch,
+            content_version,
+        }
+    }
+
+    /// Get the derived facts overlay (for diagnostics or further processing).
+    pub fn derived(&self) -> &DerivedFactsOverlay {
+        &self.derived
+    }
+}
+
+impl OverlayProvider for ReasoningOverlay<'_> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.base.as_any()
+    }
+
+    /// The base's: a derived fact carries no list position.
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        self.base.list_predicates()
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.content_version
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // The base's whole-graph count bounds its range count.
+        let base = self
+            .base
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+            .or_else(|| self.base.overlay_flake_count(g_id))?;
+        let derived = self
+            .derived
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)?;
+        Some(base + derived)
+    }
+
+    fn for_each_overlay_flake(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+        to_t: i64,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        // Collect flakes from both overlays (already sorted by index order)
+        let mut base_flakes: Vec<Flake> = Vec::new();
+        let mut derived_flakes: Vec<Flake> = Vec::new();
+
+        self.base
+            .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
+                base_flakes.push(f.clone());
+            });
+
+        self.derived
+            .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
+                derived_flakes.push(f.clone());
+            });
+
+        // Derived facts carry the query's `t`. When the commit at that `t`
+        // retracted the stored copy of a fact the rules derive again, both
+        // ops reach readers at one `t`, and the assertion holds
+        // (`fluree_db_core::same_t`): the rules derived it from the state
+        // after that commit.
+
+        // Linear merge of two sorted sequences - O(n) instead of O(n log n).
+        // A base fact the rules also derive appears twice; readers keep one.
+        let mut base_iter = base_flakes.iter().peekable();
+        let mut derived_iter = derived_flakes.iter().peekable();
+
+        loop {
+            match (base_iter.peek(), derived_iter.peek()) {
+                (Some(base), Some(derived)) => match index.compare(base, derived) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                        callback(base_iter.next().unwrap());
+                    }
+                    std::cmp::Ordering::Greater => {
+                        callback(derived_iter.next().unwrap());
+                    }
+                },
+                (Some(_), None) => {
+                    callback(base_iter.next().unwrap());
+                }
+                (None, Some(_)) => {
+                    callback(derived_iter.next().unwrap());
+                }
+                (None, None) => break,
+            }
+        }
+    }
+}
+
+/// Global reasoning cache for cross-query result reuse.
+///
+/// This uses a lazy_static pattern to maintain a shared cache across
+/// queries. The cache is keyed by (ledger, epoch, time, config) so
+/// results are reused when the database state hasn't changed.
+pub fn global_reasoning_cache() -> &'static ReasoningCache {
+    use once_cell::sync::Lazy;
+    static CACHE: Lazy<ReasoningCache> = Lazy::new(ReasoningCache::with_default_capacity);
+    &CACHE
+}
+
+/// Re-export reasoning types for convenience
+pub use fluree_db_reasoner::{
+    reason_owl2rl, DerivedFactsBuilder, FrozenSameAs, ReasoningBudget, ReasoningDiagnostics,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::NoOverlay;
+    use fluree_db_reasoner::FrozenSameAs;
+
+    #[test]
+    fn test_reasoning_overlay_epoch() {
+        let base = NoOverlay;
+        let derived = Arc::new(DerivedFactsOverlay::empty_with_metadata(
+            FrozenSameAs::empty(),
+            42,
+        ));
+
+        let combined = ReasoningOverlay::new(&base, derived);
+
+        // Epoch should be deterministic and non-zero
+        assert_ne!(combined.epoch(), 0);
+    }
+
+    /// A base that vouches for a version, or one that cannot.
+    struct Stamped(Option<u64>);
+
+    impl OverlayProvider for Stamped {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn content_version(&self) -> Option<u64> {
+            self.0
+        }
+        fn for_each_overlay_flake(
+            &self,
+            _: GraphId,
+            _: IndexType,
+            _: Option<&Flake>,
+            _: Option<&Flake>,
+            _: bool,
+            _: i64,
+            _: &mut dyn FnMut(&Flake),
+        ) {
+        }
+    }
+
+    /// The cross-query translation cache is keyed on this: the same
+    /// (base, materialization) pair must report one stable version across
+    /// constructions, and any change to either part must move it.
+    #[test]
+    fn content_version_is_stable_per_pair_and_moves_with_either_part() {
+        let base = Stamped(Some(fluree_db_core::overlay::next_overlay_content_version()));
+        let derived = Arc::new(DerivedFactsOverlay::empty());
+
+        let first = ReasoningOverlay::new(&base, derived.clone())
+            .content_version()
+            .expect("vouching base + derived vouch");
+        let again = ReasoningOverlay::new(&base, derived.clone()).content_version();
+        assert_eq!(Some(first), again, "same pair, same version");
+
+        let other_derived = Arc::new(DerivedFactsOverlay::empty());
+        assert_ne!(
+            ReasoningOverlay::new(&base, other_derived).content_version(),
+            Some(first),
+            "a different materialization is a different version"
+        );
+
+        let other_base = Stamped(Some(fluree_db_core::overlay::next_overlay_content_version()));
+        assert_ne!(
+            ReasoningOverlay::new(&other_base, derived.clone()).content_version(),
+            Some(first),
+            "a different base is a different version"
+        );
+
+        let silent = Stamped(None);
+        assert_eq!(
+            ReasoningOverlay::new(&silent, derived).content_version(),
+            None,
+            "a base that cannot vouch leaves the composite unvouched"
+        );
+    }
+
+    #[test]
+    fn test_global_cache_exists() {
+        let cache = global_reasoning_cache();
+        // Just verify the cache is accessible and has the expected capacity
+        assert_eq!(cache.capacity(), 16);
+    }
+}

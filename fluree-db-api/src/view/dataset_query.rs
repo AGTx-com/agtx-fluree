@@ -1,0 +1,1217 @@
+//! Query execution against DataSetDb
+//!
+//! Provides `query_dataset` for multi-ledger queries.
+
+use crate::query::helpers::{
+    build_query_result, charge_query_floor, lower_sparql_ast, parse_jsonld_query_for_dataset,
+    parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset, tracked_query_tracker,
+    tracker_for_input_limits,
+};
+use crate::view::{DataSetDb, QueryInput};
+use crate::{
+    ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
+    TrackingOptions,
+};
+use fluree_db_core::VerifiedIdentity;
+use fluree_db_query::execute::{
+    execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
+};
+use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+
+// ============================================================================
+// Dataset Query Execution
+// ============================================================================
+
+impl Fluree {
+    /// Execute a query against a dataset view (multi-ledger).
+    ///
+    /// For single-ledger datasets, this delegates to `query`.
+    /// For multi-ledger datasets, this executes against the merged default graphs.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let view1 = fluree.db("ledger1:main").await?;
+    /// let view2 = fluree.db("ledger2:main").await?;
+    ///
+    /// let dataset = DataSetDb::new()
+    ///     .with_default(view1)
+    ///     .with_default(view2);
+    ///
+    /// let result = fluree.query_dataset(&dataset, &query).await?;
+    /// ```
+    pub async fn query_dataset<'a>(
+        &'a self,
+        dataset: &'a DataSetDb,
+        q: impl Into<QueryInput<'a>>,
+    ) -> Result<QueryResult> {
+        self.query_dataset_with_options(dataset, q, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a query against a dataset view with explicit execution controls.
+    pub fn query_dataset_with_options<'a>(
+        &'a self,
+        dataset: &'a DataSetDb,
+        q: impl Into<QueryInput<'a>>,
+        options: QueryExecutionOptions,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<QueryResult>> + Send + 'a>> {
+        // Concrete boxed return (not an opaque `async fn`) so that
+        // `query_with_options` — which delegates here for within-ledger datasets
+        // and which this method's single-ledger fast path delegates back to —
+        // does not form an opaque-recursive-async `Send` auto-trait cycle. It
+        // also keeps this crate's type-check fast (the recursion otherwise makes
+        // it pathologically slow, 30+ min).
+        Box::pin(self.query_dataset_with_options_impl(dataset, q.into(), options, None))
+    }
+
+    /// Within-ledger dataset execution reusing the entry method's already-parsed
+    /// SPARQL AST (#1473). Skips the string re-parse the `query_dataset_with_options`
+    /// path performs for the has-dataset check and IR lowering. Boxed for the same
+    /// `Send`-cycle reason documented on `query_dataset_with_options`.
+    pub(crate) fn query_dataset_with_prepared_ast<'a>(
+        &'a self,
+        dataset: &'a DataSetDb,
+        input: QueryInput<'a>,
+        options: QueryExecutionOptions,
+        ast: fluree_db_sparql::SparqlAst,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<QueryResult>> + Send + 'a>> {
+        Box::pin(self.query_dataset_with_options_impl(dataset, input, options, Some(ast)))
+    }
+
+    async fn query_dataset_with_options_impl(
+        &self,
+        dataset: &DataSetDb,
+        input: QueryInput<'_>,
+        options: QueryExecutionOptions,
+        parsed_ast: Option<fluree_db_sparql::SparqlAst>,
+    ) -> Result<QueryResult> {
+        options.sparql_params(&input)?;
+
+        // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
+        if dataset.is_single_ledger() {
+            if let Some(view) = dataset.primary() {
+                match &input {
+                    // This view is the whole dataset, already read from the body.
+                    QueryInput::JsonLd(_) => {
+                        return self
+                            .query_with_options(view, input, options.on_the_datasets_view())
+                            .await;
+                    }
+                    QueryInput::Sparql(sparql) => {
+                        // Reuse the entry method's AST when it threaded one
+                        // (within-ledger FROM path); otherwise parse just to
+                        // classify. A threaded AST always carries a dataset
+                        // clause, so this never delegates in that case.
+                        let has_dataset = match &parsed_ast {
+                            Some(ast) => sparql_ast_has_dataset(ast),
+                            None => sparql_ast_has_dataset(&options.parse_sparql(sparql, None)?),
+                        };
+                        if !has_dataset {
+                            return self.query_with_options(view, input, options).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Require at least one default graph.
+        //
+        // IMPORTANT (multi-ledger semantics):
+        // - We intentionally treat the *first* default graph as the "primary" view.
+        // - The primary db is used for:
+        //   - parsing / namespace resolution
+        //   - reasoning defaults
+        //   - query planning / optimization stats (HLL/NDV)
+        //
+        // Execution still scans *all* default graphs in the dataset (union semantics),
+        // but optimization is driven by the primary graph under the assumption that
+        // default graphs in a dataset represent similarly-shaped data.
+        let primary = dataset
+            .primary()
+            .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
+
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to `query`,
+        // which charges the floor itself — so we only reach here, and charge
+        // once, on the genuine multi-ledger/dataset path.)
+        let tracker = tracker_for_input_limits(&input, parsed_ast.as_ref());
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
+        // 1. Parse to common IR (using primary db for namespace resolution).
+        let (vars, mut parsed) = match &input {
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
+                json,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                None,
+                dataset,
+            )?,
+            QueryInput::Sparql(sparql) => {
+                // For dataset view, SPARQL FROM/FROM NAMED are allowed
+                // (they were validated when building the dataset). Reuse the
+                // entry method's AST when present (#1473) rather than re-parsing.
+                match parsed_ast {
+                    Some(ast) => lower_sparql_ast(
+                        ast,
+                        &primary.snapshot,
+                        primary.default_context.as_ref(),
+                        sparql,
+                        options.rdf_list_view(),
+                    )?,
+                    None => parse_sparql_to_ir(
+                        options.sparql_parse(),
+                        sparql,
+                        &primary.snapshot,
+                        primary.default_context.as_ref(),
+                        options.sparql_params(&input)?,
+                        options.rdf_list_view(),
+                    )?,
+                }
+            }
+        };
+
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
+        super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
+
+        // 2. Build executable with optional reasoning override from primary view
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
+
+        // 4. Execute against merged dataset
+        let batches = self
+            .execute_dataset_internal(dataset, &vars, &executable, &tracker, &options)
+            .await?;
+
+        // 5. Build result with max_t across all views
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
+            vars,
+            parsed,
+            batches,
+            dataset.result_t(),
+            dataset.composite_overlay(),
+            primary.binary_graph(),
+        );
+        result.advisories = advisories;
+        Ok(result)
+    }
+
+    pub(crate) async fn query_dataset_with_r2rml_options(
+        &self,
+        dataset: &DataSetDb,
+        q: impl Into<QueryInput<'_>>,
+        r2rml_provider: &dyn R2rmlProvider,
+        r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
+        let input = q.into();
+        options.sparql_params(&input)?;
+
+        // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
+        if dataset.is_single_ledger() {
+            if let Some(view) = dataset.primary() {
+                match &input {
+                    // This view is the whole dataset, already read from the body.
+                    QueryInput::JsonLd(_) => {
+                        return self
+                            .query_view_with_r2rml_options(
+                                view,
+                                input,
+                                r2rml_provider,
+                                r2rml_table_provider,
+                                options.on_the_datasets_view(),
+                            )
+                            .await;
+                    }
+                    QueryInput::Sparql(sparql) => {
+                        let ast = options.parse_sparql(sparql, None)?;
+                        let has_dataset = match &ast.body {
+                            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
+                            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),
+                            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.is_some(),
+                            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.is_some(),
+                            fluree_db_sparql::ast::QueryBody::Update(_) => false,
+                        };
+                        if !has_dataset {
+                            return self
+                                .query_view_with_r2rml_options(
+                                    view,
+                                    input,
+                                    r2rml_provider,
+                                    r2rml_table_provider,
+                                    options,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        let primary = dataset
+            .primary()
+            .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
+
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to
+        // `query_view_with_r2rml`, which charges the floor — so we charge once.)
+        let tracker = tracker_for_input_limits(&input, None);
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
+        // 1. Parse to common IR (using primary db for namespace resolution).
+        let (vars, mut parsed) = match &input {
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
+                json,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                None,
+                dataset,
+            )?,
+            QueryInput::Sparql(sparql) => parse_sparql_to_ir(
+                options.sparql_parse(),
+                sparql,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                options.sparql_params(&input)?,
+                options.rdf_list_view(),
+            )?,
+        };
+
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
+        super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
+
+        // 2. Build executable with optional reasoning override from primary view
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
+
+        // 4. Execute against merged dataset
+        let batches = self
+            .execute_dataset_internal_with_r2rml(
+                dataset,
+                &vars,
+                &executable,
+                &tracker,
+                crate::R2rmlProviders {
+                    provider: r2rml_provider,
+                    table_provider: r2rml_table_provider,
+                },
+                &options,
+            )
+            .await?;
+
+        let advisories = dataset.advisories(&parsed.patterns);
+        let mut result = build_query_result(
+            vars,
+            parsed,
+            batches,
+            dataset.result_t(),
+            dataset.composite_overlay(),
+            primary.binary_graph(),
+        );
+        result.advisories = advisories;
+        Ok(result)
+    }
+
+    /// Execute a dataset query with tracking.
+    ///
+    /// When `format_config` is `None`, defaults to JSON-LD for FlureeQL
+    /// queries and SPARQL JSON for SPARQL queries.
+    pub(crate) async fn query_dataset_tracked_with_options(
+        &self,
+        dataset: &DataSetDb,
+        q: impl Into<QueryInput<'_>>,
+        format_config: Option<crate::format::FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        self.query_dataset_tracked_with_options_impl(
+            dataset,
+            q.into(),
+            format_config,
+            tracking_override,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// Shared tracked-dataset execution. `parsed_ast` carries the entry
+    /// method's already-parsed SPARQL AST on the within-ledger FROM path so it
+    /// isn't re-lexed (#1473); `None` re-parses from the string. `pub(crate)`
+    /// so the within-ledger entry method
+    /// ([`query_tracked_with_options`](Self::query_tracked_with_options)) can
+    /// thread the AST in directly.
+    pub(crate) async fn query_dataset_tracked_with_options_impl(
+        &self,
+        dataset: &DataSetDb,
+        input: QueryInput<'_>,
+        format_config: Option<crate::format::FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
+        parsed_ast: Option<fluree_db_sparql::SparqlAst>,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        // Tracker: caller-provided options if given, else per-input defaults.
+        let tracker = tracked_query_tracker(&input, &tracking_override, parsed_ast.as_ref());
+        let params = options
+            .sparql_params(&input)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
+
+        // Determine output format: caller override > input-type default
+        let default_format = match &input {
+            QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),
+            _ => crate::format::FormatterConfig::jsonld(),
+        };
+        let mut format_config = format_config.unwrap_or(default_format);
+
+        // Require primary
+        let primary = dataset.primary().ok_or_else(|| {
+            crate::query::TrackedErrorResponse::new(400, "Dataset has no graphs", tracker.tally())
+        })?;
+
+        // Parse (SPARQL reuses the entry method's AST when threaded — #1473)
+        let (vars, mut parsed) = match &input {
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
+                json,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                None,
+                dataset,
+            )
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
+            QueryInput::Sparql(sparql) => {
+                let lowered = match parsed_ast {
+                    Some(ast) => lower_sparql_ast(
+                        ast,
+                        &primary.snapshot,
+                        primary.default_context.as_ref(),
+                        sparql,
+                        options.rdf_list_view(),
+                    ),
+                    None => parse_sparql_to_ir(
+                        options.sparql_parse(),
+                        sparql,
+                        &primary.snapshot,
+                        primary.default_context.as_ref(),
+                        params,
+                        options.rdf_list_view(),
+                    ),
+                };
+                lowered
+                    .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?
+            }
+        };
+
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
+        if let Some(primary) = dataset.primary() {
+            super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        }
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        // Build executable
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        // Execute with tracking
+        let batches = self
+            .execute_dataset_tracked(dataset, &vars, &executable, &tracker, &options)
+            .await
+            .map_err(|e| {
+                let status = crate::error::query_error_status(&e);
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
+            })?;
+
+        // Build result
+        let query_result = build_query_result(
+            vars,
+            parsed,
+            batches,
+            dataset.result_t(),
+            None,
+            primary.binary_graph(),
+        );
+
+        // CONSTRUCT/DESCRIBE graph results must be formatted as JSON-LD.
+        if query_result.output.construct_template().is_some()
+            && format_config.format != crate::format::OutputFormat::JsonLd
+        {
+            format_config = crate::format::FormatterConfig::jsonld();
+        }
+
+        // Format with tracking
+        let result_json = query_result
+            .format_async_for_view_tracked(primary, &format_config, &tracker)
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        Ok(crate::query::TrackedQueryResponse::success(
+            result_json,
+            tracker.tally(),
+        ))
+    }
+
+    pub(crate) async fn query_dataset_tracked_with_r2rml_options(
+        &self,
+        dataset: &DataSetDb,
+        q: impl Into<QueryInput<'_>>,
+        format_config: Option<crate::format::FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        let input = q.into();
+
+        let tracker = tracked_query_tracker(&input, &tracking_override, None);
+        let params = options
+            .sparql_params(&input)
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
+
+        let default_format = match &input {
+            QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),
+            _ => crate::format::FormatterConfig::jsonld(),
+        };
+        let mut format_config = format_config.unwrap_or(default_format);
+
+        let primary = dataset.primary().ok_or_else(|| {
+            crate::query::TrackedErrorResponse::new(400, "Dataset has no graphs", tracker.tally())
+        })?;
+
+        let (vars, mut parsed) = match &input {
+            QueryInput::JsonLd(json) => parse_jsonld_query_for_dataset(
+                json,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                None,
+                dataset,
+            )
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
+            QueryInput::Sparql(sparql) => parse_sparql_to_ir(
+                options.sparql_parse(),
+                sparql,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                params,
+                options.rdf_list_view(),
+            )
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?,
+        };
+
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
+        if let Some(primary) = dataset.primary() {
+            super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        }
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        let batches = self
+            .execute_dataset_tracked_with_r2rml(
+                dataset,
+                &vars,
+                &executable,
+                &tracker,
+                r2rml,
+                &options,
+            )
+            .await
+            .map_err(|e| {
+                let status = crate::error::query_error_status(&e);
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
+            })?;
+
+        let query_result = build_query_result(
+            vars,
+            parsed,
+            batches,
+            dataset.result_t(),
+            None,
+            primary.binary_graph(),
+        );
+
+        if query_result.output.construct_template().is_some()
+            && format_config.format != crate::format::OutputFormat::JsonLd
+        {
+            format_config = crate::format::FormatterConfig::jsonld();
+        }
+
+        let result_json = query_result
+            .format_async_for_view_tracked(primary, &format_config, &tracker)
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+
+        Ok(crate::query::TrackedQueryResponse::success(
+            result_json,
+            tracker.tally(),
+        ))
+    }
+
+    // ========================================================================
+    // Internal Helpers
+    // ========================================================================
+
+    /// Build an ExecutableQuery for dataset queries.
+    ///
+    /// Reasoning is governed by the dataset's primary view: the shared
+    /// `apply_reasoning_to_executable` choke point applies the same surface
+    /// as the single-ledger path — mode precedence, config budget, datalog
+    /// restrictions, local and cross-ledger `f:rulesSource`, and the
+    /// `f:schemaSource` bundle (local, cross-ledger, and inline ontology).
+    /// The query-time rule policy gate uses `dataset.any_non_root_policy()`
+    /// so a restricted policy on *any* source strips caller-supplied rules.
+    ///
+    /// `server_identity` is the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on (`QueryExecutionOptions::server_identity`
+    /// at the entry points that carry execution options); `None` is anonymous.
+    pub(crate) async fn build_executable_for_dataset(
+        &self,
+        dataset: &DataSetDb,
+        parsed: &fluree_db_query::ir::Query,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<ExecutableQuery> {
+        let mut executable = prepare_for_execution(parsed);
+
+        // A history/changes dataset takes no config reasoning defaults: a
+        // from–to range has no single state to derive entailments against,
+        // and `reject_reasoning_in_history_mode` refuses any enabled mode.
+        // Applying `f:reasoningDefaults` here would trip that gate on every
+        // history query against a configured ledger (fluree/db#1806), so only
+        // a mode the query itself supplies reaches it.
+        match dataset.primary() {
+            Some(primary) if !dataset.is_history_mode() => {
+                self.apply_reasoning_to_executable(
+                    primary,
+                    &mut executable,
+                    dataset.any_non_root_policy(),
+                    server_identity,
+                )
+                .await?;
+            }
+            _ => {
+                if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
+                    tracing::debug!(
+                        "stripping query-time datalog rules under non-root view policy"
+                    );
+                    executable.reasoning.modes.rules.clear();
+                }
+            }
+        }
+
+        Ok(executable)
+    }
+
+    /// Execute against dataset (multi-ledger).
+    ///
+    /// Calls `prepare_execution` + `execute_prepared` directly so that
+    /// `binary_store` from the primary view is threaded into the
+    /// `ExecutionContext` for `BinaryScanOperator`.
+    async fn execute_dataset_internal(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        options: &QueryExecutionOptions,
+    ) -> Result<Vec<crate::Batch>> {
+        let noop = crate::NoOpR2rmlProvider::new();
+        self.execute_dataset_internal_with_r2rml(
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
+    }
+
+    /// Execute against dataset with explicit R2RML provider.
+    ///
+    /// Used by callers that need R2RML/Iceberg graph source support
+    /// (e.g., server query handlers with iceberg support).
+    pub(crate) async fn execute_dataset_internal_with_r2rml(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+    ) -> Result<Vec<crate::Batch>> {
+        let mut sink = crate::view::stream_query::CollectSink::default();
+        self.execute_dataset_into_with_r2rml(
+            dataset, vars, executable, tracker, r2rml, options, &mut sink,
+        )
+        .await?;
+        Ok(sink.batches)
+    }
+
+    /// Sink-generic core shared by the buffered
+    /// [`execute_dataset_internal_with_r2rml`] and the streaming dataset
+    /// producer. Builds the runtime dataset (carrying per-graph policy
+    /// enforcers) and the execution context exactly once, then drives
+    /// `execute_prepared_streaming` so buffered and streaming dataset execution
+    /// can never diverge in setup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_dataset_into_with_r2rml<S: fluree_db_query::execute::BatchSink>(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+        sink: &mut S,
+    ) -> Result<()> {
+        // As in `execute_dataset_tracked_with_r2rml`: recorded before execution
+        // and aggregated across every graph. This is also the streaming dataset
+        // producer's path, so the NDJSON `end` record carries the same state.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
+        // Time-pinned graph-source views read that table state, never current.
+        crate::graph_source::pin_graph_source_times(dataset.views(), r2rml.table_provider)
+            .map_err(query_error_to_api_error)?;
+
+        let primary = dataset
+            .primary()
+            .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
+
+        let runtime_dataset = self
+            .runtime_dataset(dataset, executable.query.union_default_graph)
+            .await?;
+
+        let db = primary.as_graph_db_ref();
+
+        // Detect history mode from the dataset spec *before* prepare so the
+        // planner can construct mode-aware operators in a single pass.
+        let (from_t, to_t, history_mode) = match dataset.history_time_range() {
+            Some((hist_from, hist_to)) => (Some(hist_from), hist_to, true),
+            None => (None, primary.t, false),
+        };
+
+        reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
+
+        // Binary scans rely on a ledger-specific binary index store. For datasets that span
+        // multiple ledgers, using only the primary view's store will silently drop results.
+        //
+        // In multi-ledger mode we disable binary scans (and associated provider maps) so
+        // execution falls back to per-snapshot range scans which are correctly ledger-scoped.
+        let primary_ledger_id: &str = primary.ledger_id.as_ref();
+        let is_single_ledger_dataset = dataset
+            .default
+            .iter()
+            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
+            && dataset
+                .named
+                .values()
+                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
+        let mut prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        // A `>= 2`-member default union is an RDF merge (a set), not a bag
+        // (SPARQL §13.2); tell the planner so it forces full triple identity and
+        // the `DatasetOperator` deduplicates across members.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_dataset_scope(Some(&runtime_dataset));
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
+
+        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
+        // for queries that don't actually call `fulltext(...)`. Spatial
+        // providers keep their current eager-build semantics.
+        let uses_fulltext = executable.uses_fulltext();
+        let (binary_store, dict_novelty, spatial_map, fulltext_map, english_lang_id) =
+            if is_single_ledger_dataset {
+                let spatial_map = primary
+                    .binary_store
+                    .as_ref()
+                    .map(|s| s.spatial_provider_map());
+                let fulltext_map = if uses_fulltext {
+                    primary
+                        .binary_store
+                        .as_ref()
+                        .map(|s| s.fulltext_provider_map())
+                } else {
+                    None
+                };
+                let english_lang_id = if uses_fulltext {
+                    primary
+                        .binary_store
+                        .as_ref()
+                        .and_then(|s| s.resolve_lang_id("en"))
+                } else {
+                    None
+                };
+                (
+                    primary.binary_store.clone(),
+                    primary.dict_novelty.clone(),
+                    spatial_map,
+                    fulltext_map,
+                    english_lang_id,
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        // Wire the BM25 index provider so embedded `f:searchText` graph-source
+        // queries execute in-process over the standard query route.
+        // It is a zero-cost `&Fluree` wrapper and is only consulted by the
+        // `IndexSearch` operator, so non-search queries are unaffected. Declared
+        // before `config` so it outlives the borrow held by the context.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
+        let index_provider = crate::FlureeIndexProvider::new(self);
+
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
+            tracker: if tracker.is_enabled() {
+                Some(tracker)
+            } else {
+                None
+            },
+            cancellation: options.cancellation.clone(),
+            dataset: Some(&runtime_dataset),
+            policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
+            bm25_provider: Some(&index_provider),
+            binary_g_id: primary.graph_id,
+            binary_store,
+            dict_novelty,
+            spatial_providers: spatial_map.as_ref(),
+            fulltext_providers: fulltext_map.as_ref(),
+            english_lang_id,
+            remote_service: self.remote_service_executor(),
+            from_t,
+            // SPARQL 1.1 §18.5 Extend: projection/BIND/ORDER-BY expression
+            // errors leave the variable unbound, not fail the query.
+            strict_bind_errors: false,
+            include_system_facts: executable.query.include_system_facts,
+            cypher_vocab: executable.query.cypher_vocab.clone(),
+            trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
+            ..Default::default()
+        };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
+
+        let exec_db = db.with_t(to_t);
+        fluree_db_query::execute::execute_prepared_streaming(exec_db, vars, prepared, config, sink)
+            .await
+            .map_err(query_error_to_api_error)
+    }
+
+    /// Execute against dataset with tracking.
+    ///
+    /// Threads `binary_store` from the primary view into the execution context.
+    async fn execute_dataset_tracked(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        options: &QueryExecutionOptions,
+    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+        let noop = crate::NoOpR2rmlProvider::new();
+        self.execute_dataset_tracked_with_r2rml(
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
+    }
+
+    async fn execute_dataset_tracked_with_r2rml(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+    ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+        // See `execute_view_tracked_with_r2rml`: recorded before execution, and
+        // aggregated across every graph the dataset can read.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
+        crate::graph_source::pin_graph_source_times(dataset.views(), r2rml.table_provider)?;
+
+        let primary = dataset.primary().ok_or_else(|| {
+            fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())
+        })?;
+
+        let runtime_dataset = self
+            .runtime_dataset(dataset, executable.query.union_default_graph)
+            .await
+            .map_err(|e| fluree_db_query::QueryError::Internal(e.to_string()))?;
+
+        let db = primary.as_graph_db_ref();
+
+        // Detect history mode from the dataset spec *before* prepare so the
+        // planner can construct mode-aware operators in a single pass.
+        let (from_t, to_t, history_mode) = match dataset.history_time_range() {
+            Some((hist_from, hist_to)) => (Some(hist_from), hist_to, true),
+            None => (None, primary.t, false),
+        };
+
+        reject_reasoning_in_history_mode(history_mode, executable)
+            .map_err(fluree_db_query::QueryError::InvalidQuery)?;
+
+        // See `execute_dataset_into_with_r2rml`: a multi-ledger dataset runs
+        // without binary scans.
+        let primary_ledger_id: &str = primary.ledger_id.as_ref();
+        let is_single_ledger_dataset = dataset
+            .default
+            .iter()
+            .all(|v| v.ledger_id.as_ref() == primary_ledger_id)
+            && dataset
+                .named
+                .values()
+                .all(|v| v.ledger_id.as_ref() == primary_ledger_id);
+
+        let mut prepare_config = if history_mode {
+            PrepareConfig::history(primary.binary_store.as_ref())
+        } else {
+            PrepareConfig::current(primary.binary_store.as_ref())
+        };
+        // See `execute_dataset_into_with_r2rml`: a `>= 2`-member default union is
+        // a set (SPARQL §13.2), so the planner enforces triple-identity dedup.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_dataset_scope(Some(&runtime_dataset));
+        if !is_single_ledger_dataset {
+            prepare_config = prepare_config.without_binary_scans();
+        }
+        let prepare_config =
+            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+            .await
+            .map_err(|e| e.name_variables(vars))?;
+
+        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
+        // for queries that don't actually call `fulltext(...)`. Spatial
+        // providers keep their current eager-build semantics.
+        let uses_fulltext = executable.uses_fulltext();
+        let (binary_store, dict_novelty, spatial_map, fulltext_map, english_lang_id) =
+            if is_single_ledger_dataset {
+                let spatial_map = primary
+                    .binary_store
+                    .as_ref()
+                    .map(|s| s.spatial_provider_map());
+                let fulltext_map = if uses_fulltext {
+                    primary
+                        .binary_store
+                        .as_ref()
+                        .map(|s| s.fulltext_provider_map())
+                } else {
+                    None
+                };
+                let english_lang_id = if uses_fulltext {
+                    primary
+                        .binary_store
+                        .as_ref()
+                        .and_then(|s| s.resolve_lang_id("en"))
+                } else {
+                    None
+                };
+                (
+                    primary.binary_store.clone(),
+                    primary.dict_novelty.clone(),
+                    spatial_map,
+                    fulltext_map,
+                    english_lang_id,
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        // Wire the BM25 index provider so embedded `f:searchText` graph-source
+        // queries execute in-process over the standard query route.
+        // Zero-cost `&Fluree` wrapper, only consulted by the `IndexSearch`
+        // operator; declared before `config` so it outlives the context borrow.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
+        let index_provider = crate::FlureeIndexProvider::new(self);
+
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
+            tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
+            dataset: Some(&runtime_dataset),
+            policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
+            bm25_provider: Some(&index_provider),
+            binary_g_id: primary.graph_id,
+            binary_store,
+            dict_novelty,
+            spatial_providers: spatial_map.as_ref(),
+            fulltext_providers: fulltext_map.as_ref(),
+            english_lang_id,
+            remote_service: self.remote_service_executor(),
+            from_t,
+            // SPARQL 1.1 §18.5 Extend: projection/BIND/ORDER-BY expression
+            // errors leave the variable unbound, not fail the query.
+            strict_bind_errors: false,
+            include_system_facts: executable.query.include_system_facts,
+            cypher_vocab: executable.query.cypher_vocab.clone(),
+            trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
+            ..Default::default()
+        };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
+
+        let exec_db = db.with_t(to_t);
+        execute_prepared(exec_db, vars, prepared, config).await
+    }
+}
+
+fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
+    ApiError::Query(err)
+}
+
+/// Reject an explicit reasoning request on a history/changes dataset query.
+///
+/// A history/changes query enumerates the persisted flake deltas over a
+/// `(from, to)` t-range; reasoning derives *virtual* facts by forward-chaining
+/// at a single state and never persists them, so the two do not compose — the
+/// derived overlay would be computed against the latest state and silently
+/// dropped rather than applied at any point in the range. Config reasoning
+/// defaults are not applied to history datasets (see
+/// `build_executable_for_dataset`), so this only fires when a query explicitly
+/// asks for a mode. Fail loudly instead of returning results that silently
+/// omit entailments.
+///
+/// Mirrors the reasoning gate in `prepare_execution_with_config`
+/// (`executable.reasoning.modes.has_any_enabled()`); `"reasoning": "none"`
+/// sets no mode flag and is therefore allowed.
+fn reject_reasoning_in_history_mode(
+    history_mode: bool,
+    executable: &ExecutableQuery,
+) -> std::result::Result<(), String> {
+    if history_mode && executable.reasoning.modes.has_any_enabled() {
+        return Err("reasoning is not supported for history/changes queries \
+             (a from–to time range); remove the reasoning mode or query a \
+             single point in time"
+            .to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::view::DataSetDb;
+    use crate::FlureeBuilder;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_query_dataset_single_ledger() {
+        let fluree = FlureeBuilder::memory().build_memory();
+
+        // Create ledger with data
+        let ledger = fluree.create_ledger("testdb").await.unwrap();
+        let txn = json!({
+            "insert": [{
+                "@id": "http://example.org/alice",
+                "http://example.org/name": "Alice"
+            }]
+        });
+        let _ledger = fluree.update(ledger, &txn).await.unwrap().ledger;
+
+        // Query via dataset view (single ledger)
+        let view = fluree.db("testdb:main").await.unwrap();
+        let dataset = DataSetDb::single(view);
+
+        let query = json!({
+            "select": ["?name"],
+            "where": {"@id": "http://example.org/alice", "http://example.org/name": "?name"}
+        });
+
+        let result = fluree.query_dataset(&dataset, &query).await.unwrap();
+        assert!(!result.batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_dataset_formatted() {
+        let fluree = FlureeBuilder::memory().build_memory();
+
+        let ledger = fluree.create_ledger("testdb").await.unwrap();
+        let txn = json!({
+            "insert": [{
+                "@id": "http://example.org/bob",
+                "http://example.org/name": "Bob"
+            }]
+        });
+        let _ledger = fluree.update(ledger, &txn).await.unwrap().ledger;
+
+        let view = fluree.db("testdb:main").await.unwrap();
+        let dataset = DataSetDb::single(view);
+
+        let query = json!({
+            "select": ["?name"],
+            "where": {"@id": "http://example.org/bob", "http://example.org/name": "?name"}
+        });
+
+        let result = dataset
+            .query(&fluree)
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert!(result.is_array() || result.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_query_dataset_multi_ledger_union() {
+        let fluree = FlureeBuilder::memory().build_memory();
+
+        // Two independent ledgers with distinct subjects
+        let ledger1 = fluree.create_ledger("db1").await.unwrap();
+        let ledger2 = fluree.create_ledger("db2").await.unwrap();
+
+        let txn1 = json!({
+            "insert": [{
+                "@id": "http://example.org/alice",
+                "http://example.org/name": "Alice"
+            }]
+        });
+        let _ledger1 = fluree.update(ledger1, &txn1).await.unwrap().ledger;
+
+        let txn2 = json!({
+            "insert": [{
+                "@id": "http://example.org/bob",
+                "http://example.org/name": "Bob"
+            }]
+        });
+        let _ledger2 = fluree.update(ledger2, &txn2).await.unwrap().ledger;
+
+        let view1 = fluree.db("db1:main").await.unwrap();
+        let view2 = fluree.db("db2:main").await.unwrap();
+
+        let dataset = DataSetDb::new().with_default(view1).with_default(view2);
+
+        let query = json!({
+            "select": ["?s", "?name"],
+            "where": {
+                "@id": "?s",
+                "http://example.org/name": "?name"
+            }
+        });
+
+        let result = fluree.query_dataset(&dataset, &query).await.unwrap();
+        let total_solutions: usize = result.batches.iter().map(fluree_db_query::Batch::len).sum();
+        assert_eq!(total_solutions, 2);
+    }
+
+    #[tokio::test]
+    async fn test_query_empty_dataset_error() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let _ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        let dataset: DataSetDb = DataSetDb::new();
+        let query = json!({ "select": ["?s"], "where": {"@id": "?s"} });
+
+        let result = fluree.query_dataset(&dataset, &query).await;
+        assert!(result.is_err());
+    }
+}

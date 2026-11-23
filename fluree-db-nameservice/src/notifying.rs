@@ -1,0 +1,521 @@
+//! Decorator that emits [`NameServiceEvent`]s on a [`LedgerEventBus`]
+//! after successful nameservice writes.
+//!
+//! Wrap any nameservice implementation in [`NotifyingNameService`] to get
+//! automatic event emission without modifying the backend itself.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use fluree_db_core::{ContentId, LedgerId};
+
+use crate::{
+    event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
+    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
+    LedgerLifecycle, NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord,
+    NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue, Subscription, SubscriptionScope,
+};
+
+/// Decorator that wraps a nameservice and emits events on a [`LedgerEventBus`]
+/// after successful write operations.
+///
+/// Read-only methods delegate directly without side effects.
+/// Write methods that mutate nameservice state emit the corresponding
+/// [`NameServiceEvent`] variant on success.
+#[derive(Debug)]
+pub struct NotifyingNameService<N> {
+    inner: N,
+    event_bus: Arc<LedgerEventBus>,
+}
+
+impl<N> NotifyingNameService<N> {
+    /// Wrap a nameservice with event notification.
+    pub fn new(inner: N, event_bus: Arc<LedgerEventBus>) -> Self {
+        Self { inner, event_bus }
+    }
+
+    /// Get a reference to the underlying nameservice.
+    pub fn inner(&self) -> &N {
+        &self.inner
+    }
+
+    /// Get a reference to the event bus.
+    pub fn event_bus(&self) -> &Arc<LedgerEventBus> {
+        &self.event_bus
+    }
+
+    /// Subscribe to events with the given scope.
+    pub fn subscribe(&self, scope: SubscriptionScope) -> Subscription {
+        self.event_bus.subscribe(scope)
+    }
+}
+
+impl<N: Clone> Clone for NotifyingNameService<N> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_bus: Arc::clone(&self.event_bus),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read + branch lifecycle — pure delegation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> NameServiceLookup for NotifyingNameService<N>
+where
+    N: NameServiceLookup,
+{
+    async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.inner.lookup(ledger_id).await
+    }
+
+    async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        self.inner.all_records().await
+    }
+
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        self.inner.branch_records(ledger_name).await
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        self.inner.heads(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<N> BranchLifecycle for NotifyingNameService<N>
+where
+    N: BranchLifecycle,
+{
+    async fn create_branch(
+        &self,
+        ledger_name: &str,
+        new_branch: &str,
+        source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
+    ) -> Result<()> {
+        self.inner
+            .create_branch(ledger_name, new_branch, source_branch, at_commit)
+            .await
+    }
+
+    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
+        let remaining = self.inner.drop_branch(ledger_id).await?;
+        // Symmetric with `Publisher::retract` / `Publisher::purge`: subscribers
+        // (ledger cache, query peers) rely on `LedgerRetracted` to clear
+        // their per-branch state. Without this notification the new
+        // whole-ledger drop path would leave stale caches behind.
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
+        });
+        Ok(remaining)
+    }
+
+    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+        let head = snapshot
+            .commit_head_id
+            .clone()
+            .map(|id| (id, snapshot.commit_t));
+        self.inner.reset_head(ledger_id, snapshot).await?;
+        // A reset moves the head (a rebase, or a rollback), and its index
+        // with it. Subscribers re-read the whole record on a commit event,
+        // so query peers follow the index too.
+        if let Some((commit_id, commit_t)) = head {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerCommitPublished {
+                    ledger_id: LedgerId::parse_persisted(ledger_id)?,
+                    commit_id,
+                    commit_t,
+                });
+        }
+        Ok(())
+    }
+
+    // Pass-through wrapper: delegate so the inner backend's commit-CID index
+    // (e.g. FileNameService) still accelerates incremental indexing. Falling
+    // back to the trait default here would silently force the serial DAG walk
+    // for the entire FileStorage server path, which wraps in this notifier.
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> Result<Option<Vec<(i64, ContentId)>>> {
+        self.inner.pending_commit_cids(ledger_id, since_t).await
+    }
+
+    async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        self.inner.prune_commit_index(ledger_id, up_to_t).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Publisher — emit events after successful writes
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> LedgerLifecycle for NotifyingNameService<N>
+where
+    N: LedgerLifecycle,
+{
+    async fn init(&self, ledger_id: &str) -> Result<()> {
+        self.inner.init(ledger_id).await
+    }
+
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        self.inner.retract(ledger_id).await?;
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
+        });
+        Ok(())
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        self.inner.purge(ledger_id).await?;
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: LedgerId::parse(ledger_id)?,
+        });
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<N> CommitPublisher for NotifyingNameService<N>
+where
+    N: CommitPublisher,
+{
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()> {
+        self.inner
+            .publish_commit(ledger_id, commit_t, commit_id)
+            .await?;
+        self.event_bus
+            .notify(NameServiceEvent::LedgerCommitPublished {
+                ledger_id: LedgerId::parse(ledger_id)?,
+                commit_id: commit_id.clone(),
+                commit_t,
+            });
+        Ok(())
+    }
+
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        self.inner.publishing_ledger_id(ledger_id)
+    }
+}
+
+#[async_trait]
+impl<N> IndexPublisher for NotifyingNameService<N>
+where
+    N: IndexPublisher,
+{
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        self.inner
+            .publish_index(ledger_id, index_t, index_id)
+            .await?;
+        self.event_bus
+            .notify(NameServiceEvent::LedgerIndexPublished {
+                ledger_id: LedgerId::parse(ledger_id)?,
+                index_id: index_id.clone(),
+                index_t,
+            });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdminPublisher — emit after successful allow-equal index publish
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> AdminPublisher for NotifyingNameService<N>
+where
+    N: AdminPublisher,
+{
+    async fn publish_index_allow_equal(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        self.inner
+            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .await?;
+        self.event_bus
+            .notify(NameServiceEvent::LedgerIndexPublished {
+                ledger_id: LedgerId::parse(ledger_id)?,
+                index_id: index_id.clone(),
+                index_t,
+            });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RefLookup — pure delegation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> RefLookup for NotifyingNameService<N>
+where
+    N: RefLookup,
+{
+    async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+        self.inner.get_ref(ledger_id, kind).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RefPublisher — emit only on successful CAS (Updated)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> RefPublisher for NotifyingNameService<N>
+where
+    N: RefPublisher,
+{
+    async fn compare_and_set_ref(
+        &self,
+        ledger_id: &str,
+        kind: RefKind,
+        expected: Option<&RefValue>,
+        new: &RefValue,
+    ) -> Result<CasResult> {
+        let result = self
+            .inner
+            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .await?;
+
+        if matches!(result, CasResult::Updated) {
+            if let Some(ref cid) = new.id {
+                match kind {
+                    RefKind::CommitHead => {
+                        self.event_bus
+                            .notify(NameServiceEvent::LedgerCommitPublished {
+                                ledger_id: LedgerId::parse(ledger_id)?,
+                                commit_id: cid.clone(),
+                                commit_t: new.t,
+                            });
+                    }
+                    RefKind::IndexHead => {
+                        self.event_bus
+                            .notify(NameServiceEvent::LedgerIndexPublished {
+                                ledger_id: LedgerId::parse(ledger_id)?,
+                                index_id: cid.clone(),
+                                index_t: new.t,
+                            });
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GraphSourceLookup — pure delegation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> GraphSourceLookup for NotifyingNameService<N>
+where
+    N: GraphSourceLookup,
+{
+    async fn lookup_graph_source(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<Option<GraphSourceRecord>> {
+        self.inner.lookup_graph_source(graph_source_id).await
+    }
+
+    async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
+        self.inner.lookup_any(resource_id).await
+    }
+
+    async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+        self.inner.all_graph_source_records().await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GraphSourcePublisher — emit after successful writes
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> GraphSourcePublisher for NotifyingNameService<N>
+where
+    N: GraphSourcePublisher,
+{
+    async fn publish_graph_source(
+        &self,
+        name: &str,
+        branch: &str,
+        source_type: GraphSourceType,
+        config: &str,
+        dependencies: &[String],
+    ) -> Result<()> {
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        let canonical_deps = dependencies
+            .iter()
+            .map(|d| LedgerId::parse(d))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.inner
+            .publish_graph_source(name, branch, source_type.clone(), config, dependencies)
+            .await?;
+        self.event_bus
+            .notify(NameServiceEvent::GraphSourceConfigPublished {
+                graph_source_id,
+                source_type,
+                dependencies: canonical_deps,
+            });
+        Ok(())
+    }
+
+    async fn publish_graph_source_index(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        self.inner
+            .publish_graph_source_index(name, branch, index_id, index_t)
+            .await?;
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        self.event_bus
+            .notify(NameServiceEvent::GraphSourceIndexPublished {
+                graph_source_id,
+                index_id: index_id.clone(),
+                index_t,
+            });
+        Ok(())
+    }
+
+    async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
+        self.inner.retract_graph_source(name, branch).await?;
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        self.event_bus
+            .notify(NameServiceEvent::GraphSourceRetracted { graph_source_id });
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StatusLookup — pure delegation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> StatusLookup for NotifyingNameService<N>
+where
+    N: StatusLookup,
+{
+    async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
+        self.inner.get_status(ledger_id).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StatusPublisher — pure delegation (no events)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> StatusPublisher for NotifyingNameService<N>
+where
+    N: StatusPublisher,
+{
+    async fn push_status(
+        &self,
+        ledger_id: &str,
+        expected: Option<&StatusValue>,
+        new: &StatusValue,
+    ) -> Result<StatusCasResult> {
+        self.inner.push_status(ledger_id, expected, new).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConfigLookup — pure delegation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> ConfigLookup for NotifyingNameService<N>
+where
+    N: ConfigLookup,
+{
+    async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+        self.inner.get_config(ledger_id).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConfigPublisher — pure delegation (no events)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<N> ConfigPublisher for NotifyingNameService<N>
+where
+    N: ConfigPublisher,
+{
+    async fn push_config(
+        &self,
+        ledger_id: &str,
+        expected: Option<&ConfigValue>,
+        new: &ConfigValue,
+    ) -> Result<ConfigCasResult> {
+        self.inner.push_config(ledger_id, expected, new).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryNameService;
+    use fluree_db_core::ContentKind;
+
+    /// A reset moves the head and the index together; subscribers (query
+    /// peers among them) hear of it as a commit and re-read the record.
+    #[tokio::test]
+    async fn a_reset_is_announced_as_a_commit() {
+        let ns =
+            NotifyingNameService::new(MemoryNameService::new(), Arc::new(LedgerEventBus::new(16)));
+        ns.init("reset:main").await.expect("init");
+        let mut events = ns.subscribe(SubscriptionScope::All).receiver;
+        let head = ContentId::new(ContentKind::Commit, b"rebased-head");
+        ns.reset_head(
+            "reset:main",
+            NsRecordSnapshot {
+                commit_head_id: Some(head.clone()),
+                commit_t: 2,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .expect("reset");
+        match events.try_recv().expect("an event") {
+            NameServiceEvent::LedgerCommitPublished {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id.as_str(), "reset:main");
+                assert_eq!(commit_id, head);
+                assert_eq!(commit_t, 2);
+            }
+            other => panic!("expected a commit event, got {other:?}"),
+        }
+    }
+}

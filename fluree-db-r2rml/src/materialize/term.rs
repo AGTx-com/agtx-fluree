@@ -1,0 +1,1762 @@
+//! RDF term materialization
+//!
+//! Functions for generating RDF terms from tabular column values.
+//!
+//! This module provides two APIs:
+//!
+//! 1. **HashMap-based API** (`materialize_subject`, `materialize_object`): For testing
+//!    and simple use cases. Takes `HashMap<String, Option<String>>` as input.
+//!
+//! 2. **ColumnBatch API** (`materialize_subject_from_batch`, `materialize_object_from_batch`):
+//!    For efficient production use. Works directly with `&ColumnBatch` and row indices,
+//!    avoiding per-row allocations.
+
+use std::collections::HashMap;
+
+use fluree_db_tabular::{Column, ColumnBatch};
+use fluree_vocab::UnresolvedDatatypeConstraint;
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+use crate::error::{R2rmlError, R2rmlResult};
+use crate::mapping::{ConstantValue, GraphMap, ObjectMap, PredicateMap, SubjectMap, TermType};
+use crate::vocab::R2RML;
+
+/// Materialized RDF term
+///
+/// Represents an RDF term generated from tabular data according to
+/// an R2RML term map specification.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RdfTerm {
+    /// An IRI
+    Iri(String),
+    /// A blank node with local identifier
+    BlankNode(String),
+    /// A literal with optional datatype constraint
+    Literal {
+        value: String,
+        dtc: Option<UnresolvedDatatypeConstraint>,
+    },
+}
+
+impl RdfTerm {
+    /// Create an IRI term
+    pub fn iri(iri: impl Into<String>) -> Self {
+        RdfTerm::Iri(iri.into())
+    }
+
+    /// Create a blank node term
+    pub fn blank_node(id: impl Into<String>) -> Self {
+        RdfTerm::BlankNode(id.into())
+    }
+
+    /// Create a plain string literal
+    pub fn string(value: impl Into<String>) -> Self {
+        RdfTerm::Literal {
+            value: value.into(),
+            dtc: None,
+        }
+    }
+
+    /// Create a typed literal
+    pub fn typed(value: impl Into<String>, datatype: impl Into<String>) -> Self {
+        RdfTerm::Literal {
+            value: value.into(),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(
+                datatype.into().into(),
+            )),
+        }
+    }
+
+    /// Create a language-tagged string
+    pub fn lang_string(value: impl Into<String>, lang: impl Into<String>) -> Self {
+        RdfTerm::Literal {
+            value: value.into(),
+            dtc: Some(UnresolvedDatatypeConstraint::LangTag(lang.into().into())),
+        }
+    }
+
+    /// Check if this is an IRI
+    pub fn is_iri(&self) -> bool {
+        matches!(self, RdfTerm::Iri(_))
+    }
+
+    /// Check if this is a blank node
+    pub fn is_blank_node(&self) -> bool {
+        matches!(self, RdfTerm::BlankNode(_))
+    }
+
+    /// Check if this is a literal
+    pub fn is_literal(&self) -> bool {
+        matches!(self, RdfTerm::Literal { .. })
+    }
+
+    /// Get as IRI string if this is an IRI
+    pub fn as_iri(&self) -> Option<&str> {
+        match self {
+            RdfTerm::Iri(iri) => Some(iri),
+            _ => None,
+        }
+    }
+}
+
+/// Convert separate `ObjectMap` datatype/language fields into an
+/// `UnresolvedDatatypeConstraint`, preferring language over datatype
+/// (per R2RML spec, they are mutually exclusive).
+fn object_map_dtc(
+    datatype: Option<&str>,
+    language: Option<&str>,
+) -> Option<UnresolvedDatatypeConstraint> {
+    language
+        .map(|l| UnresolvedDatatypeConstraint::LangTag(l.into()))
+        .or_else(|| datatype.map(|d| UnresolvedDatatypeConstraint::Explicit(d.into())))
+}
+
+/// Expand a template by substituting column placeholders with values
+///
+/// Template placeholders are in the form `{column_name}`. Values are
+/// IRI-escaped according to R2RML rules.
+///
+/// # Arguments
+///
+/// * `template` - Template string with `{column}` placeholders
+/// * `values` - Map from column names to values
+///
+/// # Returns
+///
+/// The expanded template string, or an error if a required column is null.
+pub fn expand_template(
+    template: &str,
+    values: &HashMap<String, Option<String>>,
+) -> R2rmlResult<String> {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+
+    let mut result = template.to_string();
+    let mut error: Option<R2rmlError> = None;
+
+    // Find all placeholders and replace them
+    for cap in PLACEHOLDER_RE.captures_iter(template) {
+        let full_match = cap.get(0).unwrap().as_str();
+        let column = &cap[1];
+
+        match values.get(column) {
+            Some(Some(value)) => {
+                // IRI-escape the value
+                let escaped = iri_escape(value);
+                result = result.replace(full_match, &escaped);
+            }
+            Some(None) | None => {
+                // Column is null or not present - this produces no term
+                error = Some(R2rmlError::Materialization(format!(
+                    "Column '{column}' is null, cannot expand template"
+                )));
+                break;
+            }
+        }
+    }
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    Ok(result)
+}
+
+/// IRI-escape a string value for use in templates
+///
+/// Escapes characters that are not allowed in IRIs according to RFC 3987.
+fn iri_escape(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+
+    for c in value.chars() {
+        match c {
+            // Safe characters that don't need escaping
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~' => {
+                result.push(c);
+            }
+            // Sub-delims that are often allowed
+            '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' => {
+                result.push(c);
+            }
+            // Colon and @ are allowed in path segments
+            ':' | '@' => {
+                result.push(c);
+            }
+            // Encode space as %20
+            ' ' => {
+                result.push_str("%20");
+            }
+            // Percent-encode other characters
+            _ => {
+                for byte in c.to_string().as_bytes() {
+                    result.push_str(&format!("%{byte:02X}"));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Whether `iri_escape` always percent-encodes `c` (i.e. `c` can never appear
+/// literally inside an escaped template value). This is exactly the complement of
+/// the "safe" set in [`iri_escape`] — keep the two in sync.
+///
+/// A "hard" delimiter (every char always-escaped) between placeholders is what
+/// makes [`reverse_subject_template`] unambiguous.
+fn is_always_escaped(c: char) -> bool {
+    !matches!(c,
+        'A'..='Z' | 'a'..='z' | '0'..='9'
+        | '-' | '.' | '_' | '~'
+        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+        | ':' | '@')
+}
+
+/// Whether `c` never appears in the output of [`iri_escape`]: it is always
+/// percent-encoded, and it is not `%`, which starts every encoding the escape
+/// writes. A template's literal text holding one between two placeholders
+/// marks exactly where the first value's encoding ends.
+fn is_hard_separator(c: char) -> bool {
+    is_always_escaped(c) && c != '%'
+}
+
+/// Whether distinct values of a template's columns always expand to distinct
+/// strings ([`expand_template`], [`expand_template_from_batch`]).
+///
+/// The escape is injective on each value, so the template is injective when
+/// every value's encoding can be delimited: the literal text between each
+/// pair of adjacent placeholders holds at least one character the escape
+/// never writes ([`is_hard_separator`]). The first such character after a
+/// value's start then lies in that literal text, which fixes the value's
+/// length. Adjacent placeholders (`{a}{b}`) and separators the escape can
+/// also write inside a value (`-`, `.`, `_`, `~`, the sub-delimiters, `:`,
+/// `@`, and `%`) are not injective: `{a}-{b}` expands `("x-y", "z")` and
+/// `("x", "y-z")` alike. A template with at most one placeholder is
+/// injective.
+pub fn template_is_injective(template: &str) -> bool {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+    let spans: Vec<(usize, usize)> = PLACEHOLDER_RE
+        .find_iter(template)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    spans
+        .windows(2)
+        .all(|w| template[w[0].1..w[1].0].chars().any(is_hard_separator))
+}
+
+/// Percent-decode a value produced by [`iri_escape`] back to its raw bytes.
+/// Inverse of the `%XX` encoding; returns `None` on a malformed escape or on
+/// bytes that are not valid UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Reverse a subject template against a concrete IRI, recovering the raw column
+/// value for each `{placeholder}`. This is the inverse of [`expand_template`] +
+/// [`iri_escape`]: `("http://ex/store/{store_key}", "http://ex/store/5")` yields
+/// `[("store_key", "5")]`.
+///
+/// Returns `None` — and the caller falls back to a full scan, which is always
+/// correct — when the IRI does not match the template, or when the template shape
+/// is not *unambiguously* reversible (see [`TemplateReverser`]). A caller that
+/// needs to tell those two apart builds a [`TemplateReverser`].
+pub fn reverse_subject_template(template: &str, iri: &str) -> Option<Vec<(String, String)>> {
+    TemplateReverser::new(template)?.reverse(iri)
+}
+
+/// The inverse of a template's expansion ([`expand_template`] +
+/// [`iri_escape`]), for a template whose shape is *unambiguously* reversible.
+///
+/// Reversal is unambiguous only when every placeholder is either the final
+/// token at end-of-template, or is followed by a literal separator whose first
+/// character is always percent-encoded by `iri_escape` (a "hard" delimiter that
+/// can never appear literally inside an encoded value). This admits the common
+/// `.../{key}` and `.../{a}/{b}` shapes and rejects ambiguous ones like
+/// `.../{a};{b}` (`;` is not escaped) or `.../{a}{b}` (adjacent placeholders).
+///
+/// Building one decides the template once, and [`Self::reverse`] then decides
+/// each IRI. The split is what lets a caller conclude anything from an IRI that
+/// does not reverse: through a reverser, every IRI the template expands to
+/// reverses (the expander writes the literal text verbatim and each value
+/// escaped, so a value never contains a separator's first character), so an
+/// IRI that does not is one the template cannot produce. No reverser exists for
+/// a template where that would not hold.
+#[derive(Debug, Clone)]
+pub struct TemplateReverser {
+    /// The literal text before the first placeholder.
+    prefix: String,
+    /// Each placeholder's column and the literal text after it, up to the next
+    /// placeholder or the end (empty only for a final placeholder at the end).
+    parts: Vec<(String, String)>,
+}
+
+impl TemplateReverser {
+    /// The reverser of `template`, or `None` when it has no placeholder or its
+    /// shape is not unambiguously reversible.
+    pub fn new(template: &str) -> Option<Self> {
+        static PLACEHOLDER_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+
+        // Placeholder columns with their byte spans in the template.
+        let cols: Vec<(String, usize, usize)> = PLACEHOLDER_RE
+            .captures_iter(template)
+            .map(|cap| {
+                let m = cap.get(0).unwrap();
+                (cap[1].to_string(), m.start(), m.end())
+            })
+            .collect();
+        if cols.is_empty() {
+            return None; // constant subject — nothing to reverse
+        }
+
+        let mut parts = Vec::with_capacity(cols.len());
+        for i in 0..cols.len() {
+            let (col, _start, end) = &cols[i];
+            let sep_end = if i + 1 < cols.len() {
+                cols[i + 1].1
+            } else {
+                template.len()
+            };
+            let sep = &template[*end..sep_end];
+            if sep.is_empty() {
+                // Only the final placeholder may run to end-of-string; two
+                // adjacent placeholders have no boundary and are ambiguous.
+                if i + 1 < cols.len() {
+                    return None;
+                }
+            } else if !sep
+                .chars()
+                .next()
+                .is_some_and(|c| is_always_escaped(c) && c != '%')
+            {
+                // The separator must begin with a hard (always-escaped) char so
+                // the value's right boundary is unambiguous — EXCEPT `%`, which
+                // is always-escaped yet also introduces every `%XX` byte
+                // *inside* an encoded value, so a `%`-led separator (e.g. `%20`)
+                // can match a false boundary within a value. `%` is the only
+                // always-escaped char in `iri_escape`'s output, so excluding it
+                // fully closes the hole (such templates fall back to a full
+                // scan — correct, just unpruned).
+                return None;
+            }
+            parts.push((col.clone(), sep.to_string()));
+        }
+        Some(Self {
+            prefix: template[..cols[0].1].to_string(),
+            parts,
+        })
+    }
+
+    /// The template's columns, in placeholder order (a column used twice is
+    /// listed twice).
+    pub fn columns(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().map(|(col, _)| col.as_str())
+    }
+
+    /// The raw value of each placeholder's column in `iri`, in placeholder
+    /// order, or `None` when `iri` is not one this template can produce.
+    pub fn reverse(&self, iri: &str) -> Option<Vec<(String, String)>> {
+        // The leading literal (prefix) must anchor the IRI.
+        let mut rest = iri.strip_prefix(self.prefix.as_str())?;
+        let mut out = Vec::with_capacity(self.parts.len());
+        for (col, sep) in &self.parts {
+            let value_enc = if sep.is_empty() {
+                let v = rest;
+                rest = "";
+                v
+            } else {
+                let idx = rest.find(sep.as_str())?;
+                let v = &rest[..idx];
+                rest = &rest[idx + sep.len()..];
+                v
+            };
+            out.push((col.clone(), percent_decode(value_enc)?));
+        }
+        // The whole IRI must be consumed — no trailing residue.
+        rest.is_empty().then_some(out)
+    }
+}
+
+/// Materialize a subject term from a SubjectMap and column values
+///
+/// # Arguments
+///
+/// * `subject_map` - The subject map specification
+/// * `values` - Map from column names to values
+/// * `row_id` - Optional row identifier for generating unique blank nodes
+///
+/// # Returns
+///
+/// The materialized RDF term, or None if any required column is null.
+pub fn materialize_subject(
+    subject_map: &SubjectMap,
+    values: &HashMap<String, Option<String>>,
+    row_id: Option<&str>,
+) -> R2rmlResult<Option<RdfTerm>> {
+    // Check for constant subject
+    if let Some(ref constant) = subject_map.constant {
+        return Ok(Some(RdfTerm::iri(constant.clone())));
+    }
+
+    // Check for column-based subject
+    if let Some(ref column) = subject_map.column {
+        match values.get(column) {
+            Some(Some(value)) => {
+                return match subject_map.term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(value.clone()))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(value.clone()))),
+                    TermType::Literal => Err(R2rmlError::InvalidValue {
+                        property: "rr:termType".to_string(),
+                        message: "Subject cannot be a literal".to_string(),
+                    }),
+                };
+            }
+            _ => return Ok(None), // Null column produces no subject
+        }
+    }
+
+    // Check for template-based subject
+    if let Some(ref template) = subject_map.template {
+        match expand_template(template, values) {
+            Ok(expanded) => {
+                return match subject_map.term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(expanded))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(expanded))),
+                    TermType::Literal => Err(R2rmlError::InvalidValue {
+                        property: "rr:termType".to_string(),
+                        message: "Subject cannot be a literal".to_string(),
+                    }),
+                };
+            }
+            Err(_) => return Ok(None), // Null column in template produces no subject
+        }
+    }
+
+    // No subject specification - generate blank node if possible
+    if subject_map.term_type == TermType::BlankNode {
+        let id = row_id.unwrap_or("row");
+        return Ok(Some(RdfTerm::blank_node(format!("_:gen_{id}"))));
+    }
+
+    Err(R2rmlError::MissingProperty(
+        "Subject map must have rr:template, rr:column, or rr:constant".to_string(),
+    ))
+}
+
+/// Materialize an object term from an ObjectMap and column values
+///
+/// # Arguments
+///
+/// * `object_map` - The object map specification
+/// * `values` - Map from column names to values
+///
+/// # Returns
+///
+/// The materialized RDF term, or None if any required column is null.
+/// RefObjectMaps return None (must be resolved separately via join).
+pub fn materialize_object(
+    object_map: &ObjectMap,
+    values: &HashMap<String, Option<String>>,
+) -> R2rmlResult<Option<RdfTerm>> {
+    match object_map {
+        ObjectMap::Column {
+            column,
+            datatype,
+            language,
+            term_type,
+        } => {
+            match values.get(column) {
+                Some(Some(value)) => match term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(value.clone()))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(value.clone()))),
+                    TermType::Literal => Ok(Some(RdfTerm::Literal {
+                        value: value.clone(),
+                        dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+                    })),
+                },
+                _ => Ok(None), // Null produces no object
+            }
+        }
+
+        ObjectMap::Constant { value } => match value {
+            ConstantValue::Iri(iri) => Ok(Some(RdfTerm::iri(iri.clone()))),
+            ConstantValue::Literal {
+                value,
+                datatype,
+                language,
+            } => Ok(Some(RdfTerm::Literal {
+                value: value.clone(),
+                dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+            })),
+        },
+
+        ObjectMap::Template {
+            template,
+            term_type,
+            datatype,
+            language,
+            ..
+        } => {
+            match expand_template(template, values) {
+                Ok(expanded) => match term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(expanded))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(expanded))),
+                    TermType::Literal => Ok(Some(RdfTerm::Literal {
+                        value: expanded,
+                        dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+                    })),
+                },
+                Err(_) => Ok(None), // Null in template produces no object
+            }
+        }
+
+        ObjectMap::RefObjectMap(_) => {
+            // RefObjectMaps must be resolved via join, not direct materialization
+            Ok(None)
+        }
+    }
+}
+
+/// Infer XSD datatype from column value type
+///
+/// Used when no explicit datatype is specified in the object map.
+#[cfg(test)]
+pub fn infer_datatype(value: &str) -> Option<&'static str> {
+    // Try to parse as integer
+    if value.parse::<i64>().is_ok() {
+        return Some(fluree_vocab::xsd::INTEGER);
+    }
+
+    // Try to parse as decimal/double
+    if value.parse::<f64>().is_ok() {
+        return Some(fluree_vocab::xsd::DECIMAL);
+    }
+
+    // Try to parse as boolean
+    if value == "true" || value == "false" {
+        return Some(fluree_vocab::xsd::BOOLEAN);
+    }
+
+    // Default: xsd:string (no need to specify)
+    None
+}
+
+// =============================================================================
+// ColumnBatch API - Efficient production materialization
+// =============================================================================
+
+/// Get column value as string at a given row index
+///
+/// This avoids allocation for numeric types by formatting directly.
+/// Returns None if the column is not found or the value is null.
+fn column_value_as_string(
+    batch: &ColumnBatch,
+    column_name: &str,
+    row_idx: usize,
+) -> Option<String> {
+    let col = batch.column_by_name(column_name)?;
+    column_to_string(col, row_idx)
+}
+
+/// Read a column's value at `row_idx` as a string, using the exact same
+/// conversion the subject/object materializers use. Intended for reading
+/// auxiliary columns (e.g. a delete-marker column) so comparisons match the
+/// source encoding (booleans as `true`/`false`, timestamps/decimals formatted
+/// identically). Returns `None` when the column is absent OR the value is null
+/// — use [`batch_has_column`] to distinguish the two.
+pub fn column_string(batch: &ColumnBatch, column_name: &str, row_idx: usize) -> Option<String> {
+    column_value_as_string(batch, column_name, row_idx)
+}
+
+/// Whether `column_name` exists in `batch` (to validate a configured
+/// marker column independently of whether a given row's value is null).
+pub fn batch_has_column(batch: &ColumnBatch, column_name: &str) -> bool {
+    batch.column_by_name(column_name).is_some()
+}
+
+/// A total-order sort key for an ordering column value at `row_idx`, used for
+/// latest-by-key materialization. Numeric and temporal columns (int, date,
+/// timestamp) compare by their integer value; all other columns compare
+/// lexicographically by their string form. The returned `(i128, String)`
+/// compares as a tuple, so within one column (one type) the comparison is the
+/// natural one. `None` when the column is absent or null for that row (treated
+/// by callers as the smallest / "no ordering info").
+pub fn column_sort_key(
+    batch: &ColumnBatch,
+    column_name: &str,
+    row_idx: usize,
+) -> Option<(i128, String)> {
+    let col = batch.column_by_name(column_name)?;
+    match col {
+        Column::Int32(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Int64(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Date(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Timestamp(v) | Column::TimestampTz(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        // Floats and other types: fall back to string ordering (numeric part 0).
+        // Callers that require value-correct ordering must gate on
+        // [`column_is_orderable`] first (the materializer rejects non-orderable
+        // `order_by` columns), so this arm is only a best-effort fallback.
+        _ => column_to_string(col, row_idx).map(|s| (0i128, s)),
+    }
+}
+
+/// Whether `column_name` is a type [`column_sort_key`] orders by value (integer,
+/// date, or timestamp). Float/decimal/string/boolean are NOT value-orderable by
+/// the sort key (they fall back to a lexicographic string, which mis-orders
+/// numbers like `10 < 9`), so a latest-by-key `order_by` column must be one of
+/// these types. Returns `false` if the column is absent.
+pub fn column_is_orderable(batch: &ColumnBatch, column_name: &str) -> bool {
+    matches!(
+        batch.column_by_name(column_name),
+        Some(
+            Column::Int32(_)
+                | Column::Int64(_)
+                | Column::Date(_)
+                | Column::Timestamp(_)
+                | Column::TimestampTz(_)
+        )
+    )
+}
+
+/// A whole column as the lexical forms [`materialize_object_from_batch`] gives
+/// its cells: a `String` column of what an un-annotated `rr:column` renders
+/// (`10`, `-0`, `0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), nulls kept.
+/// A string column comes back borrowed. For a lane that keys or compares an
+/// un-annotated column by its `xsd:string` value without materializing terms:
+/// the rendering is this module's own, so the lane cannot drift from it.
+pub fn lexical_column(col: &Column) -> std::borrow::Cow<'_, Column> {
+    match col {
+        Column::String(_) => std::borrow::Cow::Borrowed(col),
+        _ => std::borrow::Cow::Owned(Column::String(
+            (0..col.len())
+                .map(|row| column_to_string(col, row))
+                .collect(),
+        )),
+    }
+}
+
+/// Convert a Column value at a row index to a String
+fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
+    match col {
+        Column::Boolean(v) => v.get(row_idx).and_then(|v| *v).map(|b| b.to_string()),
+        Column::Int32(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
+        Column::Int64(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
+        Column::Float32(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
+        Column::Float64(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
+        Column::String(v) => v.get(row_idx).and_then(std::clone::Clone::clone),
+        Column::Bytes(v) => v
+            .get(row_idx)
+            .and_then(|v| v.as_ref())
+            .map(|b| base64_encode(b)),
+        Column::Date(v) => v.get(row_idx).and_then(|v| *v).map(format_date),
+        Column::Timestamp(v) | Column::TimestampTz(v) => {
+            v.get(row_idx).and_then(|v| *v).map(format_timestamp)
+        }
+        Column::Decimal { values, scale, .. } => values
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| format_decimal(n, *scale)),
+    }
+}
+
+/// The lexical form of a floating-point cell. Finite values keep Rust's
+/// shortest round-trip form; NaN and the infinities take their XSD spellings
+/// (`NaN`, `INF`, `-INF`), since Rust's own `inf` / `-inf` are not
+/// `xsd:double` lexical forms and would not read back as numbers.
+fn float_lexical<F: fluree_graph_ir::XsdFloat + std::fmt::Display>(n: F) -> String {
+    match n.nonfinite_xsd() {
+        Some(special) => special.to_string(),
+        None => n.to_string(),
+    }
+}
+
+/// Base64 encode bytes (simple implementation)
+fn base64_encode(bytes: &[u8]) -> String {
+    // Simple hex encoding for now; can be replaced with proper base64
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Format date (days since epoch) as ISO 8601
+fn format_date(days: i32) -> String {
+    // Simple implementation: 1970-01-01 + days
+    // For production, use chrono or similar
+    // Days from 0001-01-01 (day 0 in days_to_ymd) to 1970-01-01. days_to_ymd is
+    // 0-indexed, so this is 719162, not 719163 — otherwise every date is +1 day.
+    let epoch = 719_162i64;
+    let total_days = epoch + days as i64;
+
+    // Simplified Gregorian calendar calculation
+    let (year, month, day) = days_to_ymd(total_days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Format timestamp (microseconds since epoch) as ISO 8601, with six
+/// fractional digits when the microseconds are not zero. Divisions round
+/// down, so an instant before 1970 falls in the second and the day at or
+/// before it: -1 µs is `1969-12-31T23:59:59.999999Z`.
+fn format_timestamp(micros: i64) -> String {
+    let seconds = micros.div_euclid(1_000_000);
+    let micros_part = micros.rem_euclid(1_000_000);
+
+    // Days since epoch
+    let days_since_epoch = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let secs = time_of_day % 60;
+
+    let epoch = 719_162i64; // see format_date: 0-indexed days_to_ymd
+    let total_days = epoch + days_since_epoch;
+    let (year, month, day) = days_to_ymd(total_days);
+
+    if micros_part > 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{secs:02}.{micros_part:06}Z")
+    } else {
+        format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{secs:02}Z")
+    }
+}
+
+/// Convert total days (from year 0) to (year, month, day)
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    // Simplified algorithm - for production use chrono
+    let mut remaining = days;
+    let mut year = 1i32;
+
+    // Handle years
+    while remaining >= 365 {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining >= days_in_year {
+            remaining -= days_in_year;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Handle months
+    let days_in_months = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u32;
+    for days_in_month in &days_in_months {
+        if remaining >= *days_in_month as i64 {
+            remaining -= *days_in_month as i64;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+
+    (year, month, remaining as u32 + 1)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Format decimal with scale
+fn format_decimal(unscaled: i128, scale: i8) -> String {
+    if scale <= 0 {
+        // No decimal point needed
+        let multiplier = 10i128.pow((-scale) as u32);
+        match unscaled.checked_mul(multiplier) {
+            Some(v) => v.to_string(),
+            None => {
+                // Out of i128 range: append zeros to the digits instead.
+                format!("{}{}", unscaled, "0".repeat((-scale) as usize))
+            }
+        }
+    } else {
+        // Insert decimal point. Truncating division loses the sign when the
+        // integer part is zero (-5/10 == 0), so format from the absolute
+        // value and apply the sign explicitly: -0.5 must not become "0.5".
+        let divisor = 10i128.pow(scale as u32);
+        let sign = if unscaled < 0 { "-" } else { "" };
+        let abs = unscaled.unsigned_abs();
+        let integer_part = abs / divisor.unsigned_abs();
+        let fractional_part = abs % divisor.unsigned_abs();
+        format!(
+            "{}{}.{:0>width$}",
+            sign,
+            integer_part,
+            fractional_part,
+            width = scale as usize
+        )
+    }
+}
+
+/// Expand a template using values from a ColumnBatch at a specific row
+///
+/// This is the efficient batch-aware version that avoids HashMap allocation.
+pub fn expand_template_from_batch(
+    template: &str,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<String> {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+
+    // Single-pass build from the original template's literal/placeholder segments
+    // (O4). The previous body did `result.replace(full_match, ..)` once PER
+    // placeholder, each a full re-scan + re-alloc of the whole (growing) string —
+    // O(placeholders x len) allocations per row on the hot path — and could even
+    // double-expand a value that happened to contain another placeholder's text.
+    // Expanding each placeholder positionally from the ORIGINAL template into one
+    // reserved String is one pass, one allocation, and exact R2RML semantics.
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut last = 0usize;
+    for cap in PLACEHOLDER_RE.captures_iter(template) {
+        let m = cap.get(0).unwrap();
+        out.push_str(&template[last..m.start()]);
+        let column = &cap[1];
+        match column_value_as_string(batch, column, row_idx) {
+            Some(value) => out.push_str(&iri_escape(&value)),
+            None => {
+                return Err(R2rmlError::Materialization(format!(
+                    "Column '{column}' is null or not found at row {row_idx}, cannot expand template"
+                )));
+            }
+        }
+        last = m.end();
+    }
+    out.push_str(&template[last..]);
+    Ok(out)
+}
+
+/// Materialize a subject term from a SubjectMap and a ColumnBatch row
+///
+/// This is the efficient batch-aware version that avoids HashMap allocation.
+///
+/// # Arguments
+///
+/// * `subject_map` - The subject map specification
+/// * `batch` - The column batch containing data
+/// * `row_idx` - The row index to materialize from
+///
+/// # Returns
+///
+/// The materialized RDF term, or None if any required column is null.
+pub fn materialize_subject_from_batch(
+    subject_map: &SubjectMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<RdfTerm>> {
+    // Check for constant subject
+    if let Some(ref constant) = subject_map.constant {
+        return Ok(Some(RdfTerm::iri(constant.clone())));
+    }
+
+    // Check for column-based subject
+    if let Some(ref column) = subject_map.column {
+        match column_value_as_string(batch, column, row_idx) {
+            Some(value) => {
+                return match subject_map.term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(value))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(value))),
+                    TermType::Literal => Err(R2rmlError::InvalidValue {
+                        property: "rr:termType".to_string(),
+                        message: "Subject cannot be a literal".to_string(),
+                    }),
+                };
+            }
+            None => return Ok(None),
+        }
+    }
+
+    // Check for template-based subject
+    if let Some(ref template) = subject_map.template {
+        match expand_template_from_batch(template, batch, row_idx) {
+            Ok(expanded) => {
+                return match subject_map.term_type {
+                    TermType::Iri => Ok(Some(RdfTerm::iri(expanded))),
+                    TermType::BlankNode => Ok(Some(RdfTerm::blank_node(expanded))),
+                    TermType::Literal => Err(R2rmlError::InvalidValue {
+                        property: "rr:termType".to_string(),
+                        message: "Subject cannot be a literal".to_string(),
+                    }),
+                };
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+
+    // No subject specification - generate blank node if possible
+    if subject_map.term_type == TermType::BlankNode {
+        return Ok(Some(RdfTerm::blank_node(format!("_:gen_row_{row_idx}"))));
+    }
+
+    Err(R2rmlError::MissingProperty(
+        "Subject map must have rr:template, rr:column, or rr:constant".to_string(),
+    ))
+}
+
+/// Materialize the named-graph IRI for a row from a [`GraphMap`].
+///
+/// Returns `Some(graph_iri)` when the graph map yields a named graph, or `None`
+/// for the default graph: the source value is null, the template can't expand,
+/// or the value is `rr:defaultGraph`, which R2RML defines as naming the default
+/// graph. A graph term is always an IRI (no blank-node / literal graphs), so
+/// there is no term-type branch. Reuses the exact template/column expansion the
+/// subject materializer uses, so a graph template and a subject template
+/// resolve column values identically.
+pub fn materialize_graph_from_batch(
+    graph_map: &GraphMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<String>> {
+    let graph = if let Some(ref constant) = graph_map.constant {
+        Some(constant.clone())
+    } else if let Some(ref column) = graph_map.column {
+        // A null graph column routes the row to the default graph.
+        column_value_as_string(batch, column, row_idx)
+    } else if let Some(ref template) = graph_map.template {
+        // A null column in the template -> no graph IRI -> default graph.
+        expand_template_from_batch(template, batch, row_idx).ok()
+    } else {
+        None
+    };
+    Ok(graph.filter(|iri| iri != R2RML::DEFAULT_GRAPH))
+}
+
+/// Materialize an object term from an ObjectMap and a ColumnBatch row
+///
+/// This is the efficient batch-aware version that avoids HashMap allocation.
+///
+/// # Arguments
+///
+/// * `object_map` - The object map specification
+/// * `batch` - The column batch containing data
+/// * `row_idx` - The row index to materialize from
+///
+/// # Returns
+///
+/// The materialized RDF term, or None if any required column is null.
+/// RefObjectMaps return None (must be resolved separately via join).
+pub fn materialize_object_from_batch(
+    object_map: &ObjectMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<RdfTerm>> {
+    match object_map {
+        ObjectMap::Column {
+            column,
+            datatype,
+            language,
+            term_type,
+        } => match column_value_as_string(batch, column, row_idx) {
+            Some(value) => match term_type {
+                TermType::Iri => Ok(Some(RdfTerm::iri(value))),
+                TermType::BlankNode => Ok(Some(RdfTerm::blank_node(value))),
+                TermType::Literal => Ok(Some(RdfTerm::Literal {
+                    value,
+                    dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+                })),
+            },
+            None => Ok(None),
+        },
+
+        ObjectMap::Constant { value } => match value {
+            ConstantValue::Iri(iri) => Ok(Some(RdfTerm::iri(iri.clone()))),
+            ConstantValue::Literal {
+                value,
+                datatype,
+                language,
+            } => Ok(Some(RdfTerm::Literal {
+                value: value.clone(),
+                dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+            })),
+        },
+
+        ObjectMap::Template {
+            template,
+            term_type,
+            datatype,
+            language,
+            ..
+        } => match expand_template_from_batch(template, batch, row_idx) {
+            Ok(expanded) => match term_type {
+                TermType::Iri => Ok(Some(RdfTerm::iri(expanded))),
+                TermType::BlankNode => Ok(Some(RdfTerm::blank_node(expanded))),
+                TermType::Literal => Ok(Some(RdfTerm::Literal {
+                    value: expanded,
+                    dtc: object_map_dtc(datatype.as_deref(), language.as_deref()),
+                })),
+            },
+            Err(_) => Ok(None),
+        },
+
+        ObjectMap::RefObjectMap(_) => {
+            // RefObjectMaps must be resolved via join, not direct materialization
+            Ok(None)
+        }
+    }
+}
+
+/// Materialize a predicate IRI from a [`PredicateMap`] and a `ColumnBatch` row.
+///
+/// Constant predicates (the overwhelmingly common case) return their IRI
+/// verbatim. A templated or column-based predicate (rare, but representable —
+/// `rr:predicateMap [ rr:template/rr:column ... ]`) is expanded from the row's
+/// values; a NULL referenced column yields `Ok(None)` — the triple simply does
+/// not exist for that row, mirroring subject/object template semantics.
+pub fn materialize_predicate_from_batch(
+    predicate_map: &PredicateMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<String>> {
+    match predicate_map {
+        PredicateMap::Constant(iri) => Ok(Some(iri.clone())),
+        PredicateMap::Template { template, .. } => {
+            match expand_template_from_batch(template, batch, row_idx) {
+                Ok(expanded) => Ok(Some(expanded)),
+                Err(_) => Ok(None),
+            }
+        }
+        PredicateMap::Column(column) => Ok(column_value_as_string(batch, column, row_idx)),
+    }
+}
+
+/// Get the join key values for a row (used for RefObjectMap joins)
+///
+/// Returns the child column values as strings for hash-based join matching, or
+/// `None` if any key column is NULL (the row has no join key). Allocates a fresh
+/// `Vec` per call — for the per-fact-row PROBE path use [`fill_join_key_from_batch`]
+/// with a reused buffer instead; this owned-`Vec` form is for the BUILD path that
+/// inserts the key into a map (which needs ownership anyway).
+pub fn get_join_key_from_batch(
+    child_columns: &[String],
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> Option<Vec<String>> {
+    let mut key_values = Vec::with_capacity(child_columns.len());
+    if fill_join_key_from_batch(child_columns, batch, row_idx, &mut key_values) {
+        Some(key_values)
+    } else {
+        None
+    }
+}
+
+/// Fill `scratch` with a row's join-key column values, REUSING the buffer across
+/// rows so a per-row probe allocates no `Vec` (the N1 borrowed-scratch idiom applied
+/// to the FK probe). Returns `false` — leaving `scratch` cleared — when any key
+/// column is NULL (the row has no join key and cannot match, mirroring
+/// [`get_join_key_from_batch`]'s `None`). The probe caller then queries the set/map
+/// via `scratch.as_slice()` (`Vec<String>: Borrow<[String]>`), so no owned key is
+/// built for a lookup. NOTE: the component `String`s are still allocated per fill
+/// (`column_value_as_string` owns its result); interning the FK key to a fixed-width
+/// tuple to remove those too is a deferred follow-on — this removes only the per-row
+/// `Vec` allocation.
+pub fn fill_join_key_from_batch(
+    child_columns: &[String],
+    batch: &ColumnBatch,
+    row_idx: usize,
+    scratch: &mut Vec<String>,
+) -> bool {
+    scratch.clear();
+    for col_name in child_columns {
+        let Some(v) = column_value_as_string(batch, col_name, row_idx) else {
+            scratch.clear();
+            return false;
+        };
+        scratch.push(v);
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timestamp renders on its own day, before 1970 too, and keeps the
+    /// sign of its fraction: the microsecond a nanosecond reader rounds
+    /// -500 ns down to is the last one of 1969. Later instants render as
+    /// they always have, six fractional digits or none.
+    #[test]
+    fn a_timestamp_before_1970_renders_on_its_own_day() {
+        assert_eq!(format_timestamp(-3_600_000_000), "1969-12-31T23:00:00Z");
+        assert_eq!(format_timestamp(-1), "1969-12-31T23:59:59.999999Z");
+        assert_eq!(format_timestamp(-86_400_000_000), "1969-12-31T00:00:00Z");
+        assert_eq!(
+            format_timestamp(-86_400_000_001),
+            "1969-12-30T23:59:59.999999Z"
+        );
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_timestamp(1_577_836_800_123_000),
+            "2020-01-01T00:00:00.123000Z"
+        );
+    }
+
+    #[test]
+    fn test_expand_template_simple() {
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), Some("123".to_string()));
+
+        let result = expand_template("http://example.org/item/{id}", &values).unwrap();
+        assert_eq!(result, "http://example.org/item/123");
+    }
+
+    #[test]
+    fn test_expand_template_multiple() {
+        let mut values = HashMap::new();
+        values.insert("ns".to_string(), Some("test".to_string()));
+        values.insert("id".to_string(), Some("42".to_string()));
+
+        let result = expand_template("http://example.org/{ns}/{id}", &values).unwrap();
+        assert_eq!(result, "http://example.org/test/42");
+    }
+
+    #[test]
+    fn test_expand_template_escaping() {
+        let mut values = HashMap::new();
+        values.insert("name".to_string(), Some("hello world".to_string()));
+
+        let result = expand_template("http://example.org/{name}", &values).unwrap();
+        assert_eq!(result, "http://example.org/hello%20world");
+    }
+
+    #[test]
+    fn test_expand_template_null_column() {
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), None);
+
+        let result = expand_template("http://example.org/{id}", &values);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_materialize_subject_template() {
+        let sm = SubjectMap::template("http://example.org/airline/{id}");
+
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), Some("42".to_string()));
+
+        let result = materialize_subject(&sm, &values, None).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/airline/42")));
+    }
+
+    #[test]
+    fn test_materialize_subject_constant() {
+        let sm = SubjectMap::constant("http://example.org/singleton");
+
+        let values = HashMap::new();
+        let result = materialize_subject(&sm, &values, None).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/singleton")));
+    }
+
+    #[test]
+    fn test_materialize_subject_null_produces_none() {
+        let sm = SubjectMap::template("http://example.org/{id}");
+
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), None);
+
+        let result = materialize_subject(&sm, &values, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_materialize_object_column() {
+        let om = ObjectMap::column("name");
+
+        let mut values = HashMap::new();
+        values.insert("name".to_string(), Some("Alice".to_string()));
+
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(result, Some(RdfTerm::string("Alice")));
+    }
+
+    #[test]
+    fn test_materialize_object_typed() {
+        let om = ObjectMap::column_typed("age", "http://www.w3.org/2001/XMLSchema#integer");
+
+        let mut values = HashMap::new();
+        values.insert("age".to_string(), Some("30".to_string()));
+
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(
+            result,
+            Some(RdfTerm::typed(
+                "30",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_materialize_object_iri() {
+        let om = ObjectMap::column_iri("homepage");
+
+        let mut values = HashMap::new();
+        values.insert(
+            "homepage".to_string(),
+            Some("http://example.org/alice".to_string()),
+        );
+
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/alice")));
+    }
+
+    #[test]
+    fn test_materialize_object_constant() {
+        let om = ObjectMap::constant_iri("http://example.org/constant");
+
+        let values = HashMap::new();
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/constant")));
+    }
+
+    #[test]
+    fn test_materialize_object_template() {
+        let om = ObjectMap::template("http://example.org/category/{cat}", vec!["cat".to_string()]);
+
+        let mut values = HashMap::new();
+        values.insert("cat".to_string(), Some("books".to_string()));
+
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(
+            result,
+            Some(RdfTerm::iri("http://example.org/category/books"))
+        );
+    }
+
+    #[test]
+    fn test_materialize_object_null_produces_none() {
+        let om = ObjectMap::column("missing");
+
+        let values = HashMap::new();
+        let result = materialize_object(&om, &values).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_iri_escape() {
+        assert_eq!(iri_escape("simple"), "simple");
+        assert_eq!(iri_escape("with space"), "with%20space");
+        assert_eq!(iri_escape("test/path"), "test%2Fpath");
+        assert_eq!(iri_escape("你好"), "%E4%BD%A0%E5%A5%BD");
+    }
+
+    #[test]
+    fn test_infer_datatype() {
+        assert_eq!(
+            infer_datatype("42"),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert_eq!(
+            infer_datatype("3.14"),
+            Some("http://www.w3.org/2001/XMLSchema#decimal")
+        );
+        assert_eq!(
+            infer_datatype("true"),
+            Some("http://www.w3.org/2001/XMLSchema#boolean")
+        );
+        assert_eq!(infer_datatype("hello"), None);
+    }
+
+    #[test]
+    fn test_rdf_term_constructors() {
+        let iri = RdfTerm::iri("http://example.org");
+        assert!(iri.is_iri());
+        assert_eq!(iri.as_iri(), Some("http://example.org"));
+
+        let blank = RdfTerm::blank_node("b0");
+        assert!(blank.is_blank_node());
+
+        let lit = RdfTerm::string("hello");
+        assert!(lit.is_literal());
+    }
+
+    // =========================================================================
+    // ColumnBatch API tests
+    // =========================================================================
+
+    use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+    use std::sync::Arc;
+
+    fn sample_batch() -> ColumnBatch {
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "id".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "age".to_string(),
+                field_type: FieldType::Int32,
+                nullable: true,
+                field_id: 3,
+            },
+        ]));
+
+        let columns = vec![
+            Column::Int64(vec![Some(1), Some(2), Some(3)]),
+            Column::String(vec![
+                Some("Alice".to_string()),
+                Some("Bob".to_string()),
+                None,
+            ]),
+            Column::Int32(vec![Some(30), Some(25), Some(40)]),
+        ];
+
+        ColumnBatch::new(schema, columns).unwrap()
+    }
+
+    #[test]
+    fn test_expand_template_from_batch() {
+        let batch = sample_batch();
+
+        // Row 0: id=1, name="Alice"
+        let result =
+            expand_template_from_batch("http://example.org/person/{id}", &batch, 0).unwrap();
+        assert_eq!(result, "http://example.org/person/1");
+
+        // Row 1: id=2, name="Bob"
+        let result =
+            expand_template_from_batch("http://example.org/{name}/{id}", &batch, 1).unwrap();
+        assert_eq!(result, "http://example.org/Bob/2");
+
+        // Row 2: name is null - should error
+        let result = expand_template_from_batch("http://example.org/{name}", &batch, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_materialize_subject_from_batch() {
+        let batch = sample_batch();
+        let sm = SubjectMap::template("http://example.org/person/{id}");
+
+        let result = materialize_subject_from_batch(&sm, &batch, 0).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/person/1")));
+
+        let result = materialize_subject_from_batch(&sm, &batch, 1).unwrap();
+        assert_eq!(result, Some(RdfTerm::iri("http://example.org/person/2")));
+    }
+
+    #[test]
+    fn test_materialize_object_from_batch_column() {
+        let batch = sample_batch();
+        let om = ObjectMap::column("name");
+
+        let result = materialize_object_from_batch(&om, &batch, 0).unwrap();
+        assert_eq!(result, Some(RdfTerm::string("Alice")));
+
+        let result = materialize_object_from_batch(&om, &batch, 1).unwrap();
+        assert_eq!(result, Some(RdfTerm::string("Bob")));
+
+        // Row 2 has null name
+        let result = materialize_object_from_batch(&om, &batch, 2).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_materialize_object_from_batch_int() {
+        let batch = sample_batch();
+        let om = ObjectMap::column_typed("age", "http://www.w3.org/2001/XMLSchema#integer");
+
+        let result = materialize_object_from_batch(&om, &batch, 0).unwrap();
+        assert_eq!(
+            result,
+            Some(RdfTerm::typed(
+                "30",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_get_join_key_from_batch() {
+        let batch = sample_batch();
+
+        // Single column key
+        let key = get_join_key_from_batch(&["id".to_string()], &batch, 0);
+        assert_eq!(key, Some(vec!["1".to_string()]));
+
+        // Composite key
+        let key = get_join_key_from_batch(&["id".to_string(), "name".to_string()], &batch, 1);
+        assert_eq!(key, Some(vec!["2".to_string(), "Bob".to_string()]));
+
+        // Null in key returns None
+        let key = get_join_key_from_batch(&["name".to_string()], &batch, 2);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn test_format_decimal() {
+        assert_eq!(format_decimal(12345, 2), "123.45");
+        assert_eq!(format_decimal(100, 2), "1.00");
+        assert_eq!(format_decimal(5, 3), "0.005");
+        assert_eq!(format_decimal(1000, 0), "1000");
+        assert_eq!(format_decimal(5, -2), "500"); // scale -2 = multiply by 100
+    }
+
+    #[test]
+    fn test_format_decimal_negative() {
+        // Sign must survive when the integer part is zero: truncating
+        // division (-5/10 == 0) previously dropped it.
+        assert_eq!(format_decimal(-5, 1), "-0.5");
+        assert_eq!(format_decimal(-5, 3), "-0.005");
+        assert_eq!(format_decimal(-12345, 2), "-123.45");
+        assert_eq!(format_decimal(-1000, 0), "-1000");
+        assert_eq!(format_decimal(-5, -2), "-500");
+        assert_eq!(format_decimal(i128::MIN, 2), {
+            let s = i128::MIN.to_string();
+            format!("{}.{}", &s[..s.len() - 2], &s[s.len() - 2..])
+        });
+    }
+
+    /// `expand_template` then `reverse_subject_template` must recover the exact
+    /// raw values — the bijection the subject-key pushdown relies on.
+    fn assert_round_trips(template: &str, cols: &[(&str, &str)]) {
+        let mut values = HashMap::new();
+        for (c, v) in cols {
+            values.insert((*c).to_string(), Some((*v).to_string()));
+        }
+        let iri = expand_template(template, &values).unwrap();
+        let reversed = reverse_subject_template(template, &iri)
+            .unwrap_or_else(|| panic!("template {template:?} should reverse from {iri:?}"));
+        let expected: Vec<(String, String)> = cols
+            .iter()
+            .map(|(c, v)| ((*c).to_string(), (*v).to_string()))
+            .collect();
+        assert_eq!(reversed, expected, "round-trip for {template:?}");
+    }
+
+    #[test]
+    fn reverse_template_round_trips() {
+        // Single trailing placeholder — the common surrogate-key shape.
+        assert_round_trips("http://ex/store/{store_key}", &[("store_key", "5")]);
+        // Values with hard chars survive because they percent-encode losslessly.
+        assert_round_trips("http://ex/store/{k}", &[("k", "west/5")]);
+        assert_round_trips("http://ex/store/{k}", &[("k", "a b")]);
+        assert_round_trips("http://ex/store/{k}", &[("k", "café")]);
+        // A literal '%' in the raw value round-trips (it encodes to %25).
+        assert_round_trips("http://ex/store/{k}", &[("k", "50%off")]);
+        // Multi-placeholder with a hard '/' separator.
+        assert_round_trips(
+            "http://ex/{region}/{store_key}",
+            &[("region", "west"), ("store_key", "5")],
+        );
+        assert_round_trips("http://ex/{a}/{b}", &[("a", "x/y"), ("b", "z")]);
+        // Trailing suffix that begins with a hard char.
+        assert_round_trips("http://ex/store/{k}/detail", &[("k", "5")]);
+    }
+
+    #[test]
+    fn reverse_template_bails_on_ambiguous_shapes() {
+        // Soft separator (';' is never escaped) → ambiguous → None.
+        assert!(reverse_subject_template("http://ex/{a};{b}", "http://ex/x;y").is_none());
+        // Adjacent placeholders, no boundary → None.
+        assert!(reverse_subject_template("http://ex/{a}{b}", "http://ex/xy").is_none());
+        // No placeholder (constant subject) → None.
+        assert!(reverse_subject_template("http://ex/store", "http://ex/store").is_none());
+        // A '%'-led separator ('%20') is always-escaped yet also begins every
+        // '%XX' byte inside an encoded value, so `find` could match a false
+        // boundary inside a value (`first="Mary Ann"` → `%20` at index 4) and
+        // recover wrong keys. Must bail. Regression for the composite-key hole.
+        assert!(reverse_subject_template(
+            "http://ex/person/{first}%20{last}",
+            "http://ex/person/Mary%20Ann%20Smith"
+        )
+        .is_none());
+    }
+
+    /// Through a reverser, every IRI the batch expander produces reverses to
+    /// the row's own values, whatever characters they hold, so an IRI that
+    /// does not reverse is one the template cannot produce. A template with no
+    /// such guarantee has no reverser.
+    #[test]
+    fn every_iri_a_reversible_template_expands_to_reverses() {
+        let values = [
+            "5", "", "west/5", "a b", "café", "50%off", "x;y", "a:b@c", "%2F", "{k}", "-._~",
+        ];
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "a".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "b".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        let column =
+            |vs: Vec<&str>| Column::String(vs.into_iter().map(|v| Some(v.into())).collect());
+        let a: Vec<&str> = values.iter().flat_map(|v| values.map(|_| *v)).collect();
+        let b: Vec<&str> = values.iter().flat_map(|_| values).collect();
+        let batch = ColumnBatch::new(schema, vec![column(a.clone()), column(b.clone())]).unwrap();
+        for template in [
+            "http://ex/{a}",
+            "http://ex/{a}/{b}",
+            "http://ex/{a}/x/{b}/detail",
+            "http://ex/{a}#{b}",
+        ] {
+            let reverser = TemplateReverser::new(template).expect("reversible");
+            for row in 0..batch.num_rows {
+                let iri = expand_template_from_batch(template, &batch, row).unwrap();
+                let reversed = reverser
+                    .reverse(&iri)
+                    .unwrap_or_else(|| panic!("{template}: {iri} does not reverse"));
+                for (column, raw) in reversed {
+                    let want = if column == "a" { a[row] } else { b[row] };
+                    assert_eq!(raw, want, "{template}: {iri}");
+                }
+            }
+        }
+        for template in [
+            "http://ex/{a};{b}",
+            "http://ex/{a}{b}",
+            "http://ex/static",
+            "http://ex/{a}%20{b}",
+        ] {
+            assert!(TemplateReverser::new(template).is_none(), "{template}");
+        }
+        let reverser = TemplateReverser::new("http://ex/{a}/{b}").unwrap();
+        assert_eq!(reverser.columns().collect::<Vec<_>>(), ["a", "b"]);
+        assert!(reverser.reverse("http://ex/only-one").is_none());
+    }
+
+    #[test]
+    fn reverse_template_rejects_non_matching_iri() {
+        // Wrong prefix.
+        assert!(reverse_subject_template("http://ex/store/{k}", "http://other/store/5").is_none());
+        // Missing required suffix.
+        assert!(
+            reverse_subject_template("http://ex/store/{k}/detail", "http://ex/store/5").is_none()
+        );
+    }
+
+    #[test]
+    fn graph_map_default_graph_value_routes_to_the_default_graph() {
+        // R2RML: a graph map producing rr:defaultGraph targets the default
+        // graph, whichever value source produced it. Read as an ordinary IRI it
+        // would mint a named graph called 'http://www.w3.org/ns/r2rml#defaultGraph'.
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "graph".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::String(vec![
+                Some("http://www.w3.org/ns/r2rml#defaultGraph".to_string()),
+                Some("http://example.org/g1".to_string()),
+                None,
+            ])],
+        )
+        .unwrap();
+
+        let by_column = GraphMap::column("graph");
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 1).unwrap(),
+            Some("http://example.org/g1".to_string())
+        );
+        // A null graph value is the default graph too.
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 2).unwrap(),
+            None
+        );
+
+        let constant = GraphMap::constant("http://www.w3.org/ns/r2rml#defaultGraph");
+        assert_eq!(
+            materialize_graph_from_batch(&constant, &batch, 0).unwrap(),
+            None
+        );
+        let named = GraphMap::constant("http://example.org/g1");
+        assert_eq!(
+            materialize_graph_from_batch(&named, &batch, 0).unwrap(),
+            Some("http://example.org/g1".to_string())
+        );
+    }
+
+    #[test]
+    fn float_cells_render_xsd_lexical_forms() {
+        let doubles = Column::Float64(vec![
+            Some(1.5),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::NAN),
+        ]);
+        let floats = Column::Float32(vec![
+            Some(1.5),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+            Some(f32::NAN),
+        ]);
+        for col in [doubles, floats] {
+            let rendered: Vec<String> = (0..4)
+                .map(|row| column_to_string(&col, row).unwrap())
+                .collect();
+            assert_eq!(rendered, ["1.5", "INF", "-INF", "NaN"]);
+            for lexical in &rendered {
+                assert!(
+                    fluree_graph_ir::parse_xsd_double(lexical).is_some(),
+                    "{lexical} reads back as an xsd:double"
+                );
+            }
+        }
+    }
+
+    /// `lexical_column` gives every cell the lexical form the object
+    /// materializer gives it, for every physical type, nulls included.
+    #[test]
+    fn lexical_column_matches_the_object_materializer() {
+        let columns = [
+            Column::Boolean(vec![Some(true), None, Some(false)]),
+            Column::Int32(vec![Some(10), None, Some(-3)]),
+            Column::Int64(vec![Some(9_007_199_254_740_993), None, Some(9)]),
+            Column::Float32(vec![Some(-0.0), None, Some(0.1)]),
+            Column::Float64(vec![Some(f64::NAN), None, Some(1e21)]),
+            Column::String(vec![Some("b".into()), None, Some(String::new())]),
+            Column::Bytes(vec![Some(vec![0, 1]), None, Some(vec![])]),
+            Column::Date(vec![Some(-1), None, Some(19_731)]),
+            Column::Timestamp(vec![Some(-1), None, Some(1)]),
+            Column::TimestampTz(vec![Some(500_000), None, Some(0)]),
+            Column::Decimal {
+                values: vec![Some(50_000_000), None, Some(-500_000_000)],
+                precision: 38,
+                scale: 9,
+            },
+        ];
+        for col in columns {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: "c".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            }]));
+            let batch = ColumnBatch::new(schema, vec![col.clone()]).unwrap();
+            let Column::String(lexical) = lexical_column(&col).into_owned() else {
+                panic!("not a string column: {col:?}");
+            };
+            let om = ObjectMap::column("c");
+            for (row, lex) in lexical.iter().enumerate() {
+                let term = materialize_object_from_batch(&om, &batch, row).unwrap();
+                assert_eq!(term, lex.clone().map(RdfTerm::string), "{col:?} row {row}");
+            }
+        }
+    }
+
+    /// `template_is_injective` against the expansion itself: over every pair
+    /// of short values from an alphabet holding the characters the escape
+    /// treats differently, a template it calls injective never expands two
+    /// distinct pairs to one string, and each one it refuses here does.
+    #[test]
+    fn template_injectivity_matches_the_expansion() {
+        let alphabet = ['a', '1', '-', '.', ':', ';', '%', '/', ' ', '\u{e9}'];
+        let mut values = vec![String::new()];
+        for &c in &alphabet {
+            values.push(c.to_string());
+            for &d in &alphabet {
+                values.push(format!("{c}{d}"));
+            }
+        }
+        let expand = |template: &str, a: &str, b: &str| {
+            let row: HashMap<String, Option<String>> = [
+                ("a".to_string(), Some(a.to_string())),
+                ("b".to_string(), Some(b.to_string())),
+            ]
+            .into_iter()
+            .collect();
+            expand_template(template, &row).expect("both columns bound")
+        };
+        // Values for `b` only when the template reads it: a column the
+        // template does not read would "collide" with itself.
+        let collides = |template: &str| {
+            let bs: &[String] = if template.contains("{b}") {
+                &values
+            } else {
+                &values[..1]
+            };
+            let mut seen: HashMap<String, (&str, &str)> = HashMap::new();
+            for a in &values {
+                for b in bs {
+                    let out = expand(template, a, b);
+                    if let Some(prev) = seen.insert(out, (a, b)) {
+                        if prev != (a.as_str(), b.as_str()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        let injective = [
+            "http://ex/{a}/{b}",
+            "http://ex/{a}-/{b}",
+            "http://ex/{a}#{b}",
+            "http://ex/{a} {b}",
+            "http://ex/{a}\u{e9}{b}",
+            "http://ex/{a}",
+            "http://ex/{a}/x",
+        ];
+        for t in injective {
+            assert!(template_is_injective(t), "{t}");
+            assert!(!collides(t), "{t} called injective but two pairs collide");
+        }
+        let merging = [
+            "http://ex/{a}{b}",
+            "http://ex/{a}-{b}",
+            "http://ex/{a}.{b}",
+            "http://ex/{a}:{b}",
+            "http://ex/{a};{b}",
+            "http://ex/{a}%2F{b}",
+            "http://ex/{a}a{b}",
+        ];
+        for t in merging {
+            assert!(!template_is_injective(t), "{t}");
+            assert!(collides(t), "{t} refused, and two pairs do collide");
+        }
+    }
+}

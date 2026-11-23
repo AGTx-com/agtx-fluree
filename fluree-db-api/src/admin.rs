@@ -1,0 +1,2730 @@
+//! Administrative operations for Fluree DB
+//!
+//! This module provides admin-level operations like `drop_ledger` and
+//! `drop_graph_source` that are separate from normal CRUD operations.
+//!
+//! # Note
+//!
+//! These operations require `S: Storage`, which provides full read/write/delete
+//! capabilities. They work with memory/file/S3 admin backends but are not
+//! available on read-only storage.
+
+use crate::{error::ApiError, tx::IndexingMode, GraphPayload, Result};
+use fluree_db_core::tracking::{Tracker, TrackingOptions};
+use fluree_db_core::ContentId;
+use fluree_db_core::{format_ledger_id, DEFAULT_BRANCH};
+use fluree_db_core::{LedgerId, LedgerName};
+use fluree_db_indexer::{
+    current_sibling_heads, execute_sweep, nested_ledgers, nested_prefixes, plan_garbage,
+    plan_sweep, rebuild_index_from_commits_with_tracker, release_garbage_plan,
+    shared_refs_of_branches, siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard,
+    SweepPlan, SweepResult,
+};
+use fluree_db_nameservice::{GraphSourceType, NsRecord};
+use fluree_db_transact::GraphSel;
+use std::collections::HashSet;
+use std::time::Duration;
+use tracing::{debug, info, warn};
+
+// =============================================================================
+// Drop Mode and Status Types
+// =============================================================================
+
+/// Mode for drop operation
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DropMode {
+    /// Retract from nameservice only (data files remain)
+    ///
+    /// This is the default and safest option. The ledger is marked as retracted
+    /// in the nameservice, but all data files remain on disk for potential
+    /// recovery.
+    #[default]
+    Soft,
+
+    /// Retract + delete all storage artifacts (irreversible)
+    ///
+    /// **WARNING**: This is irreversible. All commit and index files will be
+    /// permanently deleted after the nameservice retraction.
+    Hard,
+}
+
+/// Result status of drop operation
+///
+/// NOTE: This reflects the **nameservice state at lookup time**, not deletion success.
+/// Deletion success is reported via `artifacts_deleted` and `warnings` fields
+/// in `DropReport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DropStatus {
+    /// Record existed and was not retracted at lookup time
+    Dropped,
+    /// Record was already marked as retracted
+    AlreadyRetracted,
+    /// No record found for this ledger_id or graph_source_id
+    #[default]
+    NotFound,
+}
+
+// =============================================================================
+// Drop Report Types
+// =============================================================================
+
+/// Report of what was deleted/retracted for a ledger.
+///
+/// `drop_ledger` operates on the **whole ledger** (every branch under a
+/// ledger name). `artifacts_deleted` is the sum across all branches plus
+/// the cross-branch `@shared/dicts/` cleanup; `branch_reports` carries the
+/// per-branch detail so partial failures can be inspected.
+#[derive(Debug, Clone, Default)]
+pub struct DropReport {
+    /// The ledger name that was dropped (e.g. `"mydb"`, without `:branch`).
+    pub ledger_id: String,
+    /// Aggregate status across branches:
+    /// - `Dropped` if at least one branch was dropped or already retracted
+    /// - `AlreadyRetracted` if every branch was already retracted
+    /// - `NotFound` if no branches exist (or never existed)
+    pub status: DropStatus,
+    /// Number of storage artifacts deleted (Hard mode only), summed across
+    /// every branch + the `@shared/dicts/` namespace.
+    ///
+    /// Includes commits, transactions, index roots, leaves, branches, dicts,
+    /// garbage records, config, and context blobs.
+    pub artifacts_deleted: usize,
+    /// Per-branch reports. One entry per branch we attempted to drop, in
+    /// leaf-first order. Empty when the ledger had no branches.
+    pub branch_reports: Vec<BranchDropReport>,
+    /// Any non-fatal errors or warnings encountered during the operation.
+    /// Branch-scoped warnings are also surfaced inside `branch_reports`;
+    /// top-level warnings cover whole-ledger steps (shared cleanup,
+    /// branch enumeration, etc.).
+    pub warnings: Vec<String>,
+}
+
+/// Report of what was deleted/retracted for a graph source
+#[derive(Debug, Clone, Default)]
+pub struct GraphSourceDropReport {
+    /// Name of the graph source
+    pub name: String,
+    /// Branch of the graph source
+    pub branch: String,
+    /// Status based on nameservice state at lookup time
+    pub status: DropStatus,
+    /// Number of files deleted (Hard mode only)
+    pub files_deleted: usize,
+    /// Any non-fatal errors or warnings encountered during the operation
+    pub warnings: Vec<String>,
+}
+
+/// Report of a `drop_named_graph` call: SPARQL `DROP GRAPH`.
+///
+/// The drop commits at `t = current + 1` and retracts nothing: the graph and
+/// what it held stop being queryable, at the head and as of any earlier `t`,
+/// while the commits that wrote it keep it. The graph no longer exists until
+/// something writes to it again. A graph that does not exist, the dropped one
+/// included, returns `ApiError::NotFound` instead of producing a report.
+#[derive(Debug, Clone, Default)]
+pub struct DropNamedGraphReport {
+    /// Full `ledger:branch` identifier the drop targeted.
+    pub ledger_id: String,
+    /// Graph IRI that was dropped (echoed for clarity).
+    pub graph_iri: String,
+    /// Always `0`: a drop retracts nothing. Kept for clients of the
+    /// retracting drop, which read it.
+    pub retracted: usize,
+    /// Whether a new commit was created: always, on success.
+    pub committed: bool,
+    /// Commit `t` of the drop.
+    pub t: i64,
+    /// The drop commit's id.
+    pub commit_id: Option<ContentId>,
+}
+
+/// Options for [`Fluree::sync_named_graph`].
+#[derive(Debug, Clone, Default)]
+pub struct SyncGraphOpts {
+    /// Compute the delta and report counts without committing anything.
+    pub dry_run: bool,
+    /// Allow an explicitly empty payload (`"@graph": []`), which clears the
+    /// graph. Off by default so a truncated or accidentally-empty export
+    /// cannot silently wipe the graph.
+    pub allow_empty: bool,
+    /// Recorded as the commit's `f:message`.
+    pub message: Option<String>,
+}
+
+/// Report of a [`Fluree::sync_named_graph`] call.
+///
+/// Graph sync is **transactional and history-preserving**: it produces one
+/// normal commit containing exactly the delta between the graph's current
+/// contents and the payload (`current − payload` retracted, `payload −
+/// current` asserted; unchanged facts produce no flakes). An identical
+/// payload produces no commit (`committed = false`).
+#[derive(Debug, Clone, Default)]
+pub struct SyncGraphReport {
+    /// Full `ledger:branch` identifier the sync targeted.
+    pub ledger_id: String,
+    /// Graph IRI that was synchronized (echoed for clarity); `None` for the
+    /// default graph.
+    pub graph_iri: Option<String>,
+    /// Flakes asserted by the delta (`payload − current`).
+    pub asserted: usize,
+    /// Flakes retracted by the delta (`current − payload`).
+    pub retracted: usize,
+    /// Whether a new commit was created. `false` when the payload matched
+    /// the graph exactly, and always `false` for a dry run.
+    pub committed: bool,
+    /// The new commit, when `committed`.
+    pub commit_id: Option<fluree_db_core::ContentId>,
+    /// Whether this was a dry run (staged and counted, nothing committed).
+    pub dry_run: bool,
+    /// Current commit `t` for the branch after the call. Equal to the
+    /// pre-sync `t` when nothing was committed.
+    pub t: i64,
+}
+
+/// Report of a branch drop operation
+#[derive(Debug, Clone, Default)]
+pub struct BranchDropReport {
+    /// The normalized ledger ID of the dropped branch
+    pub ledger_id: String,
+    /// Status based on nameservice state at lookup time
+    pub status: DropStatus,
+    /// Whether the branch was deferred (retracted but storage preserved for children)
+    pub deferred: bool,
+    /// Number of storage artifacts deleted
+    pub artifacts_deleted: usize,
+    /// Ledger IDs of ancestor branches that were cascade-dropped
+    pub cascaded: Vec<String>,
+    /// Any non-fatal errors or warnings encountered
+    pub warnings: Vec<String>,
+}
+
+// =============================================================================
+// Index Maintenance Types
+// =============================================================================
+
+/// Options for trigger_index operation
+#[derive(Debug, Clone, Default)]
+pub struct TriggerIndexOptions {
+    /// Optional wait timeout in milliseconds.
+    ///
+    /// If `None`, `trigger_index()` waits until indexing completes.
+    pub timeout_ms: Option<u64>,
+}
+
+impl TriggerIndexOptions {
+    /// Set the timeout in milliseconds
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+}
+
+/// Options for reindex operation
+#[derive(Debug, Clone, Default)]
+pub struct ReindexOptions {
+    /// Indexer configuration (leaf/branch sizes, GC settings)
+    /// If not specified, uses IndexerConfig::default()
+    pub indexer_config: Option<fluree_db_indexer::IndexerConfig>,
+}
+
+impl ReindexOptions {
+    /// Set the indexer configuration for controlling output index structure
+    ///
+    /// Controls leaf/branch node sizes in the resulting index.
+    pub fn with_indexer_config(mut self, config: fluree_db_indexer::IndexerConfig) -> Self {
+        self.indexer_config = Some(config);
+        self
+    }
+}
+
+/// Result of trigger_index operation
+#[derive(Debug, Clone)]
+pub struct TriggerIndexResult {
+    /// Ledger ID
+    pub ledger_id: String,
+    /// Transaction time the index was built to
+    pub index_t: i64,
+    /// Content identifier of the index root (when available)
+    pub root_id: Option<fluree_db_core::ContentId>,
+    /// Total fuel charged for the build that satisfied this trigger. The
+    /// background orchestrator always measures with a per-build tracker, so
+    /// this is normally `Some(N)` (or `Some(0.0)` when the requested t was
+    /// already indexed and no work was needed). Coalesced trigger callers
+    /// all receive the fuel of the single build that satisfied them.
+    pub fuel: Option<f64>,
+}
+
+/// Result of reindex operation
+#[derive(Debug, Clone)]
+pub struct ReindexResult {
+    /// Ledger ID
+    pub ledger_id: String,
+    /// Transaction time the index was built to
+    pub index_t: i64,
+    /// Content identifier of the index root
+    pub root_id: fluree_db_core::ContentId,
+    /// Build statistics
+    pub stats: fluree_db_indexer::IndexStats,
+    /// Total fuel charged for this reindex (decimal). `None` only if fuel
+    /// tracking was disabled at the caller; `/reindex` always populates it.
+    pub fuel: Option<f64>,
+}
+
+/// Result of index_status query
+#[derive(Debug, Clone)]
+pub struct IndexStatusResult {
+    /// Ledger ID
+    pub ledger_id: String,
+    /// Current index transaction time (from nameservice)
+    pub index_t: i64,
+    /// Current commit transaction time (from nameservice)
+    pub commit_t: i64,
+    /// Whether background indexing is enabled
+    pub indexing_enabled: bool,
+    /// Current indexing phase (Idle/Pending/InProgress)
+    pub phase: fluree_db_indexer::IndexPhase,
+    /// Pending minimum t (if work is queued)
+    pub pending_min_t: Option<i64>,
+    /// Last error message (if any)
+    pub last_error: Option<String>,
+    /// The last build stopped on committed data it cannot index, so commits
+    /// start no build until an explicit index request
+    /// ([`crate::Fluree::trigger_index`]), a reindex, dropping the ledger, a
+    /// restart, or (where catch-up sweeps run) a newer index from another
+    /// process; `last_error` says why. See
+    /// [`fluree_db_indexer::IndexStatusSnapshot::halted`].
+    pub halted: bool,
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Validate that `value` is an absolute IRI suitable for admin lookup.
+///
+/// This is intentionally a minimal check, not a full RFC 3987 parser. It
+/// enforces only the properties the admin path actually needs:
+///
+/// - No leading/trailing whitespace, and no whitespace anywhere in the
+///   value (preserves caller-exact identity in error messages).
+/// - None of the characters RFC 3987 excludes from an IRI
+///   (`<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, `` ` ``).
+/// - A valid `<scheme>:<rest>` head per RFC 3986 §3.1: `scheme` starts
+///   with ALPHA and contains only ALPHA / DIGIT / `+` / `-` / `.`,
+///   `rest` is non-empty.
+///
+/// Returns the error message to surface as `400` on failure.
+/// A named sync target must be an absolute IRI and not one of the ledger's
+/// system graphs (staging re-checks by g_id).
+fn validate_sync_graph_iri(graph_iri: &str, ledger_id: &str) -> std::result::Result<(), String> {
+    use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+    if graph_iri.is_empty() {
+        return Err("graph IRI is required; sync targets exactly one named graph".to_string());
+    }
+    validate_absolute_iri(graph_iri)?;
+    if graph_iri == txn_meta_graph_iri(ledger_id) {
+        return Err(format!(
+            "Cannot sync the txn-meta system graph '{graph_iri}'"
+        ));
+    }
+    if graph_iri == config_graph_iri(ledger_id) {
+        return Err(format!("Cannot sync the config system graph '{graph_iri}'"));
+    }
+    Ok(())
+}
+
+fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("graph IRI is required and cannot be empty".to_string());
+    }
+    // RFC 3987 excludes whitespace, C0 controls (`U+0000..=U+001F`), DEL
+    // (`U+007F`), and the bracket/quote characters below. The C0 check is
+    // important because callers can otherwise sneak a `U+0000` past
+    // `is_whitespace` and have it surface as a SPARQL parse 500 instead
+    // of the documented 400.
+    if value.chars().any(|c| {
+        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+            || c.is_whitespace()
+            || c <= '\u{20}'
+            || c == '\u{7F}'
+    }) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': contains whitespace, a control character, \
+             or a character not allowed in an IRI \
+             (one of `<`, `>`, `\"`, `{{`, `}}`, `|`, `\\`, `^`, `` ` ``)"
+        ));
+    }
+    // `<scheme>:<rest>` per RFC 3986 §3.1.
+    let (scheme, rest) = value.split_once(':').ok_or_else(|| {
+        format!("Invalid graph IRI '{value}': missing scheme (expected an absolute IRI like 'urn:...' or 'http://...')")
+    })?;
+    let mut sc = scheme.chars();
+    let first = sc
+        .next()
+        .ok_or_else(|| format!("Invalid graph IRI '{value}': scheme is empty"))?;
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme must start with an ASCII letter"
+        ));
+    }
+    if !sc.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme contains a character outside ALPHA / DIGIT / '+' / '-' / '.'"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme is followed by an empty body"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_absolute_iri_tests {
+    use super::validate_absolute_iri;
+
+    #[test]
+    fn accepts_typical_iris() {
+        assert!(validate_absolute_iri("http://example.org/g").is_ok());
+        assert!(validate_absolute_iri("https://example.org/path?x=1").is_ok());
+        assert!(validate_absolute_iri("urn:example:org/payroll").is_ok());
+        assert!(validate_absolute_iri("urn:fluree:mydb:main#config").is_ok());
+        assert!(validate_absolute_iri("ftp://example.org").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_absolute_iri("").is_err());
+    }
+
+    #[test]
+    fn rejects_relative_iri() {
+        assert!(validate_absolute_iri("payroll").is_err());
+        assert!(validate_absolute_iri("/absolute/path").is_err());
+        assert!(validate_absolute_iri("ex:").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        assert!(validate_absolute_iri(" http://example.org").is_err());
+        assert!(validate_absolute_iri("http://example.org ").is_err());
+        assert!(validate_absolute_iri("http://example.org/with space").is_err());
+        assert!(validate_absolute_iri("http://example.org\n").is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_iri_characters() {
+        for bad in ['<', '>', '"', '{', '}', '|', '\\', '^', '`'] {
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{bad}")).is_err(),
+                "should reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_c0_and_del_controls() {
+        for cp in [0u32, 0x01, 0x09, 0x0A, 0x0D, 0x1F, 0x7F] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{c}")).is_err(),
+                "should reject control U+{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_scheme() {
+        assert!(validate_absolute_iri("1http://example.org").is_err());
+        assert!(validate_absolute_iri("ht_tp://example.org").is_err());
+        assert!(validate_absolute_iri(":nopath").is_err());
+    }
+}
+
+/// Parse the input to an operation that acts on a whole ledger.
+///
+/// Accepted forms:
+/// - `"mydb"`: names the whole ledger. Returns `"mydb"`.
+/// - Any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) is rejected
+///   with `ApiError::Http(400)`. `:main` is not special: a caller passing
+///   the suffix likely expected branch-level semantics, and silently
+///   widening that to every branch is the surprise worth refusing.
+///
+/// `operation` selects the rejection message, so each caller explains what
+/// *it* offers instead — see [`WholeLedgerOperation`].
+fn parse_whole_ledger_input(input: &str, operation: WholeLedgerOperation) -> Result<LedgerName> {
+    let bad_input = |msg: String| ApiError::Http {
+        status: 400,
+        message: msg,
+    };
+
+    if !input.contains(':') {
+        return LedgerName::parse(input)
+            .map_err(|e| bad_input(format!("Invalid ledger name '{input}': {e}")));
+    }
+
+    let id = LedgerId::parse(input)
+        .map_err(|e| bad_input(format!("Invalid ledger id '{input}': {e}")))?;
+
+    // No branch suffix is accepted — including the default-name suffix —
+    // so callers can't be surprised by `drop_ledger("mydb:main")` quietly
+    // removing every other branch alongside main.
+    Err(bad_input(
+        operation.branch_suffix_message(id.name(), id.branch()),
+    ))
+}
+
+/// An operation that acts on a whole ledger and so refuses a branch suffix.
+///
+/// Named rather than a bare string so each operation's rejection tells the
+/// caller what *that* operation offers — pointing a `sweep` caller at
+/// `drop_branch` would be worse than unhelpful on a destructive surface.
+#[derive(Clone, Copy)]
+enum WholeLedgerOperation {
+    Drop,
+    Sweep,
+}
+
+impl WholeLedgerOperation {
+    fn branch_suffix_message(self, name: &str, branch: &str) -> String {
+        match self {
+            Self::Drop => format!(
+                "drop_ledger drops the whole ledger and does not accept a branch suffix \
+                 '{branch}'. Pass \"{name}\" to drop the whole ledger, or use \
+                 drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
+            ),
+            Self::Sweep => format!(
+                "a sweep covers every branch of a ledger and does not accept a branch \
+                 suffix '{branch}' — dictionary blobs are shared across branches, so \
+                 reclaiming them is only safe with all of them accounted for. Pass \
+                 \"{name}\" to sweep the whole ledger."
+            ),
+        }
+    }
+}
+
+/// Sort branches so children come before their parents (leaf-first).
+///
+/// Used by `drop_ledger` so that if the operation aborts mid-way the
+/// surviving state is consistent: a parent may end up orphaned of
+/// children, but a child never points at a missing parent. Branches
+/// whose `source_branch` doesn't resolve to a record in `records`
+/// (orphan branches, broken pointers) are placed after their named
+/// peers — they'll be dropped after siblings, before genuine roots.
+fn sort_leaf_first(records: &mut [NsRecord]) {
+    use std::collections::{HashMap, HashSet};
+
+    // Map branch name → index. Then count descendants under each name.
+    let by_branch: HashMap<String, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.branch.clone(), i))
+        .collect();
+
+    // For each record, count how many other records are descended from it
+    // (so true leaves get 0; the root gets the largest count).
+    let mut descendants: HashMap<usize, usize> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        let mut walker = r.source_branch.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(r.branch.clone());
+        while let Some(parent) = walker {
+            if !seen.insert(parent.clone()) {
+                break; // cycle guard
+            }
+            if let Some(&pi) = by_branch.get(&parent) {
+                *descendants.entry(pi).or_insert(0) += 1;
+                walker = records[pi].source_branch.clone();
+            } else {
+                break;
+            }
+        }
+        descendants.entry(i).or_insert(0);
+    }
+
+    records.sort_by(|a, b| {
+        let ai = by_branch[&a.branch];
+        let bi = by_branch[&b.branch];
+        descendants[&ai]
+            .cmp(&descendants[&bi])
+            .then_with(|| a.branch.cmp(&b.branch))
+    });
+}
+
+// =============================================================================
+// Fluree Drop Implementation
+// =============================================================================
+
+impl crate::Fluree {
+    /// Drop an entire ledger — every branch under the supplied name, plus
+    /// the cross-branch `@shared/dicts/` namespace in hard mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `ledger_id` - Ledger name. See **Input forms** below for accepted shapes.
+    /// * `mode` - `Soft` (retract only) or `Hard` (retract + delete artifacts).
+    ///
+    /// # Operation
+    ///
+    /// 1. Parses the input (rejects non-default branch suffixes).
+    /// 2. Snapshots every NsRecord under the ledger name via `all_records`
+    ///    (includes retracted-but-not-purged branches). Enumeration failures
+    ///    propagate as `Err`. If no records exist, returns `NotFound` without
+    ///    touching storage — no orphan-cleanup path is built in.
+    /// 3. Sorts branches leaf-first via `source_branch` pointers so partial
+    ///    failures leave orphan parents, never dangling children.
+    /// 4. Cancels and waits for pending background indexing on each branch.
+    /// 5. For each branch (leaf-first): deletes per-branch artifacts (hard
+    ///    mode) and retracts (soft) or drops the NS record (hard) using the
+    ///    parent-aware path so surviving parents have accurate child counts.
+    /// 6. Hard mode: wipes `{ledger_name}/@shared/dicts/` after every branch
+    ///    is gone.
+    /// 7. Disconnects each branch from the ledger cache.
+    ///
+    /// # Input forms
+    ///
+    /// - `"mydb"` → drop the whole `mydb` ledger.
+    /// - `"mydb:<any-branch>"` (including `"mydb:main"`) → rejected with a
+    ///   `400`. `:main` carries no special meaning, so the caller probably
+    ///   meant `drop_branch("mydb", "<branch>")` if they passed a suffix.
+    ///
+    /// # Safety
+    ///
+    /// - `Soft` mode is reversible (data remains, only nameservice retracted).
+    /// - `Hard` mode is **IRREVERSIBLE** — artifacts are permanently deleted.
+    ///
+    /// # Idempotency
+    ///
+    /// Safe to call multiple times:
+    /// - Returns `AlreadyRetracted` when every branch was already retracted.
+    /// - Returns `NotFound` (without storage action) when no NsRecords exist
+    ///   under the ledger name. Truly orphaned storage with no NsRecord
+    ///   pointer is **not** cleaned up here; that's a separate admin
+    ///   concern.
+    /// - On a real per-branch nameservice failure, returns `ApiError::Drop`
+    ///   without touching parents or `@shared/dicts/`. Retry is safe — each
+    ///   step is idempotent under partial prior progress.
+    ///
+    /// # External Indexers
+    ///
+    /// This only stops the in-process background worker. External indexers
+    /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
+    /// and before publishing to prevent recreating files after drop.
+    pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
+        let ledger_name = parse_whole_ledger_input(ledger_id, WholeLedgerOperation::Drop)?;
+        info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
+
+        let mut report = DropReport {
+            ledger_id: ledger_name.to_string(),
+            ..Default::default()
+        };
+
+        // 1. Snapshot every record under this ledger name, retracted ones
+        // included, so hard-drop cleans up retracted-but-not-purged branches
+        // too. `all_records` rather than `branch_records`: the nested-ledger
+        // check needs the whole listing anyway. Keep the snapshots in
+        // memory — the CID-walk fallback needs them after the records are
+        // purged from the nameservice.
+        // Enumeration failures propagate as errors: silently coercing them
+        // to `NotFound` would let the HTTP route fall through to the
+        // drop_graph_source path, potentially deleting an unrelated graph
+        // source with the same name.
+        let all = self.nameservice().all_records().await?;
+        let nested = nested_ledgers(&all, &ledger_name);
+        let mut branches: Vec<NsRecord> = all
+            .into_iter()
+            .filter(|r| r.ledger_id.name() == ledger_name.as_str())
+            .collect();
+
+        if branches.is_empty() {
+            report.status = DropStatus::NotFound;
+            info!(ledger_name = %ledger_name, "No branches found for ledger");
+            return Ok(report);
+        }
+
+        // Aggregate status: AlreadyRetracted iff every branch was already
+        // retracted; otherwise Dropped (matches per-branch semantics).
+        report.status = if branches.iter().all(|r| r.retracted) {
+            DropStatus::AlreadyRetracted
+        } else {
+            DropStatus::Dropped
+        };
+
+        // 2. Order branches leaf-first. A branch can appear after its parent
+        // in `all_records`; sort so children always come before the branches
+        // they point at via `source_branch`.
+        sort_leaf_first(&mut branches);
+
+        // 3. Stop indexing across all branches before touching storage. This
+        // also blocks any in-flight writes from publishing artifacts after
+        // we've started deleting.
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            for branch in &branches {
+                info!(ledger_id = %branch.ledger_id, "Cancelling pending indexing");
+                handle.cancel(&branch.ledger_id).await;
+                handle.wait_for_idle(&branch.ledger_id).await;
+            }
+        }
+
+        // 4. Drop each branch (artifacts + nameservice). `@shared/dicts/` is
+        // intentionally NOT wiped here — it lives at the ledger level and
+        // gets cleaned in the next step, once every branch is gone.
+        // Soft mode uses `LedgerLifecycle::retract`; hard mode uses
+        // `BranchLifecycle::drop_branch` so the parent's child count is
+        // decremented atomically — both surfaces are available on
+        // ReadWrite and Replicated nameservices.
+        let ledger_admin = self.ledger_admin()?;
+        let branch_admin = self.branch_admin()?;
+        for branch in &branches {
+            let mut br = BranchDropReport {
+                ledger_id: branch.ledger_id.to_string(),
+                status: if branch.retracted {
+                    DropStatus::AlreadyRetracted
+                } else {
+                    DropStatus::Dropped
+                },
+                ..Default::default()
+            };
+
+            if matches!(mode, DropMode::Hard) {
+                let (count, warnings) = self
+                    .drop_artifacts(&branch.ledger_id, Some(branch), &nested)
+                    .await;
+                br.artifacts_deleted += count;
+                br.warnings.extend(warnings);
+            }
+
+            // Hard mode uses `AdminPublisher::drop_branch` rather than
+            // `Publisher::purge` so the parent's `branches` count is
+            // decremented atomically with the row sweep. If we abort
+            // partway through a whole-ledger drop, surviving parent
+            // records still have an accurate child count rather than a
+            // stale one. Soft mode just retracts.
+            let ns_result = if matches!(mode, DropMode::Hard) {
+                branch_admin
+                    .drop_branch(&branch.ledger_id)
+                    .await
+                    .map(|_| ())
+                    .or_else(|e| {
+                        // Race: another caller already removed the meta
+                        // row. Treat as success — the row sweep inside
+                        // drop_branch ran regardless, and the other
+                        // caller already handled the parent decrement.
+                        if matches!(e, fluree_db_nameservice::NameServiceError::NotFound(_)) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })
+            } else {
+                ledger_admin.retract(&branch.ledger_id).await
+            };
+            // Cache disconnect runs unconditionally — the artifact deletion
+            // and any nameservice mutation already happened above, so even
+            // on a failure-about-to-bail-out we want stale state evicted.
+            if let Some(mgr) = &self.ledger_manager {
+                mgr.disconnect(&branch.ledger_id).await;
+            }
+
+            if let Err(e) = ns_result {
+                // Real nameservice failure (already filtered out the
+                // NotFound race-as-success). Continuing would risk
+                // purging parents while children still point at them.
+                // Bail with an error; the per-branch reports for what
+                // succeeded survive in tracing logs. Idempotent retry
+                // is safe because each step (artifact deletion, NS
+                // mutation, cache disconnect) tolerates partial prior
+                // progress.
+                let msg = format!("Nameservice retract/drop: {e}");
+                warn!(ledger_id = %branch.ledger_id, error = %e, "Aborting drop_ledger on nameservice failure");
+                br.warnings.push(msg.clone());
+                report.artifacts_deleted += br.artifacts_deleted;
+                report.warnings.extend(br.warnings.iter().cloned());
+                report.branch_reports.push(br);
+                return Err(ApiError::Drop(format!(
+                    "Failed to drop branch '{}' of ledger '{}': {e}. \
+                     Stopped before touching parent branches or @shared/dicts. \
+                     Retry is safe.",
+                    branch.ledger_id, ledger_name
+                )));
+            }
+
+            report.artifacts_deleted += br.artifacts_deleted;
+            report.warnings.extend(br.warnings.iter().cloned());
+            report.branch_reports.push(br);
+        }
+
+        // 5. Hard drop only: wipe the cross-branch `@shared/dicts/` namespace.
+        // Safe at this point because every branch under this ledger name has
+        // been dropped, so nothing left to reference shared dicts.
+        if matches!(mode, DropMode::Hard) {
+            let (count, warnings) = self.drop_shared_artifacts(&ledger_name).await;
+            report.artifacts_deleted += count;
+            report.warnings.extend(warnings);
+        }
+
+        info!(
+            ledger_name = %ledger_name,
+            branches = report.branch_reports.len(),
+            artifacts_deleted = report.artifacts_deleted,
+            "Ledger dropped"
+        );
+        Ok(report)
+    }
+
+    /// Drop a branch
+    ///
+    /// This operation:
+    /// 1. Refuses to drop the **root** branch (any branch whose
+    ///    `source_branch` is `None`) — use [`drop_ledger`](Self::drop_ledger)
+    ///    to remove the whole ledger including its root.
+    /// 2. If the branch has children (`branches > 0`): retracts (soft-delete),
+    ///    preserving storage for children, reports as deferred.
+    /// 3. If the branch is a leaf (`branches == 0`): cancels indexing, deletes
+    ///    all storage artifacts, purges from nameservice, and cascades upward
+    ///    to any retracted ancestors that now have zero children.
+    ///
+    /// "main" carries no special meaning here — it's just the default branch
+    /// name when none is supplied. A ledger created with a different initial
+    /// branch (e.g. `mydb:trunk`) has that branch as its root and is the one
+    /// `drop_branch` will refuse.
+    ///
+    /// # Errors
+    /// - `ApiError::NotFound` if the branch does not exist
+    /// - `ApiError::Http(400)` if attempting to drop the root
+    pub async fn drop_branch(&self, ledger_name: &str, branch: &str) -> Result<BranchDropReport> {
+        let ledger_id = LedgerId::from_parts(ledger_name, branch)?;
+        info!(ledger_id = %ledger_id, "Dropping branch");
+
+        let mut report = BranchDropReport {
+            ledger_id: ledger_id.to_string(),
+            ..Default::default()
+        };
+
+        // Look up the record first — the root check is record-based, not
+        // name-based, so we have to load before we can validate.
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Branch not found: {ledger_id}")))?;
+
+        if record.source_branch.is_none() {
+            return Err(ApiError::Http {
+                status: 400,
+                message: format!(
+                    "Cannot drop '{branch}': it is the root of ledger '{ledger_name}'. \
+                     Use drop_ledger to remove the whole ledger."
+                ),
+            });
+        }
+
+        if record.retracted {
+            report.status = DropStatus::AlreadyRetracted;
+            return Ok(report);
+        }
+
+        report.status = DropStatus::Dropped;
+
+        if record.branches > 0 {
+            // Has children — retract but preserve storage
+            self.ledger_admin()?.retract(&ledger_id).await?;
+            report.deferred = true;
+
+            // Disconnect from cache
+            if let Some(mgr) = &self.ledger_manager {
+                mgr.disconnect(&ledger_id).await;
+            }
+
+            info!(
+                ledger_id = %ledger_id,
+                children = record.branches,
+                "Branch retracted (deferred — has children)"
+            );
+            return Ok(report);
+        }
+
+        // Leaf branch — full drop
+        let parent_new_count = self
+            .purge_branch(&ledger_id, Some(&record), &mut report)
+            .await?;
+
+        // Cascade upward if parent is retracted with zero children
+        if let (Some(0), Some(source)) = (parent_new_count, &record.source_branch) {
+            let parent_id = LedgerId::from_parts(ledger_name, source)?;
+            self.try_cascade_drop(ledger_name, &parent_id, &mut report)
+                .await;
+        }
+
+        info!(
+            ledger_id = %ledger_id,
+            artifacts_deleted = report.artifacts_deleted,
+            cascaded = ?report.cascaded,
+            "Branch dropped"
+        );
+        Ok(report)
+    }
+
+    /// Drop a named graph from a single branch: SPARQL `DROP GRAPH <iri>`.
+    ///
+    /// One commit at `t = current_t + 1` records the drop and retracts
+    /// nothing. The graph and its history stop being queryable — a query
+    /// `as-of` an earlier `t` naming it is refused — while the commits that
+    /// wrote it keep it, so a branch from before the drop still has it. The
+    /// graph no longer exists until something writes to it again, under the
+    /// same IRI.
+    ///
+    /// # Arguments
+    ///
+    /// * `ledger_id` - Full ledger identifier (`"mydb"` is normalized to
+    ///   `"mydb:main"`). The drop only affects the targeted branch.
+    /// * `graph_iri` - Full IRI of the named graph to drop (matched exactly
+    ///   against the ledger's graph registry).
+    ///
+    /// # Restrictions
+    ///
+    /// The following graph identifiers are **always** rejected with
+    /// `ApiError::Http(400)`:
+    /// - The default graph (`graph_iri` is empty or refers to g_id 0).
+    /// - The system `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`,
+    ///   g_id 1).
+    /// - The system `config` graph (`urn:fluree:{ledger_id}#config`, g_id 2).
+    ///
+    /// A graph that does not exist — not registered in the ledger's graph
+    /// registry, or dropped and not written since — returns
+    /// `ApiError::NotFound`.
+    ///
+    /// # Behavior
+    ///
+    /// 1. Normalizes the ledger id (`":main"` default).
+    /// 2. Resolves `graph_iri` against the snapshot's `GraphRegistry`.
+    /// 3. Stages [`fluree_db_transact::Txn::drop_graph`] and commits it. The
+    ///    drop reads none of the graph's facts, so its cost does not depend
+    ///    on the graph's size.
+    ///
+    /// # Errors
+    ///
+    /// - `ApiError::Http(400)` — `graph_iri` is empty, malformed, or names a
+    ///   protected system graph.
+    /// - `ApiError::NotFound` — the ledger does not exist, or the graph does
+    ///   not.
+    pub async fn drop_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> Result<DropNamedGraphReport> {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+            TXN_META_GRAPH_ID,
+        };
+
+        let bad_request = |msg: String| ApiError::Http {
+            status: 400,
+            message: msg,
+        };
+
+        if graph_iri.is_empty() {
+            return Err(bad_request(
+                "graph IRI is required and cannot drop the default graph".to_string(),
+            ));
+        }
+        // The CLI / HTTP contract is "full graph IRI". We enforce that
+        // exactly here so an accidentally trimmed value or a relative
+        // reference that happens to match a registry entry can't slip
+        // through. `validate_absolute_iri` rejects whitespace, the
+        // characters RFC 3987 excludes from an IRI, and any value
+        // lacking a proper `<scheme>:<rest>` head.
+        validate_absolute_iri(graph_iri).map_err(bad_request)?;
+
+        let ledger_id = LedgerId::parse(ledger_id)?;
+
+        // Reject system graphs purely by IRI shape — this catches the case
+        // even on ledgers whose registry was seeded permissively without
+        // the config graph (legacy roots).
+        if graph_iri == txn_meta_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the txn-meta system graph '{graph_iri}'"
+            )));
+        }
+        if graph_iri == config_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the config system graph '{graph_iri}'"
+            )));
+        }
+
+        info!(ledger_id = %ledger_id, graph_iri = %graph_iri, "Dropping named graph");
+
+        let handle = self.ledger_cached(&ledger_id).await?;
+        let view = handle.snapshot().await;
+        let snapshot = &view.snapshot;
+
+        let g_id = snapshot
+            .graph_registry
+            .assigned_graph_id(graph_iri)
+            .filter(|g_id| !snapshot.graph_registry.is_dropped(*g_id))
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "Named graph '{graph_iri}' does not exist in ledger '{ledger_id}'"
+                ))
+            })?;
+
+        // Belt-and-suspenders: a registry built from a non-standard root could
+        // theoretically map a user-supplied IRI to a system slot. Refuse it.
+        if matches!(g_id, DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
+            return Err(bad_request(format!(
+                "Cannot drop system graph '{graph_iri}' (g_id={g_id})"
+            )));
+        }
+
+        drop(view);
+
+        let txn = fluree_db_transact::Txn::drop_graph(graph_iri);
+        let result = self.stage(&handle).txn(txn).execute().await?;
+
+        info!(
+            ledger_id = %ledger_id,
+            graph_iri = %graph_iri,
+            t = result.receipt.t,
+            "Named graph dropped",
+        );
+
+        Ok(DropNamedGraphReport {
+            ledger_id: ledger_id.to_string(),
+            graph_iri: graph_iri.to_string(),
+            retracted: 0,
+            committed: true,
+            t: result.receipt.t,
+            commit_id: Some(result.receipt.commit_id),
+        })
+    }
+
+    /// Synchronize a named graph's contents with `data`, committing only the
+    /// delta (see [`SyncGraphReport`]).
+    ///
+    /// `data` is an insert-shaped JSON-LD document describing the graph's
+    /// DESIRED full contents. Staging retracts `current − payload` and
+    /// asserts `payload − current`; unchanged facts produce no flakes, so an
+    /// identical payload reports `committed = false` without creating a
+    /// commit. The scope is exactly the named graph — the payload may not
+    /// address named graphs itself, and reserved system graphs are rejected.
+    /// [`Self::sync_graph_with`] also syncs the default graph.
+    ///
+    /// Like `CLEAR`/`COPY`/`MOVE` (and unlike DELETE-WHERE), the
+    /// current-contents scan is not view-policy filtered: sync is an
+    /// authoritative whole-graph replacement, and a view-filtered scan would
+    /// leave rows the caller cannot see in place. Modify-policy is still
+    /// enforced on the resulting delta.
+    pub async fn sync_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        data: &serde_json::Value,
+        opts: SyncGraphOpts,
+    ) -> Result<SyncGraphReport> {
+        self.sync_named_graph_with(
+            ledger_id,
+            graph_iri,
+            data,
+            opts,
+            fluree_db_transact::TxnOpts::default(),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::sync_named_graph`] with explicit transaction options and an
+    /// optional policy context — the form the HTTP layer uses so a dry run
+    /// stages under exactly the policy / inline-constraint inputs the real
+    /// (consensus-submitted) run will, and therefore reports the same delta
+    /// or fails the same way. `policy: None` runs as root.
+    pub async fn sync_named_graph_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        data: &serde_json::Value,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        let graph = GraphSel::Graph(graph_iri.to_string());
+        let payload = GraphPayload::JsonLd(data);
+        self.sync_graph_with(ledger_id, &graph, payload, opts, txn_opts, policy)
+            .await
+    }
+
+    /// [`Self::sync_named_graph_with`] for Turtle, N-Triples or TriG text
+    /// (see [`GraphPayload::Rdf`] for how a TriG body names the graph).
+    pub async fn sync_named_graph_rdf_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        text: &str,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        let graph = GraphSel::Graph(graph_iri.to_string());
+        let payload = GraphPayload::Rdf(text);
+        self.sync_graph_with(ledger_id, &graph, payload, opts, txn_opts, policy)
+            .await
+    }
+
+    /// Synchronize `graph`, the default graph or one named graph, with
+    /// `payload` (see [`Self::sync_named_graph`]). The general form the other
+    /// sync entry points delegate to.
+    pub async fn sync_graph_with(
+        &self,
+        ledger_id: &str,
+        graph: &GraphSel,
+        payload: GraphPayload<'_>,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        let bad_request = |msg: String| ApiError::Http {
+            status: 400,
+            message: msg,
+        };
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        let graph_iri = match graph {
+            GraphSel::Default => None,
+            GraphSel::Graph(iri) => {
+                validate_sync_graph_iri(iri, &ledger_id).map_err(bad_request)?;
+                Some(iri.clone())
+            }
+        };
+        let graph_label = graph_iri.as_deref().unwrap_or("default graph");
+
+        // An explicitly empty payload clears the graph — require the
+        // explicit opt-in so a truncated export cannot wipe it silently.
+        // Staging makes the same check for an RDF payload once parsed.
+        if payload.is_explicitly_empty_jsonld() && !opts.allow_empty {
+            return Err(bad_request(
+                "sync payload is empty; this would clear the graph — set allowEmpty to confirm"
+                    .to_string(),
+            ));
+        }
+
+        info!(ledger_id = %ledger_id, graph = graph_label, dry_run = opts.dry_run, "Syncing graph");
+
+        let handle = self.ledger_cached(&ledger_id).await?;
+        let pre_t = handle.t().await;
+
+        if opts.dry_run {
+            let snap = handle.snapshot().await;
+            let ledger_state = snap.to_ledger_state();
+            // Report the `t` of the state the delta was actually computed
+            // against, not a separately-read head.
+            let staged_against_t = ledger_state.t();
+            let stage_result = self
+                .stage_sync_transaction_tracked(
+                    ledger_state,
+                    graph,
+                    payload,
+                    opts.allow_empty,
+                    txn_opts,
+                    None,
+                    None,
+                    policy.as_ref(),
+                )
+                .await?;
+            let flakes = stage_result.view.staged_flakes();
+            let asserted = flakes.iter().filter(|f| f.op).count();
+            let retracted = flakes.len() - asserted;
+            return Ok(SyncGraphReport {
+                ledger_id: ledger_id.to_string(),
+                graph_iri,
+                asserted,
+                retracted,
+                committed: false,
+                commit_id: None,
+                dry_run: true,
+                t: staged_against_t,
+            });
+        }
+
+        let mut commit_opts = fluree_db_transact::CommitOpts::default();
+        if let Some(message) = opts.message {
+            commit_opts = commit_opts.with_txn_meta(vec![fluree_db_core::TxnMetaEntry::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                fluree_vocab::db::MESSAGE,
+                fluree_db_core::TxnMetaValue::string(message),
+            )]);
+        }
+        let mut builder = self
+            .stage(&handle)
+            .sync_graph_payload(graph.clone(), payload, opts.allow_empty)
+            .txn_opts(txn_opts)
+            .commit_opts(commit_opts);
+        if let Some(policy) = policy {
+            builder = builder.policy(policy);
+        }
+        let result = builder.execute().await?;
+        // A delta commit always carries flakes. The only zero-flake commit a
+        // sync can produce is a registration-only one (an explicitly empty
+        // payload into a never-registered graph), which advances `t` under a
+        // real commit id; a no-change sync returns either the no-op sentinel
+        // id (local path) or the unchanged head (consensus path). Keying on
+        // the flake count first keeps the common cases exact even when an
+        // unrelated writer advances the head concurrently.
+        let noop_sentinel =
+            fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Commit, &[]);
+        let committed = result.receipt.flake_count > 0
+            || (result.receipt.t > pre_t && result.receipt.commit_id != noop_sentinel);
+        let t = if committed { result.receipt.t } else { pre_t };
+
+        info!(
+            ledger_id = %ledger_id,
+            graph = graph_label,
+            asserted = result.receipt.assert_count,
+            retracted = result.receipt.retract_count,
+            committed,
+            t,
+            "Graph synced",
+        );
+
+        Ok(SyncGraphReport {
+            ledger_id: ledger_id.to_string(),
+            graph_iri,
+            asserted: result.receipt.assert_count,
+            retracted: result.receipt.retract_count,
+            committed,
+            commit_id: committed.then_some(result.receipt.commit_id),
+            dry_run: false,
+            t,
+        })
+    }
+
+    /// Whether `graph` holds any triple at the ledger head. The default graph
+    /// always exists. A named graph exists while it has an asserted triple:
+    /// Fluree has no empty named graph, so a graph whose triples were all
+    /// retracted (a `DROP`, or a sync to empty) no longer exists. The ledger's
+    /// system graphs are never reported as existing.
+    ///
+    /// Not policy filtered: this answers whether the graph is there, not what
+    /// the caller may read of it.
+    pub async fn graph_exists(&self, ledger_id: &str, graph: &GraphSel) -> Result<bool> {
+        use fluree_db_core::comparator::IndexType;
+        use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+        use fluree_db_core::query_bounds::RangeTest;
+        use fluree_db_core::range::RangeMatch;
+
+        let GraphSel::Graph(iri) = graph else {
+            return Ok(true);
+        };
+        let handle = self.ledger_cached(ledger_id).await?;
+        let ledger = handle.snapshot().await.to_ledger_state();
+        let Some(g_id) = ledger.snapshot.graph_registry.assigned_graph_id(iri) else {
+            return Ok(false);
+        };
+        if g_id < FIRST_USER_GRAPH_ID {
+            return Ok(false);
+        }
+        let opts = fluree_db_core::RangeOptions {
+            flake_limit: Some(1),
+            ..Default::default()
+        };
+        let flakes = ledger
+            .as_graph_db_ref(g_id)
+            .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
+            .await?;
+        Ok(!flakes.is_empty())
+    }
+
+    /// Whether the ledger holds, or has held, an RDF 1.2 edge annotation
+    /// (indexed or in novelty). Lets a reader skip annotation lookups on the
+    /// many ledgers that have none.
+    pub async fn has_annotations(&self, ledger_id: &str) -> Result<bool> {
+        let handle = self.ledger_cached(ledger_id).await?;
+        let ledger = handle.snapshot().await.to_ledger_state();
+        Ok(ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
+    }
+
+    /// Cancel indexing, delete storage artifacts, purge nameservice record,
+    /// and disconnect from cache. Returns the parent's new child count.
+    ///
+    /// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace,
+    /// so the branch prefix delete does not reach them. The ones only this
+    /// branch's index chain referenced go last, once the record is gone: a
+    /// sibling's collector pass may already have deferred them to this branch
+    /// (see the module docs on `fluree_db_indexer::gc`), after which nothing
+    /// else names them.
+    async fn purge_branch(
+        &self,
+        ledger_id: &LedgerId,
+        record: Option<&NsRecord>,
+        report: &mut BranchDropReport,
+    ) -> Result<Option<u32>> {
+        // Before anything is deleted: without the listing that says which
+        // nested ledgers share this branch's prefixes, the drop must fail
+        // while the record still names the files.
+        let nested = nested_ledgers(
+            &self.nameservice().all_records().await?,
+            &ledger_id.ledger_name(),
+        );
+
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            handle.cancel(ledger_id).await;
+            handle.wait_for_idle(ledger_id).await;
+        }
+
+        // Read before the branch's roots are deleted: the chain is what says
+        // which blobs it referenced.
+        let own_dicts = self
+            .shared_blobs_of(ledger_id, record, &mut report.warnings)
+            .await;
+
+        // Branch path: only the per-branch artifacts. The rest of
+        // `@shared/dicts/` stays — sibling/parent branches reference it — and
+        // is wiped by `drop_ledger` once every branch is gone.
+        let (count, warnings) = self.drop_artifacts(ledger_id, record, &nested).await;
+        report.artifacts_deleted += count;
+        report.warnings.extend(warnings);
+
+        let parent_new_count = self.branch_admin()?.drop_branch(ledger_id).await?;
+
+        if let Some(mgr) = &self.ledger_manager {
+            mgr.disconnect(ledger_id).await;
+        }
+
+        if !own_dicts.is_empty() {
+            // Not concurrently with a sibling's collector pass, which decides
+            // from the same chains this does, and with every surviving
+            // branch's builds held off: what the survivors reference is only
+            // true while none of them can publish. See
+            // `IndexerHandle::open_release_window`.
+            let _quiet = match &self.indexing_mode {
+                IndexingMode::Background(handle) => {
+                    let gc_guard = handle.hold_gc(&ledger_id.ledger_name()).await;
+                    match handle.open_release_window(&gc_guard).await {
+                        Some(window) => Some((window, gc_guard)),
+                        None => {
+                            report.warnings.push(
+                                "A branch of the ledger is held for maintenance; the dropped \
+                                 branch's dictionary blobs are left for a sweep"
+                                    .to_string(),
+                            );
+                            return Ok(parent_new_count);
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let unique_dicts = self
+                .unreferenced_by_survivors(ledger_id, own_dicts, &mut report.warnings)
+                .await;
+            let failures = self
+                .content_store(ledger_id)
+                .release_many(&unique_dicts)
+                .await;
+            let released = unique_dicts.len() - failures.len();
+            report.artifacts_deleted += released;
+            for (cid, error) in failures {
+                warn!(ledger_id = %ledger_id, %cid, %error, "Failed to release a dropped branch's dictionary blob");
+                report
+                    .warnings
+                    .push(format!("Failed to release dictionary blob {cid}: {error}"));
+            }
+            info!(
+                ledger_id = %ledger_id,
+                released, "Released dictionary blobs only the dropped branch referenced"
+            );
+        }
+
+        Ok(parent_new_count)
+    }
+
+    /// Dictionary blobs `ledger_id`'s index chain references.
+    ///
+    /// Here and in [`Self::unreferenced_by_survivors`], any failure to read a
+    /// chain or list the branches returns nothing and records a warning:
+    /// releasing on an incomplete picture could take a dictionary a surviving
+    /// branch still reads, whereas leaving the blobs costs disk until a sweep.
+    async fn shared_blobs_of(
+        &self,
+        ledger_id: &LedgerId,
+        record: Option<&NsRecord>,
+        warnings: &mut Vec<String>,
+    ) -> HashSet<ContentId> {
+        let Some(head) = record.and_then(|r| r.index_head_id.clone()) else {
+            return HashSet::new();
+        };
+        let backend = self.backend();
+        let own = BranchIndexHead {
+            ledger_id: ledger_id.clone(),
+            index_head_id: Some(head),
+        };
+        match shared_refs_of_branches(backend, &[own], None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read the branch's index chain; its dictionary blobs are left for a sweep: {e}"
+                ));
+                HashSet::new()
+            }
+        }
+    }
+
+    /// The blobs in `referenced` that no surviving branch of `ledger_id`'s
+    /// ledger reaches, retracted branches included. Listed and walked now
+    /// rather than earlier: the caller holds the survivors quiet.
+    async fn unreferenced_by_survivors(
+        &self,
+        ledger_id: &LedgerId,
+        referenced: HashSet<ContentId>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<ContentId> {
+        let backend = self.backend();
+        let records = match self.nameservice().branch_records(ledger_id.name()).await {
+            Ok(records) => records,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not list branches; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        // The listing's branches plus any this process built that the listing
+        // does not show yet (DynamoDB lists through an eventually consistent
+        // index), each head re-read.
+        let mut candidates: Vec<LedgerId> = siblings_of(&records, ledger_id)
+            .into_iter()
+            .map(|b| b.ledger_id)
+            .collect();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            candidates.extend(handle.built_branches(&ledger_id.ledger_name()));
+        }
+        let survivors = match current_sibling_heads(self.nameservice(), ledger_id, &candidates)
+            .await
+        {
+            Ok(survivors) => survivors,
+            Err(e) => {
+                warnings.push(format!(
+                        "Could not read a sibling branch's record; the branch's dictionary blobs are left for a sweep: {e}"
+                    ));
+                return Vec::new();
+            }
+        };
+        let elsewhere = match shared_refs_of_branches(backend, &survivors, None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read a sibling branch's index chain; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        let mut unique: Vec<ContentId> = referenced.difference(&elsewhere).cloned().collect();
+        unique.sort();
+        unique
+    }
+
+    /// Recursively drop retracted ancestor branches that have zero children.
+    async fn try_cascade_drop(
+        &self,
+        ledger_name: &str,
+        ancestor_id: &LedgerId,
+        report: &mut BranchDropReport,
+    ) {
+        let Ok(Some(ancestor)) = self.nameservice().lookup(ancestor_id).await else {
+            return;
+        };
+
+        if !ancestor.retracted || ancestor.branches > 0 {
+            return;
+        }
+
+        info!(ledger_id = %ancestor_id, "Cascading drop to retracted ancestor");
+
+        let parent_new_count = match self
+            .purge_branch(ancestor_id, Some(&ancestor), report)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("Cascade purge of {ancestor_id}: {e}"));
+                return;
+            }
+        };
+
+        report.cascaded.push(ancestor_id.to_string());
+
+        if let (Some(0), Some(source)) = (parent_new_count, &ancestor.source_branch) {
+            match ancestor_id.with_branch(source) {
+                Ok(next_ancestor) => {
+                    Box::pin(self.try_cascade_drop(ledger_name, &next_ancestor, report)).await;
+                }
+                Err(e) => report.warnings.push(format!(
+                    "Cascade stopped at {ancestor_id}: source branch {e}"
+                )),
+            }
+        }
+    }
+
+    /// Delete the branch-scoped storage artifacts for a single branch.
+    ///
+    /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
+    /// `config/`, `blob/`). Cross-branch `@shared/dicts/` is **not** touched here —
+    /// `drop_ledger` cleans it up via [`drop_shared_artifacts`] once every
+    /// branch has been dropped.
+    ///
+    /// Uses a two-path strategy:
+    /// - **Fast path**: list each known subprefix and batch delete. Per-
+    ///   subprefix enumeration is required so that `TieredStorage` routes
+    ///   commit/txn listings to the commit tier and index/config listings
+    ///   to the index tier — a single ledger-root list misses the commit
+    ///   tier entirely in split commit/index deployments.
+    /// - **Slow path**: If `list_prefix` fails (e.g., IPFS), walks the commit
+    ///   chain + index tree to collect all CIDs, derives storage addresses,
+    ///   and deletes each individually.
+    ///
+    /// Returns `(count_deleted, warnings)`.
+    async fn drop_artifacts(
+        &self,
+        ledger_id: &LedgerId,
+        record: Option<&fluree_db_nameservice::NsRecord>,
+        nested: &[LedgerId],
+    ) -> (usize, Vec<String>) {
+        let mut warnings = Vec::new();
+        let storage = match self.admin_storage() {
+            Some(s) => s,
+            None => {
+                // Permanent backend (IPFS): no list_prefix or delete — use
+                // CID-walk + release to unpin artifacts.
+                return self
+                    .drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
+                    .await;
+            }
+        };
+        let storage_method = storage.storage_method();
+        let branch_prefix = ledger_id.path_prefix();
+
+        // Ledger names may contain `/`, so another ledger's files can sit
+        // under this branch's prefixes (`a/main/index/child:main` inside
+        // `a:main`'s `index/`).
+        let foreign = nested_prefixes(storage_method, nested);
+
+        // Enumerate explicit subprefixes. `TieredStorage` routes by substring
+        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so we
+        // must hit each one separately. `index/` covers index roots, garbage,
+        // and all object subkinds (branches, leaves, dicts when per-branch);
+        // `config/` covers the LedgerConfig blob and the default-context blob,
+        // both stored as `ContentKind::LedgerConfig`; `blob/` holds every kind
+        // with no layout of its own, which includes the edge-annotation arenas.
+        let subprefixes = vec![
+            format!("fluree:{storage_method}://{branch_prefix}/commit/"),
+            format!("fluree:{storage_method}://{branch_prefix}/txn/"),
+            format!("fluree:{storage_method}://{branch_prefix}/index/"),
+            format!("fluree:{storage_method}://{branch_prefix}/config/"),
+            format!("fluree:{storage_method}://{branch_prefix}/blob/"),
+        ];
+
+        let mut total = 0usize;
+        let mut any_listed = false;
+        let mut listing_errors: Vec<String> = Vec::new();
+
+        for sub in &subprefixes {
+            match storage.list_prefix(sub).await {
+                Ok(files) => {
+                    any_listed = true;
+                    let (mut sorted, nested): (Vec<_>, Vec<_>) = files
+                        .into_iter()
+                        .partition(|f| !foreign.iter().any(|p| f.starts_with(p.as_str())));
+                    if !nested.is_empty() {
+                        warnings.push(format!(
+                            "Kept {} file(s) under {sub} that belong to a nested ledger",
+                            nested.len()
+                        ));
+                    }
+                    sorted.sort();
+                    for file in &sorted {
+                        if let Err(e) = storage.delete(file).await {
+                            warn!(file = %file, error = %e, "Failed to delete artifact");
+                            warnings.push(format!("Failed to delete {file}: {e}"));
+                        } else {
+                            total += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("list_prefix({sub}) failed: {e}");
+                    warn!(error = %e, prefix = %sub, "list_prefix failed during drop");
+                    listing_errors.push(msg);
+                }
+            }
+        }
+
+        // Two failure modes to handle distinctly:
+        //
+        // - No subprefix listed successfully: backend doesn't support
+        //   list_prefix at all (or every call errored). Fall back to the CID
+        //   walk so we still remove what we can address.
+        // - Some succeeded, some failed: we likely deleted a partial set of
+        //   artifacts. Run the CID walk as a cleanup pass — `release` is
+        //   idempotent on already-deleted CIDs — and record the listing
+        //   errors as warnings so callers see the partial-failure.
+        if !any_listed {
+            info!(
+                errors = ?listing_errors,
+                "list_prefix unavailable for all subprefixes, falling back to CID-walking drop"
+            );
+            return self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
+                .await;
+        }
+
+        if !listing_errors.is_empty() {
+            warn!(
+                errors = ?listing_errors,
+                "fast-path drop had partial listing failures; running CID walk to clean up"
+            );
+            warnings.extend(listing_errors);
+            let (extra, cid_warnings) = self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut Vec::new())
+                .await;
+            total += extra;
+            warnings.extend(cid_warnings);
+        }
+
+        info!(count = total, "Fast-path artifact deletion complete");
+        (total, warnings)
+    }
+
+    /// Slow-path artifact deletion: walk commit + index chains to collect CIDs,
+    /// then release each via `ContentStore::release`.
+    ///
+    /// For managed backends, `release` deletes by derived address. For permanent
+    /// backends (IPFS), it unpins the CID so Kubo's GC can reclaim the block.
+    async fn drop_artifacts_by_cid_walk(
+        &self,
+        ledger_id: &str,
+        record: Option<&fluree_db_nameservice::NsRecord>,
+        warnings: &mut Vec<String>,
+    ) -> (usize, Vec<String>) {
+        let content_store = self.content_store(ledger_id);
+
+        let record = match record {
+            Some(r) => r,
+            None => {
+                warnings.push("No NsRecord available for CID-walking drop".to_string());
+                return (0, std::mem::take(warnings));
+            }
+        };
+
+        let cids = match fluree_db_indexer::collect_ledger_cids(
+            content_store.as_ref(),
+            record.commit_head_id.as_ref(),
+            record.index_head_id.as_ref(),
+            record.config_id.as_ref(),
+            record.default_context.as_ref(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "Failed to collect ledger CIDs for drop");
+                warnings.push(format!("CID collection failed: {e}"));
+                return (0, std::mem::take(warnings));
+            }
+        };
+
+        info!(cid_count = cids.len(), "Collected CIDs for slow-path drop");
+
+        let mut count = 0;
+        for cid in &cids {
+            if let Err(e) = content_store.release(cid).await {
+                let msg = e.to_string();
+                if msg.contains("not found")
+                    || msg.contains("No such file")
+                    || msg.contains("not pinned")
+                {
+                    tracing::debug!(cid = %cid, error = %e, "artifact already removed");
+                } else {
+                    warn!(cid = %cid, error = %e, "unexpected error releasing artifact");
+                    warnings.push(format!("Release failed for {cid}: {e}"));
+                }
+            } else {
+                count += 1;
+            }
+        }
+
+        info!(count = count, "Slow-path artifact deletion complete");
+        (count, std::mem::take(warnings))
+    }
+
+    /// Delete the cross-branch `{ledger_name}/@shared/dicts/` namespace.
+    ///
+    /// Only safe once every branch under `ledger_name` has been dropped —
+    /// `drop_ledger` calls this as its final step. Branch drops never call
+    /// it, since sibling and parent branches may still reference shared
+    /// blobs. Failures are returned as warnings, not errors: orphaned
+    /// shared blobs are recoverable via a follow-up admin sweep.
+    async fn drop_shared_artifacts(&self, ledger_name: &LedgerName) -> (usize, Vec<String>) {
+        let mut warnings = Vec::new();
+        let Some(storage) = self.admin_storage() else {
+            // Permanent backends (IPFS) reach shared dicts through the CID
+            // walk path on each branch; nothing to do here.
+            return (0, warnings);
+        };
+        let storage_method = storage.storage_method();
+        let prefix = format!(
+            "fluree:{storage_method}://{}/dicts/",
+            ledger_name.shared_prefix()
+        );
+
+        match storage.list_prefix(&prefix).await {
+            Ok(files) => {
+                let mut sorted = files;
+                sorted.sort();
+                let mut count = 0;
+                for file in &sorted {
+                    if let Err(e) = storage.delete(file).await {
+                        warn!(file = %file, error = %e, "Failed to delete shared dict blob");
+                        warnings.push(format!("Failed to delete {file}: {e}"));
+                    } else {
+                        count += 1;
+                    }
+                }
+                info!(count, "@shared/dicts cleanup complete");
+                (count, warnings)
+            }
+            Err(e) => {
+                warn!(error = %e, prefix = %prefix, "list_prefix failed on @shared/dicts");
+                warnings.push(format!("@shared/dicts list_prefix failed: {e}"));
+                (0, warnings)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Graph Source Drop Implementation
+// =============================================================================
+
+impl crate::Fluree {
+    /// Drop a graph source
+    ///
+    /// This operation:
+    /// 1. Looks up the graph source record in the nameservice
+    /// 2. In Hard mode: deletes graph source index files (if prefix is defined)
+    /// 3. Retracts from nameservice
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Graph source name (e.g., "my-search")
+    /// * `branch` - Branch name (defaults to "main" if None)
+    /// * `mode` - `Soft` (retract only) or `Hard` (retract + delete files)
+    ///
+    /// # Note
+    ///
+    /// Graph source artifact deletion requires a canonical storage prefix defined in the
+    /// indexer crate. Until that exists, Hard mode may skip artifact deletion
+    /// and report a warning.
+    pub async fn drop_graph_source(
+        &self,
+        name: &str,
+        branch: Option<&str>,
+        mode: DropMode,
+    ) -> Result<GraphSourceDropReport> {
+        let branch = branch.unwrap_or(DEFAULT_BRANCH);
+        let graph_source_id = format_ledger_id(name, branch);
+        info!(name = %name, branch = %branch, mode = ?mode, "Dropping graph source");
+
+        let mut report = GraphSourceDropReport {
+            name: name.to_string(),
+            branch: branch.to_string(),
+            ..Default::default()
+        };
+
+        // 1. Lookup graph source record (for status)
+        let record = self
+            .nameservice()
+            .lookup_graph_source(&graph_source_id)
+            .await?;
+        let status = match &record {
+            None => DropStatus::NotFound,
+            Some(r) if r.retracted => DropStatus::AlreadyRetracted,
+            Some(_) => DropStatus::Dropped,
+        };
+        report.status = status;
+
+        // 2. Delete graph source artifacts (Hard mode)
+        #[cfg(feature = "iceberg")]
+        if matches!(mode, DropMode::Hard) {
+            if let Some(ref record) = record {
+                // Try to delete the CAS-stored mapping blob (Iceberg, R2RML or SQL record)
+                {
+                    if let Some(mapping) = &crate::graph_source::mapping_source_of(record) {
+                        if let Ok(cid) = mapping.source.parse::<fluree_db_core::ContentId>() {
+                            // Resolve CID to storage path and delete
+                            let path = fluree_db_core::content_path(
+                                fluree_db_core::ContentKind::GraphSourceMapping,
+                                &graph_source_id,
+                                &cid.digest_hex(),
+                            );
+                            if let Some(storage) = self.admin_storage() {
+                                if let Err(e) = storage.delete(&path).await {
+                                    report.warnings.push(format!(
+                                        "Failed to delete mapping blob {}: {}",
+                                        mapping.source, e
+                                    ));
+                                } else {
+                                    report.files_deleted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Delete BM25 snapshot blobs (Hard mode). Runs before the retract
+        // below so the manifest is still resolvable. Without this a BM25 index
+        // dropped through this path — the `POST /drop` route, and `fluree drop`
+        // — leaves every snapshot behind; `drop_full_text_index` is the only
+        // other entrypoint that sweeps them.
+        if matches!(mode, DropMode::Hard) {
+            if let Some(ref record) = record {
+                if matches!(record.source_type, GraphSourceType::Bm25) {
+                    match self.load_or_create_bm25_manifest(&graph_source_id).await {
+                        Ok(manifest) => {
+                            let (deleted, warnings) = self
+                                .delete_bm25_snapshots(&graph_source_id, &manifest)
+                                .await;
+                            report.files_deleted += deleted;
+                            report.warnings.extend(warnings);
+                        }
+                        // An unreadable manifest costs the sweep, not the drop.
+                        // The snapshots leak, which `delete_bm25_snapshots`
+                        // already treats as no reason to leave the record
+                        // published — and drop is the recovery action for a
+                        // graph source wedged in exactly this way, so failing it
+                        // closed would strand the caller with no way out.
+                        Err(e) => {
+                            warn!(
+                                graph_source = %graph_source_id,
+                                error = %e,
+                                "BM25 snapshot sweep skipped; manifest unreadable"
+                            );
+                            report.warnings.push(format!(
+                                "BM25 snapshot sweep skipped, manifest unreadable: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Retract from nameservice (always attempt, idempotent)
+        if let Err(e) = self.publisher()?.retract_graph_source(name, branch).await {
+            warn!(name = %name, branch = %branch, error = %e, "Nameservice graph source retract warning");
+            report.warnings.push(format!("Nameservice retract: {e}"));
+        }
+
+        info!(name = %name, branch = %branch, status = ?report.status, "Graph source dropped");
+        Ok(report)
+    }
+}
+
+// =============================================================================
+// Index Status and Trigger (minimal bounds - not native-only)
+// =============================================================================
+
+impl crate::Fluree {
+    /// Get current indexing status for a ledger
+    ///
+    /// Returns status from both nameservice (index_t, commit_t) and
+    /// the background indexer (phase, pending work).
+    pub async fn index_status(&self, ledger_id: &str) -> Result<IndexStatusResult> {
+        use fluree_db_indexer::IndexPhase;
+
+        let ledger_id = LedgerId::parse(ledger_id)?;
+
+        // Get nameservice record
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
+
+        // Get indexer status if available
+        let (indexing_enabled, phase, pending_min_t, last_error, halted) = match &self.indexing_mode
+        {
+            IndexingMode::Background(handle) => {
+                if let Some(status) = handle.status(&ledger_id).await {
+                    (
+                        true,
+                        status.phase,
+                        status.pending_min_t,
+                        status.last_error,
+                        status.halted,
+                    )
+                } else {
+                    (true, IndexPhase::Idle, None, None, false)
+                }
+            }
+            IndexingMode::Disabled => (false, IndexPhase::Idle, None, None, false),
+        };
+
+        Ok(IndexStatusResult {
+            ledger_id: ledger_id.to_string(),
+            index_t: record.index_t,
+            commit_t: record.commit_t,
+            indexing_enabled,
+            phase,
+            pending_min_t,
+            last_error,
+            halted,
+        })
+    }
+
+    /// Trigger background indexing and wait for completion
+    ///
+    /// Enqueues an index request for the ledger and waits for the index to
+    /// reach the current commit_t.
+    ///
+    /// If `opts.timeout_ms` is set, waiting stops with `IndexTimeout` once the
+    /// deadline expires. If `opts.timeout_ms` is `None`, this waits until the
+    /// indexing work completes or fails.
+    ///
+    /// # No-commit ledgers
+    /// If the ledger has no commits yet, returns successfully with index_t=0.
+    ///
+    /// # Concurrent commits
+    /// This targets `commit_t` at call time. Commits after the call aren't waited for.
+    ///
+    /// # Errors
+    /// - `IndexingDisabled` if no background indexer configured
+    /// - `IndexTimeout` if timeout expires before completion
+    /// - `NotFound` if ledger doesn't exist
+    pub async fn trigger_index(
+        &self,
+        ledger_id: &str,
+        opts: TriggerIndexOptions,
+    ) -> Result<TriggerIndexResult> {
+        use fluree_db_indexer::IndexOutcome;
+
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        info!(ledger_id = %ledger_id, "Triggering index");
+
+        // Check indexing mode
+        let handle = match &self.indexing_mode {
+            IndexingMode::Background(h) => h,
+            IndexingMode::Disabled => return Err(ApiError::IndexingDisabled),
+        };
+
+        // Look up current state
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
+
+        if record.retracted {
+            return Err(ApiError::NotFound(format!(
+                "Ledger is retracted: {ledger_id}"
+            )));
+        }
+
+        // Handle no-commit ledgers (nothing to index)
+        if record.commit_head_id.is_none() {
+            info!(ledger_id = %ledger_id, "No commits to index");
+            return Ok(TriggerIndexResult {
+                ledger_id: ledger_id.to_string(),
+                index_t: 0,
+                root_id: None,
+                fuel: Some(0.0),
+            });
+        }
+
+        // Trigger with min_t = commit_t
+        let min_t = record.commit_t;
+        let timeout_ms = opts.timeout_ms;
+        info!(
+            ledger_id = %ledger_id,
+            index_t = record.index_t,
+            commit_t = record.commit_t,
+            timeout_ms = ?timeout_ms,
+            "Queueing index request"
+        );
+        // An explicit request: it also retries a halted ledger.
+        let completion = handle.trigger_explicit(&ledger_id, min_t).await;
+
+        if let Some(status) = handle.status(&ledger_id).await {
+            info!(
+                ledger_id = %ledger_id,
+                target_t = min_t,
+                phase = ?status.phase,
+                pending_min_t = ?status.pending_min_t,
+                last_index_t = status.last_index_t,
+                waiter_count = status.waiter_count,
+                "Index request queued"
+            );
+        } else {
+            info!(
+                ledger_id = %ledger_id,
+                target_t = min_t,
+                "Index request queued"
+            );
+        }
+
+        // Wait for completion, emitting periodic status so long-running or
+        // stuck indexing work shows up clearly in INFO/DEBUG logs. Apply a
+        // deadline only when the caller requested one.
+        info!(
+            ledger_id = %ledger_id,
+            target_t = min_t,
+            timeout_ms = ?timeout_ms,
+            "Waiting for index completion"
+        );
+        let wait_started = std::time::Instant::now();
+        let mut wait_fut = Box::pin(completion.wait());
+        let mut info_interval = tokio::time::interval(Duration::from_secs(60));
+        info_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = info_interval.tick().await;
+        let mut debug_interval = tokio::time::interval(Duration::from_secs(15));
+        debug_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = debug_interval.tick().await;
+
+        macro_rules! finish_wait {
+            ($outcome:expr) => {
+                match $outcome {
+                    IndexOutcome::Completed {
+                        index_t,
+                        root_id,
+                        fuel,
+                    } => {
+                        info!(
+                            ledger_id = %ledger_id,
+                            index_t = index_t,
+                            fuel = ?fuel,
+                            elapsed_ms = wait_started.elapsed().as_millis() as u64,
+                            "Indexing completed"
+                        );
+                        return Ok(TriggerIndexResult {
+                            ledger_id: ledger_id.to_string(),
+                            index_t,
+                            root_id,
+                            fuel,
+                        });
+                    }
+                    IndexOutcome::Failed(msg) => {
+                        warn!(
+                            ledger_id = %ledger_id,
+                            elapsed_ms = wait_started.elapsed().as_millis() as u64,
+                            error = %msg,
+                            "Indexing failed while waiting"
+                        );
+                        return Err(ApiError::internal(format!("Indexing failed: {}", msg)));
+                    }
+                    IndexOutcome::Cancelled => {
+                        warn!(
+                            ledger_id = %ledger_id,
+                            elapsed_ms = wait_started.elapsed().as_millis() as u64,
+                            "Indexing was cancelled while waiting"
+                        );
+                        return Err(ApiError::internal("Indexing was cancelled"));
+                    }
+                }
+            };
+        }
+
+        macro_rules! log_wait_status {
+            ($level:ident, $message:literal) => {{
+                let elapsed_ms = wait_started.elapsed().as_millis() as u64;
+                if let Some(status) = handle.status(&ledger_id).await {
+                    $level!(
+                        ledger_id = %ledger_id,
+                        elapsed_ms,
+                        target_t = min_t,
+                        phase = ?status.phase,
+                        pending_min_t = ?status.pending_min_t,
+                        last_index_t = status.last_index_t,
+                        last_error = ?status.last_error,
+                        waiter_count = status.waiter_count,
+                        $message
+                    );
+                } else {
+                    $level!(
+                        ledger_id = %ledger_id,
+                        elapsed_ms,
+                        target_t = min_t,
+                        $message
+                    );
+                }
+            }};
+        }
+
+        if let Some(timeout_ms) = timeout_ms {
+            let mut timeout_fut = Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms)));
+            loop {
+                tokio::select! {
+                    outcome = &mut wait_fut => finish_wait!(outcome),
+                    () = &mut timeout_fut => {
+                        let elapsed_ms = wait_started.elapsed().as_millis() as u64;
+                        if let Some(status) = handle.status(&ledger_id).await {
+                            warn!(
+                                ledger_id = %ledger_id,
+                                timeout_ms,
+                                elapsed_ms,
+                                target_t = min_t,
+                                phase = ?status.phase,
+                                pending_min_t = ?status.pending_min_t,
+                                last_index_t = status.last_index_t,
+                                last_error = ?status.last_error,
+                                waiter_count = status.waiter_count,
+                                "Index trigger timed out"
+                            );
+                        } else {
+                            warn!(
+                                ledger_id = %ledger_id,
+                                timeout_ms,
+                                elapsed_ms,
+                                target_t = min_t,
+                                "Index trigger timed out"
+                            );
+                        }
+                        return Err(ApiError::IndexTimeout(timeout_ms));
+                    }
+                    _ = info_interval.tick() => {
+                        log_wait_status!(info, "Still waiting for index completion");
+                    }
+                    _ = debug_interval.tick() => {
+                        log_wait_status!(debug, "Waiting for index completion");
+                    }
+                }
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    outcome = &mut wait_fut => finish_wait!(outcome),
+                    _ = info_interval.tick() => {
+                        log_wait_status!(info, "Still waiting for index completion");
+                    }
+                    _ = debug_interval.tick() => {
+                        log_wait_status!(debug, "Waiting for index completion");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Reindex (requires AdminPublisher for allow-equal publish)
+// =============================================================================
+
+impl crate::Fluree {
+    /// Full offline reindex from commit history
+    ///
+    /// Rebuilds the binary index by replaying all commits. This operation:
+    /// 1. Cancels any background indexing
+    /// 2. Builds a fresh binary columnar index from the commit chain
+    /// 3. Validates ledger hasn't advanced (conflict detection)
+    /// 4. Publishes new index (allows same t via AdminPublisher)
+    /// 5. Evicts the cached ledger so subsequent loads use the rebuilt index
+    ///
+    /// # Errors
+    /// - `NotFound` if ledger doesn't exist or has no commits
+    /// - `ReindexConflict` (409) if ledger advanced during rebuild
+    pub async fn reindex(&self, ledger_id: &str, opts: ReindexOptions) -> Result<ReindexResult> {
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        info!(ledger_id = %ledger_id, "Starting reindex");
+
+        // 1. Look up current state and capture commit_t for conflict detection
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
+
+        if record.retracted {
+            return Err(ApiError::NotFound(format!(
+                "Ledger is retracted: {ledger_id}"
+            )));
+        }
+
+        let initial_commit_t = record.commit_t;
+        if record.commit_head_id.is_none() {
+            return Err(ApiError::NotFound("No commits to reindex".to_string()));
+        }
+
+        // 2. Hold the ledger against indexing for the whole rebuild.
+        //
+        // A reindex writes index artifacts before publishing the root that
+        // references them, so anything enumerating unreferenced artifacts
+        // meanwhile — a storage sweep — would see them as orphans and delete
+        // them. Cancelling and waiting for idle is not enough on its own: a
+        // build can start again the moment the wait returns. The guard is
+        // held until this function exits.
+        let _maintenance = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                info!(ledger_id = %ledger_id, "Holding ledger for reindex");
+                Some(hold_branch_quiesced(handle, &ledger_id).await?)
+            }
+            IndexingMode::Disabled => None,
+        };
+
+        // Re-fetch the record after the background indexer has quiesced: a
+        // background build racing this reindex may have published between
+        // the lookup above and the cancel. The stale record's
+        // `index_head_id` (None, or an older root) would make the rebuild
+        // lose sight of the just-published root — including a sealed
+        // annotation arena the Augment merge in root assembly needs.
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
+
+        // 3. Build binary index from commit chain
+        let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
+        let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
+        let gc_min_time_mins = indexer_config.gc_min_time_mins;
+        let gc_hard_max_old_indexes = indexer_config.gc_hard_max_old_indexes;
+
+        // Resolve attachment events and read fulltext config off a single
+        // `LedgerState` load so the reindex doesn't pay for two snapshot
+        // hydrations on the non-annotation hot path.
+        //
+        // **Attachment-events resolution.** The rebuild path
+        // (`rebuild_index_from_commits`) only consumes the concrete
+        // `IndexerConfig.attachment_events` field; the `attachment_events_provider`
+        // trait is consumed only by the orchestrator's per-job dispatch
+        // loop. So we resolve here whenever no concrete envelope is set,
+        // preferring a caller-supplied provider over the API's own and
+        // falling back to the API provider when neither is supplied.
+        // (A caller-supplied **concrete** envelope is respected as-is.)
+        //
+        // **Sticky-bit gate.** We only resolve for ledgers that have
+        // actually observed a `f:reifies*` flake. On non-annotation
+        // ledgers, going through the provider has been observed to
+        // disturb novelty bookkeeping for unrelated facts
+        // (regression caught by
+        // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`).
+        // The gate keeps the M2b arena-seal path intact for annotation
+        // ledgers while restoring the pre-M2b behavior elsewhere.
+        let ledger_state = match self.ledger(&ledger_id).await {
+            Ok(state) => Some(state),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "reindex: no loadable ledger state for config read; proceeding without fulltext config"
+                );
+                None
+            }
+        };
+
+        if indexer_config.attachment_events.is_none() {
+            let ledger_has_annotations = ledger_state
+                .as_ref()
+                .map(|st| st.snapshot.has_annotations || st.novelty.attachments.has_annotations())
+                .unwrap_or(false);
+            if ledger_has_annotations {
+                // Caller-supplied provider wins; fall back to the API's
+                // own provider. The provider trait is consumed via a
+                // ref so we don't `take()` either field — the trait
+                // implementation may itself be reusable downstream.
+                let caller_provider = indexer_config.attachment_events_provider.as_deref();
+                let api_provider = self.attachment_events_provider();
+                let chosen_caller = caller_provider;
+                let chosen_api = api_provider.as_ref().map(AsRef::as_ref);
+                let provider_ref: Option<&dyn fluree_db_indexer::AttachmentEventsProvider> =
+                    chosen_caller.or(chosen_api);
+                if let Some(provider) = provider_ref {
+                    // Pre-load via the cached path so the provider's
+                    // `try_running_attachment_events` finds the running
+                    // ledger handle even when the only LedgerState we
+                    // hold above came from a fresh-load.
+                    let _ = self.ledger_cached(&ledger_id).await;
+                    indexer_config.attachment_events = provider.attachment_events(&ledger_id).await;
+                }
+                // No provider (the CLI's client carries no ledger manager) or
+                // the provider found nothing: derive coverage from the ledger
+                // state loaded above the way the provider would, including the
+                // base-index bootstrap for a fresh bulk import. Without this
+                // the indexer receives `None`, seals no arena, and every
+                // quoted-triple query on the imported ledger takes the
+                // generic join chain.
+                #[cfg(not(target_arch = "wasm32"))]
+                if indexer_config.attachment_events.is_none() {
+                    if let Some(state) = ledger_state.as_ref() {
+                        indexer_config.attachment_events =
+                            crate::indexer_attachment_provider::attachment_events_from_state(state)
+                                .await;
+                    }
+                }
+                match indexer_config.attachment_events.as_ref() {
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Authoritative(ev)) => {
+                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: sealing annotation arena from authoritative attachment events");
+                    }
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Augment(ev)) => {
+                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: augmenting the previous annotation arena");
+                    }
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Unknown) | None => {
+                        tracing::warn!(ledger_id = %ledger_id, "reindex: no attachment-event coverage resolved; annotation arena will not be sealed this pass");
+                    }
+                }
+            }
+        }
+
+        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
+        // configured plain-string values into BM25 arena building. Reuses the
+        // `ledger_state` we already loaded above. Best-effort: if the existing
+        // index can't be loaded (e.g. first-ever reindex of a commits-only
+        // ledger) we fall back to empty — only the `@fulltext` datatype path
+        // will contribute entries, which matches pre-config behavior.
+        //
+        // An index from before config graphs were read across ledgers can
+        // hold one as an ordinary graph, where no config is read. The rebuild
+        // reads it as the config graph, so its full-text settings are read
+        // from the commits as well.
+        let from_commits = match ledger_state.as_ref() {
+            Some(state) if state.snapshot.graph_registry.has_config_in_user_slot() => {
+                let mut unindexed = record.clone();
+                unindexed.index_head_id = None;
+                let loaded = match self.branched_content_store(&ledger_id).await {
+                    Ok(store) => fluree_db_ledger::LedgerState::load_with_store(store, unindexed)
+                        .await
+                        .map_err(ApiError::from),
+                    Err(e) => Err(e),
+                };
+                match loaded {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reindex: failed to load the commits for the config read; configured fulltext properties will be skipped"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(state) = from_commits.as_ref().or(ledger_state.as_ref()) {
+            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
+            // first-ever reindex (no prior index, all config in novelty)
+            // the config query isn't filtered out by
+            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
+            let to_t = state.t();
+            let snapshot = &state.snapshot;
+            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+                Ok(Some(cfg)) => {
+                    indexer_config.fulltext_configured_properties =
+                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                }
+                Ok(None) => {
+                    // No LedgerConfig — nothing to seed.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                    );
+                }
+            }
+        }
+
+        // Reindex is a user-triggered API call; create a fuel-enabled,
+        // no-limit tracker per request so the response can report total fuel.
+        // Indexing never enforces a fuel limit (measurement only) — a partial
+        // index is worse than a slow one.
+        let reindex_tracker = Tracker::new(TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        // Branch-aware: a branch's history runs through its source's commits.
+        let store = self
+            .content_store_for_record_or_id(Some(&record), &ledger_id)
+            .await?;
+        let index_result = rebuild_index_from_commits_with_tracker(
+            store,
+            reindex_tracker,
+            &ledger_id,
+            &record,
+            indexer_config,
+        )
+        .await?;
+
+        info!(
+            ledger_id = %ledger_id,
+            index_t = index_result.index_t,
+            "Binary index build complete"
+        );
+
+        // 4. Conflict detection: check if ledger advanced during rebuild
+        let final_record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("Ledger disappeared during reindex: {ledger_id}"))
+            })?;
+
+        if final_record.commit_t != initial_commit_t {
+            return Err(ApiError::ReindexConflict {
+                expected: initial_commit_t,
+                found: final_record.commit_t,
+            });
+        }
+
+        // 5. Publish new index (allows same t for reindex via AdminPublisher)
+        self.publisher()?
+            .publish_index_allow_equal(&ledger_id, index_result.index_t, &index_result.root_id)
+            .await?;
+        // The committed data indexed, so a halt the background indexer
+        // recorded for this ledger no longer holds.
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            handle.clear_halt(&ledger_id).await;
+        }
+
+        // Reindex can replace a damaged root at the same index t. A cached
+        // handle may otherwise keep its old graph registry indefinitely.
+        if let Some(ref lm) = self.ledger_manager {
+            lm.disconnect(&ledger_id).await;
+        }
+
+        info!(
+            ledger_id = %ledger_id,
+            index_t = index_result.index_t,
+            root_id = %index_result.root_id,
+            "Reindex completed"
+        );
+
+        // 6. Spawn async garbage collection (non-blocking) only after enough
+        // published index versions can exist to exceed retention.
+        let gc_keep_count = 1_i64 + i64::from(gc_max_old_indexes);
+        if index_result.index_t <= gc_keep_count {
+            tracing::debug!(
+                root_id = %index_result.root_id,
+                index_t = index_result.index_t,
+                gc_keep_count,
+                "Skipping background garbage collection; index chain cannot exceed retention yet"
+            );
+        } else {
+            let gc_store = self.content_store(&ledger_id);
+            let gc_root_id = index_result.root_id.clone();
+            let gc_backend = self.backend().clone();
+            let gc_ledger_id = ledger_id.clone();
+            let gc_nameservice = self.nameservice_mode.as_arc_reader();
+            let gc_handle = match &self.indexing_mode {
+                IndexingMode::Background(handle) => Some(handle.clone()),
+                _ => None,
+            };
+            tokio::spawn(async move {
+                let gc_config = CleanGarbageConfig {
+                    max_old_indexes: Some(gc_max_old_indexes),
+                    min_time_garbage_mins: Some(gc_min_time_mins),
+                    hard_max_old_indexes: gc_hard_max_old_indexes,
+                    ..Default::default()
+                };
+                let pass = async {
+                    // Serialised with the worker's own passes on this ledger's
+                    // branches where a worker exists, and released with its
+                    // builds held off; see `IndexerHandle::open_release_window`.
+                    let gc_guard = match &gc_handle {
+                        Some(handle) => Some(handle.hold_gc(&gc_ledger_id.ledger_name()).await),
+                        None => None,
+                    };
+                    let plan = plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?;
+                    if plan.is_empty() {
+                        return Ok(());
+                    }
+                    let _window = match (&gc_handle, &gc_guard) {
+                        (Some(handle), Some(guard)) => {
+                            match handle.open_release_window(guard).await {
+                                Some(window) => Some(window),
+                                // Held for maintenance; the periodic pass retries.
+                                None => return Ok(()),
+                            }
+                        }
+                        _ => None,
+                    };
+                    // Listed inside the release window, so only this
+                    // ledger's branches. A failed listing defers every
+                    // shared blob.
+                    let siblings = match gc_nameservice.branch_records(gc_ledger_id.name()).await {
+                        Ok(records) => {
+                            let mut ids: Vec<LedgerId> = siblings_of(&records, &gc_ledger_id)
+                                .into_iter()
+                                .map(|b| b.ledger_id)
+                                .collect();
+                            if let Some(handle) = &gc_handle {
+                                ids.extend(handle.built_branches(&gc_ledger_id.ledger_name()));
+                            }
+                            Some(ids)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "could not list branches for the collector's sibling check; deferring shared blobs"
+                            );
+                            None
+                        }
+                    };
+                    release_garbage_plan(
+                        plan,
+                        &gc_backend,
+                        gc_nameservice.as_ref(),
+                        &gc_ledger_id,
+                        siblings.as_deref(),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                };
+                let result: fluree_db_indexer::Result<()> = pass.await;
+                if let Err(e) = result {
+                    tracing::warn!(
+                        error = %e,
+                        root_id = %gc_root_id,
+                        "Background garbage collection failed (non-fatal)"
+                    );
+                } else {
+                    tracing::debug!(root_id = %gc_root_id, "Background garbage collection completed");
+                }
+            });
+        }
+
+        Ok(ReindexResult {
+            ledger_id: ledger_id.to_string(),
+            index_t: index_result.index_t,
+            root_id: index_result.root_id,
+            stats: index_result.stats,
+            fuel: index_result.fuel,
+        })
+    }
+}
+
+// =============================================================================
+// Ledger Config
+// =============================================================================
+
+impl crate::Fluree {
+    /// Store a `LedgerConfig` blob in CAS and update the config_id on the
+    /// NsRecord via ConfigPublisher.
+    ///
+    /// Returns the `ContentId` of the stored config blob.
+    pub async fn set_ledger_config(
+        &self,
+        ledger_id: &str,
+        config: &fluree_db_nameservice::LedgerConfig,
+    ) -> Result<fluree_db_core::ContentId> {
+        use fluree_db_core::ContentKind;
+        use fluree_db_core::ContentStore;
+        use fluree_db_nameservice::{ConfigCasResult, ConfigPayload, ConfigValue};
+
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        let canonical_bytes = config.to_bytes();
+
+        // Store blob in CAS.
+        let content_store = self.content_store(&ledger_id);
+        let cid = content_store
+            .put(ContentKind::LedgerConfig, &canonical_bytes)
+            .await?;
+
+        // Update config_id via ConfigPublisher (preserving existing payload fields).
+        let publisher = self.publisher()?;
+        let current = publisher.get_config(&ledger_id).await?;
+        let existing_payload = current
+            .as_ref()
+            .and_then(|c| c.payload.clone())
+            .unwrap_or_default();
+        let new_config = ConfigValue::new(
+            current.as_ref().map_or(1, |c| c.v + 1),
+            Some(ConfigPayload {
+                config_id: Some(cid.clone()),
+                default_context: existing_payload.default_context,
+                extra: existing_payload.extra,
+            }),
+        );
+        match publisher
+            .push_config(&ledger_id, current.as_ref(), &new_config)
+            .await?
+        {
+            ConfigCasResult::Updated => {}
+            ConfigCasResult::Conflict { .. } => {
+                return Err(ApiError::Http {
+                    status: 409,
+                    message: format!("config for '{ledger_id}' was modified concurrently; retry"),
+                });
+            }
+        }
+
+        info!(ledger_id = %ledger_id, %cid, "LedgerConfig set");
+        Ok(cid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drop_mode_default() {
+        assert_eq!(DropMode::default(), DropMode::Soft);
+    }
+
+    #[test]
+    fn test_drop_status_default() {
+        assert_eq!(DropStatus::default(), DropStatus::NotFound);
+    }
+}
+
+// =============================================================================
+// Storage sweep (reclaims index artifacts no index chain references)
+// =============================================================================
+
+/// Take an exclusive maintenance hold on one branch, reporting a conflict
+/// rather than blocking when another operation already holds it.
+async fn hold_branch_quiesced<'a>(
+    handle: &'a fluree_db_indexer::IndexerHandle,
+    ledger_id: &'a LedgerId,
+) -> Result<MaintenanceGuard> {
+    handle.hold_quiesced(ledger_id).await.ok_or_else(|| {
+        ApiError::BranchConflict(format!(
+            "another maintenance operation holds {ledger_id}; retry when it completes"
+        ))
+    })
+}
+
+impl crate::Fluree {
+    /// Hold every branch of `ledger_name` excluded from indexing and collect
+    /// their index heads.
+    ///
+    /// Enumerates every record under the name, so that **retracted** branches
+    /// participate, through `all_records`, which the nested-ledger check needs
+    /// too. A soft drop is reversible until the name is purged, so a
+    /// soft-dropped branch's index must survive a sweep.
+    /// Its own artifacts are safe either way — an unlisted branch contributes
+    /// no prefix to scan — but dict blobs are shared across a ledger's
+    /// branches, so omitting one would reclaim dicts it still reads.
+    ///
+    /// Also returns the other ledgers whose storage nests under this one's
+    /// (see [`nested_ledgers`]), from the same listing.
+    async fn hold_ledger_for_maintenance(
+        &self,
+        ledger_name: &LedgerName,
+    ) -> Result<(Vec<MaintenanceGuard>, Vec<BranchIndexHead>, Vec<LedgerId>)> {
+        let all = self.nameservice().all_records().await?;
+        let nested = nested_ledgers(&all, ledger_name);
+        let records: Vec<_> = all
+            .into_iter()
+            .filter(|r| r.ledger_id.name() == ledger_name.as_str())
+            .collect();
+
+        if records.is_empty() {
+            return Err(ApiError::NotFound(format!(
+                "Ledger not found: {ledger_name}"
+            )));
+        }
+
+        // Holds are per-branch, so a ledger-wide sweep must hold them all.
+        // Guards release on drop, so an early return frees whatever was taken.
+        // `Disabled` leaves `guards` empty and the sweep runs unexcluded. That
+        // is safe only because no in-process indexer exists to race it; an
+        // external one is not covered here either way, which is the
+        // single-process caveat documented on `MaintenanceGuard`.
+        let mut guards = Vec::with_capacity(records.len());
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            for record in &records {
+                guards.push(hold_branch_quiesced(handle, &record.ledger_id).await?);
+            }
+        }
+
+        // Re-read after quiescing: a build that published between the
+        // enumeration above and the drain would have advanced the index head,
+        // and planning against the stale one would treat the new root's
+        // artifacts as orphaned.
+        let mut branches = Vec::with_capacity(records.len());
+        for record in &records {
+            let current = self.nameservice().lookup(&record.ledger_id).await?;
+            branches.push(BranchIndexHead {
+                ledger_id: record.ledger_id.clone(),
+                index_head_id: current.and_then(|r| r.index_head_id),
+            });
+        }
+
+        Ok((guards, branches, nested))
+    }
+
+    /// Where a sweep may read index roots from local disk instead of storage.
+    ///
+    /// Only the background indexer's cache qualifies: reading through a
+    /// directory no builder writes would cost the writes and return no hits.
+    /// `None` without one, which plans against storage alone.
+    fn sweep_artifact_cache_dir(&self) -> Option<&std::path::Path> {
+        match &self.indexing_mode {
+            IndexingMode::Background(handle) => Some(handle.artifact_cache_dir()),
+            IndexingMode::Disabled => None,
+        }
+    }
+
+    /// The storage a sweep enumerates and deletes through.
+    ///
+    /// `None` only for permanent (append-only) backends, which cannot list a
+    /// prefix or delete.
+    fn sweepable_storage(&self) -> Result<std::sync::Arc<dyn fluree_db_core::Storage>> {
+        self.backend.admin_storage_cloned().ok_or_else(|| {
+            ApiError::Internal(
+                "storage sweep requires a backend that supports listing and deletion".to_string(),
+            )
+        })
+    }
+
+    /// Report which index artifacts under `ledger_name` no live index chain
+    /// references, without deleting anything.
+    ///
+    /// Takes the same exclusive hold as [`sweep_index_storage`](Self::sweep_index_storage)
+    /// so the report reflects a quiesced ledger, and releases it on return.
+    pub async fn plan_index_sweep(&self, ledger_name: &str) -> Result<SweepPlan> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches, nested) = self.hold_ledger_for_maintenance(&ledger_name).await?;
+        Ok(plan_sweep(
+            &storage,
+            &ledger_name,
+            &branches,
+            &nested,
+            self.sweep_artifact_cache_dir(),
+        )
+        .await?)
+    }
+
+    /// Reclaim index artifacts that no live index chain references.
+    ///
+    /// Plans and deletes under one hold: a plan describes storage as it stood
+    /// when planned, so releasing between the two would let a build publish
+    /// artifacts the plan had already classified as orphaned.
+    pub async fn sweep_index_storage(&self, ledger_name: &str) -> Result<SweepResult> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches, nested) = self.hold_ledger_for_maintenance(&ledger_name).await?;
+
+        let plan = plan_sweep(
+            &storage,
+            &ledger_name,
+            &branches,
+            &nested,
+            self.sweep_artifact_cache_dir(),
+        )
+        .await?;
+        info!(
+            ledger_name = %ledger_name,
+            orphans = plan.orphans.len(),
+            scanned = plan.scanned,
+            live = plan.live,
+            "Reclaiming orphaned index artifacts"
+        );
+        Ok(execute_sweep(&storage, &plan).await)
+    }
+}

@@ -1,0 +1,6707 @@
+//! Integration tests for R2RML graph sources.
+//!
+//! These tests verify that GRAPH patterns correctly execute against R2RML
+//! graph sources backed by Iceberg tables.
+//!
+//! Test categories:
+//! - Unit tests: R2RML parsing, compilation, term materialization
+//! - Engine-level E2E: Full query execution with mocked providers (no external infra)
+//! - External E2E: Real Polaris/MinIO integration (requires infrastructure)
+
+mod support;
+
+use async_trait::async_trait;
+use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+use fluree_db_query::error::{QueryError, Result as QueryResult};
+use fluree_db_query::r2rml::{
+    convert_triple_to_r2rml, ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
+    ScanOrder, ScanTopK, ScanValue,
+};
+use fluree_db_r2rml::loader::R2rmlLoader;
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// Additional imports for engine-level E2E tests
+use fluree_db_api::{
+    execute, ContextConfig, ExecutableQuery, FlureeBuilder, ParsedContext, Pattern, VarRegistry,
+};
+use fluree_db_core::{FlakeValue, GraphDbRef, NoOverlay, Tracker};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::GraphName;
+use fluree_db_query::ir::{
+    AggregateFn, AggregateSpec, Expression, Function, Grouping, InputSemantics, Query, QueryOutput,
+};
+use fluree_db_query::var_registry::VarId;
+use support::genesis_ledger;
+
+fn r2rml_test_config<'a, P: R2rmlProvider + R2rmlTableProvider>(
+    tracker: &'a Tracker,
+    provider: &'a P,
+) -> ContextConfig<'a, 'a> {
+    ContextConfig {
+        tracker: Some(tracker),
+        r2rml: Some((provider, provider)),
+        ..Default::default()
+    }
+}
+
+// =============================================================================
+// Mock R2RML Provider for Testing
+// =============================================================================
+
+/// A mock R2RML provider that returns pre-configured data.
+///
+/// This allows testing the R2RML query integration without requiring
+/// external Iceberg/Polaris/MinIO infrastructure.
+#[derive(Debug)]
+struct MockR2rmlProvider {
+    /// Pre-compiled R2RML mapping
+    mapping: Arc<CompiledR2rmlMapping>,
+    /// Pre-built column batches to return from scan_table
+    batches: Vec<ColumnBatch>,
+    /// The row order each scan asked for; `None` for a plain `scan_table`.
+    orders: Mutex<Vec<Option<ScanOrder>>>,
+}
+
+impl MockR2rmlProvider {
+    fn new(mapping: CompiledR2rmlMapping, batches: Vec<ColumnBatch>) -> Self {
+        Self {
+            mapping: Arc::new(mapping),
+            batches,
+            orders: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl R2rmlProvider for MockR2rmlProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for MockR2rmlProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders.lock().unwrap().push(None);
+        Ok(vec_batch_stream(self.batches.clone()))
+    }
+
+    async fn scan_table_ordered(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+        order: ScanOrder,
+        _memory: &fluree_db_core::QueryCancellation,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders.lock().unwrap().push(Some(order));
+        Ok(vec_batch_stream(self.batches.clone()))
+    }
+}
+
+/// Wrap pre-built batches as a `ColumnBatchStream` for the mock providers.
+fn vec_batch_stream(batches: Vec<ColumnBatch>) -> ColumnBatchStream {
+    use futures::StreamExt;
+    Box::pin(futures::stream::iter(batches).map(Ok))
+}
+
+// =============================================================================
+// Test Fixtures
+// =============================================================================
+
+/// Simple R2RML mapping for airlines table.
+const AIRLINE_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#AirlineMapping> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "openflights.airlines" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/airline/{id}" ;
+        rr:class ex:Airline
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:country ;
+        rr:objectMap [ rr:column "country" ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:iata ;
+        rr:objectMap [ rr:column "iata" ]
+    ] .
+"#;
+
+/// Create a sample column batch representing airline data.
+fn sample_airline_batch() -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "country".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 3,
+        },
+        FieldInfo {
+            name: "iata".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 4,
+        },
+    ]);
+
+    let columns = vec![
+        Column::Int64(vec![Some(1), Some(2), Some(3)]),
+        Column::String(vec![
+            Some("Delta Air Lines".to_string()),
+            Some("United Airlines".to_string()),
+            Some("American Airlines".to_string()),
+        ]),
+        Column::String(vec![
+            Some("United States".to_string()),
+            Some("United States".to_string()),
+            Some("United States".to_string()),
+        ]),
+        Column::String(vec![
+            Some("DL".to_string()),
+            Some("UA".to_string()),
+            Some("AA".to_string()),
+        ]),
+    ];
+
+    ColumnBatch::new(Arc::new(schema), columns).unwrap()
+}
+
+/// Compile the airline mapping from Turtle.
+fn compile_airline_mapping() -> CompiledR2rmlMapping {
+    R2rmlLoader::from_turtle(AIRLINE_MAPPING_TTL)
+        .expect("Failed to parse R2RML Turtle")
+        .compile()
+        .expect("Failed to compile R2RML mapping")
+}
+
+// =============================================================================
+// Unit-Level Tests (Mock Provider)
+// =============================================================================
+
+/// Test that the R2RML loader can parse and compile the airline mapping.
+#[test]
+fn test_r2rml_mapping_compilation() {
+    let mapping = compile_airline_mapping();
+
+    // Should have one TriplesMap
+    assert_eq!(mapping.triples_maps.len(), 1);
+
+    // Should be indexed by class
+    let airline_maps = mapping.find_maps_for_class("http://example.org/Airline");
+    assert_eq!(airline_maps.len(), 1);
+
+    // Should be indexed by predicate
+    let name_maps = mapping.find_maps_for_predicate("http://example.org/name");
+    assert_eq!(name_maps.len(), 1);
+}
+
+/// Test that mock provider returns expected data.
+#[tokio::test]
+async fn test_mock_r2rml_provider() {
+    let mapping = compile_airline_mapping();
+    let batch = sample_airline_batch();
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    // Test has_r2rml_mapping
+    assert!(provider.has_r2rml_mapping("test-gs:main").await.unwrap());
+
+    // Test compiled_mapping
+    let loaded = provider
+        .compiled_mapping("test-gs:main", Some(0))
+        .await
+        .unwrap();
+    assert_eq!(loaded.triples_maps.len(), 1);
+
+    // Test scan_table
+    use futures::StreamExt;
+    let batches: Vec<ColumnBatch> = provider
+        .scan_table(
+            "test-gs:main",
+            "openflights.airlines",
+            &[],
+            &[],
+            None,
+            Some(0),
+        )
+        .await
+        .unwrap()
+        .map(|b| b.unwrap())
+        .collect()
+        .await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows, 3);
+}
+
+// =============================================================================
+// Integration Tests with Fluree
+// =============================================================================
+
+// Note: Full GRAPH query integration tests require the nameservice to be
+// configured with an Iceberg graph source. These tests are marked as ignored until
+// we have proper test infrastructure for registering mock graph sources.
+
+/// Test that R2RML materialization produces correct RDF terms.
+#[test]
+fn test_r2rml_term_materialization() {
+    use fluree_db_r2rml::mapping::{ObjectMap, SubjectMap};
+    use fluree_db_r2rml::materialize::{
+        materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
+    };
+
+    let batch = sample_airline_batch();
+
+    // Test subject materialization
+    let subject_map = SubjectMap::template("http://example.org/airline/{id}");
+    let subject = materialize_subject_from_batch(&subject_map, &batch, 0).unwrap();
+    assert!(subject.is_some());
+    match subject.unwrap() {
+        RdfTerm::Iri(iri) => assert_eq!(iri, "http://example.org/airline/1"),
+        _ => panic!("Expected IRI"),
+    }
+
+    // Test object materialization (column value)
+    let object_map = ObjectMap::column("name");
+    let object = materialize_object_from_batch(&object_map, &batch, 0).unwrap();
+    assert!(object.is_some());
+    match object.unwrap() {
+        RdfTerm::Literal { value, .. } => assert_eq!(value, "Delta Air Lines"),
+        _ => panic!("Expected Literal"),
+    }
+
+    // Second row
+    let subject2 = materialize_subject_from_batch(&subject_map, &batch, 1).unwrap();
+    match subject2.unwrap() {
+        RdfTerm::Iri(iri) => assert_eq!(iri, "http://example.org/airline/2"),
+        _ => panic!("Expected IRI"),
+    }
+}
+
+/// Test materialization handles null values correctly.
+#[test]
+fn test_r2rml_null_handling() {
+    use fluree_db_r2rml::mapping::SubjectMap;
+    use fluree_db_r2rml::materialize::materialize_subject_from_batch;
+
+    // Create batch with null in template column
+    let schema = BatchSchema::new(vec![FieldInfo {
+        name: "id".to_string(),
+        field_type: FieldType::Int64,
+        nullable: true,
+        field_id: 1,
+    }]);
+    let columns = vec![Column::Int64(vec![Some(1), None, Some(3)])];
+    let batch = ColumnBatch::new(Arc::new(schema), columns).unwrap();
+
+    let subject_map = SubjectMap::template("http://example.org/{id}");
+
+    // Row 0: non-null id
+    let result0 = materialize_subject_from_batch(&subject_map, &batch, 0).unwrap();
+    assert!(result0.is_some());
+
+    // Row 1: null id - should produce None (skip row)
+    let result1 = materialize_subject_from_batch(&subject_map, &batch, 1).unwrap();
+    assert!(
+        result1.is_none(),
+        "Null template column should produce None"
+    );
+
+    // Row 2: non-null id
+    let result2 = materialize_subject_from_batch(&subject_map, &batch, 2).unwrap();
+    assert!(result2.is_some());
+}
+
+// =============================================================================
+// End-to-End Tests (Requires Polaris/MinIO)
+// =============================================================================
+
+/// End-to-end test with real Polaris REST catalog and S3/MinIO.
+///
+/// This test requires:
+/// - Polaris REST catalog (default: localhost:8182)
+/// - S3/MinIO with OpenFlights Parquet data
+/// - Tables: openflights/airlines, openflights/airports, openflights/routes
+///
+/// Environment variables:
+/// - ICEBERG_E2E=1 to enable the test
+/// - ICEBERG_CATALOG_URI (default: http://localhost:8182)
+/// - ICEBERG_WAREHOUSE (default: openflights)
+/// - S3_ENDPOINT (optional, for MinIO)
+/// - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (for S3 auth)
+///
+/// Run with: ICEBERG_E2E=1 cargo test e2e_r2rml_query_iceberg_table -- --nocapture
+#[tokio::test]
+#[ignore = "Requires external Polaris/MinIO infrastructure. Set ICEBERG_E2E=1 to run."]
+async fn e2e_r2rml_query_iceberg_table() {
+    if std::env::var("ICEBERG_E2E").is_err() {
+        eprintln!("Skipping E2E test (set ICEBERG_E2E=1 to run)");
+        return;
+    }
+
+    // R2RML mapping for airlines table
+    const AIRLINES_R2RML: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#AirlineMapping>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "openflights/airlines" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/airline/{id}" ;
+                rr:class ex:Airline
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:name ;
+                rr:objectMap [ rr:column "name" ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:country ;
+                rr:objectMap [ rr:column "country" ]
+            ] .
+    "#;
+
+    // Configuration from environment
+    // Default to Polaris (8182) with OAuth2 auth
+    let catalog_uri = std::env::var("ICEBERG_CATALOG_URI")
+        .unwrap_or_else(|_| "http://localhost:8182/api/catalog".to_string());
+    let warehouse =
+        std::env::var("ICEBERG_WAREHOUSE").unwrap_or_else(|_| "openflights".to_string());
+    // OAuth2 credential for Polaris: client_id:client_secret
+    let oauth2_credential = std::env::var("ICEBERG_OAUTH2_CREDENTIAL")
+        .ok()
+        .or_else(|| Some("root:s3cr3t".to_string())); // Default Polaris credentials
+
+    eprintln!("E2E Test Configuration:");
+    eprintln!("  Catalog URI: {catalog_uri}");
+    eprintln!("  Warehouse: {warehouse}");
+    eprintln!(
+        "  OAuth2: {}",
+        oauth2_credential
+            .as_ref()
+            .map(|c| c.split(':').next().unwrap_or("?"))
+            .unwrap_or("none")
+    );
+
+    // Compile R2RML mapping
+    let mapping = R2rmlLoader::from_turtle(AIRLINES_R2RML)
+        .expect("Failed to parse R2RML")
+        .compile()
+        .expect("Failed to compile R2RML");
+
+    eprintln!(
+        "Compiled R2RML mapping with {} TriplesMap(s)",
+        mapping.triples_maps.len()
+    );
+
+    // Create a custom provider that uses Iceberg directly
+    let provider = IcebergDirectProvider {
+        mapping: Arc::new(mapping),
+        catalog_uri,
+        warehouse,
+        s3_endpoint: std::env::var("S3_ENDPOINT").ok(),
+        s3_region: Some("us-east-1".to_string()),
+        s3_path_style: true,
+        oauth2_credential,
+    };
+
+    // Create Fluree instance and ledger
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "e2e-iceberg:main");
+
+    // Register example.org namespace
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Build query: SELECT ?airline ?name ?country WHERE { GRAPH <gs:main> { ?airline ex:name ?name ; ex:country ?country } }
+    let mut vars = VarRegistry::new();
+    let airline_var = vars.get_or_insert("?airline");
+    let name_var = vars.get_or_insert("?name");
+    let country_var = vars.get_or_insert("?country");
+
+    // Register predicate IRIs
+    let ex_name_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("namespace should be registered");
+    let ex_country_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/country")
+        .expect("namespace should be registered");
+
+    let inner_patterns = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(airline_var),
+            Ref::Sid(ex_name_sid),
+            Term::Var(name_var),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(airline_var),
+            Ref::Sid(ex_country_sid),
+            Term::Var(country_var),
+        )),
+    ];
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: inner_patterns,
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![airline_var, name_var, country_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    eprintln!("Executing query against Iceberg...");
+
+    // Execute query
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await;
+
+    match result {
+        Ok(batches) => {
+            let total_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+            eprintln!("Query returned {total_rows} rows");
+
+            // Print first few results
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                for row_idx in 0..batch.len().min(5) {
+                    if let (Some(name_col), Some(country_col)) =
+                        (batch.column_by_idx(1), batch.column_by_idx(2))
+                    {
+                        eprintln!(
+                            "  Row {}: name={:?}, country={:?}",
+                            batch_idx * 1000 + row_idx,
+                            name_col[row_idx],
+                            country_col[row_idx]
+                        );
+                    }
+                }
+                if batch.len() > 5 {
+                    eprintln!("  ... and {} more rows", batch.len() - 5);
+                }
+            }
+
+            // OpenFlights has ~6000 airlines
+            assert!(
+                total_rows > 100,
+                "Expected many airline rows, got {total_rows}"
+            );
+        }
+        Err(e) => {
+            eprintln!("Query failed: {e}");
+            // Don't panic if it's a connection error - the infrastructure might not be running
+            if e.to_string().contains("connection") || e.to_string().contains("Connection") {
+                eprintln!("WARNING: Could not connect to Iceberg catalog - is it running?");
+            } else {
+                panic!("Query failed with unexpected error: {e}");
+            }
+        }
+    }
+}
+
+/// End-to-end test using FlureeR2rmlProvider through the full Fluree API.
+///
+/// This test exercises the complete production flow:
+/// 1. Store R2RML mapping in Fluree storage
+/// 2. Create graph source using `create_r2rml_graph_source()` which registers in nameservice
+/// 3. Query using `query_graph_source()` which uses `FlureeR2rmlProvider`
+///
+/// This test requires:
+/// - Polaris REST catalog (default: localhost:8182)
+/// - S3/MinIO with OpenFlights Parquet data
+/// - Tables: openflights/airlines
+///
+/// Environment variables:
+/// - ICEBERG_E2E=1 to enable the test
+/// - ICEBERG_E2E_STRICT=1 to fail hard on connection errors (for CI)
+/// - ICEBERG_CATALOG_URI (default: http://localhost:8182/api/catalog)
+/// - ICEBERG_WAREHOUSE (default: openflights)
+/// - ICEBERG_OAUTH2_CREDENTIAL (default: root:s3cr3t)
+///
+/// Run with: ICEBERG_E2E=1 cargo test e2e_fluree_r2rml_provider_full_flow -- --nocapture
+/// Run strict: ICEBERG_E2E=1 ICEBERG_E2E_STRICT=1 cargo test e2e_fluree_r2rml_provider_full_flow -- --nocapture
+#[tokio::test]
+#[ignore = "Requires external Polaris/MinIO infrastructure. Set ICEBERG_E2E=1 to run."]
+async fn e2e_fluree_r2rml_provider_full_flow() {
+    use fluree_db_api::R2rmlCreateConfig;
+
+    if std::env::var("ICEBERG_E2E").is_err() {
+        eprintln!("Skipping E2E test (set ICEBERG_E2E=1 to run)");
+        return;
+    }
+
+    // Strict mode: fail hard on connection errors (useful for CI)
+    let strict_mode = std::env::var("ICEBERG_E2E_STRICT").is_ok();
+
+    // Configuration from environment
+    let catalog_uri = std::env::var("ICEBERG_CATALOG_URI")
+        .unwrap_or_else(|_| "http://localhost:8182/api/catalog".to_string());
+    let warehouse =
+        std::env::var("ICEBERG_WAREHOUSE").unwrap_or_else(|_| "openflights".to_string());
+    let oauth2_credential =
+        std::env::var("ICEBERG_OAUTH2_CREDENTIAL").unwrap_or_else(|_| "root:s3cr3t".to_string());
+
+    eprintln!("E2E FlureeR2rmlProvider Full Flow Test:");
+    eprintln!("  Catalog URI: {catalog_uri}");
+    eprintln!("  Warehouse: {warehouse}");
+
+    // R2RML mapping for airlines table
+    const AIRLINES_R2RML: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#AirlineMapping>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "openflights.airlines" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/airline/{id}" ;
+                rr:class ex:Airline
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:name ;
+                rr:objectMap [ rr:column "name" ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:country ;
+                rr:objectMap [ rr:column "country" ]
+            ] .
+    "#;
+
+    // Create Fluree instance
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create a ledger for query execution
+    let mut ledger = genesis_ledger(&fluree, "e2e-provider:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Step 1: Store the R2RML mapping in Fluree storage
+    eprintln!("Step 1: Storing R2RML mapping...");
+    let mapping_address = "r2rml/airlines-e2e.ttl";
+    fluree
+        .admin_storage()
+        .expect("managed backend")
+        .write_bytes(mapping_address, AIRLINES_R2RML.as_bytes())
+        .await
+        .expect("Failed to store mapping");
+    eprintln!("  Mapping stored at: {mapping_address}");
+
+    // Step 2: Create graph source using create_r2rml_graph_source()
+    eprintln!("Step 2: Creating R2RML graph source...");
+
+    // Parse OAuth2 credentials
+    let parts: Vec<&str> = oauth2_credential.split(':').collect();
+    let token_url = format!("{catalog_uri}/v1/oauth/tokens");
+
+    let mut config = R2rmlCreateConfig::new(
+        "airlines-e2e",
+        &catalog_uri,
+        "openflights.airlines",
+        AIRLINES_R2RML,
+    )
+    .with_warehouse(&warehouse)
+    .with_mapping_media_type("text/turtle")
+    .with_vended_credentials(true)
+    .with_s3_path_style(true);
+
+    // Set OAuth2 auth
+    if parts.len() == 2 {
+        config = config.with_auth_oauth2(&token_url, parts[0], parts[1]);
+    }
+
+    let gs_result = fluree.create_r2rml_graph_source(config).await;
+    match &gs_result {
+        Ok(result) => {
+            eprintln!("  Graph source created: {}", result.graph_source_id);
+            eprintln!("  Connection tested: {}", result.connection_tested);
+            eprintln!("  Mapping validated: {}", result.mapping_validated);
+            eprintln!("  TriplesMap count: {}", result.triples_map_count);
+        }
+        Err(e) => {
+            eprintln!("  Graph source creation failed: {e}");
+            let is_connection_error =
+                e.to_string().contains("connection") || e.to_string().contains("Connection");
+
+            if strict_mode {
+                // In strict mode, fail hard on any error
+                panic!("Graph source creation failed (strict mode): {e}");
+            } else if is_connection_error {
+                // In lenient mode, skip on connection errors
+                eprintln!("WARNING: Could not connect to Iceberg catalog - skipping test");
+                return;
+            }
+        }
+    }
+
+    // Graph source should be created even if connection test fails
+    let gs_result = gs_result.expect("Graph source creation should succeed");
+    assert!(gs_result.mapping_validated, "Mapping should be validated");
+    assert_eq!(gs_result.triples_map_count, 1, "Should have 1 TriplesMap");
+
+    // Step 3: Query using query_graph_source() which uses FlureeR2rmlProvider
+    eprintln!("Step 3: Querying graph source...");
+
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?airline", "?name", "?country"],
+        "where": {
+            "@graph": "airlines-e2e:main",
+            "patterns": [
+                {"@id": "?airline", "ex:name": "?name", "ex:country": "?country"}
+            ]
+        }
+    });
+
+    // Execute query via query_graph_source - this exercises the full FlureeR2rmlProvider path
+    let result = fluree.query_graph_source(&ledger, &query).await;
+
+    match result {
+        Ok(query_result) => {
+            let total_rows: usize = query_result
+                .batches
+                .iter()
+                .map(fluree_db_api::Batch::len)
+                .sum();
+            eprintln!("  Query returned {total_rows} rows");
+
+            // Print first few results
+            for (i, batch) in query_result.batches.iter().enumerate() {
+                for row_idx in 0..batch.len().min(3) {
+                    if let (Some(name_col), Some(country_col)) =
+                        (batch.column_by_idx(1), batch.column_by_idx(2))
+                    {
+                        eprintln!(
+                            "  Row {}: name={:?}, country={:?}",
+                            i * 1000 + row_idx,
+                            name_col[row_idx],
+                            country_col[row_idx]
+                        );
+                    }
+                }
+            }
+
+            // OpenFlights has ~6000 airlines
+            assert!(
+                total_rows > 100,
+                "Expected many airline rows, got {total_rows}"
+            );
+            eprintln!("SUCCESS: Full FlureeR2rmlProvider flow works!");
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            eprintln!("  Query failed: {error_msg}");
+
+            let is_connection_error = error_msg.contains("connection")
+                || error_msg.contains("Connection")
+                || error_msg.contains("catalog");
+
+            if strict_mode {
+                // In strict mode, fail hard on any error
+                panic!("Query failed (strict mode): {e}");
+            } else if is_connection_error {
+                // In lenient mode, warn on connection errors
+                eprintln!("WARNING: Could not connect to Iceberg - is infrastructure running?");
+            } else {
+                panic!("Query failed with unexpected error: {e}");
+            }
+        }
+    }
+}
+
+/// Gated live-Iceberg test for the FQL `@type` by-class regression: a derived
+/// single-table R2RML mapping must return the class's instances for FQL `@type`
+/// (both the flat `?s a <Class>` scan and the `{"?s": ["*"]}` crawl the Solo
+/// "View Instances" screen issues), matching SPARQL `a`.
+///
+/// Skips cleanly (does not fail) unless the live catalog is configured via env:
+///   FLUREE_TEST_ICEBERG_CATALOG_URI   (required — the gate)
+///   FLUREE_TEST_ICEBERG_WAREHOUSE     (required)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SECRET (required; `client_id:client_secret`)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SCOPE  (default `session:role:ICEBERG_READER` —
+///                                      the Snowflake Horizon/Polaris role scope,
+///                                      matching the it_iceberg_*_live suites)
+///   FLUREE_TEST_ICEBERG_TABLE         (default `DW.DIM_GEOGRAPHY`)
+///   FLUREE_TEST_ICEBERG_KEY_COLUMN    (default `GEOGRAPHY_KEY`)
+///
+/// Like the E2E test above it is lenient: a catalog-connection failure warns and
+/// returns rather than failing, so it is safe to leave enabled in CI.
+#[tokio::test]
+async fn live_iceberg_fql_type_returns_instances() {
+    use fluree_db_api::R2rmlCreateConfig;
+
+    // --- Gate: all three connection vars must be present, else skip cleanly. ---
+    let (Ok(catalog_uri), Ok(warehouse), Ok(oauth2_secret)) = (
+        std::env::var("FLUREE_TEST_ICEBERG_CATALOG_URI"),
+        std::env::var("FLUREE_TEST_ICEBERG_WAREHOUSE"),
+        std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SECRET"),
+    ) else {
+        eprintln!(
+            "Skipping live-Iceberg @type test \
+             (set FLUREE_TEST_ICEBERG_CATALOG_URI / _WAREHOUSE / _OAUTH2_SECRET to run)"
+        );
+        return;
+    };
+    let table = std::env::var("FLUREE_TEST_ICEBERG_TABLE")
+        .unwrap_or_else(|_| "DW.DIM_GEOGRAPHY".to_string());
+    let key_column = std::env::var("FLUREE_TEST_ICEBERG_KEY_COLUMN")
+        .unwrap_or_else(|_| "GEOGRAPHY_KEY".to_string());
+
+    // A derived single-table mapping: subject template + class, no POMs required
+    // for the type-scan (the crawl also exercises predicate/object materialization
+    // via the table's remaining columns).
+    let mapping = format!(
+        r#"@base <http://mapping.fluree.dev/r2rml> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix v: <http://example/org/ns> .
+
+<#T> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "{table}" ] ;
+  rr:subjectMap [ rr:template "http://example/org/ns/inst/{{{key_column}}}" ; rr:class v:Thing ] .
+"#
+    );
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = genesis_ledger(&fluree, "live-iceberg-type:main");
+
+    let alias = "fql-type-e2e";
+    let mut config = R2rmlCreateConfig::new(alias, &catalog_uri, &table, mapping)
+        .with_warehouse(&warehouse)
+        .with_mapping_media_type("text/turtle")
+        .with_vended_credentials(true)
+        .with_s3_path_style(true);
+    if let Some((client_id, client_secret)) = oauth2_secret.split_once(':') {
+        let token_url = format!("{catalog_uri}/v1/oauth/tokens");
+        let scope = std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SCOPE")
+            .unwrap_or_else(|_| "session:role:ICEBERG_READER".to_string());
+        config = config
+            .with_auth_oauth2(&token_url, client_id, client_secret)
+            .with_oauth2_scope(scope);
+    }
+
+    if let Err(e) = fluree.create_r2rml_graph_source(config).await {
+        // Creation reaches the catalog for validation; a connection failure here
+        // is environmental, so warn + skip rather than fail.
+        eprintln!("WARNING: could not create live R2RML graph source: {e}");
+        return;
+    }
+
+    // --- Flat FQL `@type` (bound class) must return the class's instances. ---
+    // Uses the `from`/FromQueryBuilder path with an inline WHERE (the previous
+    // `{"@graph":.., "patterns":[..]}` envelope panicked "Arrays in property
+    // values not yet supported" — it is not a valid FQL WHERE shape).
+    let type_query = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
+        "select": ["?s"],
+        "where": {"@id": "?s", "@type": "v:Thing"},
+    });
+    match fluree
+        .query_from()
+        .jsonld(&type_query)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let rows = json.as_array().map_or(0, Vec::len);
+            eprintln!("live-iceberg flat @type returned {rows} rows");
+            assert!(rows > 0, "FQL @type must return the class's instances");
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live @type query failed environmentally: {e}");
+            return;
+        }
+        Err(e) => panic!("FQL @type query failed unexpectedly: {e}"),
+    }
+
+    // --- The `{"?s": ["*"]}` crawl (Solo "View Instances") must return hydrated
+    //     instances, not an empty array. ---
+    let crawl = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
+        "limit": 3,
+    });
+    match fluree
+        .graph(&format!("{alias}:main"))
+        .query()
+        .with_r2rml()
+        .jsonld(&crawl)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let docs = json.as_array().expect("crawl returns a JSON array");
+            eprintln!("live-iceberg crawl returned {} instances", docs.len());
+            assert!(
+                !docs.is_empty(),
+                "the @type crawl must return instances (View Instances regression)"
+            );
+            assert!(
+                docs[0].get("@id").is_some(),
+                "each crawled instance carries an @id"
+            );
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live crawl query failed environmentally: {e}");
+        }
+        Err(e) => panic!("FQL @type crawl failed unexpectedly: {e}"),
+    }
+
+    // --- SAME crawl through the `from`/FromQueryBuilder path (the DEPLOYED
+    //     `POST /v1/fluree/query/<ledger>` route that returned []). Pre-fix this
+    //     native-hydrated the empty index → []; post-fix (FIX 1) it routes
+    //     through R2RML and returns the same hydrated instances as the alias
+    //     path above. ---
+    let crawl_from = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
+        "limit": 3,
+    });
+    match fluree
+        .query_from()
+        .jsonld(&crawl_from)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let docs = json.as_array().expect("crawl returns a JSON array");
+            eprintln!("live-iceberg from-crawl returned {} instances", docs.len());
+            assert!(
+                !docs.is_empty(),
+                "the from/connection-path @type crawl must return instances (deployed \
+                 View Instances regression)"
+            );
+            assert!(
+                docs.iter().all(|d| d.get("@id").is_some()),
+                "each from-crawled instance carries an @id"
+            );
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live from-crawl query failed environmentally: {e}");
+        }
+        Err(e) => panic!("FQL from-crawl failed unexpectedly: {e}"),
+    }
+}
+
+/// Whether an error string looks like an environmental (catalog/connection)
+/// failure rather than an engine bug, for the lenient live-test skip path.
+fn is_environmental(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("connection")
+        || m.contains("catalog")
+        || m.contains("oauth")
+        || m.contains("credential")
+}
+
+/// Provider that queries Iceberg directly (without nameservice graph source registration).
+#[derive(Debug)]
+struct IcebergDirectProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    catalog_uri: String,
+    warehouse: String,
+    s3_endpoint: Option<String>,
+    s3_region: Option<String>,
+    s3_path_style: bool,
+    /// OAuth2 credentials for Polaris (client_id:client_secret)
+    oauth2_credential: Option<String>,
+}
+
+#[async_trait]
+impl R2rmlProvider for IcebergDirectProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for IcebergDirectProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use fluree_db_iceberg::{
+            auth::AuthConfig,
+            catalog::{
+                parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
+            },
+            config_value::ConfigValue,
+            io::{S3IcebergStorage, SendIcebergStorage, SendParquetReader},
+            metadata::TableMetadata,
+            scan::{ScanConfig, SendScanPlanner},
+        };
+
+        eprintln!("IcebergDirectProvider.scan_table: {table_name}");
+        eprintln!("  projection: {projection:?}");
+
+        // Create catalog client with OAuth2 auth if credentials provided
+        let catalog_config = RestCatalogConfig {
+            uri: self.catalog_uri.clone(),
+            warehouse: Some(self.warehouse.clone()),
+            ..Default::default()
+        };
+
+        // Use OAuth2 auth for Polaris, or no auth for Tabular
+        let auth = if let Some(ref cred) = self.oauth2_credential {
+            let parts: Vec<&str> = cred.split(':').collect();
+            if parts.len() == 2 {
+                let token_url = format!("{}/v1/oauth/tokens", self.catalog_uri);
+                eprintln!("  Using OAuth2 auth with token_url: {token_url}");
+                AuthConfig::OAuth2ClientCredentials {
+                    token_url,
+                    client_id: ConfigValue::literal(parts[0]),
+                    client_secret: ConfigValue::literal(parts[1]),
+                    scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+                    audience: None,
+                }
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+                .map_err(|e| QueryError::Internal(format!("OAuth2 auth error: {e}")))?
+            } else {
+                AuthConfig::None
+                    .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+                    .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
+            }
+        } else {
+            AuthConfig::None
+                .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+                .map_err(|e| QueryError::Internal(format!("Auth error: {e}")))?
+        };
+
+        let catalog = RestCatalogClient::new(catalog_config, auth)
+            .map_err(|e| QueryError::Internal(format!("Catalog error: {e}")))?;
+
+        // Parse table identifier
+        let table_id = parse_table_identifier(table_name)
+            .map_err(|e| QueryError::Internal(format!("Table ID error: {e}")))?;
+
+        eprintln!("  Loading table: {}.{}", table_id.namespace, table_id.table);
+
+        // Load table metadata with vended credentials
+        let load_response = catalog
+            .load_table(&table_id, true)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Load table error: {e}")))?;
+
+        eprintln!("  Metadata location: {}", load_response.metadata_location);
+        eprintln!(
+            "  Has vended creds: {}",
+            load_response.credentials.is_some()
+        );
+
+        // Create S3 storage (a live-catalog test double, outside the engine's
+        // storage decision).
+        #[allow(deprecated)]
+        let storage = if let Some(fluree_db_iceberg::credential::VendedCredentials::S3(creds)) =
+            load_response.credentials
+        {
+            eprintln!("  Using vended credentials");
+            eprintln!("    Endpoint from creds: {:?}", creds.endpoint);
+            eprintln!("    Region from creds: {:?}", creds.region);
+
+            // Override Docker internal hostname with localhost for test access
+            // Polaris returns iceberg-minio:9000 (Docker network) but we need localhost:9000
+            let endpoint = creds.endpoint.as_ref().map(|ep| {
+                if ep.contains("iceberg-minio") {
+                    ep.replace("iceberg-minio", "localhost")
+                } else {
+                    ep.clone()
+                }
+            });
+            eprintln!("    Using endpoint: {endpoint:?}");
+
+            // Workaround for AWS SDK TLS initialization issues:
+            // Set environment variables and use the default chain instead of explicit credentials.
+            // This avoids potential TLS cert parsing issues on some systems.
+            std::env::set_var("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+            if let Some(ref token) = creds.session_token {
+                std::env::set_var("AWS_SESSION_TOKEN", token);
+            }
+
+            S3IcebergStorage::from_default_chain(
+                creds.region.as_deref(),
+                endpoint.as_deref(),
+                creds.path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("S3 storage error: {e}")))?
+        } else {
+            eprintln!("  Using default AWS credentials");
+            S3IcebergStorage::from_default_chain(
+                self.s3_region.as_deref(),
+                self.s3_endpoint.as_deref(),
+                self.s3_path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("S3 storage error: {e}")))?
+        };
+
+        // Read and parse metadata
+        let metadata_bytes = storage
+            .read(&load_response.metadata_location)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Metadata read error: {e}")))?;
+
+        let metadata = TableMetadata::from_json(&metadata_bytes)
+            .map_err(|e| QueryError::Internal(format!("Metadata parse error: {e}")))?;
+
+        let schema = metadata
+            .current_schema()
+            .ok_or_else(|| QueryError::Internal("No current schema".to_string()))?;
+
+        eprintln!("  Schema fields: {:?}", schema.field_names());
+
+        // Resolve projection to field IDs
+        let projected_field_ids: Vec<i32> = if projection.is_empty() {
+            schema
+                .fields
+                .iter()
+                .filter(|f| !f.is_nested())
+                .map(|f| f.id)
+                .collect()
+        } else {
+            projection
+                .iter()
+                .filter_map(|name| schema.field_by_name(name).map(|f| f.id))
+                .collect()
+        };
+
+        eprintln!("  Projected field IDs: {projected_field_ids:?}");
+
+        // Create scan plan
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(&storage, &metadata, scan_config);
+        let plan = planner
+            .plan_scan()
+            .await
+            .map_err(|e| QueryError::Internal(format!("Scan plan error: {e}")))?;
+
+        eprintln!(
+            "  Scan plan: {} files, ~{} rows",
+            plan.files_selected, plan.estimated_row_count
+        );
+
+        if plan.is_empty() {
+            return Ok(vec_batch_stream(Vec::new()));
+        }
+
+        // Read Parquet files
+        let reader = SendParquetReader::new(&storage);
+        let mut all_batches = Vec::new();
+
+        for task in &plan.tasks {
+            eprintln!("  Reading: {}", task.data_file.file_path);
+            let batches = reader
+                .read_task(task)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Parquet read error: {e}")))?;
+            all_batches.extend(batches);
+        }
+
+        let total_rows: usize = all_batches.iter().map(|b| b.num_rows).sum();
+        eprintln!(
+            "  Loaded {} batches, {} total rows",
+            all_batches.len(),
+            total_rows
+        );
+
+        Ok(vec_batch_stream(all_batches))
+    }
+}
+
+// =============================================================================
+// Multi-Table / RefObjectMap Tests
+// =============================================================================
+
+/// R2RML mapping with RefObjectMap join between routes and airlines.
+const ROUTES_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#AirlineMapping> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "openflights.airlines" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/airline/{id}" ;
+        rr:class ex:Airline
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] .
+
+<http://example.org/mapping#RouteMapping> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "openflights.routes" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/route/{airline_id}_{src_id}_{dst_id}" ;
+        rr:class ex:Route
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:operatedBy ;
+        rr:objectMap [
+            rr:parentTriplesMap <http://example.org/mapping#AirlineMapping> ;
+            rr:joinCondition [
+                rr:child "airline_id" ;
+                rr:parent "id"
+            ]
+        ]
+    ] .
+"#;
+
+/// Test RefObjectMap parsing and compiled mapping indexes.
+#[test]
+fn test_ref_object_map_compilation() {
+    let mapping = R2rmlLoader::from_turtle(ROUTES_MAPPING_TTL)
+        .expect("Failed to parse R2RML")
+        .compile()
+        .expect("Failed to compile");
+
+    // Debug: print what TriplesMap keys were found
+    let keys: Vec<_> = mapping.triples_maps.keys().collect();
+    eprintln!("Found TriplesMap keys: {keys:?}");
+
+    // Should have two TriplesMap
+    assert_eq!(
+        mapping.triples_maps.len(),
+        2,
+        "Expected 2 TriplesMap, found: {keys:?}"
+    );
+
+    // RouteMapping should reference AirlineMapping
+    // Full IRIs as written in Turtle: http://example.org/mapping#AirlineMapping
+    let route_map = mapping
+        .get("http://example.org/mapping#RouteMapping")
+        .expect("RouteMapping not found");
+
+    // Find the operatedBy predicate-object map
+    let operated_by_pom = route_map
+        .predicate_object_maps
+        .iter()
+        .find(|pom| pom.predicate_map.as_constant() == Some("http://example.org/operatedBy"))
+        .expect("operatedBy POM not found");
+
+    // It should have a RefObjectMap
+    match &operated_by_pom.object_map {
+        fluree_db_r2rml::mapping::ObjectMap::RefObjectMap(rom) => {
+            assert_eq!(
+                rom.parent_triples_map,
+                "http://example.org/mapping#AirlineMapping"
+            );
+            assert_eq!(rom.join_conditions.len(), 1);
+            assert_eq!(rom.join_conditions[0].child_column, "airline_id");
+            assert_eq!(rom.join_conditions[0].parent_column, "id");
+        }
+        _ => panic!("Expected RefObjectMap for operatedBy"),
+    }
+
+    // Test find_maps_referencing index
+    let referencing = mapping.find_maps_referencing("http://example.org/mapping#AirlineMapping");
+    assert_eq!(referencing.len(), 1);
+    assert_eq!(
+        referencing[0].iri,
+        "http://example.org/mapping#RouteMapping"
+    );
+}
+
+// =============================================================================
+// Engine-Level E2E Tests (Mock Providers, No External Infrastructure)
+// =============================================================================
+//
+// These tests exercise the full query execution pipeline with GRAPH patterns:
+// 1. GraphOperator detects R2RML graph source and rewrites triple patterns
+// 2. R2rmlScanOperator loads mapping, scans tables, materializes terms
+// 3. Variable binding/unification works end-to-end
+//
+// Uses MockR2rmlProvider to return test data without external infrastructure.
+
+/// Engine-level E2E test: Execute GRAPH pattern query against R2RML graph source.
+///
+/// This test verifies:
+/// - Pattern::Graph with concrete IRI triggers R2RML rewriting
+/// - R2rmlScanOperator materializes subject IRIs from templates
+/// - Object values are correctly extracted from columns
+/// - Variable bindings match expected results
+#[tokio::test]
+async fn engine_e2e_graph_pattern_r2rml_scan() {
+    // Create a minimal Fluree instance (we only need a Db for IRI encoding)
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-e2e:main");
+
+    // Register the example.org namespace prefix in this Db so the R2RML operator
+    // can encode subject IRIs produced by rr:template. Without this, encode_iri()
+    // returns None and the operator will skip all rows as "IRI not encodable".
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Compile the airline mapping
+    let mapping = compile_airline_mapping();
+    let batch = sample_airline_batch();
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    // Build a query with Pattern::Graph targeting our graph source
+    // Equivalent SPARQL: SELECT ?s ?name WHERE { GRAPH <airlines-gs:main> { ?s ex:name ?name } }
+    let mut vars = VarRegistry::new();
+    let subject_var = vars.get_or_insert("?s");
+    let name_var = vars.get_or_insert("?name");
+
+    // Create triple pattern: ?s ex:name ?name
+    // Use a real Sid for the predicate so the R2RML rewrite can apply predicate_filter
+    // and we only materialize the ex:name predicate-object map (instead of all POMs).
+    let ex_name_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("example.org namespace should be registered for Sid encoding");
+    let inner_patterns = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(subject_var),
+        Ref::Sid(ex_name_sid),
+        Term::Var(name_var),
+    ))];
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: inner_patterns,
+    };
+
+    // Build Query with this pattern
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![subject_var, name_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    // Execute with our mock R2RML provider
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("Query execution should succeed");
+
+    // Verify we got results - the R2RML pipeline should produce bindings
+    eprintln!("Query returned {} batches", batches.len());
+    for (i, batch) in batches.iter().enumerate() {
+        eprintln!("  Batch {}: {} rows", i, batch.len());
+    }
+
+    // Assert: Query should produce results (not just execute without error)
+    // With a concrete predicate (ex:name), we should get one row per input table row.
+    let total_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert!(
+        total_rows > 0,
+        "R2RML query should produce results; got {} batches with {} total rows",
+        batches.len(),
+        total_rows
+    );
+}
+
+/// The `rdf:type` IRI, exactly as both SPARQL `a` and FQL `@type` lower it
+/// (predicate `Ref::Iri(rdf::TYPE)`).
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// Build + execute a single-triple `GRAPH <airlines-gs:main> { … }` scan over the
+/// airline mock provider, returning the raw result batches.
+async fn run_airline_graph_scan(
+    ledger: &support::MemoryLedger,
+    provider: &MockR2rmlProvider,
+    vars: &VarRegistry,
+    tp: TriplePattern,
+    output_vars: Vec<VarId>,
+) -> Vec<fluree_db_api::Batch> {
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Triple(tp)],
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(output_vars);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("R2RML scan should execute")
+}
+
+/// FQL `@type` — both bound (`@type: ex:Airline`) and variable (`@type: ?type`) —
+/// must produce the SAME `rdf:type` R2RML type-scan SPARQL `a` produces: the
+/// bound form returns the class's instances; the variable form binds the class
+/// IRI to `?type` (previously it was dropped, leaving `?type` null). This is the
+/// engine-level counterpart to the `fql_type_lowers_to_same_rdf_type_scan_as_sparql_a`
+/// unit test in `fluree-db-query`.
+#[tokio::test]
+async fn engine_e2e_type_scan_bound_and_variable_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-type:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    // --- Bound class: ?s a ex:Airline → the 3 airline instances. ---
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let tp = TriplePattern::new(
+        Ref::Var(s),
+        Ref::Iri(RDF_TYPE_IRI.into()),
+        Term::Iri("http://example.org/Airline".into()),
+    );
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s]).await;
+    let bound_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        bound_rows, 3,
+        "bound @type must return the class's instances (parity with SPARQL `a`)"
+    );
+
+    // --- Variable class: ?s a ?type → 3 rows, each ?type = the class IRI. ---
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let ty = vars.get_or_insert("?type");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Iri(RDF_TYPE_IRI.into()), Term::Var(ty));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, ty]).await;
+    let mut rows = 0;
+    for b in &batches {
+        for r in 0..b.len() {
+            rows += 1;
+            let ty_binding = b.get(r, ty).expect("?type column present");
+            assert_eq!(
+                ty_binding.get_iri().map(std::convert::AsRef::as_ref),
+                Some("http://example.org/Airline"),
+                "variable @type must bind the class IRI, not null"
+            );
+        }
+    }
+    assert_eq!(rows, 3, "one row per instance, each carrying its class IRI");
+}
+
+/// A variable-predicate wildcard (`?s ?p ?o`) must bind `?p` to each triple's
+/// predicate IRI — previously the operator left `?p` unbound, so a wildcard /
+/// crawl scan returned subjects and objects with a null predicate. It must ALSO
+/// emit each subject's `rr:class`-derived `rdf:type` triple (native parity: a
+/// native wildcard returns the type triple alongside the data predicates).
+#[tokio::test]
+async fn engine_e2e_wildcard_binds_predicate_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-wild:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
+
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let known_predicates = [
+        "http://example.org/name",
+        "http://example.org/country",
+        "http://example.org/iata",
+        RDF_TYPE,
+    ];
+    let mut rows = 0;
+    let mut type_rows = 0;
+    for b in &batches {
+        for r in 0..b.len() {
+            rows += 1;
+            let p_iri = b
+                .get(r, p)
+                .and_then(fluree_db_query::Binding::get_iri)
+                .map(std::string::ToString::to_string)
+                .expect("?p must be bound to a predicate IRI");
+            assert!(
+                known_predicates.contains(&p_iri.as_str()),
+                "?p bound to a mapping predicate; got {p_iri}"
+            );
+            if p_iri == RDF_TYPE {
+                type_rows += 1;
+                let o_iri = b
+                    .get(r, o)
+                    .and_then(fluree_db_query::Binding::get_iri)
+                    .map(std::string::ToString::to_string)
+                    .expect("type row must bind ?o to an IRI");
+                assert_eq!(
+                    o_iri, "http://example.org/Airline",
+                    "type row object = the declared class"
+                );
+            }
+        }
+    }
+    // 3 airlines × (3 predicate-object maps + 1 rr:class rdf:type) = 12 triples.
+    assert_eq!(
+        rows, 12,
+        "wildcard scan yields one row per (subject, predicate) incl. rdf:type"
+    );
+    assert_eq!(type_rows, 3, "exactly one rdf:type row per subject");
+}
+
+/// SPARQL reads the ledger's RDF lists through a list view, which wraps a
+/// variable-predicate pattern. An R2RML graph source holds no lists, so a
+/// wildcard inside `GRAPH <source>` still scans the source on a ledger that
+/// holds a list.
+#[tokio::test]
+async fn engine_e2e_wildcard_over_a_ledger_holding_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-wild-lists:main");
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:config ex:order (1 2) .",
+        )
+        .await
+        .expect("insert a list")
+        .ledger;
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Var(p),
+            Term::Var(o),
+        ))],
+    }];
+    parsed.output = QueryOutput::select_all(vec![s, p, o]);
+    parsed.rdf_list_view = true;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &*ledger.novelty, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("R2RML scan should execute");
+    let rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
+}
+
+/// The same wildcard inside a sub-select inside `GRAPH <source>`: the list
+/// view wraps the pattern in the sub-select's body too, and the source reads
+/// that body without it, so the sub-select scans the source rather than
+/// answering from the ledger's lists.
+#[tokio::test]
+async fn engine_e2e_wildcard_sub_select_over_a_ledger_holding_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-wild-lists-sub:main");
+    let ledger = fluree
+        .insert_turtle(
+            ledger,
+            "@prefix ex: <http://example.org/> .\nex:config ex:order (1 2) .",
+        )
+        .await
+        .expect("insert a list")
+        .ledger;
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Subquery(
+            fluree_db_query::ir::SubqueryPattern::new(
+                vec![s, p, o],
+                vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Var(p),
+                    Term::Var(o),
+                ))],
+            ),
+        )],
+    }];
+    parsed.output = QueryOutput::select_all(vec![s, p, o]);
+    parsed.rdf_list_view = true;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &*ledger.novelty, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("R2RML scan should execute");
+    let rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(rows, 12, "3 airlines x (3 predicates + rdf:type)");
+}
+
+/// Regression (fluree/db#1406 review): a class and a predicate that live in
+/// SEPARATE TriplesMaps sharing a subject template must NOT be fused. Fusing the
+/// class into the predicate star would make TriplesMap resolution require one map
+/// with both the class and the predicate; the split mapping has none, so a fused
+/// scan resolves zero maps and silently returns no rows. The rewrite must instead
+/// leave the class as its own subject-only scan and join it with the predicate
+/// scan on the shared subject.
+#[tokio::test]
+async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
+    /// Returns different batches per logical table so the two TriplesMaps back
+    /// distinct data (unlike `MockR2rmlProvider`, which serves one batch set).
+    #[derive(Debug)]
+    struct SplitTableProvider {
+        mapping: Arc<CompiledR2rmlMapping>,
+        people: Vec<ColumnBatch>,
+        names: Vec<ColumnBatch>,
+    }
+
+    #[async_trait]
+    impl R2rmlProvider for SplitTableProvider {
+        async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+            Ok(true)
+        }
+        async fn compiled_mapping(
+            &self,
+            _gs: &str,
+            _t: Option<i64>,
+        ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+            Ok(Arc::clone(&self.mapping))
+        }
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for SplitTableProvider {
+        async fn scan_table(
+            &self,
+            _gs: &str,
+            table: &str,
+            _p: &[String],
+            _f: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _t: Option<i64>,
+        ) -> QueryResult<ColumnBatchStream> {
+            let batches = if table == "names" {
+                self.names.clone()
+            } else {
+                self.people.clone()
+            };
+            Ok(vec_batch_stream(batches))
+        }
+    }
+
+    const SPLIT_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#PersonClass> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "people" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/person/{id}" ;
+        rr:class ex:Person
+    ] .
+
+<http://example.org/mapping#PersonName> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "names" ] ;
+    rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] .
+"#;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-split:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    let mapping = R2rmlLoader::from_turtle(SPLIT_MAPPING_TTL)
+        .expect("parse split mapping")
+        .compile()
+        .expect("compile split mapping");
+
+    // people (class table): subject id only.
+    let people_schema = BatchSchema::new(vec![FieldInfo {
+        name: "id".to_string(),
+        field_type: FieldType::Int64,
+        nullable: false,
+        field_id: 1,
+    }]);
+    let people = ColumnBatch::new(
+        Arc::new(people_schema),
+        vec![Column::Int64(vec![Some(1), Some(2)])],
+    )
+    .unwrap();
+
+    // names (predicate table): same subjects, plus the name column.
+    let names_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let names = ColumnBatch::new(
+        Arc::new(names_schema),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("Alice".to_string()), Some("Bob".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let provider = SplitTableProvider {
+        mapping: Arc::new(mapping),
+        people: vec![people],
+        names: vec![names],
+    };
+
+    // SELECT ?s ?name WHERE { GRAPH <r2rml-split:main> { ?s a ex:Person ; ex:name ?name } }
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let name = vars.get_or_insert("?name");
+    let rdf_type = ledger
+        .snapshot
+        .encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+        .expect("rdf:type encodable");
+    let person = ledger
+        .snapshot
+        .encode_iri("http://example.org/Person")
+        .expect("ex:Person encodable");
+    let ex_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("ex:name encodable");
+
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(rdf_type),
+            Term::Sid(person),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(ex_name),
+            Term::Var(name),
+        )),
+    ];
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("r2rml-split:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![s, name]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("split-TriplesMap query should execute");
+
+    let total_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        total_rows, 2,
+        "class and predicate in separate TriplesMaps must join to 2 rows, not silently \
+         collapse to 0 via unsafe fusion; got {total_rows}"
+    );
+}
+
+/// Engine-level E2E test: Verify R2RML provider is consulted for GRAPH patterns.
+///
+/// This test uses a custom provider that tracks method calls to verify
+/// the execution pipeline correctly consults the R2RML provider.
+#[tokio::test]
+async fn engine_e2e_provider_method_calls() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // Provider that tracks calls
+    #[derive(Debug)]
+    struct TrackingProvider {
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: Vec<ColumnBatch>,
+        has_mapping_called: AtomicBool,
+        compiled_mapping_called: AtomicUsize,
+        scan_table_called: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl R2rmlProvider for TrackingProvider {
+        async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+            eprintln!("has_r2rml_mapping called for: {graph_source_id}");
+            self.has_mapping_called.store(true, Ordering::SeqCst);
+            Ok(graph_source_id == "airlines-gs:main")
+        }
+
+        async fn compiled_mapping(
+            &self,
+            graph_source_id: &str,
+            _as_of_t: Option<i64>,
+        ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+            eprintln!("compiled_mapping called for: {graph_source_id}");
+            self.compiled_mapping_called.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&self.mapping))
+        }
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for TrackingProvider {
+        async fn scan_table(
+            &self,
+            graph_source_id: &str,
+            table_name: &str,
+            projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> QueryResult<ColumnBatchStream> {
+            eprintln!(
+                "scan_table called: gs={graph_source_id}, table={table_name}, projection={projection:?}"
+            );
+            self.scan_table_called.fetch_add(1, Ordering::SeqCst);
+            Ok(vec_batch_stream(self.batches.clone()))
+        }
+    }
+
+    // Create tracking provider
+    let mapping = compile_airline_mapping();
+    let batch = sample_airline_batch();
+    let provider = TrackingProvider {
+        mapping: Arc::new(mapping),
+        batches: vec![batch],
+        has_mapping_called: AtomicBool::new(false),
+        compiled_mapping_called: AtomicUsize::new(0),
+        scan_table_called: AtomicUsize::new(0),
+    };
+
+    // Create minimal Fluree instance
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "r2rml-tracking:main");
+
+    // Build query with GRAPH pattern
+    let mut vars = VarRegistry::new();
+    let subject_var = vars.get_or_insert("?s");
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(subject_var),
+            Ref::Var(vars.get_or_insert("?p")),
+            Term::Var(vars.get_or_insert("?o")),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![subject_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    // Execute query - should succeed
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await;
+
+    // Assert execution succeeded
+    assert!(
+        result.is_ok(),
+        "Query execution should succeed: {:?}",
+        result.err()
+    );
+
+    // Verify provider methods were called in expected order
+    assert!(
+        provider.has_mapping_called.load(Ordering::SeqCst),
+        "has_r2rml_mapping should have been called for the GRAPH pattern"
+    );
+
+    // Once R2RML graph source is detected, compiled_mapping and scan_table should be called
+    assert!(
+        provider.compiled_mapping_called.load(Ordering::SeqCst) > 0,
+        "compiled_mapping should have been called to load the R2RML mapping"
+    );
+
+    assert!(
+        provider.scan_table_called.load(Ordering::SeqCst) > 0,
+        "scan_table should have been called to read Iceberg data"
+    );
+
+    eprintln!(
+        "Provider calls: has_mapping={}, compiled_mapping={}, scan_table={}",
+        provider.has_mapping_called.load(Ordering::SeqCst),
+        provider.compiled_mapping_called.load(Ordering::SeqCst),
+        provider.scan_table_called.load(Ordering::SeqCst)
+    );
+}
+
+// =============================================================================
+// Graph Source Creation API Tests
+// =============================================================================
+
+use fluree_db_api::{IcebergCreateConfig, R2rmlCreateConfig};
+
+/// Test IcebergCreateConfig validation - valid configuration.
+#[test]
+fn test_iceberg_create_config_validation_valid() {
+    let config = IcebergCreateConfig::new(
+        "my-iceberg-gs",
+        "https://polaris.example.com",
+        "openflights.airlines",
+    );
+
+    // Validation should pass
+    let result = config.validate();
+    assert!(
+        result.is_ok(),
+        "Valid config should pass validation: {:?}",
+        result.err()
+    );
+
+    // Check alias
+    assert_eq!(config.graph_source_id(), "my-iceberg-gs:main");
+}
+
+/// Test IcebergCreateConfig validation - empty name.
+#[test]
+fn test_iceberg_create_config_validation_empty_name() {
+    let config =
+        IcebergCreateConfig::new("", "https://polaris.example.com", "openflights.airlines");
+
+    let result = config.validate();
+    assert!(result.is_err(), "Empty name should fail validation");
+    assert!(
+        result.unwrap_err().to_string().contains("name"),
+        "Error should mention 'name'"
+    );
+}
+
+/// Test IcebergCreateConfig validation - name with colon.
+#[test]
+fn test_iceberg_create_config_validation_name_with_colon() {
+    let config = IcebergCreateConfig::new(
+        "my:gs",
+        "https://polaris.example.com",
+        "openflights.airlines",
+    );
+
+    let result = config.validate();
+    assert!(result.is_err(), "Name with colon should fail validation");
+}
+
+/// Test IcebergCreateConfig validation - empty catalog URI.
+#[test]
+fn test_iceberg_create_config_validation_empty_uri() {
+    let config = IcebergCreateConfig::new("my-gs", "", "openflights.airlines");
+
+    let result = config.validate();
+    assert!(result.is_err(), "Empty catalog URI should fail validation");
+}
+
+/// Test IcebergCreateConfig validation - invalid table identifier.
+#[test]
+fn test_iceberg_create_config_validation_invalid_table() {
+    let config = IcebergCreateConfig::new(
+        "my-gs",
+        "https://polaris.example.com",
+        "invalid_table", // Missing namespace
+    );
+
+    let result = config.validate();
+    assert!(
+        result.is_err(),
+        "Invalid table identifier should fail validation"
+    );
+}
+
+/// Test IcebergCreateConfig builder methods.
+#[test]
+fn test_iceberg_create_config_builder() {
+    let config = IcebergCreateConfig::new("my-gs", "https://polaris.example.com", "ns.table")
+        .with_branch("dev")
+        .with_warehouse("my-warehouse")
+        .with_auth_bearer("my-token")
+        .with_vended_credentials(false)
+        .with_s3_region("us-west-2")
+        .with_s3_endpoint("http://localhost:9000")
+        .with_s3_path_style(true);
+
+    assert_eq!(config.graph_source_id(), "my-gs:dev");
+    match &config.connection.catalog_mode {
+        fluree_db_api::CatalogMode::Rest(rest) => {
+            assert_eq!(rest.warehouse, Some("my-warehouse".to_string()));
+        }
+        _ => panic!("Expected REST catalog mode"),
+    }
+    assert!(!config.connection.io.vended_credentials);
+    assert_eq!(
+        config.connection.io.s3_region,
+        Some("us-west-2".to_string())
+    );
+    assert_eq!(
+        config.connection.io.s3_endpoint,
+        Some("http://localhost:9000".to_string())
+    );
+    assert!(config.connection.io.s3_path_style);
+
+    // Validation should still pass
+    assert!(config.validate().is_ok());
+}
+
+/// Test R2rmlCreateConfig validation - valid configuration.
+#[test]
+fn test_r2rml_create_config_validation_valid() {
+    let config = R2rmlCreateConfig::new(
+        "my-r2rml-gs",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        "fluree:file://mappings/airlines.ttl",
+    );
+
+    let result = config.validate();
+    assert!(
+        result.is_ok(),
+        "Valid config should pass validation: {:?}",
+        result.err()
+    );
+
+    assert_eq!(config.graph_source_id(), "my-r2rml-gs:main");
+}
+
+/// Test R2rmlCreateConfig validation - empty mapping source.
+#[test]
+fn test_r2rml_create_config_validation_empty_mapping() {
+    let config = R2rmlCreateConfig::new(
+        "my-gs",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        "", // Empty mapping source
+    );
+
+    let result = config.validate();
+    assert!(
+        result.is_err(),
+        "Empty mapping source should fail validation"
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("mapping"),
+        "Error should mention 'mapping'"
+    );
+}
+
+/// Test R2rmlCreateConfig builder methods.
+#[test]
+fn test_r2rml_create_config_builder() {
+    let config = R2rmlCreateConfig::new(
+        "airlines-rdf",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        "s3://bucket/mappings/airlines.ttl",
+    )
+    .with_branch("staging")
+    .with_mapping_media_type("text/turtle")
+    .with_auth_bearer("token123")
+    .with_warehouse("analytics");
+
+    assert_eq!(config.graph_source_id(), "airlines-rdf:staging");
+    assert!(
+        matches!(&config.mapping, fluree_db_api::R2rmlMappingInput::Content(c) if c == "s3://bucket/mappings/airlines.ttl")
+    );
+    assert_eq!(config.mapping_media_type, Some("text/turtle".to_string()));
+    match &config.iceberg.connection.catalog_mode {
+        fluree_db_api::CatalogMode::Rest(rest) => {
+            assert_eq!(rest.warehouse, Some("analytics".to_string()));
+        }
+        _ => panic!("Expected REST catalog mode"),
+    }
+
+    // Validation should pass
+    assert!(config.validate().is_ok());
+}
+
+/// Test IcebergGsConfig serialization roundtrip.
+#[test]
+fn test_iceberg_graph_source_config_serialization() {
+    let config = IcebergCreateConfig::new("test-gs", "https://polaris.example.com", "ns.table")
+        .with_warehouse("my-warehouse")
+        .with_vended_credentials(true);
+
+    // Convert to IcebergGsConfig for storage
+    let iceberg_config = config.to_iceberg_gs_config();
+
+    // Serialize to JSON
+    let json = iceberg_config
+        .to_json()
+        .expect("serialization should succeed");
+
+    // Parse back
+    use fluree_db_iceberg::IcebergGsConfig;
+    let parsed = IcebergGsConfig::from_json(&json).expect("parsing should succeed");
+
+    match &parsed.catalog {
+        fluree_db_iceberg::CatalogConfig::Rest { uri, warehouse, .. } => {
+            assert_eq!(uri, "https://polaris.example.com");
+            assert_eq!(warehouse, &Some("my-warehouse".to_string()));
+        }
+        other => panic!("Expected Rest variant, got {other:?}"),
+    }
+    assert_eq!(parsed.table.identifier(), "ns.table");
+    assert!(parsed.io.vended_credentials);
+    assert!(parsed.mapping.is_none());
+}
+
+/// Test R2rmlGsConfig serialization with mapping.
+#[test]
+fn test_r2rml_graph_source_config_serialization() {
+    let config = R2rmlCreateConfig::new(
+        "test-gs",
+        "https://polaris.example.com",
+        "ns.table",
+        "fluree:file://mapping.ttl",
+    )
+    .with_mapping_media_type("text/turtle");
+
+    // Convert to IcebergGsConfig for storage
+    let iceberg_config = config.to_iceberg_gs_config("test-mapping-address");
+
+    // Serialize to JSON
+    let json = iceberg_config
+        .to_json()
+        .expect("serialization should succeed");
+
+    // Parse back
+    use fluree_db_iceberg::IcebergGsConfig;
+    let parsed = IcebergGsConfig::from_json(&json).expect("parsing should succeed");
+
+    // Should have mapping
+    assert!(parsed.mapping.is_some(), "Mapping should be present");
+    let mapping = parsed.mapping.unwrap();
+    assert_eq!(mapping.source, "test-mapping-address");
+    assert_eq!(mapping.media_type, Some("text/turtle".to_string()));
+}
+
+/// Integration test: Create R2RML graph source with mapping validation.
+///
+/// This test stores a real mapping file and validates the creation flow.
+#[tokio::test]
+async fn integration_create_r2rml_graph_source_with_mapping() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create R2RML graph source config with inline mapping content
+    let config = R2rmlCreateConfig::new(
+        "airlines-rdf",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    )
+    .with_mapping_media_type("text/turtle");
+
+    // Create the graph source — mapping content is stored to CAS internally
+    let result = fluree.create_r2rml_graph_source(config).await;
+
+    assert!(
+        result.is_ok(),
+        "Graph source creation should succeed: {:?}",
+        result.err()
+    );
+
+    let create_result = result.unwrap();
+    assert_eq!(create_result.graph_source_id, "airlines-rdf:main");
+    // mapping_source should be a CID (content-addressed)
+    assert!(!create_result.mapping_source.is_empty());
+    assert!(
+        create_result.mapping_validated,
+        "Mapping should be validated"
+    );
+    assert_eq!(
+        create_result.triples_map_count, 1,
+        "Should have 1 TriplesMap"
+    );
+    assert!(
+        !create_result.connection_tested,
+        "Connection test should fail without real catalog"
+    );
+
+    // Verify graph source is registered in nameservice
+    let gs_record = fluree
+        .nameservice()
+        .lookup_graph_source("airlines-rdf:main")
+        .await
+        .expect("Lookup should succeed");
+    assert!(gs_record.is_some(), "Graph source record should exist");
+
+    // The config JSON should contain the mapping
+    let record = gs_record.unwrap();
+    assert_eq!(
+        record.source_type,
+        fluree_db_nameservice::GraphSourceType::Iceberg
+    );
+    let config_json: serde_json::Value = serde_json::from_str(&record.config).unwrap();
+    assert!(
+        config_json.get("mapping").is_some(),
+        "Config should contain mapping"
+    );
+}
+
+/// Regression test for issue #1397: a Turtle mapping registered WITHOUT an
+/// explicit media type must still compile at query time.
+///
+/// Before the shared `MappingFormat` resolver, registration defaulted a missing
+/// media type to Turtle (so creation succeeded) but the query path defaulted it
+/// to JSON-LD and failed with "...uses JSON-LD format, which is not yet
+/// supported". The stored `mapping_source` is a content-addressed CID with no
+/// extension, so the query-time extension sniff could never recover Turtle.
+///
+/// This test deliberately omits `.with_mapping_media_type(...)` — mirroring
+/// `fluree iceberg map` of a `.ttl` file without `--r2rml-type` — and asserts
+/// both that the resolved media type is persisted (not `null`) and that the
+/// real `FlureeR2rmlProvider::compiled_mapping` now returns `Ok`.
+#[tokio::test]
+async fn integration_r2rml_turtle_without_media_type_compiles_at_query_time() {
+    use fluree_db_api::{FlureeR2rmlProvider, R2rmlCreateConfig};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // NOTE: no `.with_mapping_media_type(...)` — this is the reported flow.
+    let config = R2rmlCreateConfig::new(
+        "airlines-rdf",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    );
+
+    let create_result = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("registering a Turtle mapping without an explicit media type should succeed");
+    assert!(
+        create_result.mapping_validated,
+        "mapping should validate at registration"
+    );
+
+    // Persistence: the stored config must carry a concrete `text/turtle` media
+    // type (not `null`) so the query path reuses it instead of re-defaulting.
+    let record = fluree
+        .nameservice()
+        .lookup_graph_source("airlines-rdf:main")
+        .await
+        .expect("lookup should succeed")
+        .expect("graph source record should exist");
+    let config_json: serde_json::Value = serde_json::from_str(&record.config).unwrap();
+    assert_eq!(
+        config_json["mapping"]["media_type"], "text/turtle",
+        "resolved media type must be persisted (not null) so query-time reuses it"
+    );
+
+    // Regression: the real provider's `compiled_mapping` must now succeed. Before
+    // the fix this returned `Err(InvalidQuery(\"...uses JSON-LD format...\"))`.
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let compiled = provider
+        .compiled_mapping("airlines-rdf:main", Some(0))
+        .await;
+    assert!(
+        compiled.is_ok(),
+        "compiled_mapping must succeed for a Turtle mapping with no explicit media type (issue #1397); got: {:?}",
+        compiled.err()
+    );
+    assert_eq!(
+        compiled.unwrap().len(),
+        1,
+        "the airline mapping defines exactly one TriplesMap"
+    );
+}
+
+// =============================================================================
+// query_graph_source API Tests (GraphSourcePublisher impl)
+// =============================================================================
+
+/// Test that query_graph_source method properly wires FlureeR2rmlProvider.
+///
+/// This test verifies the query_graph_source API path uses the real R2RML provider
+/// when the nameservice implements GraphSourcePublisher.
+#[tokio::test]
+async fn integration_query_graph_source_provider_wiring() {
+    use serde_json::json;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Store the mapping file
+    // Create R2RML graph source with inline mapping content
+    let config = R2rmlCreateConfig::new(
+        "airlines-query-test",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    )
+    .with_mapping_media_type("text/turtle");
+
+    let gs_result = fluree.create_r2rml_graph_source(config).await;
+    assert!(
+        gs_result.is_ok(),
+        "Graph source creation should succeed: {:?}",
+        gs_result.err()
+    );
+
+    let graph_source_id = gs_result.unwrap().graph_source_id;
+
+    // Create a basic ledger to query against
+    let ledger = genesis_ledger(&fluree, "query-gs-test:main");
+
+    // Build a simple query with GRAPH pattern targeting our graph source
+    // SELECT ?s WHERE { GRAPH <airlines-query-test:main> { ?s a ex:Airline } }
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            {
+                "graph": graph_source_id,
+                "where": [
+                    ["?s", "a", "ex:Airline"]
+                ]
+            }
+        ]
+    });
+
+    // Execute query via query_graph_source - this exercises the FlureeR2rmlProvider path
+    // The query will fail at scan_table level (no real Iceberg catalog) but
+    // should get far enough to exercise the provider lookup
+    let result = fluree.query_graph_source(&ledger, &query).await;
+
+    // We expect an error because there's no real Iceberg catalog,
+    // but the error should come from the R2RML provider trying to connect,
+    // NOT from "R2RML not supported" (which would indicate wrong provider)
+    match result {
+        Ok(_) => panic!("Query should fail without real catalog"),
+        Err(e) => {
+            let error_msg = e.to_string();
+            eprintln!("Expected error from query_graph_source: {error_msg}");
+
+            // Verify it's NOT a "not supported" error from NoOpR2rmlProvider
+            assert!(
+                !error_msg.contains("R2RML graph sources are not supported"),
+                "Should use FlureeR2rmlProvider, not NoOpR2rmlProvider. Got: {error_msg}"
+            );
+        }
+    }
+}
+
+/// Streaming parity for `integration_query_graph_source_provider_wiring`: a
+/// streaming query over a mapped graph source must resolve through the real
+/// `FlureeR2rmlProvider`, not the no-op stand-in.
+///
+/// The no-op provider reports no mapping, so the GRAPH would read as an empty
+/// native graph and the stream would end cleanly with zero rows. The real
+/// provider instead rewrites to an R2RML scan and fails (there is no live
+/// Iceberg catalog) — so an `error` terminal proves the real provider was the
+/// one consulted on the streaming path.
+#[tokio::test]
+async fn streaming_graph_source_uses_real_r2rml_provider() {
+    use fluree_db_api::{OwnedStreamQuery, QueryExecutionOptions};
+    use support::graphdb_from_ledger;
+    use tokio::sync::mpsc;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let config = R2rmlCreateConfig::new(
+        "airlines-stream-test",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    )
+    .with_mapping_media_type("text/turtle");
+    let graph_source_id = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("graph source creation should succeed")
+        .graph_source_id;
+
+    let ledger = genesis_ledger(&fluree, "stream-gs-test:main");
+
+    let sparql = format!(
+        "SELECT ?s WHERE {{ GRAPH <{graph_source_id}> {{ ?s a <http://example.org/Airline> }} }}"
+    );
+
+    let graph = graphdb_from_ledger(&ledger);
+    let plan = fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::Sparql(sparql))
+        .await
+        .expect("plan should succeed");
+    drop(graph);
+
+    let (tx, mut rx) = mpsc::channel(1024);
+    fluree
+        .run_stream_query(
+            ledger,
+            plan,
+            Tracker::disabled(),
+            QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        bytes.extend_from_slice(&chunk);
+    }
+    let records: Vec<serde_json::Value> = String::from_utf8(bytes)
+        .expect("ndjson is utf-8")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(
+        terminal["type"], "error",
+        "real provider attempts the R2RML scan and fails without a catalog; \
+         a clean `end` would mean the no-op provider was wired. Terminal: {terminal}"
+    );
+    assert!(
+        !terminal
+            .to_string()
+            .contains("does not support graph source operations"),
+        "must use FlureeR2rmlProvider, not the no-op. Terminal: {terminal}"
+    );
+}
+
+// =============================================================================
+// RefObjectMap Join Execution Tests
+// =============================================================================
+
+/// Create sample route data batch.
+fn sample_routes_batch() -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "airline_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "src_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "dst_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 3,
+        },
+    ]);
+
+    // Routes with airline_id matching airlines.id
+    let columns = vec![
+        Column::Int64(vec![Some(1), Some(1), Some(2), Some(3), Some(999)]), // airline_id - 999 has no match
+        Column::Int64(vec![Some(100), Some(101), Some(100), Some(102), Some(100)]), // src_id
+        Column::Int64(vec![Some(200), Some(201), Some(202), Some(200), Some(201)]), // dst_id
+    ];
+
+    ColumnBatch::new(Arc::new(schema), columns).unwrap()
+}
+
+/// Create sample airlines batch for join (simpler than main test).
+fn sample_airlines_for_join() -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+
+    let columns = vec![
+        Column::Int64(vec![Some(1), Some(2), Some(3)]),
+        Column::String(vec![
+            Some("Delta".to_string()),
+            Some("United".to_string()),
+            Some("American".to_string()),
+        ]),
+    ];
+
+    ColumnBatch::new(Arc::new(schema), columns).unwrap()
+}
+
+/// Mock provider that returns different batches based on table name.
+#[derive(Debug)]
+struct MultiTableMockProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    airlines_batch: ColumnBatch,
+    routes_batch: ColumnBatch,
+}
+
+#[async_trait]
+impl R2rmlProvider for MultiTableMockProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for MultiTableMockProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        eprintln!("MultiTableMockProvider.scan_table: {table_name}");
+        // Return appropriate batch based on table name
+        // Table names are normalized to dot notation
+        match table_name {
+            "openflights.airlines" => Ok(vec_batch_stream(vec![self.airlines_batch.clone()])),
+            "openflights.routes" => Ok(vec_batch_stream(vec![self.routes_batch.clone()])),
+            _ => {
+                eprintln!("Unknown table: {table_name}");
+                Ok(vec_batch_stream(vec![]))
+            }
+        }
+    }
+}
+
+/// Test RefObjectMap join execution end-to-end.
+///
+/// This test verifies:
+/// 1. Routes table is scanned
+/// 2. Airlines table is scanned for parent lookup
+/// 3. Join is performed correctly (routes.airline_id = airlines.id)
+/// 4. Parent subject IRIs are correctly materialized as object values
+/// 5. Orphan foreign keys (airline_id=999) produce no output
+#[tokio::test]
+async fn engine_e2e_ref_object_map_join_execution() {
+    // Compile the routes mapping with RefObjectMap
+    let mapping = R2rmlLoader::from_turtle(ROUTES_MAPPING_TTL)
+        .expect("Failed to parse R2RML")
+        .compile()
+        .expect("Failed to compile");
+
+    let provider = MultiTableMockProvider {
+        mapping: Arc::new(mapping),
+        airlines_batch: sample_airlines_for_join(),
+        routes_batch: sample_routes_batch(),
+    };
+
+    // Create a minimal Fluree instance
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "ref-join-test:main");
+
+    // Register example.org namespace
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Build query: SELECT ?route ?airline WHERE { GRAPH <gs:main> { ?route ex:operatedBy ?airline } }
+    let mut vars = VarRegistry::new();
+    let route_var = vars.get_or_insert("?route");
+    let airline_var = vars.get_or_insert("?airline");
+
+    // Register predicate IRI
+    let ex_operated_by_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/operatedBy")
+        .expect("namespace should be registered");
+
+    let inner_patterns = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(route_var),
+        Ref::Sid(ex_operated_by_sid),
+        Term::Var(airline_var),
+    ))];
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("routes-gs:main".into()),
+        patterns: inner_patterns,
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![route_var, airline_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    // Execute query
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("Query execution should succeed");
+
+    // Count results
+    let total_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    eprintln!("RefObjectMap join query returned {total_rows} rows");
+
+    // We have 5 routes, but airline_id=999 has no matching airline
+    // So we expect 4 results (routes with airline_id 1, 1, 2, 3)
+    assert_eq!(
+        total_rows, 4,
+        "Should have 4 results (5 routes minus 1 orphan foreign key)"
+    );
+
+    // Verify the bindings contain expected values
+    // The airline var should be IRI like "http://example.org/airline/1"
+    for batch in &batches {
+        for row_idx in 0..batch.len() {
+            // Get airline binding
+            if let Some(col) = batch.column_by_idx(1) {
+                let airline_binding = &col[row_idx];
+                eprintln!("Row {row_idx}: airline = {airline_binding:?}");
+                // Should be a Sid (encoded IRI), not Unbound
+                assert!(
+                    airline_binding.is_bound(),
+                    "Airline binding should be bound for matched joins"
+                );
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Multi-table mapping in the idiomatic `@base` + `<#Name>` style (issue #1395)
+// =============================================================================
+
+/// A star-schema-style mapping written the way the W3C R2RML spec writes its
+/// own examples: a document `@base` plus relative `<#Name>` TriplesMap subjects.
+///
+/// Before the parser fix every `<#Name>` resolved to the same fragment-stripped
+/// IRI, collapsing all three TriplesMaps into one (single table, union of every
+/// column). With RFC 3986 §5.3 fragment resolution, `<#DimDate>`,
+/// `<#DimProduct>` and `<#FactSales>` resolve to three distinct IRIs and map
+/// three distinct tables.
+const BASE_FRAGMENT_MULTI_TABLE_TTL: &str = r#"
+@base <http://ex/edw> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#DimDate> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_DATE" ] ;
+    rr:subjectMap [ rr:template "http://example.org/date/{DATE_KEY}" ; rr:class ex:Date ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:year ;
+        rr:objectMap [ rr:column "YEAR" ]
+    ] .
+
+<#DimProduct> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_PRODUCT" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{PRODUCT_KEY}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:productName ;
+        rr:objectMap [ rr:column "NAME" ]
+    ] .
+
+<#FactSales> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.FACT_SALES" ] ;
+    rr:subjectMap [ rr:template "http://example.org/sale/{SALE_ID}" ; rr:class ex:Sale ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:amount ;
+        rr:objectMap [ rr:column "AMOUNT" ]
+    ] .
+"#;
+
+/// Two `rr:TriplesMap` subjects that resolve to the same IRI. This is the
+/// post-collapse shape the (now-fixed) Turtle parser used to produce silently;
+/// the hardening guard must reject it loudly rather than first-wins/union-merge.
+const COLLIDING_TRIPLES_MAP_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Collide> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_DATE" ] ;
+    rr:subjectMap [ rr:template "http://example.org/date/{DATE_KEY}" ; rr:class ex:Date ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:year ;
+        rr:objectMap [ rr:column "YEAR" ]
+    ] .
+
+<http://example.org/mapping#Collide> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_PRODUCT" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{PRODUCT_KEY}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:productName ;
+        rr:objectMap [ rr:column "NAME" ]
+    ] .
+"#;
+
+/// Sample batch for the `DW.DIM_PRODUCT` table (subject key + name column).
+fn sample_product_batch() -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "PRODUCT_KEY".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "NAME".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let columns = vec![
+        Column::Int64(vec![Some(10), Some(20)]),
+        Column::String(vec![Some("Widget".to_string()), Some("Gadget".to_string())]),
+    ];
+    ColumnBatch::new(Arc::new(schema), columns).unwrap()
+}
+
+/// Mock provider that records which tables `scan_table` is asked to read, so a
+/// test can assert that a non-first TriplesMap scans its own table (and not the
+/// first map's table, which was the collapse symptom).
+#[derive(Debug)]
+struct RecordingTableProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    batches: HashMap<String, ColumnBatch>,
+    scanned: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl R2rmlProvider for RecordingTableProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for RecordingTableProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scanned.lock().unwrap().push(table_name.to_string());
+        match self.batches.get(table_name) {
+            Some(batch) => Ok(vec_batch_stream(vec![batch.clone()])),
+            None => Ok(vec_batch_stream(vec![])),
+        }
+    }
+}
+
+/// Offline regression guard for issue #1395: an idiomatic `@base` + `<#Name>`
+/// multi-table mapping compiles to N distinct TriplesMaps over N distinct
+/// tables — not one merged map.
+#[test]
+fn test_base_fragment_multi_table_compiles_to_distinct_tables() {
+    let mapping = R2rmlLoader::from_turtle(BASE_FRAGMENT_MULTI_TABLE_TTL)
+        .expect("Failed to parse R2RML Turtle")
+        .compile()
+        .expect("Failed to compile R2RML mapping");
+
+    // Three TriplesMaps, not one collapsed map.
+    assert_eq!(mapping.triples_maps.len(), 3);
+
+    // Each `<#Name>` resolved to its own distinct IRI against `@base`.
+    assert!(mapping.get("http://ex/edw#DimDate").is_some());
+    assert!(mapping.get("http://ex/edw#DimProduct").is_some());
+    assert!(mapping.get("http://ex/edw#FactSales").is_some());
+
+    // Three distinct logical tables (the collapse produced exactly one).
+    let mut tables = mapping.table_names();
+    tables.sort_unstable();
+    assert_eq!(
+        tables,
+        vec!["DW.DIM_DATE", "DW.DIM_PRODUCT", "DW.FACT_SALES"]
+    );
+}
+
+/// Engine-level E2E for issue #1395: querying a predicate owned by a non-first
+/// TriplesMap scans that map's own table (`DW.DIM_PRODUCT`) and never the first
+/// map's table (`DW.DIM_DATE`). Pre-fix, every class scanned the first table.
+#[tokio::test]
+async fn engine_e2e_base_fragment_scans_non_first_table() {
+    let mapping = R2rmlLoader::from_turtle(BASE_FRAGMENT_MULTI_TABLE_TTL)
+        .expect("Failed to parse R2RML")
+        .compile()
+        .expect("Failed to compile");
+
+    let mut batches = HashMap::new();
+    batches.insert("DW.DIM_PRODUCT".to_string(), sample_product_batch());
+
+    let scanned = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingTableProvider {
+        mapping: Arc::new(mapping),
+        batches,
+        scanned: Arc::clone(&scanned),
+    };
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "edw-multi:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Query: SELECT ?p ?n WHERE { GRAPH <edw-gs:main> { ?p ex:productName ?n } }
+    // ex:productName is owned only by <#DimProduct> → only DW.DIM_PRODUCT.
+    let mut vars = VarRegistry::new();
+    let product_var = vars.get_or_insert("?p");
+    let name_var = vars.get_or_insert("?n");
+
+    let ex_product_name_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/productName")
+        .expect("example.org namespace should be registered for Sid encoding");
+
+    let inner_patterns = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(product_var),
+        Ref::Sid(ex_product_name_sid),
+        Term::Var(name_var),
+    ))];
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner_patterns,
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![product_var, name_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    let result_batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("Query execution should succeed");
+
+    let total_rows: usize = result_batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(total_rows, 2, "Should return the 2 DW.DIM_PRODUCT rows");
+
+    let scanned_tables = scanned.lock().unwrap().clone();
+    assert_eq!(
+        scanned_tables,
+        vec!["DW.DIM_PRODUCT".to_string()],
+        "Non-first TriplesMap must scan its own table only; scanned: {scanned_tables:?}"
+    );
+    assert!(
+        !scanned_tables.contains(&"DW.DIM_DATE".to_string()),
+        "The first map's table must not be scanned for a non-first predicate"
+    );
+}
+
+/// Phase-2 hardening for issue #1395: two `rr:TriplesMap` subjects that resolve
+/// to the same IRI must be a hard error, not a silent first-wins/union merge.
+#[test]
+fn test_colliding_triples_map_iris_error() {
+    let result = R2rmlLoader::from_turtle(COLLIDING_TRIPLES_MAP_TTL)
+        .expect("Turtle should parse")
+        .compile();
+
+    assert!(
+        result.is_err(),
+        "Two TriplesMap subjects colliding to one IRI should be rejected, got Ok"
+    );
+
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("Duplicate TriplesMap IRI"),
+        "Error should be a DuplicateTriplesMap, got: {msg}"
+    );
+    assert!(
+        msg.contains("http://example.org/mapping#Collide"),
+        "Error should name the colliding IRI, got: {msg}"
+    );
+}
+
+/// Test that composite join keys work correctly.
+///
+/// This test uses a mapping with multiple join conditions and verifies
+/// all conditions are applied.
+#[test]
+fn test_ref_object_map_composite_key_parsing() {
+    use fluree_db_r2rml::mapping::ObjectMap;
+
+    const COMPOSITE_KEY_MAPPING: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#ParentMap> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "parent_table" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/parent/{key1}/{key2}"
+        ] .
+
+    <http://example.org/mapping#ChildMap> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "child_table" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/child/{id}"
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:parent ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#ParentMap> ;
+                rr:joinCondition [
+                    rr:child "child_key1" ;
+                    rr:parent "key1"
+                ] ;
+                rr:joinCondition [
+                    rr:child "child_key2" ;
+                    rr:parent "key2"
+                ]
+            ]
+        ] .
+    "#;
+
+    let mapping = R2rmlLoader::from_turtle(COMPOSITE_KEY_MAPPING)
+        .expect("Failed to parse")
+        .compile()
+        .expect("Failed to compile");
+
+    let child_map = mapping
+        .get("http://example.org/mapping#ChildMap")
+        .expect("ChildMap not found");
+
+    let parent_pom = child_map
+        .predicate_object_maps
+        .iter()
+        .find(|pom| pom.predicate_map.as_constant() == Some("http://example.org/parent"))
+        .expect("parent POM not found");
+
+    match &parent_pom.object_map {
+        ObjectMap::RefObjectMap(rom) => {
+            assert_eq!(
+                rom.join_conditions.len(),
+                2,
+                "Should have 2 join conditions"
+            );
+
+            // Check first condition
+            assert_eq!(rom.join_conditions[0].child_column, "child_key1");
+            assert_eq!(rom.join_conditions[0].parent_column, "key1");
+
+            // Check second condition
+            assert_eq!(rom.join_conditions[1].child_column, "child_key2");
+            assert_eq!(rom.join_conditions[1].parent_column, "key2");
+        }
+        _ => panic!("Expected RefObjectMap"),
+    }
+}
+
+// =============================================================================
+// Fused-aggregate correctness regressions (PR #1372 internal review)
+//
+// Run aggregate queries through the fused R2RML path (default) over crafted
+// column batches and assert the result matches exact SPARQL semantics. Each
+// test fails if the fused path diverges from the normal (fallback) pipeline.
+// =============================================================================
+
+/// R2RML mapping for `?s ex:val ?o`, with `val` typed as `datatype`
+/// (e.g. `xsd:integer`, `xsd:decimal`) so the object materializes as numeric.
+fn val_mapping(datatype: &str) -> String {
+    format!(
+        r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<http://example.org/mapping#M> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "t" ] ;
+    rr:subjectMap [ rr:template "http://example.org/r/{{id}}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:val ;
+        rr:objectMap [ rr:column "val" ; rr:datatype {datatype} ] ] .
+"#
+    )
+}
+
+/// Build an `id` (non-null subject key) + `val` (crafted aggregate input) batch.
+fn id_val_batch(ids: Vec<Option<i64>>, val: Column, val_type: FieldType) -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".into(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "val".into(),
+            field_type: val_type,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    ColumnBatch::new(Arc::new(schema), vec![Column::Int64(ids), val]).unwrap()
+}
+
+/// Run `SELECT (agg) WHERE { GRAPH gs { ?s ex:val ?o } <extra> }` (implicit
+/// aggregation) over crafted batches via the fused path; return the single
+/// scalar result formatted with `{:?}`. `build` receives the registry and the
+/// object var `?o`, and returns any extra patterns (e.g. a `BIND`) plus the
+/// aggregate function.
+async fn run_val_agg(
+    datatype: &str,
+    batches: Vec<ColumnBatch>,
+    build: impl FnOnce(&mut VarRegistry, VarId) -> (Vec<Pattern>, AggregateFn),
+) -> String {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+        .unwrap()
+        .compile()
+        .unwrap();
+    let provider = MockR2rmlProvider::new(mapping, batches);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let out = vars.get_or_insert("?agg");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Var(o),
+        ))],
+    };
+    let (extra, agg_fn) = build(&mut vars, o);
+    let mut patterns = vec![graph];
+    patterns.extend(extra);
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = patterns;
+    parsed.output = QueryOutput::select_all(vec![out]);
+    parsed.grouping = Grouping::assemble(
+        vec![],
+        vec![AggregateSpec {
+            function: agg_fn,
+            output_var: out,
+        }],
+        vec![],
+        None,
+    )
+    .expect("valid grouping");
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+
+    let batch = result
+        .into_iter()
+        .find(|b| !b.is_empty())
+        .expect("one result row");
+    let value = batch
+        .column_by_idx(0)
+        .and_then(|c| c.first())
+        .expect("a scalar value");
+    format!("{value:?}")
+}
+
+#[tokio::test]
+async fn fused_sum_distinct_dedups() {
+    // SUM(DISTINCT ?o) over [10, 10, 20] must dedup to 30, not 40.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3)],
+        Column::Int64(vec![Some(10), Some(10), Some(20)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |_v, o| {
+        (vec![], AggregateFn::Sum(o, InputSemantics::Set))
+    })
+    .await;
+    assert!(
+        got.contains("30") && !got.contains("40"),
+        "SUM(DISTINCT) should dedup to 30, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_count_star_drops_null_object_rows() {
+    // COUNT(*) over `?s ex:val ?o` where val = [10, null, 30]: the null-val row
+    // produces no triple, so the count is 2, not 3.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3)],
+        Column::Int64(vec![Some(10), None, Some(30)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |_v, _o| {
+        (vec![], AggregateFn::CountAll)
+    })
+    .await;
+    assert!(
+        got.contains('2') && !got.contains('3'),
+        "COUNT(*) should drop the null-object row → 2, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_sum_overflow_falls_back_to_exact() {
+    // Two huge decimal values whose unscaled i128 sum overflows: the fused
+    // accumulator must fall back to the BigDecimal pipeline, not wrap to a
+    // wrong value. i128::MAX - 5 + 10 = i128::MAX + 5 (a 39-digit number).
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Decimal {
+            values: vec![Some(i128::MAX - 5), Some(10)],
+            precision: 38,
+            scale: 0,
+        },
+        FieldType::Decimal {
+            precision: 38,
+            scale: 0,
+        },
+    );
+    let got = run_val_agg("xsd:decimal", vec![batch], |_v, o| {
+        (vec![], AggregateFn::Sum(o, InputSemantics::List))
+    })
+    .await;
+    // Correct total is positive 2^127 + 4 (BigInt limbs [4, 2^63]); a wrapping
+    // i128 add would instead produce a negative (sign=Minus) wrong value.
+    assert!(
+        got.contains("sign=Plus") && got.contains("9223372036854775808"),
+        "overflowing SUM should fall back to the exact positive BigDecimal total, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_sum_integer_expr_keeps_integer_datatype() {
+    // SUM(?o * 2) over integer `?o` is xsd:integer in the normal pipeline; the
+    // native expr fold always finalizes as xsd:decimal, so it must fall back to
+    // keep the datatype exact. o = [10, 20] → 2*(10+20) = 60.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Int64(vec![Some(10), Some(20)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |vars, o| {
+        let e = vars.get_or_insert("?e");
+        let expr = Expression::Call {
+            func: Function::Mul,
+            args: vec![Expression::Var(o), Expression::Const(FlakeValue::Long(2))],
+        };
+        (
+            vec![Pattern::Bind { var: e, expr }],
+            AggregateFn::Sum(e, InputSemantics::List),
+        )
+    })
+    .await;
+    assert!(
+        got.contains("60") && got.contains("integer") && !got.contains("decimal"),
+        "SUM(integer expr) should stay xsd:integer (= 60), got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_fallback_applies_offset_once() {
+    // GROUP BY on an xsd:date column trips the fused operator's column-resolution
+    // gate (date isn't a supported group key), so it falls back to the normal
+    // pipeline at open. OFFSET must be applied exactly once: the fallback is built
+    // with OFFSET stripped and the engine's OffsetOperator wraps the result. The
+    // prior regression baked OFFSET into the fallback *and* re-applied it, which
+    // would drop twice as many rows.
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:date"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Three distinct date groups (days since epoch): {1: 2 rows, 2: 1, 3: 1}.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        Column::Date(vec![Some(1), Some(1), Some(2), Some(3)]),
+        FieldType::Date,
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let c = vars.get_or_insert("?c");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Var(o),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    // Detection requires the projection to equal {group keys} ∪ {agg outputs}.
+    parsed.output = QueryOutput::select_all(vec![o, c]);
+    parsed.grouping = Grouping::assemble(
+        vec![o],
+        vec![AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var: c,
+        }],
+        vec![],
+        None,
+    )
+    .expect("valid grouping");
+    parsed.offset = Some(1);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+
+    let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(
+        rows, 2,
+        "3 groups with OFFSET 1 must yield 2 rows (offset applied once, not twice)"
+    );
+}
+
+/// A temporal column materializes as a temporal value, not a string carrying
+/// the datatype: ordering coerces a string against a dateTime literal but
+/// RDFterm-equal does not, so `=` on such a value matched nothing.
+#[tokio::test]
+async fn temporal_values_compare_equal_by_value() {
+    use fluree_db_core::{Date, DateTime};
+    let cases: Vec<(&str, Column, FieldType, FlakeValue, usize)> = vec![
+        (
+            "xsd:date",
+            Column::Date(vec![Some(1), Some(1), Some(2)]),
+            FieldType::Date,
+            FlakeValue::Date(Box::new(Date::parse("1970-01-02").unwrap())),
+            2,
+        ),
+        (
+            "xsd:dateTime",
+            Column::Timestamp(vec![Some(1_000_000), Some(2_000_000), Some(2_000_000)]),
+            FieldType::Timestamp,
+            FlakeValue::DateTime(Box::new(DateTime::parse("1970-01-01T00:00:02Z").unwrap())),
+            2,
+        ),
+    ];
+    for (datatype, column, field_type, literal, expected) in cases {
+        let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+            .unwrap()
+            .compile()
+            .unwrap();
+        let batch = id_val_batch(vec![Some(1), Some(2), Some(3)], column, field_type);
+        let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let mut ledger = genesis_ledger(&fluree, "fa:main");
+        Arc::make_mut(&mut ledger.snapshot)
+            .insert_namespace_code(9_999, "http://example.org/".to_string())
+            .unwrap();
+
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let o = vars.get_or_insert("?o");
+        let pred = ledger
+            .snapshot
+            .encode_iri("http://example.org/val")
+            .expect("example.org namespace registered");
+        let graph = Pattern::Graph {
+            name: GraphName::Iri("fa-gs:main".into()),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                )),
+                Pattern::Filter(Expression::eq(
+                    Expression::Var(o),
+                    Expression::Const(literal),
+                )),
+            ],
+        };
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = vec![graph];
+        parsed.output = QueryOutput::select_all(vec![s]);
+
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        let result = execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .expect("query should execute");
+        let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+        assert_eq!(rows, expected, "{datatype}: `=` against a literal");
+    }
+}
+
+// =============================================================================
+// Scan-plan guardrails: rdf:type / class-pattern over-scan (Issue 1)
+// =============================================================================
+//
+// These lock the class/star planning behavior so future changes cannot
+// reintroduce the over-scan that made a 2-attribute query issue 6 Iceberg
+// scans (DIM_STORE ×4 + two unreferenced parent tables) against live Snowflake.
+//
+// Fixture: a 3-TriplesMap star schema where `ex:name` is shared by two maps
+// (Store and Employee) — the predicate fan-out that caused unrelated dimension
+// tables to be scanned — and Store has a RefObjectMap to Geography, so we can
+// assert parents are pruned for unreferenced predicates yet kept for referenced
+// ones (R2RML dangling-FK semantics are not weakened). Each table declares its
+// surrogate key, so each subject is one row's and the star may fuse.
+
+const EDW_GUARD_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix f: <https://ns.flur.ee/db#> .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ; f:key ( "store_key" ) ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:storeId ; rr:objectMap [ rr:column "store_id" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:storeKey ; rr:objectMap [ rr:column "store_key" ; rr:datatype xsd:integer ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:geography ;
+        rr:objectMap [
+            rr:parentTriplesMap <http://example.org/mapping#Geography> ;
+            rr:joinCondition [ rr:child "geo_key" ; rr:parent "geo_key" ]
+        ]
+    ] .
+
+<http://example.org/mapping#Geography> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.geography" ; f:key ( "geo_key" ) ] ;
+    rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Geography ] ;
+    rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
+
+<http://example.org/mapping#Employee> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.employee" ; f:key ( "emp_key" ) ] ;
+    rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Employee ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
+"#;
+
+fn edw_guard_mapping() -> CompiledR2rmlMapping {
+    R2rmlLoader::from_turtle(EDW_GUARD_MAPPING_TTL)
+        .expect("parse EDW guard mapping")
+        .compile()
+        .expect("compile EDW guard mapping")
+}
+
+fn col_i64(name: &str, field_id: i32, vals: Vec<Option<i64>>) -> (FieldInfo, Column) {
+    (
+        FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id,
+        },
+        Column::Int64(vals),
+    )
+}
+
+fn col_str(name: &str, field_id: i32, vals: &[&str]) -> (FieldInfo, Column) {
+    (
+        FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id,
+        },
+        Column::String(vals.iter().map(|s| Some((*s).to_string())).collect()),
+    )
+}
+
+fn batch_from(parts: Vec<(FieldInfo, Column)>) -> ColumnBatch {
+    let (fields, cols): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+    ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).unwrap()
+}
+
+fn edw_store_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("store_key", 1, vec![Some(1), Some(2)]),
+        col_str("store_id", 2, &["STORE-1", "STORE-2"]),
+        col_str("store_name", 3, &["Store One", "Store Two"]),
+        col_i64("geo_key", 4, vec![Some(10), Some(20)]),
+    ])
+}
+
+fn edw_geography_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("geo_key", 1, vec![Some(10), Some(20)]),
+        col_str("city", 2, &["Akron", "Boston"]),
+        col_str("region", 3, &["Midwest", "Northeast"]),
+    ])
+}
+
+fn edw_employee_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("emp_key", 1, vec![Some(100), Some(200)]),
+        col_str("emp_name", 2, &["Ann", "Bob"]),
+    ])
+}
+
+/// Provider that records every `scan_table` call by table name and returns the
+/// per-table fixture batch, so a test can assert exactly which tables a query
+/// shape touches.
+#[derive(Debug)]
+struct CountingProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    batches_by_table: HashMap<String, Vec<ColumnBatch>>,
+    /// Every scan as `(table_name, sorted projection columns)`, in call order.
+    scans: Mutex<Vec<(String, Vec<String>)>>,
+    /// Every scan's requested row order and whether it carried a top-k, in
+    /// call order. `None`: a plain `scan_table` call (a parent lookup).
+    orders: Mutex<Vec<(String, Option<ScanOrder>, bool)>>,
+}
+
+impl CountingProvider {
+    fn edw() -> Self {
+        Self::edw_with_stores(vec![edw_store_batch()])
+    }
+
+    /// Like [`Self::edw`] but with a caller-supplied `dw.store` scan (used to
+    /// drive a multi-batch outer for the inner-scan-reuse guardrail).
+    fn edw_with_stores(store: Vec<ColumnBatch>) -> Self {
+        let mut batches_by_table = HashMap::new();
+        batches_by_table.insert("dw.store".to_string(), store);
+        batches_by_table.insert("dw.geography".to_string(), vec![edw_geography_batch()]);
+        batches_by_table.insert("dw.employee".to_string(), vec![edw_employee_batch()]);
+        Self {
+            mapping: Arc::new(edw_guard_mapping()),
+            batches_by_table,
+            scans: Mutex::new(Vec::new()),
+            orders: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The EDW fixture's tables under another mapping over them.
+    fn edw_with_mapping(ttl: &str) -> Self {
+        let mut p = Self::edw();
+        p.mapping = Arc::new(
+            R2rmlLoader::from_turtle(ttl)
+                .expect("parse mapping")
+                .compile()
+                .expect("compile mapping"),
+        );
+        p
+    }
+
+    /// Scan count per table name across the whole query.
+    fn scan_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (t, _) in self.scans.lock().unwrap().iter() {
+            *counts.entry(t.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Count scans of `table` whose projection includes column `col` — used to
+    /// isolate a table's main scan (by a scalar column it projects) from an
+    /// unrelated RefObjectMap parent-lookup scan of the same table.
+    fn scans_projecting(&self, table: &str, col: &str) -> usize {
+        self.scans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, proj)| t == table && proj.iter().any(|c| c == col))
+            .count()
+    }
+
+    /// Sorted projection columns of the FIRST scan of `table` (every scan of a
+    /// given table in these fixtures uses the same projection). Panics if the
+    /// table was never scanned, so callers assert the scan happened first.
+    fn projection_of(&self, table: &str) -> Vec<String> {
+        self.scans
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(t, _)| t == table)
+            .unwrap_or_else(|| panic!("table {table} was never scanned"))
+            .1
+            .clone()
+    }
+}
+
+#[async_trait]
+impl R2rmlProvider for CountingProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for CountingProvider {
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+        _memory: &fluree_db_core::QueryCancellation,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), Some(order), topk.is_some()));
+        self.scan(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+    }
+
+    async fn scan_table(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.orders
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), None, topk.is_some()));
+        self.scan(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+    }
+}
+
+impl CountingProvider {
+    fn scan(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        let mut proj = projection.to_vec();
+        proj.sort();
+        self.scans
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), proj));
+        let batches = self
+            .batches_by_table
+            .get(table_name)
+            .cloned()
+            .unwrap_or_default();
+        Ok(vec_batch_stream(batches))
+    }
+}
+
+/// Build a memory ledger with the example.org namespace registered so subject
+/// templates and predicate IRIs encode/decode cleanly.
+fn edw_guard_ledger() -> (support::MemoryFluree, support::MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "edw-guard:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    (fluree, ledger)
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// `?s a ex:<Class>` triple (class as a constant IRI, no object var).
+fn type_triple(subject: VarId, class_iri: &str) -> Pattern {
+    Pattern::Triple(TriplePattern::new(
+        Ref::Var(subject),
+        Ref::Iri(RDF_TYPE.into()),
+        Term::Iri(class_iri.into()),
+    ))
+}
+
+/// Run a GRAPH query against the `edw-gs:main` graph source and return the
+/// per-table scan counts plus the produced row total.
+async fn run_edw_guard(
+    provider: &CountingProvider,
+    ledger: &support::MemoryLedger,
+    vars: &VarRegistry,
+    inner: Vec<Pattern>,
+    select: Vec<VarId>,
+) -> (HashMap<String, usize>, usize) {
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(select);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("EDW guard query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    (provider.scan_counts(), rows)
+}
+
+/// Two maps over `dw.store` minting the same subjects and `ex:name` alike
+/// but declaring different class sets. The alike-provider dedupe keeps one
+/// of them for `ex:name` (the graph holds the triple once), but a projected
+/// `?s a ?t` must still see both maps' classes: `{Store, Shop}`, whichever
+/// map the dedupe keeps (the first in document order).
+#[tokio::test]
+async fn projected_type_keeps_every_class_over_alike_maps() {
+    const TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#StoreA> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store, ex:Shop ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+
+<http://example.org/mapping#StoreB> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+"#;
+    let provider = CountingProvider::edw_with_mapping(TTL);
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let t = vars.get_or_insert("?t");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri(RDF_TYPE.into()),
+            Term::Var(t),
+        )),
+        Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o))),
+    ];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s, t]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+    let mut types: std::collections::BTreeSet<String> = Default::default();
+    for b in &batches {
+        for r in 0..b.len() {
+            let ty = b.get(r, t).expect("?t column present");
+            types.insert(ty.get_iri().expect("?t is an IRI").to_string());
+        }
+    }
+    assert_eq!(
+        types.into_iter().collect::<Vec<_>>(),
+        vec![
+            "http://example.org/Shop".to_string(),
+            "http://example.org/Store".to_string()
+        ],
+        "a projected type must not depend on which alike map the dedupe keeps"
+    );
+}
+
+/// A class several maps produce is scanned map by map in MAPPING-DOCUMENT
+/// order, so an unordered query over it answers the same rows in the same
+/// order in every process (a client paging it with LIMIT/OFFSET sees the pages
+/// partition the answer). The maps are written in an order that is neither
+/// their IRI order nor their table order, and the query runs over freshly
+/// compiled mappings: a hashed map of TriplesMaps iterates in a different order
+/// per instance, so it would almost surely miss in one of the runs.
+#[tokio::test]
+async fn a_class_over_several_maps_scans_them_in_document_order() {
+    const TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+
+<http://example.org/mapping#Geo> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "city" ] ] .
+
+<http://example.org/mapping#Emp> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Thing ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
+"#;
+    let expected: Vec<String> = [
+        "store/1", "store/2", "geo/10", "geo/20", "emp/100", "emp/200",
+    ]
+    .iter()
+    .map(|s| format!("http://example.org/{s}"))
+    .collect();
+    for run in 0..8 {
+        let provider = CountingProvider::edw_with_mapping(TTL);
+        let (_fluree, ledger) = edw_guard_ledger();
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let n = vars.get_or_insert("?n");
+        let inner = vec![
+            type_triple(s, "http://example.org/Thing"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Iri("http://example.org/name".into()),
+                Term::Var(n),
+            )),
+        ];
+        let graph = Pattern::Graph {
+            name: GraphName::Iri("edw-gs:main".into()),
+            patterns: inner,
+        };
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = vec![graph];
+        parsed.output = QueryOutput::select_all(vec![s, n]);
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        let batches = execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .expect("query should execute");
+        let subjects: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.len()).map(move |r| {
+                    b.get(r, s)
+                        .and_then(|v| v.get_iri())
+                        .expect("?s is an IRI")
+                        .to_string()
+                })
+            })
+            .collect();
+        assert_eq!(subjects, expected, "run {run}: rows in document order");
+        let tables: Vec<String> = provider
+            .scans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(
+            tables,
+            ["dw.store", "dw.geography", "dw.employee"],
+            "run {run}: one scan per map, in document order"
+        );
+    }
+}
+
+/// `?s a ex:Store ; ex:storeId ?id ; ex:name ?name` must scan ONLY dw.store,
+/// exactly once: the class fuses into the same-subject star (no separate class
+/// scan, no per-batch re-scan), the shared `ex:name` predicate does NOT fan out
+/// to dw.employee, and the unreferenced `ex:geography` parent is not scanned.
+#[tokio::test]
+async fn guard_class_star_scans_only_store_once() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let name = vars.get_or_insert("?name");
+    let p_store_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_store_id),
+            Term::Var(id),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_name),
+            Term::Var(name),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, id, name]).await;
+
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "Store must be scanned exactly once (class fused into star), got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.employee"),
+        None,
+        "shared ex:name must NOT fan out to dw.employee, got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.geography"),
+        None,
+        "unreferenced ex:geography parent must NOT be scanned, got {counts:?}"
+    );
+    // Fix A under fusion: the star projects exactly the subject key + the two
+    // queried predicate columns — NOT geo_key (the unreferenced RefObjectMap FK
+    // that the old `columns_for_predicate(None)` would have pulled in).
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec![
+            "store_id".to_string(),
+            "store_key".to_string(),
+            "store_name".to_string()
+        ],
+        "fused star must project only subject key + storeId + name"
+    );
+    assert_eq!(rows, 2, "two store rows expected");
+}
+
+/// A constant-object triple (`?s ex:storeId "STORE-2"`) fuses into the same-subject
+/// var-object star (`?s ex:name ?name`) as an existence constraint: dw.store is
+/// scanned exactly once (no separate scan + self-join), and only the row whose
+/// storeId equals the constant survives.
+#[tokio::test]
+async fn guard_constant_object_fuses_into_star_single_scan() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let name = vars.get_or_insert("?name");
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+    let p_store_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+
+    // ?s ex:name ?name ; ex:storeId "STORE-2"
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_name),
+            Term::Var(name),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_store_id),
+            Term::Value(FlakeValue::String("STORE-2".to_string())),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, name]).await;
+
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "constant-object storeId must fuse into the name star → one scan, got {counts:?}"
+    );
+    // The fused scan MUST project the constraint's column (`store_id`), not just
+    // the base star's `store_name`. The mock returns the full batch regardless of
+    // projection, so `rows` alone can't catch a missing column — but the real
+    // (column-pruning) reader would omit `store_id`, making the constraint
+    // materialize as NULL and drop every row. Assert the projection directly.
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec![
+            "store_id".to_string(),
+            "store_key".to_string(),
+            "store_name".to_string()
+        ],
+        "constant-object constraint column (store_id) must be projected into the fused scan"
+    );
+    assert_eq!(
+        rows, 1,
+        "only STORE-2 satisfies the fused constant-object constraint"
+    );
+}
+
+/// `?s a ex:Store` alone must scan ONLY dw.store once (subject-only): no POMs,
+/// no RefObjectMap parent, and the class filter keeps it off Employee/Geography.
+#[tokio::test]
+async fn guard_subject_only_type_pattern_scans_no_parents() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+
+    let inner = vec![type_triple(s, "http://example.org/Store")];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s]).await;
+
+    assert_eq!(counts.get("dw.store").copied(), Some(1), "got {counts:?}");
+    assert_eq!(
+        counts.len(),
+        1,
+        "subject-only type pattern scans only its own table, got {counts:?}"
+    );
+    // Fix A: a subject-only pattern projects ONLY the subject template column,
+    // never any POM/FK column. A regression to projecting all POMs would add
+    // store_id/store_name/geo_key here and this would catch it.
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec!["store_key".to_string()],
+        "subject-only type pattern must project only the subject key column"
+    );
+    assert_eq!(rows, 2, "two store subjects expected");
+}
+
+/// A referenced RefObjectMap predicate keeps its parent scan: `?s a ex:Store ;
+/// ex:geography ?g` MUST still scan dw.geography (dangling-FK semantics are not
+/// weakened — Fixes A/B only prune parents for UNreferenced predicates).
+#[tokio::test]
+async fn guard_referenced_refobjectmap_still_scans_parent() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let g = vars.get_or_insert("?g");
+    let p_geo = ledger
+        .snapshot
+        .encode_iri("http://example.org/geography")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_geo),
+            Term::Var(g),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, g]).await;
+
+    // This shape is now optimal: one scan of the base table and exactly one scan
+    // of the referenced parent (no per-batch parent re-scan). Lock the exact
+    // counts so a regression reintroducing parent re-scans is caught.
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "Store scanned exactly once, got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.geography").copied(),
+        Some(1),
+        "referenced ex:geography parent scanned exactly once, got {counts:?}"
+    );
+    assert_eq!(counts.get("dw.employee"), None, "got {counts:?}");
+    assert_eq!(rows, 2, "two store→geography joins expected");
+}
+
+/// A true wildcard `?s ?p ?o` is unchanged: it still materializes every
+/// TriplesMap and RefObjectMap parent (the all-POMs branch fires only for
+/// `object_var = Some`, which a wildcard is).
+#[tokio::test]
+async fn guard_wildcard_still_scans_all_maps() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(s),
+        Ref::Var(p),
+        Term::Var(o),
+    ))];
+    let (counts, _rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, p, o]).await;
+
+    assert!(
+        counts.contains_key("dw.store"),
+        "wildcard scans Store, got {counts:?}"
+    );
+    assert!(
+        counts.contains_key("dw.geography"),
+        "wildcard still materializes Geography (TM and/or parent), got {counts:?}"
+    );
+    assert!(
+        counts.contains_key("dw.employee"),
+        "wildcard still scans Employee, got {counts:?}"
+    );
+}
+
+/// `dw.store` scan with `n` rows, each pointing at geo_key 10 or 20 (both present
+/// in `edw_geography_batch`), so a `?store -> geography` join emits every row.
+fn edw_store_batch_n(n: usize) -> ColumnBatch {
+    let store_key: Vec<Option<i64>> = (1..=n as i64).map(Some).collect();
+    let ids: Vec<Option<String>> = (1..=n).map(|i| Some(format!("STORE-{i}"))).collect();
+    let names: Vec<Option<String>> = (1..=n).map(|i| Some(format!("Store {i}"))).collect();
+    let geo: Vec<Option<i64>> = (0..n)
+        .map(|i| Some(if i % 2 == 0 { 10 } else { 20 }))
+        .collect();
+    batch_from(vec![
+        (
+            FieldInfo {
+                name: "store_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            Column::Int64(store_key),
+        ),
+        (
+            FieldInfo {
+                name: "store_id".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            Column::String(ids),
+        ),
+        (
+            FieldInfo {
+                name: "store_name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+            Column::String(names),
+        ),
+        (
+            FieldInfo {
+                name: "geo_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 4,
+            },
+            Column::Int64(geo),
+        ),
+    ])
+}
+
+/// Issue 3: a correlated join must scan the inner table's data ONCE, not once per
+/// child batch. With a 2500-row store outer (3 batches at the 1000-row default),
+/// the Geography star (`?g city ; region`) is driven by 3 child batches; the
+/// inner-scan cache must collapse its main scan to a single call. The scan is
+/// isolated from Store's separate geography parent-lookup (which projects
+/// `geo_key`, not `city`) by matching on the `city` column.
+#[tokio::test]
+async fn guard_inner_scan_reused_across_child_batches() {
+    let provider = CountingProvider::edw_with_stores(vec![edw_store_batch_n(2500)]);
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let g = vars.get_or_insert("?g");
+    let c = vars.get_or_insert("?c");
+    let r = vars.get_or_insert("?r");
+    let p_geo = ledger
+        .snapshot
+        .encode_iri("http://example.org/geography")
+        .unwrap();
+    let p_city = ledger
+        .snapshot
+        .encode_iri("http://example.org/city")
+        .unwrap();
+    let p_region = ledger
+        .snapshot
+        .encode_iri("http://example.org/region")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_geo),
+            Term::Var(g),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(g),
+            Ref::Sid(p_city),
+            Term::Var(c),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(g),
+            Ref::Sid(p_region),
+            Term::Var(r),
+        )),
+    ];
+    let (_counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, g, c, r]).await;
+
+    let geo_main_scans = provider.scans_projecting("dw.geography", "city");
+    assert_eq!(
+        geo_main_scans, 1,
+        "Geography main scan must be cached to 1 despite a multi-batch outer \
+         (would be one-per-child-batch without the cache)"
+    );
+    assert_eq!(rows, 2500, "every store row joins to a geography");
+}
+
+/// `dw.store` streamed as `n_chunks` batches of `per_chunk` rows, so a scan's
+/// consumption is observable at batch granularity.
+fn store_chunks(n_chunks: usize, per_chunk: usize) -> Vec<ColumnBatch> {
+    (0..n_chunks)
+        .map(|c| {
+            let base = (c * per_chunk) as i64;
+            let keys: Vec<Option<i64>> =
+                (0..per_chunk as i64).map(|i| Some(base + i + 1)).collect();
+            let ids: Vec<Option<String>> = (0..per_chunk)
+                .map(|i| Some(format!("STORE-{}", base as usize + i + 1)))
+                .collect();
+            batch_from(vec![
+                (
+                    FieldInfo {
+                        name: "store_key".to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        field_id: 1,
+                    },
+                    Column::Int64(keys),
+                ),
+                (
+                    FieldInfo {
+                        name: "store_id".to_string(),
+                        field_type: FieldType::String,
+                        nullable: true,
+                        field_id: 2,
+                    },
+                    Column::String(ids),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// Provider that streams pre-chunked batches and counts how many are pulled, so a
+/// test can prove a `LIMIT` stops the scan early instead of draining the table.
+#[derive(Debug)]
+struct LimitProbeProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    chunks: Vec<ColumnBatch>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl R2rmlProvider for LimitProbeProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
+    }
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for LimitProbeProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use futures::StreamExt;
+        let polls = Arc::clone(&self.polls);
+        Ok(Box::pin(futures::stream::iter(self.chunks.clone()).map(
+            move |b| {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(b)
+            },
+        )))
+    }
+}
+
+async fn run_store_probe(
+    provider: &LimitProbeProvider,
+    ledger: &support::MemoryLedger,
+    vars: &VarRegistry,
+    inner: Vec<Pattern>,
+    select: Vec<VarId>,
+    limit: Option<usize>,
+) -> usize {
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(select);
+    parsed.limit = limit;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("store probe query should execute");
+    result.iter().fold(0, |acc, b| acc + b.len())
+}
+
+/// A provider that records the scan filters it is handed, so a test can assert
+/// exactly which pushdown predicates the operator produced.
+#[derive(Debug)]
+struct FilterCapturingProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    chunks: Vec<ColumnBatch>,
+    filters: Arc<Mutex<Vec<ScanFilter>>>,
+}
+
+#[async_trait::async_trait]
+impl R2rmlProvider for FilterCapturingProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> fluree_db_query::Result<bool> {
+        Ok(graph_source_id == "edw-gs:main")
+    }
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait::async_trait]
+impl R2rmlTableProvider for FilterCapturingProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use futures::StreamExt;
+        self.filters.lock().unwrap().extend(filters.iter().cloned());
+        Ok(Box::pin(futures::stream::iter(self.chunks.clone()).map(Ok)))
+    }
+}
+
+/// A bound subject reverses the subject template and hands the scan an equality
+/// filter on the key column, and the result is still correct (the operator
+/// remains authority). This is the end-to-end proof of the pushdown wiring; the
+/// physical-type coercion and the template reversal are unit-tested separately.
+#[tokio::test]
+async fn guard_bound_subject_pushes_key_filter() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let filters = Arc::new(Mutex::new(Vec::new()));
+    let provider = FilterCapturingProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(1, 10),
+        filters: Arc::clone(&filters),
+    };
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![id]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("bound-subject query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+
+    // The subject template `.../store/{store_key}` reversed against `.../store/5`
+    // must push `store_key = 5` as a template key.
+    let captured = filters.lock().unwrap();
+    assert!(
+        captured.iter().any(|f| f.column == "store_key"
+            && matches!(&f.value, ScanValue::TemplateKey(v) if v == "5")),
+        "expected a store_key TemplateKey(5) filter, got {captured:?}"
+    );
+    // Operator authority still yields exactly the one matching subject.
+    assert_eq!(rows, 1, "only <store/5>'s storeId object is returned");
+}
+
+/// 4a: a `LIMIT n` above the scan must terminate it early. Store is streamed as 40
+/// chunks of 50 rows (2000); `LIMIT 5` must stop after ~one chunk, while the same
+/// query without a LIMIT drains all 40 — proving the row budget reaches the scan
+/// (through Project) and caps its work.
+#[tokio::test]
+async fn guard_limit_terminates_scan_early() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let inner = || {
+        vec![
+            type_triple(s, "http://example.org/Store"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(p_id.clone()),
+                Term::Var(id),
+            )),
+        ]
+    };
+
+    let limited = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&limited, &ledger, &vars, inner(), vec![s, id], Some(5)).await;
+    let limited_polls = limited.polls.load(Ordering::SeqCst);
+    assert_eq!(rows, 5, "LIMIT 5 returns exactly 5 rows");
+    assert!(
+        limited_polls <= 2,
+        "LIMIT 5 must stop after ~one chunk, pulled {limited_polls} of 40"
+    );
+
+    let full = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let _ = run_store_probe(&full, &ledger, &vars, inner(), vec![s, id], None).await;
+    assert_eq!(
+        full.polls.load(Ordering::SeqCst),
+        40,
+        "without a LIMIT the whole table streams"
+    );
+}
+
+/// C: a scan-local FILTER folded into the single scan must not block the LIMIT
+/// budget. `?s a Store; ?s storeId ?id . FILTER(?id != "STORE-1")` fuses into
+/// one scan that consumes the filter, so a `LIMIT 5` still reaches the scan and
+/// stops it after ~one chunk (were the filter left downstream, the filter
+/// operator would block the budget and drain all 40). The scan applies the
+/// filter itself, so `STORE-1` is dropped and, without a LIMIT, exactly one row
+/// is missing.
+#[tokio::test]
+async fn guard_consumed_filter_limit_terminates_scan_early() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let inner = || {
+        vec![
+            type_triple(s, "http://example.org/Store"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(p_id.clone()),
+                Term::Var(id),
+            )),
+            Pattern::Filter(Expression::ne(
+                Expression::Var(id),
+                Expression::Const(FlakeValue::String("STORE-1".to_string())),
+            )),
+        ]
+    };
+
+    // FILTER + LIMIT 5: the consumed filter lets the budget stop the scan early.
+    let limited = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&limited, &ledger, &vars, inner(), vec![s, id], Some(5)).await;
+    assert_eq!(rows, 5, "LIMIT 5 returns exactly 5 filtered rows");
+    let limited_polls = limited.polls.load(Ordering::SeqCst);
+    assert!(
+        limited_polls <= 2,
+        "consumed FILTER + LIMIT 5 must stop early, pulled {limited_polls} of 40"
+    );
+
+    // FILTER without a LIMIT: the whole table streams and the scan drops STORE-1.
+    let full = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows_full = run_store_probe(&full, &ledger, &vars, inner(), vec![s, id], None).await;
+    assert_eq!(
+        full.polls.load(Ordering::SeqCst),
+        40,
+        "without a LIMIT the whole table streams"
+    );
+    assert_eq!(rows_full, 1999, "the consumed filter drops exactly STORE-1");
+}
+
+/// A constant object in the triple (`?s <storeId> "STORE-5"`) is enforced by the
+/// operator, not just the scan filter. The mock provider streams every row
+/// without pruning, so exactly the one matching subject must come back — proving
+/// the equality is applied as the pattern's semantics.
+#[tokio::test]
+async fn guard_constant_object_string_equality() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // ?s ex:storeId "STORE-5"
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(s),
+        Ref::Sid(p_id),
+        Term::Value(FlakeValue::String("STORE-5".to_string())),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![s], None).await;
+    assert_eq!(
+        rows, 1,
+        "only the STORE-5 subject matches the constant object"
+    );
+}
+
+/// An integer constant object (`?s ex:storeKey 5`) is enforced by the operator
+/// with pruning absent (the mock provider streams every row), so exactly the one
+/// matching subject is returned — and the exact-integer comparison does not
+/// over-match neighbouring keys.
+#[tokio::test]
+async fn guard_constant_object_integer_equality() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeKey")
+        .unwrap();
+    // ?s ex:storeKey 5
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(s),
+        Ref::Sid(p_id),
+        Term::Value(FlakeValue::Long(5)),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![s], None).await;
+    assert_eq!(rows, 1, "only store_key 5 matches the integer constant");
+}
+
+/// A bound (constant) subject (`<store/5> ex:storeId ?id`) is enforced by the
+/// operator: it materializes each row's subject from the template and keeps only
+/// the row whose subject IRI equals the constant, binding just the object var.
+/// The mock provider streams every row (no pruning), so exactly the one matching
+/// subject's object must come back.
+#[tokio::test]
+async fn guard_bound_subject_binds_object_only() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    // Select only the object var — the constant subject binds no variable.
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![id], None).await;
+    assert_eq!(
+        rows, 1,
+        "only the <store/5> subject's storeId object is returned"
+    );
+}
+
+/// A bound subject with a VARIABLE predicate (`<store/5> ?p ?o`) now converts to a
+/// bound-subject wildcard scan that binds `?p` via `predicate_var` — this is the
+/// UI's "subject inspector". (Previously it was left unconverted for want of a
+/// predicate-var field.) A bound subject with a CONSTANT predicate still converts.
+///
+/// `#[tokio::test]` (not a plain `#[test]`) because `edw_guard_ledger` builds a
+/// `Fluree`, and the builder spawns the cache event listener — which requires a
+/// live runtime even though this test body never awaits.
+#[tokio::test]
+async fn bound_subject_variable_predicate_binds_predicate_var() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+
+    let wildcard = TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Var(p),
+        Term::Var(o),
+    );
+    let pat = convert_triple_to_r2rml(&wildcard, "edw-gs:main", &ledger.snapshot)
+        .expect("bound subject + variable predicate now converts (subject inspector)");
+    assert_eq!(pat.subject_var, None);
+    assert_eq!(
+        pat.subject_constant.as_deref(),
+        Some("http://example.org/store/5")
+    );
+    assert_eq!(
+        pat.predicate_var,
+        Some(p),
+        "?p is bound to each triple's predicate"
+    );
+    assert_eq!(pat.object_var, Some(o));
+
+    // Control: a constant predicate on the same bound subject still converts.
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let bound = TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(o),
+    );
+    assert!(
+        convert_triple_to_r2rml(&bound, "edw-gs:main", &ledger.snapshot).is_some(),
+        "bound subject + constant predicate must still convert"
+    );
+}
+
+/// A decimal constant object (`?s ex:val 9.99`) is enforced by the operator with
+/// a scale-insensitive numeric match: a column materialized as `9.990` (scale 3)
+/// matches the `9.99` query constant, while `12.345` does not. This also exercises
+/// the real `format_decimal` → `BigDecimal::parse` path end to end.
+#[tokio::test]
+async fn guard_constant_object_decimal_scale_insensitive() {
+    use num_bigdecimal::BigDecimal;
+    use std::str::FromStr;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:decimal"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Scale-3 column: unscaled 9990 → "9.990", 12345 → "12.345".
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Decimal {
+            values: vec![Some(9990), Some(12345)],
+            precision: 10,
+            scale: 3,
+        },
+        FieldType::Decimal {
+            precision: 10,
+            scale: 3,
+        },
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+    // ?s ex:val 9.99
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Value(FlakeValue::Decimal(Box::new(
+                BigDecimal::from_str("9.99").unwrap(),
+            ))),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("decimal object-constant query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(rows, 1, "decimal 9.99 matches only the 9.990-scaled row");
+}
+
+// =============================================================================
+// PR-F20: RefObjectMap-target resolution prune — CROSS-SCOPE pre-bound ?p
+//
+// The static in-scope analysis (`compute_ref_prune_targets`) cannot see a ?p
+// seeded from OUTSIDE the graph scope (an outer VALUES / cross-graph join). The
+// prune stays sound there by CONJUNCTION: the in-scope required ref member
+// (`?inv product ?p`) restricts ?p to actual DIM_PRODUCT FK objects, so a pre-bound
+// NON-product ?p yields no fact row and its solution dies — identically whether or
+// not the sibling `?p name` star is pruned to Product. This test exercises that
+// runtime path (the compute-level unit tests can't seed a binding).
+// =============================================================================
+
+const F20_REFPRUNE_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<http://example.org/mapping#Fact> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.fact" ] ;
+    rr:subjectMap [ rr:template "http://example.org/inv/{inv_key}" ; rr:class ex:Inv ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:product ;
+        rr:objectMap [
+            rr:parentTriplesMap <http://example.org/mapping#Product> ;
+            rr:joinCondition [ rr:child "product_key" ; rr:parent "product_key" ]
+        ]
+    ] .
+
+<http://example.org/mapping#Product> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.product" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{product_key}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "product_name" ] ] .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+"#;
+
+fn f20_refprune_provider() -> CountingProvider {
+    let mapping = R2rmlLoader::from_turtle(F20_REFPRUNE_MAPPING_TTL)
+        .expect("parse F20 mapping")
+        .compile()
+        .expect("compile F20 mapping");
+    let mut batches_by_table = HashMap::new();
+    // Fact row: inv/1 -> product_key 1 (renders product/1). No store FK exists.
+    batches_by_table.insert(
+        "dw.fact".to_string(),
+        vec![batch_from(vec![
+            col_i64("inv_key", 1, vec![Some(1)]),
+            col_i64("product_key", 2, vec![Some(1)]),
+        ])],
+    );
+    batches_by_table.insert(
+        "dw.product".to_string(),
+        vec![batch_from(vec![
+            col_i64("product_key", 1, vec![Some(1)]),
+            col_str("product_name", 2, &["Widget"]),
+        ])],
+    );
+    // A second `ex:name`-bearing dim (the fan-out target) with a DISJOINT template.
+    batches_by_table.insert(
+        "dw.store".to_string(),
+        vec![batch_from(vec![
+            col_i64("store_key", 1, vec![Some(9)]),
+            col_str("store_name", 2, &["StoreName"]),
+        ])],
+    );
+    CountingProvider {
+        mapping: Arc::new(mapping),
+        batches_by_table,
+        scans: Mutex::new(Vec::new()),
+        orders: Mutex::new(Vec::new()),
+    }
+}
+
+/// Run `VALUES ?p { <seed> } GRAPH edw-gs:main { ?inv ex:product ?p . ?p ex:name ?pn }`
+/// and return (scan_counts, produced_row_total). The VALUES is OUTSIDE the GRAPH
+/// block, so it is invisible to the in-scope ref-prune analysis (which still fires
+/// on `?p ex:name`, constraining it to Product).
+async fn run_f20_prebound(
+    provider: &CountingProvider,
+    seed_iri: &str,
+) -> (HashMap<String, usize>, usize) {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let inv = vars.get_or_insert("?inv");
+    let p = vars.get_or_insert("?p");
+    let pn = vars.get_or_insert("?pn");
+    let p_product = ledger
+        .snapshot
+        .encode_iri("http://example.org/product")
+        .unwrap();
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(inv),
+            Ref::Sid(p_product),
+            Term::Var(p),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(p_name),
+            Term::Var(pn),
+        )),
+    ];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    // Outer VALUES ?p { <seed> } — seeds ?p from OUTSIDE the graph scope.
+    let values = Pattern::Values {
+        vars: vec![p],
+        rows: vec![vec![fluree_db_query::Binding::iri(seed_iri)]],
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![values, graph];
+    parsed.output = QueryOutput::select_all(vec![inv, p, pn]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("F20 pre-bound query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    (provider.scan_counts(), rows)
+}
+
+#[tokio::test]
+async fn f20_prebound_valid_product_yields_the_row() {
+    // Self-check + soundness: a pre-bound VALID product IRI joins the fact row and,
+    // with the prune firing (?p name -> Product only), still returns the name. If
+    // the ref-prune dropped it, this would be 0. Proves the prune keeps kept rows.
+    let provider = f20_refprune_provider();
+    let (_counts, rows) = run_f20_prebound(&provider, "http://example.org/product/1").await;
+    assert_eq!(
+        rows, 1,
+        "pre-bound valid product ?p must still produce its name row"
+    );
+}
+
+#[tokio::test]
+async fn f20_prebound_nonproduct_iri_dies_by_conjunction() {
+    // The dangerous shape: a pre-bound NON-product IRI (a Store subject) invisible
+    // to the in-scope scan. The prune fires (?p name -> Product), yet the row dies
+    // regardless because the in-scope ref member (?inv product ?p) has no fact row
+    // with product = store/9. Sound: pruned and un-pruned both yield 0 for this row.
+    let provider = f20_refprune_provider();
+    let (_counts, rows) = run_f20_prebound(&provider, "http://example.org/store/9").await;
+    assert_eq!(
+        rows, 0,
+        "a pre-bound non-product ?p must die via the ref-member conjunction, not survive"
+    );
+}
+
+// =============================================================================
+// Bulk materializer (DEC-003 Deliverable 1) — driver over the scan path
+// =============================================================================
+
+/// Decode one result binding to an N-Triples term, matching the bulk
+/// materializer's own rendering: a subject `Sid` via `decode_sid`, a raw graph
+/// source `Iri` verbatim, and a plain string literal without an explicit
+/// `xsd:string` datatype (the materializer's convention for `dtc = None`).
+fn binding_to_nt<F>(b: &fluree_db_query::Binding, decode_sid: &F) -> String
+where
+    F: Fn(&fluree_db_core::Sid) -> Option<String>,
+{
+    if let Some(iri) = b.get_iri() {
+        return format!("<{iri}>");
+    }
+    match b {
+        fluree_db_query::Binding::Sid { sid, .. } => {
+            format!("<{}>", decode_sid(sid).expect("decode subject sid to IRI"))
+        }
+        fluree_db_query::Binding::Lit {
+            val: fluree_db_core::FlakeValue::String(s),
+            ..
+        } => format!("\"{s}\""),
+        other => panic!("materializer engine-diff: unexpected binding variant {other:?}"),
+    }
+}
+
+/// ENGINE-EQUIVALENCE (Chunk B checkpoint): the bulk materializer's streaming
+/// driver, run over the SAME airline mock the engine's `?s ?p ?o` wildcard scan
+/// uses, must emit EXACTLY the triple set the engine produces — subjects,
+/// predicates, and objects decoded to N-Triples and compared as sets. This is
+/// the deterministic, hermetic analog of the live native-sf01 full-triple diff:
+/// it proves the new whole-graph enumerator agrees with the proven query engine
+/// over an identical scan, not just with hand-written expectations.
+#[tokio::test]
+async fn materializer_driver_matches_engine_wildcard() {
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-mat:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    // Path A — the bulk materializer driver.
+    let mut collector = NTriplesCollector::default();
+    let stats = fluree_db_api::materialize::materialize_graph(
+        &provider,
+        "airlines-gs:main",
+        &mut collector,
+    )
+    .await
+    .expect("materialize driver should succeed");
+    let driver_triples = collector.sorted_unique();
+
+    // Path B — the engine `?s ?p ?o` wildcard scan, decoded to N-Triples.
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
+
+    let decode = |sid: &fluree_db_core::Sid| ledger.snapshot.decode_sid(sid);
+    let mut engine_triples: Vec<String> = Vec::new();
+    for b in &batches {
+        for r in 0..b.len() {
+            let subj = binding_to_nt(b.get(r, s).expect("?s bound"), &decode);
+            let pred = b
+                .get(r, p)
+                .and_then(fluree_db_query::Binding::get_iri)
+                .expect("?p is a predicate IRI")
+                .to_string();
+            let obj = binding_to_nt(b.get(r, o).expect("?o bound"), &decode);
+            engine_triples.push(format!("{subj} <{pred}> {obj} ."));
+        }
+    }
+    engine_triples.sort();
+    engine_triples.dedup();
+
+    assert_eq!(
+        driver_triples, engine_triples,
+        "materializer driver triple set must equal the engine wildcard scan's"
+    );
+    // 3 airlines × (name + country + iata + rdf:type) = 12 triples.
+    assert_eq!(
+        stats.total_triples(),
+        12,
+        "airline mapping yields 12 triples"
+    );
+    assert_eq!(driver_triples.len(), 12);
+}
+
+/// Returns different batches per logical table so a dim + fact + foreign-key
+/// mapping can be materialized over the streaming scan path.
+#[derive(Debug)]
+struct MultiTableMock {
+    mapping: Arc<CompiledR2rmlMapping>,
+    tables: HashMap<String, Vec<ColumnBatch>>,
+}
+
+#[async_trait]
+impl R2rmlProvider for MultiTableMock {
+    async fn has_r2rml_mapping(&self, _gs: &str) -> fluree_db_query::Result<bool> {
+        Ok(true)
+    }
+    async fn compiled_mapping(
+        &self,
+        _gs: &str,
+        _t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+
+    // Fake per-table watermarks so the builder's fail-loud stamp guard passes
+    // (DEC-003 §17(b): mocks override with fakes). Keyed by the logical table
+    // name the driver scans, matching the real provider's capture.
+    fn build_watermark(
+        &self,
+        _gs: &str,
+    ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+        self.tables
+            .keys()
+            .map(|t| {
+                (
+                    t.clone(),
+                    fluree_db_query::r2rml::TableWatermark {
+                        metadata_location: format!("mock://{t}/metadata.json"),
+                        snapshot_id: Some(1),
+                        sequence_number: Some(1),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for MultiTableMock {
+    async fn scan_table(
+        &self,
+        _gs: &str,
+        table: &str,
+        _p: &[String],
+        _f: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        Ok(vec_batch_stream(
+            self.tables.get(table).cloned().unwrap_or_default(),
+        ))
+    }
+}
+
+/// FK INTEGRATION: the streaming driver resolves a foreign-key edge across two
+/// separate tables (dims-first ordering + parent index over streamed scans),
+/// and drops a dangling FK — the async analog of the in-memory golden FK test.
+#[tokio::test]
+async fn materializer_driver_resolves_fk_across_tables() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    // Customer dim (parent) + Order fact (child, FK placedBy -> Customer).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let cust_batch = ColumnBatch::new(
+        Arc::new(cust_schema),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let order_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    // order 1 -> cust 10 (match); order 2 -> cust 99 (dangling, dropped).
+    let order_batch = ColumnBatch::new(
+        Arc::new(order_schema),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(99)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = MultiTableMock { mapping, tables };
+
+    let mut collector = NTriplesCollector::default();
+    let stats = fluree_db_api::materialize::materialize_graph(&provider, "gs:main", &mut collector)
+        .await
+        .expect("materialize driver should succeed");
+    let triples = collector.sorted_unique();
+
+    assert!(
+        triples.contains(
+            &"<http://ex.org/order/1> <http://ex.org/placedBy> <http://ex.org/customer/10> ."
+                .to_string()
+        ),
+        "matched FK edge must be present: {triples:?}"
+    );
+    assert!(
+        !triples
+            .iter()
+            .any(|t| t.contains("order/2") && t.contains("placedBy")),
+        "dangling FK (cust 99) must be dropped: {triples:?}"
+    );
+    assert_eq!(stats.ref_triples, 1, "exactly one FK edge resolves");
+    assert_eq!(stats.ref_dangling, 1, "order 2's FK is dangling");
+}
+
+/// END-TO-END (Chunk B complete): materialize a virtual R2RML source into a REAL
+/// native ledger through the bulk import pipeline (ImportSource::Virtual → commit
+/// → index → publish), then query the twin back and confirm term, datatype,
+/// language, and foreign-key fidelity round-trip. Tight EXPLICIT bounds per the
+/// machine-safety directive (parallelism + a small memory budget; never
+/// auto-detection). Multi-thread runtime: the virtual producer drives its async
+/// scan via Handle::block_on off a dedicated thread.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materialize_builds_queryable_native_twin() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin:main";
+
+    // Customer dim: name (plain string) + label (lang-tagged @en).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    // Order fact: amount (xsd:decimal) + placedBy (FK → Customer).
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    // Materialize the twin with TIGHT EXPLICIT bounds (machine-safety directive).
+    let result = fluree
+        .create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize virtual twin");
+    assert!(result.root_id.is_some(), "twin index must be built");
+
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+    let json = |q: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .expect("query")
+                .to_sparql_json(&ledger.snapshot)
+                .expect("sparql json")
+        }
+    };
+
+    // Class count (parity-gate "counts" shape against the built twin).
+    let orders = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Order> }").await;
+    assert_eq!(orders["results"]["bindings"][0]["c"]["value"], "2");
+    let customers = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Customer> }").await;
+    assert_eq!(customers["results"]["bindings"][0]["c"]["value"], "2");
+
+    // Foreign-key edge fidelity: order 1 placedBy customer 10.
+    let fk = json("SELECT ?c WHERE { <http://ex.org/order/1> <http://ex.org/placedBy> ?c }").await;
+    assert_eq!(
+        fk["results"]["bindings"][0]["c"]["value"], "http://ex.org/customer/10",
+        "FK edge must resolve to the parent subject IRI"
+    );
+
+    // Typed-literal fidelity: xsd:decimal round-trips value + datatype.
+    let amt = json("SELECT ?a WHERE { <http://ex.org/order/1> <http://ex.org/amount> ?a }").await;
+    let amt_b = &amt["results"]["bindings"][0]["a"];
+    assert_eq!(amt_b["value"], "9.99", "decimal value must round-trip");
+    assert_eq!(
+        amt_b["datatype"], "http://www.w3.org/2001/XMLSchema#decimal",
+        "decimal datatype must round-trip (not narrowed to string)"
+    );
+
+    // Language-tag fidelity: label@en round-trips value + language.
+    let lbl =
+        json("SELECT ?l WHERE { <http://ex.org/customer/10> <http://ex.org/label> ?l }").await;
+    let lbl_b = &lbl["results"]["bindings"][0]["l"];
+    assert_eq!(lbl_b["value"], "hola", "lang literal value must round-trip");
+    assert_eq!(lbl_b["xml:lang"], "en", "language tag must round-trip");
+}
+
+/// Read the completion stamp off a ledger's HEAD commit by decoding its envelope
+/// `txn_meta`. Panics if the head commit carries no stamp.
+#[cfg(feature = "native")]
+async fn read_head_stamp(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+) -> fluree_db_api::materialize::WatermarkStamp {
+    use fluree_db_core::commit::codec::envelope::decode_envelope;
+    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+    use fluree_db_core::ContentStore;
+
+    let rec = fluree
+        .nameservice()
+        .lookup(ledger)
+        .await
+        .expect("ns lookup")
+        .expect("ledger exists");
+    let head = rec.commit_head_id.expect("ledger has commits");
+    let raw = fluree
+        .content_store(ledger)
+        .get(&head)
+        .await
+        .expect("read head commit blob");
+    let hdr = CommitHeader::read_from(&raw).expect("commit header");
+    let start = HEADER_LEN;
+    let end = start + hdr.envelope_len as usize;
+    let env = decode_envelope(&raw[start..end]).expect("decode envelope");
+    // The stamp predicates' ns code resolves via this commit's own namespace_delta
+    // (they were freshly interned into the final commit's sink).
+    fluree_db_api::materialize::read_stamp(&env.txn_meta, &env.namespace_delta)
+        .expect("head commit must carry the completion stamp")
+}
+
+/// D ROUND-TRIP: the twin's completion stamp is written to the FINAL commit's
+/// txn_meta, survives an archive_ledger → restore_ledger round-trip byte-for-byte,
+/// and parses back identically. This is the completion-marker contract — a valid
+/// twin is one whose head commit carries a parseable stamp.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_stamp_survives_pack_restore() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin-stamp:main";
+    const RESTORED: &str = "test/twin-stamp-restored:main";
+
+    // Two tables (dim + fact with an FK) → two watermark entries.
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+    let expected_hash = fluree_db_api::materialize::mapping_hash(&mapping);
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    // Build twin A (TIGHT bounds — machine-safety directive).
+    let src_dir = tempfile::tempdir().expect("src tmpdir");
+    let src = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source Fluree");
+    src.create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize twin");
+
+    // The head commit carries the stamp; it matches the assembled stamp.
+    let stamp_a = read_head_stamp(&src, LEDGER).await;
+    assert_eq!(
+        stamp_a.mapping_hash, expected_hash,
+        "stamp mapping hash matches"
+    );
+    assert!(
+        stamp_a.builder_version.starts_with("fluree-materialize/"),
+        "builder version stamped"
+    );
+    assert_eq!(
+        stamp_a.tables.len(),
+        2,
+        "both tables in the watermark vector"
+    );
+    assert!(
+        stamp_a.tables.contains_key("dw.customer") && stamp_a.tables.contains_key("dw.orders"),
+        "watermark keyed by logical table name"
+    );
+
+    // Pack + restore into a fresh instance under a different name.
+    let mut archive: Vec<u8> = Vec::new();
+    src.archive_ledger(LEDGER, true, &mut archive)
+        .await
+        .expect("archive twin");
+    let dst_dir = tempfile::tempdir().expect("dst tmpdir");
+    let dst = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination Fluree");
+    let mut reader = std::io::Cursor::new(archive);
+    dst.restore_ledger(RESTORED, &mut reader)
+        .await
+        .expect("restore twin");
+
+    // The stamp survives byte-for-byte and parses identically.
+    let stamp_b = read_head_stamp(&dst, RESTORED).await;
+    assert_eq!(stamp_b.builder_version, stamp_a.builder_version);
+    assert_eq!(stamp_b.mapping_hash, stamp_a.mapping_hash);
+    assert_eq!(
+        stamp_b.tables, stamp_a.tables,
+        "the watermark vector survives pack/restore byte-identical"
+    );
+}
+
+/// A dim + fact mock covering IRI, plain-string, lang-tagged, typed-decimal, and
+/// foreign-key-IRI objects — the parity-gate verification fixture.
+#[cfg(feature = "native")]
+fn verify_fixture_provider() -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// The same dim+fact shape as [`verify_fixture_provider`], but generated at
+/// `n_customers`/`n_orders` rows split into `batch_rows`-sized scan batches — so a
+/// small chunk budget yields a genuinely MULTI-CHUNK build (chunk boundaries fall
+/// between scan batches). Every order's FK resolves (`cust_key = o_key % n_customers`).
+#[cfg(feature = "native")]
+fn scaled_verify_provider(
+    n_customers: usize,
+    n_orders: usize,
+    batch_rows: usize,
+) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "label".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut cust_batches = Vec::new();
+    let mut i = 0;
+    while i < n_customers {
+        let end = (i + batch_rows).min(n_customers);
+        cust_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&cust_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("Customer {k}"))).collect()),
+                    Column::String((i..end).map(|k| Some(format!("label-{k}"))).collect()),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "amount".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut order_batches = Vec::new();
+    let mut i = 0;
+    while i < n_orders {
+        let end = (i + batch_rows).min(n_orders);
+        order_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&order_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("{k}.25"))).collect()),
+                    Column::Int64(
+                        (i..end)
+                            .map(|k| Some((k % n_customers.max(1)) as i64))
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), order_batches);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE — FULL mode at multi-chunk scale (item #2): a twin built across many
+/// scan batches + a tiny chunk budget must pass the full-triple diff. This exercises
+/// the rewritten twin-read path — a SINGLE linear pass over the binary index (the
+/// export `scan_all` shape) instead of O(n^2) `ORDER BY ?s ?p ?o ... OFFSET` paging —
+/// proving it streams the WHOLE twin (every chunk/segment) and diffs byte-identically
+/// against the enumerator source. Peak memory is bounded by construction (cursor
+/// batches on the read side, `SORT_RUN_LINES` on the sort side); this asserts
+/// correctness + completeness at multi-chunk size.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_full_passes_on_multi_chunk_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-full-multichunk:main";
+    const N_CUSTOMERS: usize = 4000;
+    const N_ORDERS: usize = 4000;
+    let provider = scaled_verify_provider(N_CUSTOMERS, N_ORDERS, 500);
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    let build = fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(64)
+        .chunk_size_mb(1) // tiny chunks × many scan batches → a genuinely multi-chunk build
+        .execute()
+        .await
+        .expect("build multi-chunk twin");
+    // MAJOR-5 (#1529 review): this test's WHOLE point is exercising verify at
+    // multi-chunk scale, but it never asserted the build actually spanned >1 chunk
+    // (a config drift could quietly make it single-chunk). `t` is the final
+    // transaction number = the chunk count; assert the build was genuinely
+    // multi-chunk so the full-verify assertion below is testing what it claims.
+    assert!(
+        build.t > 1,
+        "the build must be genuinely multi-chunk (t={}) for this test to be meaningful",
+        build.t
+    );
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Spool under the tempdir (a real .fluree-style scratch area, not tmpfs /tmp).
+    let verify_tmp = dir.path().join("materialize-verify");
+    let report = verify_twin(
+        &fluree,
+        &ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        Some(&verify_tmp),
+    )
+    .await
+    .expect("full verify");
+
+    assert!(
+        report.passed,
+        "a faithful multi-chunk twin must pass full verify; failures: {:?}",
+        report.failures()
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert_eq!(
+        full.outcome,
+        CheckOutcome::Match,
+        "the index-streamed twin must diff byte-identically against the enumerator source"
+    );
+    // Both class counts match at scale (proving the linear pass read every segment).
+    let count_outcome = |class: &str| {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == format!("count:{class}"))
+            .map(|c| c.outcome.clone())
+    };
+    assert_eq!(
+        count_outcome("http://ex.org/Customer"),
+        Some(CheckOutcome::Match)
+    );
+    assert_eq!(
+        count_outcome("http://ex.org/Order"),
+        Some(CheckOutcome::Match)
+    );
+}
+
+/// A parent whose SUBJECT is keyed on `c_id` but is JOINED on `region` (non-unique):
+/// two customers in the same region mint DIFFERENT subjects for the same join key, so
+/// key `["EU"]` maps to both `customer/1` and `customer/2` — the duplicate-parent-key
+/// fan-out shape. The two customers are split across two scan BATCHES (two data
+/// files, read in either order); `reverse` flips their order.
+#[cfg(feature = "native")]
+fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_id}").with_class("http://ex.org/Customer");
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_id}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedInRegion"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+            "<#Customer>",
+            "cust_region",
+            "region",
+        )),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let cust_batch = |c_id: i64| {
+        ColumnBatch::new(
+            Arc::clone(&cust_schema),
+            vec![
+                Column::Int64(vec![Some(c_id)]),
+                Column::String(vec![Some("EU".to_string())]),
+            ],
+        )
+        .unwrap()
+    };
+    let mut cust_batches = vec![cust_batch(1), cust_batch(2)];
+    if reverse_customer_batches {
+        cust_batches.reverse();
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let order_batch = ColumnBatch::new(
+        order_schema,
+        vec![
+            Column::Int64(vec![Some(100)]),
+            Column::String(vec![Some("EU".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// FAN-OUT (#1583): a source whose FK parent join key matches two parent subjects
+/// builds, and the order joins BOTH, whichever batch is scanned first; the twin's
+/// stamp records no ambiguous keys. The old override is accepted and changes nothing.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_emits_an_edge_to_every_parent_a_duplicate_key_matches() {
+    for (reverse, flag) in [(false, false), (true, false), (false, true)] {
+        let ledger = format!("test/dupkey-fanout-{reverse}-{flag}:main");
+        let provider = dup_parent_key_provider(reverse);
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build Fluree");
+        let mut builder = fluree
+            .create(&ledger)
+            .import_r2rml(Arc::clone(&provider), "gs:main")
+            .threads(2)
+            .memory_budget_mb(256);
+        if flag {
+            #[allow(deprecated)]
+            let with_flag = builder.allow_duplicate_parent_keys(true);
+            builder = with_flag;
+        }
+        builder
+            .execute()
+            .await
+            .expect("a duplicate parent key builds the twin");
+        let loaded = fluree.ledger(&ledger).await.expect("load twin");
+
+        let json = support::query_sparql(
+            &fluree,
+            &loaded,
+            "SELECT ?c WHERE { <http://ex.org/order/100> <http://ex.org/placedInRegion> ?c }",
+        )
+        .await
+        .expect("query")
+        .to_sparql_json(&loaded.snapshot)
+        .expect("sparql json");
+        let mut customers: Vec<&str> = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .map(|b| b["c"]["value"].as_str().expect("an IRI"))
+            .collect();
+        customers.sort_unstable();
+        assert_eq!(
+            customers,
+            ["http://ex.org/customer/1", "http://ex.org/customer/2"],
+            "the order joins both customers of its region (reverse={reverse}, flag={flag})"
+        );
+
+        let stamp = read_head_stamp(&fluree, &ledger).await;
+        assert!(
+            stamp.dup_parent_keys.is_empty(),
+            "a twin that holds every edge records no ambiguous keys (reverse={reverse}, flag={flag})"
+        );
+    }
+}
+
+/// PARITY GATE — pass case: a faithfully built twin matches its virtual source
+/// under both `Quick` (class counts + stratified sample) and `Full` (full-triple
+/// diff). Proves the twin-side N-Triples reader renders IRI, plain-string,
+/// lang-tagged, typed-decimal, and FK-IRI objects identically to the enumerator.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_passes_on_faithful_twin() {
+    use fluree_db_api::materialize::{verify_twin, VerifyMode};
+
+    const LEDGER: &str = "test/verify-pass:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    for mode in [VerifyMode::Quick, VerifyMode::Full] {
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode, None)
+            .await
+            .expect("verify");
+        assert!(
+            report.passed,
+            "a faithful twin must pass {mode:?}; failures: {:?}",
+            report.failures()
+        );
+        // Both classes are present and counted, and per-property is skip-with-note.
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "count:http://ex.org/Order"),
+            "class-count check ran for Order"
+        );
+        assert!(
+            report.checks.iter().any(|c| c.name == "per-property-counts"
+                && matches!(
+                    c.outcome,
+                    fluree_db_api::materialize::CheckOutcome::Skipped { .. }
+                )),
+            "per-property counts are skipped-with-note"
+        );
+    }
+}
+
+/// PARITY GATE — negative case: a twin corrupted after build (a spurious extra
+/// instance injected) must FAIL the gate. The class-count check catches the
+/// cardinality change, and `Full` reports the extra triple.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_fails_on_corrupted_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-corrupt:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt the twin: inject an Order that the virtual source does not have.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/order/999",
+        "@type": "http://ex.org/Order"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious order");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        None,
+    )
+    .await
+    .expect("verify");
+    assert!(!report.passed, "a corrupted twin must FAIL the gate");
+
+    // The Order class count mismatches (twin=3, source=2), and the full diff
+    // reports exactly the one extra twin triple.
+    let order_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Order")
+        .expect("Order count check present");
+    assert_eq!(
+        order_count.outcome,
+        CheckOutcome::Mismatch { source: 2, twin: 3 },
+        "the injected Order must show as a count mismatch, got {:?}",
+        order_count.outcome
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert!(
+        matches!(
+            full.outcome,
+            CheckOutcome::TripleDiff { extra_in_twin, .. } if extra_in_twin >= 1
+        ),
+        "the full diff must report the extra twin triple, got {:?}",
+        full.outcome
+    );
+}
+
+/// PARITY GATE — Quick SAMPLE arm negative: a per-subject value corruption on a
+/// SAMPLED subject (an extra property, no new instance so the class counts stay
+/// equal) must fail the Quick gate on the sample's node compare — the check the
+/// stratified sample adds over the always-on counts.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_quick_catches_sampled_subject_corruption() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-quick-neg:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt an existing (always-sampled, only 2/class) subject with a spurious
+    // extra property. No new instance → the class counts are unchanged, so ONLY
+    // the sample's per-subject node compare can catch it.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/customer/10",
+        "http://ex.org/name": "SPURIOUS"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious property");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Quick,
+        None,
+    )
+    .await
+    .expect("verify");
+    assert!(
+        !report.passed,
+        "Quick must catch a value corruption on a sampled subject"
+    );
+    // The class-count arm stays green (no new instance) — proving it is the
+    // SAMPLE arm that fired.
+    let cust_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Customer")
+        .expect("Customer count check present");
+    assert_eq!(
+        cust_count.outcome,
+        CheckOutcome::Match,
+        "class counts are unchanged by a per-subject property corruption"
+    );
+    assert!(
+        report
+            .failures()
+            .iter()
+            .any(|c| c.name == "sample:<http://ex.org/customer/10>"),
+        "the corrupted sampled subject must fail; failures: {:?}",
+        report.failures()
+    );
+}
+
+/// A source whose 0/1 columns (a `long` and a `decimal(1,0)`) are typed
+/// `xsd:boolean`: three widgets, so the Quick gate samples every one of them.
+#[cfg(feature = "native")]
+fn boolean_flag_provider() -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, SubjectMap, TriplesMap,
+    };
+
+    let mut widget = TriplesMap::new("<#Widget>", "dw.widget");
+    widget.subject_map =
+        SubjectMap::template("http://ex.org/widget/{id}").with_class("http://ex.org/Widget");
+    widget.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/active"),
+            object_map: ObjectMap::column_typed("flag", fluree_vocab::xsd::BOOLEAN),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/enabled"),
+            object_map: ObjectMap::column_typed("flag_dec", fluree_vocab::xsd::BOOLEAN),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![widget]));
+
+    let batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "id".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "flag".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "flag_dec".to_string(),
+                field_type: FieldType::Decimal {
+                    precision: 1,
+                    scale: 0,
+                },
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2), Some(3)]),
+            Column::Int64(vec![Some(1), Some(0), Some(1)]),
+            Column::Decimal {
+                values: vec![Some(0), Some(1), Some(0)],
+                precision: 1,
+                scale: 0,
+            },
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.widget".to_string(), vec![batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE (#2386): a 0/1 column typed `xsd:boolean` materializes as
+/// booleans and passes both gates. The source renders `"1"^^xsd:boolean`, the
+/// twin answers `"true"^^xsd:boolean`, and the two are the same value. A twin
+/// holding the other boolean still fails both gates.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_passes_on_a_zero_one_column_typed_boolean() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-boolean:main";
+    let provider = boolean_flag_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // The twin holds booleans, not the source's 0/1 text.
+    for (subject, predicate, want) in [
+        ("widget/1", "active", "true"),
+        ("widget/2", "active", "false"),
+        ("widget/1", "enabled", "false"),
+        ("widget/2", "enabled", "true"),
+    ] {
+        let q = format!(
+            "SELECT ?v WHERE {{ <http://ex.org/{subject}> <http://ex.org/{predicate}> ?v }}"
+        );
+        let json = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("sparql json");
+        let v = &json["results"]["bindings"][0]["v"];
+        assert_eq!(v["value"], want, "{subject} {predicate}: {v}");
+        assert_eq!(
+            v["datatype"],
+            fluree_vocab::xsd::BOOLEAN,
+            "{subject} {predicate}: {v}"
+        );
+    }
+
+    for mode in [VerifyMode::Quick, VerifyMode::Full] {
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode, None)
+            .await
+            .expect("verify");
+        assert!(
+            report.passed,
+            "a 0/1 column typed xsd:boolean must pass {mode:?}; failures: {:?}",
+            report.failures()
+        );
+    }
+
+    // Flip widget/1's ex:active from true to false: the source still says 1.
+    let flip = serde_json::json!({
+        "where":  {"@id": "http://ex.org/widget/1", "http://ex.org/active": "?a"},
+        "delete": {"@id": "http://ex.org/widget/1", "http://ex.org/active": "?a"},
+        "insert": {"@id": "http://ex.org/widget/1", "http://ex.org/active": false}
+    });
+    let flipped = fluree.update(ledger, &flip).await.expect("flip a flag");
+
+    let quick = verify_twin(
+        &fluree,
+        &flipped.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Quick,
+        None,
+    )
+    .await
+    .expect("verify quick");
+    assert!(!quick.passed, "a flipped boolean must fail Quick");
+    assert!(
+        quick
+            .failures()
+            .iter()
+            .any(|c| c.name == "sample:<http://ex.org/widget/1>"
+                && c.outcome
+                    == CheckOutcome::TripleDiff {
+                        missing_in_twin: 1,
+                        extra_in_twin: 1
+                    }),
+        "widget/1 must fail with one missing and one extra triple; failures: {:?}",
+        quick.failures()
+    );
+
+    let full = verify_twin(
+        &fluree,
+        &flipped.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        None,
+    )
+    .await
+    .expect("verify full");
+    assert!(!full.passed, "a flipped boolean must fail Full");
+    let diff = full
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert_eq!(
+        diff.outcome,
+        CheckOutcome::TripleDiff {
+            missing_in_twin: 1,
+            extra_in_twin: 1
+        },
+        "the full diff must report exactly the flipped triple"
+    );
+}
+
+/// DROP-ON-FAIL mechanism: the CLI hard-drops a twin whose gate fails, so nothing
+/// unverified stays announced. Verify the drop actually UNPUBLISHES — after a
+/// hard drop, the twin is no longer a live, queryable ledger (its nameservice
+/// head is gone / retracted).
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_twin_is_unpublished() {
+    use fluree_db_api::DropMode;
+
+    const LEDGER: &str = "test/twin-drop:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+
+    // Announced before the drop: a published head is present.
+    let before = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup")
+        .expect("built twin is registered");
+    assert!(
+        before.commit_head_id.is_some(),
+        "built twin has a published commit head"
+    );
+
+    // Drop it exactly as the gate-fail path does. drop_ledger drops the WHOLE
+    // ledger and rejects a `:branch` suffix, so strip it (this is the CLI bug the
+    // test surfaced: dropping with `:main` 400s and leaves the twin announced).
+    fluree
+        .drop_ledger("test/twin-drop", DropMode::Hard)
+        .await
+        .expect("hard drop");
+
+    // No live ledger remains — the record is absent or retracted (a drop leaves a
+    // retracted tombstone rather than purging the entry), so nothing unverified
+    // is left announced.
+    let after = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup");
+    assert!(
+        after.is_none_or(|r| r.retracted),
+        "a hard-dropped twin must leave no live, queryable ledger"
+    );
+}
+
+/// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio
+/// runtime must fail loud with a typed error, NOT deadlock in the producer's
+/// block_on. Production servers and the CLI run multi-thread; this guards a
+/// mis-wired caller.
+#[cfg(feature = "native")]
+#[tokio::test] // default flavor = current_thread
+async fn materialize_on_current_thread_runtime_fails_loud() {
+    use fluree_db_r2rml::mapping::{SubjectMap, TriplesMap};
+
+    let mut tm = TriplesMap::new("<#T>", "dw.t");
+    tm.subject_map = SubjectMap::template("http://ex.org/t/{id}").with_class("http://ex.org/T");
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+    let batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }])),
+        vec![Column::Int64(vec![Some(1)])],
+    )
+    .unwrap();
+    let mut tables = HashMap::new();
+    tables.insert("dw.t".to_string(), vec![batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let err = fluree
+        .create("test/rt:main")
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("virtual import on a current-thread runtime must fail");
+    assert!(
+        format!("{err}").contains("multi-thread"),
+        "expected a typed multi-thread-runtime error, got: {err}"
+    );
+}
+
+/// The row order each query shape asks of its graph-source table scan: only a
+/// query that takes no prefix of an answer (no LIMIT or OFFSET anywhere, no
+/// `selectOne`) may take `ScanOrder::Any` (rows as file reads finish); any
+/// slice, including one under a FILTER (which a row budget does not pass) or
+/// inside a sub-SELECT, keeps the scan deterministic so a client's pages
+/// partition the answer. An `ORDER BY … LIMIT` still takes
+/// the scan-side top-k.
+#[tokio::test]
+async fn a_scan_is_deterministic_unless_no_slice_can_observe_its_order() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let k = vars.get_or_insert("?k");
+    let count = vars.get_or_insert("?count");
+    let store_keys = || {
+        vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri("http://example.org/storeKey".into()),
+            Term::Var(k),
+        ))]
+    };
+    let graph = |inner: Vec<Pattern>| Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let query = |patterns: Vec<Pattern>| {
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = patterns;
+        parsed.output = QueryOutput::select_all(vec![s, k]);
+        parsed
+    };
+    let positive = || Expression::gt(Expression::Var(k), Expression::Const(FlakeValue::Long(0)));
+
+    let mut cases: Vec<(&str, Query, ScanOrder, bool)> = Vec::new();
+    cases.push((
+        "no slice",
+        query(vec![graph(store_keys())]),
+        ScanOrder::Any,
+        false,
+    ));
+    let mut q = query(vec![graph(store_keys())]);
+    q.limit = Some(1);
+    cases.push(("LIMIT", q, ScanOrder::Deterministic, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.offset = Some(1);
+    cases.push(("OFFSET", q, ScanOrder::Deterministic, false));
+    // `selectOne` keeps the first row when the result is formatted: a prefix
+    // of the answer, as a LIMIT 1 is.
+    let mut q = query(vec![graph(store_keys())]);
+    q.output = QueryOutput::select_one(vec![s, k]);
+    cases.push(("selectOne", q, ScanOrder::Deterministic, false));
+    let mut with_filter = store_keys();
+    with_filter.push(Pattern::Filter(positive()));
+    let mut q = query(vec![graph(with_filter)]);
+    q.limit = Some(1);
+    q.offset = Some(1);
+    cases.push(("FILTER under a slice", q, ScanOrder::Deterministic, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.output = QueryOutput::select_all(vec![count]);
+    q.grouping = Grouping::assemble(
+        vec![],
+        vec![AggregateSpec {
+            function: AggregateFn::Count(k),
+            output_var: count,
+        }],
+        vec![],
+        None,
+    )
+    .expect("valid grouping");
+    cases.push(("COUNT, no slice", q, ScanOrder::Any, false));
+    let mut q = query(vec![graph(store_keys())]);
+    q.ordering = vec![fluree_db_query::SortSpec::desc(k)];
+    q.limit = Some(1);
+    cases.push(("ORDER BY … LIMIT", q, ScanOrder::Deterministic, true));
+    let sub = fluree_db_query::SubqueryPattern::new(vec![s, k], vec![graph(store_keys())])
+        .with_uncorrelated()
+        .with_limit(1);
+    cases.push((
+        "LIMIT in a sub-SELECT",
+        query(vec![Pattern::Subquery(sub)]),
+        ScanOrder::Deterministic,
+        false,
+    ));
+    let mut exists_slice = store_keys();
+    exists_slice.push(Pattern::Filter(Expression::Exists {
+        patterns: vec![Pattern::Subquery(
+            fluree_db_query::SubqueryPattern::new(vec![s], vec![graph(store_keys())])
+                .with_uncorrelated()
+                .with_offset(1),
+        )],
+        negated: false,
+    }));
+    cases.push((
+        "OFFSET in a sub-SELECT under FILTER EXISTS",
+        query(vec![graph(exists_slice)]),
+        ScanOrder::Deterministic,
+        false,
+    ));
+
+    for (name, parsed, want, want_topk) in cases {
+        let provider = CountingProvider::edw();
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let orders = provider.orders.lock().unwrap().clone();
+        let main: Vec<_> = orders.iter().filter(|(t, _, _)| t == "dw.store").collect();
+        assert!(!main.is_empty(), "{name}: dw.store was scanned: {orders:?}");
+        for (_, order, topk) in &main {
+            assert_eq!(*order, Some(want), "{name}: scan order ({orders:?})");
+            assert_eq!(*topk, want_topk, "{name}: top-k ({orders:?})");
+        }
+    }
+}
+
+/// The fused aggregate folds its table through a scan of its own, which owes
+/// the query the same order as the generic one: `Any` for an aggregate with no
+/// slice, deterministic when a LIMIT sits over it. Two shapes, because the
+/// fused operator is built at two sites: a plain COUNT reaches it as the
+/// SQL-lane detector's fallback; a SUM over a top-level BIND, which that
+/// detector declines (its block must be the whole WHERE), reaches the fused
+/// operator directly.
+#[tokio::test]
+async fn a_fused_aggregate_scan_follows_the_query_slice() {
+    for with_bind in [false, true] {
+        for (limit, want) in [(None, ScanOrder::Any), (Some(1), ScanOrder::Deterministic)] {
+            let label = format!("bind={with_bind} limit={limit:?}");
+            let fluree = FlureeBuilder::memory().build_memory();
+            let mut ledger = genesis_ledger(&fluree, "fa:main");
+            Arc::make_mut(&mut ledger.snapshot)
+                .insert_namespace_code(9_999, "http://example.org/".to_string())
+                .unwrap();
+            let (datatype, batch) = if with_bind {
+                (
+                    "xsd:decimal",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Decimal {
+                            values: vec![Some(1000), Some(2000), Some(3000)],
+                            precision: 10,
+                            scale: 2,
+                        },
+                        FieldType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                    ),
+                )
+            } else {
+                (
+                    "xsd:integer",
+                    id_val_batch(
+                        vec![Some(1), Some(2), Some(3)],
+                        Column::Int64(vec![Some(10), Some(20), Some(30)]),
+                        FieldType::Int64,
+                    ),
+                )
+            };
+            let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+                .unwrap()
+                .compile()
+                .unwrap();
+            let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+            let mut vars = VarRegistry::new();
+            let s = vars.get_or_insert("?s");
+            let o = vars.get_or_insert("?o");
+            let e = vars.get_or_insert("?e");
+            let out = vars.get_or_insert("?agg");
+            let pred = ledger
+                .snapshot
+                .encode_iri("http://example.org/val")
+                .expect("example.org namespace registered");
+            let mut parsed = Query::new(ParsedContext::default());
+            parsed.patterns = vec![Pattern::Graph {
+                name: GraphName::Iri("fa-gs:main".into()),
+                patterns: vec![Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                ))],
+            }];
+            let function = if with_bind {
+                parsed.patterns.push(Pattern::Bind {
+                    var: e,
+                    expr: Expression::Call {
+                        func: Function::Mul,
+                        args: vec![Expression::Var(o), Expression::Const(FlakeValue::Long(2))],
+                    },
+                });
+                AggregateFn::Sum(e, InputSemantics::List)
+            } else {
+                AggregateFn::Count(o)
+            };
+            parsed.output = QueryOutput::select_all(vec![out]);
+            parsed.grouping = Grouping::assemble(
+                vec![],
+                vec![AggregateSpec {
+                    function,
+                    output_var: out,
+                }],
+                vec![],
+                None,
+            )
+            .expect("valid grouping");
+            parsed.limit = limit;
+            let executable = ExecutableQuery::simple(parsed);
+            let tracker = Tracker::disabled();
+            let result = execute(
+                GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+                &vars,
+                &executable,
+                r2rml_test_config(&tracker, &provider),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+            let value = result
+                .iter()
+                .find_map(|b| (!b.is_empty()).then(|| format!("{:?}", b.get(0, out))))
+                .expect("one row");
+            let expected = if with_bind { "120" } else { "3" };
+            assert!(value.contains(expected), "{label}: {value}");
+            let orders = provider.orders.lock().unwrap().clone();
+            assert_eq!(orders, vec![Some(want)], "{label}: the one scan's order");
+        }
+    }
+}

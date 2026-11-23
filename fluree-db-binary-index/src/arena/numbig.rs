@@ -1,0 +1,745 @@
+//! Per-predicate equality-only arena for overflow BigInt and BigDecimal values.
+//!
+//! Values that don't fit `NumInt` (i64) or `NumF64` (finite f64) are stored
+//! here with sequential `u32` handles. The handle is zero-extended to `u64`
+//! and placed in `ObjKey` with `ObjKind::NUM_BIG`.
+//!
+//! **No numeric ordering is maintained** -- range queries on `NumBig` values
+//! fall back to scan + post-filter using `FlakeValue::numeric_cmp`.
+
+use bigdecimal::BigDecimal;
+use num_bigint::BigInt;
+use std::collections::HashMap;
+use std::io;
+
+// ============================================================================
+// NumBigRepr -- canonical byte representation for dedup
+// ============================================================================
+
+/// Canonical byte representation used as the dedup key.
+#[derive(Clone, Debug)]
+pub enum NumBigRepr {
+    /// BigInt canonical signed LE bytes.
+    BigIntBytes(Vec<u8>),
+    /// BigDecimal: unscaled BigInt LE bytes + scale.
+    BigDecBytes { unscaled: Vec<u8>, scale: i64 },
+}
+
+impl PartialEq for NumBigRepr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::BigIntBytes(a), Self::BigIntBytes(b)) => a == b,
+            (
+                Self::BigDecBytes {
+                    unscaled: a_u,
+                    scale: a_s,
+                },
+                Self::BigDecBytes {
+                    unscaled: b_u,
+                    scale: b_s,
+                },
+            ) => a_u == b_u && a_s == b_s,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NumBigRepr {}
+
+impl std::hash::Hash for NumBigRepr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::BigIntBytes(bytes) => bytes.hash(state),
+            Self::BigDecBytes { unscaled, scale } => {
+                unscaled.hash(state);
+                scale.hash(state);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// StoredBigValue -- forward lookup from handle -> value
+// ============================================================================
+
+/// Stored value for forward lookup (handle -> FlakeValue reconstruction).
+#[derive(Clone, Debug)]
+pub enum StoredBigValue {
+    BigInt(Vec<u8>),
+    BigDec { unscaled: Vec<u8>, scale: i64 },
+}
+
+impl StoredBigValue {
+    /// The value's dedup key, normalized the way [`NumBigArena::get_or_insert_bigdec`]
+    /// keys it: a BigDecimal has its trailing zeros stripped so `1.5` and
+    /// `1.50` map to one repr, whatever scale the entry was persisted under
+    /// (legacy pre-normalization arenas keep the original scale on disk).
+    /// Two entries — in one arena or across arenas — denote the same term iff
+    /// their normalized reprs are equal.
+    pub fn normalized_repr(&self) -> NumBigRepr {
+        match self {
+            Self::BigInt(bytes) => NumBigRepr::BigIntBytes(bytes.clone()),
+            Self::BigDec { unscaled, scale } => {
+                let bd = BigDecimal::new(BigInt::from_signed_bytes_le(unscaled), *scale);
+                let (norm_unscaled, norm_scale) = bd.normalized().as_bigint_and_exponent();
+                NumBigRepr::BigDecBytes {
+                    unscaled: norm_unscaled.to_signed_bytes_le(),
+                    scale: norm_scale,
+                }
+            }
+        }
+    }
+
+    /// Reconstruct a `FlakeValue` from the stored bytes.
+    pub fn to_flake_value(&self) -> fluree_db_core::value::FlakeValue {
+        use fluree_db_core::value::FlakeValue;
+        match self {
+            Self::BigInt(bytes) => {
+                let bi = BigInt::from_signed_bytes_le(bytes);
+                if let Some(v) = num_traits::ToPrimitive::to_i64(&bi) {
+                    FlakeValue::Long(v)
+                } else {
+                    FlakeValue::BigInt(Box::new(bi))
+                }
+            }
+            Self::BigDec { unscaled, scale } => {
+                let bi = BigInt::from_signed_bytes_le(unscaled);
+                FlakeValue::Decimal(Box::new(BigDecimal::new(bi, *scale)))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NumBigArena -- per-predicate equality-only arena
+// ============================================================================
+
+/// Per-predicate equality-only arena for overflow numeric values.
+///
+/// Handles are sequential `u32` values (0, 1, 2, ...) assigned in insertion
+/// order. **Not** numerically ordered -- range queries post-filter.
+#[derive(Debug)]
+pub struct NumBigArena {
+    /// Dedup: repr -> handle.
+    dedup: HashMap<NumBigRepr, u32>,
+    /// Forward: handle -> stored value.
+    values: Vec<StoredBigValue>,
+    /// Monotone summary; NumBig also stores overflow integers.
+    contains_bigint: bool,
+    /// True when every stored decimal already has its normalized repr.
+    /// Legacy arenas may contain a non-normalized value even without duplicates.
+    values_normalized: bool,
+    /// Extra handles per repr beyond the first (legacy pre-normalization
+    /// arenas only: the same decimal value persisted under several scales,
+    /// each with its own positional handle). Empty for arenas written after
+    /// normalization landed. Equality consumers that key on a single handle
+    /// must consult [`Self::find_bigdec_handles`] to cover every encoding of
+    /// the value.
+    dup_handles: HashMap<NumBigRepr, Vec<u32>>,
+}
+
+impl NumBigArena {
+    pub fn new() -> Self {
+        Self {
+            dedup: HashMap::new(),
+            values: Vec::new(),
+            contains_bigint: false,
+            values_normalized: true,
+            dup_handles: HashMap::new(),
+        }
+    }
+
+    /// Look up or insert a BigInt, returning its handle.
+    pub fn get_or_insert_bigint(&mut self, bi: &BigInt) -> u32 {
+        let bytes = bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigIntBytes(bytes.clone());
+        if let Some(&handle) = self.dedup.get(&repr) {
+            return handle;
+        }
+        let handle = self.values.len() as u32;
+        self.values.push(StoredBigValue::BigInt(bytes));
+        self.contains_bigint = true;
+        self.dedup.insert(repr, handle);
+        handle
+    }
+
+    /// Look up or insert a BigDecimal, returning its handle.
+    ///
+    /// Keys on the NORMALIZED value (trailing zeros stripped): `1.5` and
+    /// `1.50` are the same xsd:decimal value and must share one handle —
+    /// `(o_type, o_key)` is persisted fact identity, so a scale-sensitive
+    /// key would let the same value exist under two encodings (breaking
+    /// retract matching).
+    pub fn get_or_insert_bigdec(&mut self, bd: &BigDecimal) -> u32 {
+        let normalized = bd.normalized();
+        let (unscaled_bi, scale) = normalized.as_bigint_and_exponent();
+        let unscaled = unscaled_bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigDecBytes {
+            unscaled: unscaled.clone(),
+            scale,
+        };
+        if let Some(&handle) = self.dedup.get(&repr) {
+            return handle;
+        }
+        let handle = self.values.len() as u32;
+        self.values.push(StoredBigValue::BigDec { unscaled, scale });
+        self.dedup.insert(repr, handle);
+        handle
+    }
+
+    /// Append a stored value preserving its position (load path: entry N must
+    /// receive handle N even if it duplicates an earlier entry). Each repr is
+    /// registered first-wins; later handles for an already-known repr are
+    /// tracked as duplicates so value lookups can report every handle.
+    fn push_stored(&mut self, value: StoredBigValue, reprs: impl IntoIterator<Item = NumBigRepr>) {
+        let handle = self.values.len() as u32;
+        self.contains_bigint |= matches!(value, StoredBigValue::BigInt(_));
+        self.values.push(value);
+        for repr in reprs {
+            match self.dedup.entry(repr) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(handle);
+                }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    if *o.get() != handle {
+                        let dups = self.dup_handles.entry(o.key().clone()).or_default();
+                        if !dups.contains(&handle) {
+                            dups.push(handle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up a stored value by handle.
+    pub fn get_by_handle(&self, handle: u32) -> Option<&StoredBigValue> {
+        self.values.get(handle as usize)
+    }
+
+    /// Whether this nonempty arena contains exclusively decimal values.
+    /// Includes obsolete handles, so retractions cannot make this proof weaker.
+    pub fn is_decimal_only(&self) -> bool {
+        !self.values.is_empty() && !self.contains_bigint
+    }
+
+    /// Find a BigInt's handle without inserting (read-only lookup for query path).
+    pub fn find_bigint(&self, bi: &BigInt) -> Option<u32> {
+        let bytes = bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigIntBytes(bytes);
+        self.dedup.get(&repr).copied()
+    }
+
+    /// Find a BigDecimal's handle without inserting (read-only lookup for query path).
+    pub fn find_bigdec(&self, bd: &BigDecimal) -> Option<u32> {
+        let normalized = bd.normalized();
+        let (unscaled_bi, scale) = normalized.as_bigint_and_exponent();
+        let unscaled = unscaled_bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigDecBytes { unscaled, scale };
+        self.dedup.get(&repr).copied()
+    }
+
+    /// ALL handles for a BigDecimal value, including legacy scale-variant
+    /// duplicates from pre-normalization arenas.
+    ///
+    /// Equality-by-handle consumers (e.g. bound-object prefilters that
+    /// translate a constant to `(NUM_BIG, handle)` keys) must match against
+    /// every handle returned here — matching only [`Self::find_bigdec`]'s
+    /// primary handle would miss base rows encoded under a duplicate.
+    pub fn find_bigdec_handles(&self, bd: &BigDecimal) -> Vec<u32> {
+        let normalized = bd.normalized();
+        let (unscaled_bi, scale) = normalized.as_bigint_and_exponent();
+        let unscaled = unscaled_bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigDecBytes { unscaled, scale };
+        let mut handles = Vec::new();
+        if let Some(&h) = self.dedup.get(&repr) {
+            handles.push(h);
+        }
+        if let Some(dups) = self.dup_handles.get(&repr) {
+            handles.extend_from_slice(dups);
+        }
+        handles
+    }
+
+    /// True if any value in this arena has more than one handle (legacy
+    /// pre-normalization duplicates). When false, a single-handle lookup is
+    /// complete.
+    pub fn has_duplicate_handles(&self) -> bool {
+        !self.dup_handles.is_empty()
+    }
+
+    /// Whether stored values can be used directly as normalized dedup keys.
+    /// New inserts are normalized; loading checks every decimal's stored repr.
+    /// This is independent of whether the arena has duplicate handles.
+    pub fn values_are_normalized(&self) -> bool {
+        self.values_normalized
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// All stored values (for persistence, in handle order).
+    pub fn values(&self) -> &[StoredBigValue] {
+        &self.values
+    }
+}
+
+impl Default for NumBigArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// NBA1 binary persistence
+// ============================================================================
+
+/// Magic bytes for a numbig arena file.
+const NBA_MAGIC: [u8; 4] = *b"NBA1";
+
+const REPR_TAG_BIGINT: u8 = 0;
+const REPR_TAG_BIGDEC: u8 = 1;
+
+/// Serialize a NumBigArena to an in-memory NBA1 byte buffer.
+///
+/// Format:
+/// ```text
+/// magic: "NBA1" (4B)
+/// entry_count: u32 LE
+/// Per entry (in handle order):
+///   repr_tag: u8
+///   repr_len: u32 LE
+///   repr_bytes: [u8; repr_len]
+/// ```
+pub fn write_numbig_arena_to_bytes(arena: &NumBigArena) -> io::Result<Vec<u8>> {
+    use std::io::Write;
+
+    let mut buf = Vec::new();
+    buf.write_all(&NBA_MAGIC)?;
+    buf.write_all(&(arena.values().len() as u32).to_le_bytes())?;
+
+    for entry in arena.values() {
+        match entry {
+            StoredBigValue::BigInt(bytes) => {
+                buf.write_all(&[REPR_TAG_BIGINT])?;
+                buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                buf.write_all(bytes)?;
+            }
+            StoredBigValue::BigDec { unscaled, scale } => {
+                buf.write_all(&[REPR_TAG_BIGDEC])?;
+                let repr_len = 4 + unscaled.len() + 8;
+                buf.write_all(&(repr_len as u32).to_le_bytes())?;
+                buf.write_all(&(unscaled.len() as u32).to_le_bytes())?;
+                buf.write_all(unscaled)?;
+                buf.write_all(&scale.to_le_bytes())?;
+            }
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Write a NumBigArena to a binary NBA1 file.
+pub fn write_numbig_arena(path: &std::path::Path, arena: &NumBigArena) -> io::Result<()> {
+    let bytes = write_numbig_arena_to_bytes(arena)?;
+    std::fs::write(path, &bytes)
+}
+
+/// Parse a NumBigArena from a byte buffer (NBA1 format).
+///
+/// Entries are inserted in file order, so handles are preserved
+/// (entry 0 = handle 0, etc.).
+pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
+    if data.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "numbig arena too small",
+        ));
+    }
+    if data[0..4] != NBA_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("numbig arena: invalid magic {:?}", &data[0..4]),
+        ));
+    }
+
+    let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let mut arena = NumBigArena::new();
+    let mut pos = 8;
+
+    for _ in 0..count {
+        if pos + 1 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numbig entry truncated (tag)",
+            ));
+        }
+        let tag = data[pos];
+        pos += 1;
+
+        if pos + 4 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numbig entry truncated (len)",
+            ));
+        }
+        let repr_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if pos + repr_len > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numbig entry truncated (data)",
+            ));
+        }
+        let repr_bytes = &data[pos..pos + repr_len];
+        pos += repr_len;
+
+        match tag {
+            REPR_TAG_BIGINT => {
+                arena.push_stored(
+                    StoredBigValue::BigInt(repr_bytes.to_vec()),
+                    [NumBigRepr::BigIntBytes(repr_bytes.to_vec())],
+                );
+            }
+            REPR_TAG_BIGDEC => {
+                if repr_bytes.len() < 12 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bigdec repr too short",
+                    ));
+                }
+                let unscaled_len =
+                    u32::from_le_bytes(repr_bytes[0..4].try_into().unwrap()) as usize;
+                if 4 + unscaled_len + 8 != repr_bytes.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "bigdec repr size mismatch: unscaled_len={}, total={}",
+                            unscaled_len,
+                            repr_bytes.len()
+                        ),
+                    ));
+                }
+                let unscaled_bytes = &repr_bytes[4..4 + unscaled_len];
+                let scale_bytes = &repr_bytes[4 + unscaled_len..];
+                let scale = i64::from_le_bytes(scale_bytes.try_into().unwrap());
+
+                // Handles are positional (entry N = handle N), so legacy
+                // entries must append as-stored — never dedup-skip. Register
+                // the raw repr AND the normalized repr (first-wins) so both
+                // pre-normalization rows and new normalized lookups resolve.
+                let raw_repr = NumBigRepr::BigDecBytes {
+                    unscaled: unscaled_bytes.to_vec(),
+                    scale,
+                };
+                let stored = StoredBigValue::BigDec {
+                    unscaled: unscaled_bytes.to_vec(),
+                    scale,
+                };
+                let norm_repr = stored.normalized_repr();
+                arena.values_normalized &= raw_repr == norm_repr;
+                arena.push_stored(stored, [raw_repr, norm_repr]);
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown numbig tag: {tag}"),
+                ));
+            }
+        }
+    }
+
+    Ok(arena)
+}
+
+/// Read a NumBigArena from a binary NBA1 file.
+///
+/// Entries are inserted in file order, so handles are preserved
+/// (entry 0 = handle 0, etc.).
+pub fn read_numbig_arena(path: &std::path::Path) -> io::Result<NumBigArena> {
+    read_numbig_arena_from_bytes(&std::fs::read(path)?)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_arena() {
+        let arena = NumBigArena::new();
+        assert!(arena.values_are_normalized());
+        assert_eq!(arena.len(), 0);
+        assert!(arena.is_empty());
+        assert!(arena.get_by_handle(0).is_none());
+    }
+
+    #[test]
+    fn test_bigint_insert_and_dedup() {
+        let mut arena = NumBigArena::new();
+        let bi = BigInt::from(999_999_999_999_999_999i64) * BigInt::from(1000i64);
+        let h1 = arena.get_or_insert_bigint(&bi);
+        let h2 = arena.get_or_insert_bigint(&bi);
+        assert_eq!(h1, 0);
+        assert_eq!(h1, h2);
+        assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn test_bigdec_insert_and_dedup() {
+        let mut arena = NumBigArena::new();
+        let bd: BigDecimal = "123456789.123456789".parse().unwrap();
+        let h1 = arena.get_or_insert_bigdec(&bd);
+        let h2 = arena.get_or_insert_bigdec(&bd);
+        assert_eq!(h1, 0);
+        assert_eq!(h1, h2);
+        assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn test_bigdec_scale_variants_share_handle() {
+        // 1.5 and 1.50 are the same xsd:decimal value: one handle, one entry.
+        let mut arena = NumBigArena::new();
+        let h1 = arena.get_or_insert_bigdec(&"1.50".parse::<BigDecimal>().unwrap());
+        let h2 = arena.get_or_insert_bigdec(&"1.5".parse::<BigDecimal>().unwrap());
+        assert_eq!(h1, h2);
+        assert_eq!(arena.len(), 1);
+
+        assert_eq!(
+            arena.find_bigdec(&"1.500".parse::<BigDecimal>().unwrap()),
+            Some(h1)
+        );
+
+        // Decode is value-equal regardless of input scale.
+        let val = arena.get_by_handle(h1).unwrap().to_flake_value();
+        match val {
+            fluree_db_core::value::FlakeValue::Decimal(d) => {
+                assert_eq!(*d, "1.5".parse::<BigDecimal>().unwrap());
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_arena_with_scale_variants_loads_positionally() {
+        // Hand-craft an NBA1 buffer the way a pre-normalization build could
+        // have written it: the same value under two scales, plus a bigint.
+        fn bigdec_entry(buf: &mut Vec<u8>, unscaled: i64, scale: i64) {
+            let unscaled_bytes = BigInt::from(unscaled).to_signed_bytes_le();
+            buf.push(1); // REPR_TAG_BIGDEC
+            let repr_len = 4 + unscaled_bytes.len() + 8;
+            buf.extend_from_slice(&(repr_len as u32).to_le_bytes());
+            buf.extend_from_slice(&(unscaled_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&unscaled_bytes);
+            buf.extend_from_slice(&scale.to_le_bytes());
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"NBA1");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        bigdec_entry(&mut buf, 150, 2); // 1.50  -> handle 0
+        bigdec_entry(&mut buf, 15, 1); // 1.5   -> handle 1 (same value!)
+        bigdec_entry(&mut buf, 1999, 2); // 19.99 -> handle 2
+
+        let arena = read_numbig_arena_from_bytes(&buf).unwrap();
+        assert!(!arena.values_are_normalized());
+
+        // Handles are positional: a duplicate-value legacy entry must NOT
+        // shift subsequent handles.
+        assert_eq!(arena.len(), 3);
+        match arena.get_by_handle(2).unwrap().to_flake_value() {
+            fluree_db_core::value::FlakeValue::Decimal(d) => {
+                assert_eq!(*d, "19.99".parse::<BigDecimal>().unwrap());
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+
+        // Normalized lookup resolves (first-wins) for both legacy variants.
+        assert_eq!(
+            arena.find_bigdec(&"1.5".parse::<BigDecimal>().unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            arena.find_bigdec(&"1.50".parse::<BigDecimal>().unwrap()),
+            Some(0)
+        );
+
+        // Multi-handle lookup reports EVERY handle for the duplicated value —
+        // base rows may be encoded under either, so single-handle identity
+        // (e.g. prefilter keys, translated retracts) is incomplete here.
+        assert!(arena.has_duplicate_handles());
+        let mut handles = arena.find_bigdec_handles(&"1.5".parse::<BigDecimal>().unwrap());
+        handles.sort_unstable();
+        assert_eq!(handles, vec![0, 1]);
+        // Non-duplicated value still resolves to its single handle.
+        assert_eq!(
+            arena.find_bigdec_handles(&"19.99".parse::<BigDecimal>().unwrap()),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn decimal_only_summary_survives_reload_and_integer_insertion() {
+        let mut arena = NumBigArena::new();
+        assert!(!arena.is_decimal_only());
+        arena.get_or_insert_bigdec(&"22.00".parse().unwrap());
+        assert!(arena.is_decimal_only());
+        let mut loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        assert!(loaded.is_decimal_only());
+        loaded.get_or_insert_bigint(&BigInt::from(22));
+        loaded.get_or_insert_bigdec(&"23.0".parse().unwrap());
+        assert!(!loaded.is_decimal_only());
+        let reloaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&loaded).unwrap()).unwrap();
+        assert!(!reloaded.is_decimal_only());
+    }
+
+    #[test]
+    fn test_normalized_arena_has_no_duplicate_handles() {
+        let mut arena = NumBigArena::new();
+        arena.get_or_insert_bigdec(&"1.50".parse::<BigDecimal>().unwrap());
+        arena.get_or_insert_bigdec(&"1.5".parse::<BigDecimal>().unwrap());
+        arena.get_or_insert_bigdec(&"19.99".parse::<BigDecimal>().unwrap());
+        assert!(!arena.has_duplicate_handles());
+        assert!(arena.values_are_normalized());
+        let loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        assert!(loaded.values_are_normalized());
+        assert_eq!(
+            arena.find_bigdec_handles(&"1.500".parse::<BigDecimal>().unwrap()),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn test_legacy_normalization_is_independent_of_duplicate_handles() {
+        for lexical in ["1.50", "0.000", "-10.00"] {
+            // A single legacy value cannot have duplicate handles, but still
+            // needs normalization. Test both entry orders so later normalized
+            // entries cannot accidentally reset the arena-wide flag.
+            for legacy_first in [false, true] {
+                let decimal: BigDecimal = lexical.parse().unwrap();
+                let (unscaled, scale) = decimal.as_bigint_and_exponent();
+                let legacy = StoredBigValue::BigDec {
+                    unscaled: unscaled.to_signed_bytes_le(),
+                    scale,
+                };
+                let normalized = StoredBigValue::BigDec {
+                    unscaled: vec![23],
+                    scale: 1,
+                };
+                let mut original = NumBigArena::new();
+                original.values = if legacy_first {
+                    vec![legacy, normalized]
+                } else {
+                    vec![normalized, legacy]
+                };
+                let bytes = write_numbig_arena_to_bytes(&original).unwrap();
+                let mut loaded = read_numbig_arena_from_bytes(&bytes).unwrap();
+                assert!(!loaded.has_duplicate_handles());
+                assert!(!loaded.values_are_normalized(), "{lexical}");
+                loaded.get_or_insert_bigdec(&"9.90".parse().unwrap());
+                assert!(!loaded.values_are_normalized());
+                let reloaded =
+                    read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&loaded).unwrap())
+                        .unwrap();
+                assert!(!reloaded.values_are_normalized());
+            }
+        }
+    }
+
+    #[test]
+    fn test_sequential_handles() {
+        let mut arena = NumBigArena::new();
+        let bi1 = BigInt::from(i64::MAX) + BigInt::from(1);
+        let bi2 = BigInt::from(i64::MIN) - BigInt::from(1);
+        let bd1: BigDecimal = "1.23".parse().unwrap();
+
+        let h1 = arena.get_or_insert_bigint(&bi1);
+        let h2 = arena.get_or_insert_bigint(&bi2);
+        let h3 = arena.get_or_insert_bigdec(&bd1);
+
+        assert_eq!(h1, 0);
+        assert_eq!(h2, 1);
+        assert_eq!(h3, 2);
+        assert_eq!(arena.len(), 3);
+    }
+
+    #[test]
+    fn test_forward_lookup() {
+        let mut arena = NumBigArena::new();
+        let bi = BigInt::from(i64::MAX) + BigInt::from(100);
+        let handle = arena.get_or_insert_bigint(&bi);
+
+        let stored = arena.get_by_handle(handle).unwrap();
+        let val = stored.to_flake_value();
+        match val {
+            fluree_db_core::value::FlakeValue::BigInt(v) => {
+                assert_eq!(*v, bi);
+            }
+            _ => panic!("expected BigInt"),
+        }
+    }
+
+    #[test]
+    fn test_bigdec_forward_lookup() {
+        let mut arena = NumBigArena::new();
+        let bd: BigDecimal = "123456789.987654321".parse().unwrap();
+        let handle = arena.get_or_insert_bigdec(&bd);
+
+        let stored = arena.get_by_handle(handle).unwrap();
+        let val = stored.to_flake_value();
+        match val {
+            fluree_db_core::value::FlakeValue::Decimal(v) => {
+                assert_eq!(*v, bd);
+            }
+            _ => panic!("expected Decimal"),
+        }
+    }
+
+    #[test]
+    fn test_nba1_round_trip() {
+        let mut arena = NumBigArena::new();
+        let bi = BigInt::from(i64::MAX) + BigInt::from(42);
+        let bd: BigDecimal = "3.14159265358979323846".parse().unwrap();
+        arena.get_or_insert_bigint(&bi);
+        arena.get_or_insert_bigdec(&bd);
+
+        let dir = std::env::temp_dir().join("fluree_nba1_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.nba");
+
+        write_numbig_arena(&path, &arena).unwrap();
+        let loaded = read_numbig_arena(&path).unwrap();
+
+        assert_eq!(loaded.len(), arena.len());
+
+        // Verify BigInt round-trip
+        let val0 = loaded.get_by_handle(0).unwrap().to_flake_value();
+        match val0 {
+            fluree_db_core::value::FlakeValue::BigInt(v) => assert_eq!(*v, bi),
+            _ => panic!("expected BigInt"),
+        }
+
+        // Verify BigDecimal round-trip
+        let val1 = loaded.get_by_handle(1).unwrap().to_flake_value();
+        match val1 {
+            fluree_db_core::value::FlakeValue::Decimal(v) => assert_eq!(*v, bd),
+            _ => panic!("expected Decimal"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

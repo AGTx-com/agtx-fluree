@@ -1,0 +1,1589 @@
+//! JSON-LD graph formatter
+//!
+//! Formats a `Graph` as JSON-LD: `{"@context": ..., "@graph": [...]}`
+
+use crate::collections::{blank_nodes_in_several_graphs, Collections};
+use crate::policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
+use fluree_graph_ir::datatype::iri as dt_iri;
+use fluree_graph_ir::{BlankId, Dataset, Datatype, Graph, LiteralValue, Term};
+use serde_json::{json, Map, Value as JsonValue};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+/// Type alias for IRI compaction functions used in JSON-LD formatting.
+type IriCompactor = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// A literal where JSON-LD needs a node: a subject, a graph name or a reifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralAsNode;
+
+impl std::fmt::Display for LiteralAsNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a literal cannot be a subject, graph name or reifier in JSON-LD")
+    }
+}
+
+impl std::error::Error for LiteralAsNode {}
+
+/// Configuration for JSON-LD formatting
+#[derive(Clone, Default)]
+pub struct JsonLdFormatConfig {
+    /// How to handle @context
+    pub context_policy: ContextPolicy,
+
+    /// How to format blank node IDs
+    pub blank_node_policy: BlankNodePolicy,
+
+    /// How to handle rdf:type predicate
+    pub type_handling: TypeHandling,
+
+    /// Always wrap property values in arrays (CONSTRUCT parity)
+    ///
+    /// When true, all property values are arrays, even single values.
+    /// When false (default), single values are scalars, multiple values are arrays.
+    pub multicardinal_arrays: bool,
+
+    /// Optional IRI compaction function for vocab positions (predicates and @type values)
+    ///
+    /// If None, IRIs are output in expanded form.
+    compactor_vocab: Option<IriCompactor>,
+
+    /// Optional IRI compaction function for `@id` positions (node identifiers)
+    ///
+    /// If None, falls back to `compactor_vocab` when present; otherwise expanded IRIs.
+    compactor_id: Option<IriCompactor>,
+}
+
+impl std::fmt::Debug for JsonLdFormatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonLdFormatConfig")
+            .field("context_policy", &self.context_policy)
+            .field("blank_node_policy", &self.blank_node_policy)
+            .field("type_handling", &self.type_handling)
+            .field("multicardinal_arrays", &self.multicardinal_arrays)
+            .field(
+                "compactor_vocab",
+                &self.compactor_vocab.as_ref().map(|_| "<fn>"),
+            )
+            .field("compactor_id", &self.compactor_id.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+impl JsonLdFormatConfig {
+    /// Create a new config with default settings
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the context policy
+    pub fn with_context_policy(mut self, policy: ContextPolicy) -> Self {
+        self.context_policy = policy;
+        self
+    }
+
+    /// Set the blank node policy
+    pub fn with_blank_node_policy(mut self, policy: BlankNodePolicy) -> Self {
+        self.blank_node_policy = policy;
+        self
+    }
+
+    /// Set the type handling
+    pub fn with_type_handling(mut self, handling: TypeHandling) -> Self {
+        self.type_handling = handling;
+        self
+    }
+
+    /// Enable multicardinal arrays (all values as arrays)
+    pub fn with_multicardinal_arrays(mut self, enabled: bool) -> Self {
+        self.multicardinal_arrays = enabled;
+        self
+    }
+
+    /// Set the IRI compactor function
+    pub fn with_compactor<F>(mut self, compactor: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.compactor_vocab = Some(Arc::new(compactor));
+        self
+    }
+
+    /// Set the `@id` IRI compactor function (vocab=false semantics)
+    pub fn with_id_compactor<F>(mut self, compactor: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.compactor_id = Some(Arc::new(compactor));
+        self
+    }
+
+    /// Create a config for CONSTRUCT query output
+    ///
+    /// This convenience builder encapsulates all CONSTRUCT-specific settings:
+    /// - `rdf:type` → `@type` conversion
+    /// - Singleton values unwrapped (arrays only for multi-values)
+    /// - Deterministic blank node IDs
+    ///
+    /// It does NOT deduplicate: a CONSTRUCT result is an RDF graph, and set
+    /// semantics belong to the graph, not the rendering. Call
+    /// [`Graph::canonicalize`](fluree_graph_ir::Graph::canonicalize) before
+    /// formatting.
+    ///
+    /// # Arguments
+    ///
+    /// * `orig_context` - Original @context from the query (for output), or None
+    /// * `compactor` - Function to compact expanded IRIs to prefixed form
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fluree_graph_format::JsonLdFormatConfig;
+    ///
+    /// let config = JsonLdFormatConfig::construct_parity(None, |iri| iri.to_string());
+    /// assert!(config.multicardinal_arrays);
+    /// ```
+    pub fn construct_parity<F>(orig_context: Option<JsonValue>, compactor: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        let context_policy = match orig_context {
+            Some(ctx) => ContextPolicy::UseOriginal(ctx),
+            None => ContextPolicy::None,
+        };
+
+        Self::new()
+            .with_context_policy(context_policy)
+            .with_type_handling(TypeHandling::AsAtType)
+            .with_blank_node_policy(BlankNodePolicy::Deterministic)
+            // For CONSTRUCT (JSON-LD): always use arrays for values.
+            // (The API layer may override this for SPARQL CONSTRUCT output.)
+            .with_multicardinal_arrays(true)
+            .with_compactor(compactor)
+    }
+
+    /// Create a config for expanded graph output (debugging/export)
+    ///
+    /// Outputs fully expanded IRIs with no compaction and no context.
+    /// Useful for debugging or when you need raw RDF graph output.
+    ///
+    /// - No @context in output
+    /// - All IRIs in expanded form
+    /// - `rdf:type` → `@type` conversion
+    /// - Deterministic blank node IDs
+    pub fn expanded_graph() -> Self {
+        Self::new()
+            .with_context_policy(ContextPolicy::None)
+            .with_type_handling(TypeHandling::AsAtType)
+            .with_blank_node_policy(BlankNodePolicy::Deterministic)
+    }
+
+    /// Compact an IRI for vocab positions (predicates and @type values)
+    fn compact_vocab_iri(&self, iri: &str) -> String {
+        match &self.compactor_vocab {
+            Some(f) => f(iri),
+            None => iri.to_string(),
+        }
+    }
+
+    /// Compact an IRI for `@id` positions (node identifiers)
+    fn compact_id_iri(&self, iri: &str) -> String {
+        if let Some(f) = &self.compactor_id {
+            return f(iri);
+        }
+        // Fallback (best effort) if caller only provided one compactor.
+        self.compact_vocab_iri(iri)
+    }
+}
+
+/// Blank node renamer for deterministic output
+struct BlankNodeRenamer {
+    policy: BlankNodePolicy,
+    counter: u32,
+    mapping: HashMap<String, String>,
+}
+
+impl BlankNodeRenamer {
+    fn new(policy: BlankNodePolicy) -> Self {
+        Self {
+            policy,
+            counter: 0,
+            mapping: HashMap::new(),
+        }
+    }
+
+    /// Rename a blank node ID according to the policy
+    fn rename(&mut self, id: &BlankId) -> String {
+        let original = id.as_str();
+
+        match &self.policy {
+            BlankNodePolicy::PreserveLabeled => {
+                // Keep original label
+                format!("_:{original}")
+            }
+            BlankNodePolicy::Deterministic => {
+                // Rewrite to _:b0, _:b1, etc.
+                if let Some(renamed) = self.mapping.get(original) {
+                    renamed.clone()
+                } else {
+                    let renamed = format!("_:b{}", self.counter);
+                    self.counter += 1;
+                    self.mapping.insert(original.to_string(), renamed.clone());
+                    renamed
+                }
+            }
+            BlankNodePolicy::FlureeStyle => {
+                // Keep original (Fluree-style IDs should already be in the right format)
+                format!("_:{original}")
+            }
+        }
+    }
+}
+
+/// Format a Graph as JSON-LD
+///
+/// Produces: `{"@context": ..., "@graph": [...]}`
+///
+/// The graph should be sorted before calling this function for deterministic output.
+///
+/// # List support
+///
+/// Triples with `list_index` are grouped by (subject, predicate) and formatted as:
+/// ```json
+/// "pred": {"@list": [item0, item1, item2]}
+/// ```
+///
+/// # Example
+///
+/// ```
+/// use fluree_graph_ir::{Graph, Term};
+/// use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
+///
+/// let mut graph = Graph::new();
+/// graph.add_triple(
+///     Term::iri("http://example.org/alice"),
+///     Term::iri("http://xmlns.com/foaf/0.1/name"),
+///     Term::string("Alice"),
+/// );
+/// graph.sort();
+///
+/// let config = JsonLdFormatConfig::default();
+/// let json = format_jsonld(&graph, &config).unwrap();
+/// ```
+pub fn format_jsonld(
+    graph: &Graph,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let nodes = graph_nodes(graph, config, &HashSet::new(), &mut bnode_renamer)?;
+    Ok(document(config, nodes))
+}
+
+/// Format a dataset as JSON-LD: the default graph's nodes, then one
+/// `{"@id": <graph name>, "@graph": [...]}` node per named graph. Blank-node
+/// labels are shared across graphs, since a JSON-LD document scopes them to
+/// the whole document. A dataset with no named graphs formats exactly as
+/// [`format_jsonld`] formats its default graph.
+pub fn format_jsonld_dataset(
+    dataset: &Dataset,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut bnode_renamer = BlankNodeRenamer::new(config.blank_node_policy.clone());
+    let shared = blank_nodes_in_several_graphs(dataset);
+    let mut nodes = graph_nodes(&dataset.default, config, &shared, &mut bnode_renamer)?;
+    for (name, graph) in &dataset.named {
+        let mut node = Map::new();
+        node.insert(
+            "@id".to_string(),
+            JsonValue::String(term_to_subject_key(name, config, &mut bnode_renamer)?),
+        );
+        node.insert(
+            "@graph".to_string(),
+            JsonValue::Array(graph_nodes(graph, config, &shared, &mut bnode_renamer)?),
+        );
+        nodes.push(JsonValue::Object(node));
+    }
+    Ok(document(config, nodes))
+}
+
+fn document(config: &JsonLdFormatConfig, nodes: Vec<JsonValue>) -> JsonValue {
+    let mut output = Map::new();
+    if let Some(ctx) = config.context_policy.context() {
+        output.insert("@context".to_string(), ctx.clone());
+    }
+    output.insert("@graph".to_string(), JsonValue::Array(nodes));
+    JsonValue::Object(output)
+}
+
+/// One graph's node objects, in subject order. A collection is written as
+/// `{"@list": [...]}` where its head is named, and its cells are not nodes.
+fn graph_nodes<'g>(
+    graph: &'g Graph,
+    config: &JsonLdFormatConfig,
+    shared: &HashSet<&'g Term>,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> Result<Vec<JsonValue>, LiteralAsNode> {
+    // Reifiers by the triple they reify, rendered as `@annotation`.
+    let reifiers = graph.reifiers_by_triple();
+    let collections = Collections::of(graph, &reifiers, shared);
+
+    // Group triples by subject, then by predicate
+    // This allows us to detect and handle list predicates
+    let mut subjects: BTreeMap<String, SubjectData> = BTreeMap::new();
+
+    for triple in graph.iter() {
+        if collections.cells.contains(&triple.s) {
+            continue;
+        }
+        let subj_key = term_to_subject_key(&triple.s, config, bnode_renamer)?;
+
+        let subj_data = subjects
+            .entry(subj_key.clone())
+            .or_insert_with(|| SubjectData::new(subj_key.clone()));
+
+        subj_data.add_triple(triple);
+    }
+
+    // Convert grouped data to JSON-LD nodes
+    let mut nodes: BTreeMap<String, Map<String, JsonValue>> = BTreeMap::new();
+
+    for (subj_key, subj_data) in subjects {
+        let node = subj_data.into_jsonld_node(config, bnode_renamer, &reifiers, &collections)?;
+        nodes.insert(subj_key, node);
+    }
+
+    // Post-process: wrap single values in arrays if multicardinal_arrays is enabled
+    // Note: @list values should NOT be wrapped
+    if config.multicardinal_arrays {
+        for node in nodes.values_mut() {
+            wrap_values_in_arrays(node);
+        }
+    }
+
+    Ok(nodes.into_values().map(JsonValue::Object).collect())
+}
+
+/// Attach `@annotation` to a rendered object value: `{"@id": r}` for one
+/// reifier, an array for several. A bare scalar becomes a value object.
+fn annotate(
+    value: JsonValue,
+    reifiers: &[&Term],
+    bnode_renamer: &mut BlankNodeRenamer,
+    config: &JsonLdFormatConfig,
+) -> Result<JsonValue, LiteralAsNode> {
+    let mut refs = reifiers
+        .iter()
+        .map(|r| Ok(json!({"@id": term_to_subject_key(r, config, bnode_renamer)?})))
+        .collect::<Result<Vec<JsonValue>, _>>()?;
+    let annotation = if refs.len() == 1 {
+        refs.remove(0)
+    } else {
+        JsonValue::Array(refs)
+    };
+    let mut obj = match value {
+        JsonValue::Object(obj) => obj,
+        scalar => {
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), scalar);
+            obj
+        }
+    };
+    obj.insert("@annotation".to_string(), annotation);
+    Ok(JsonValue::Object(obj))
+}
+
+/// Intermediate structure for grouping triples by predicate
+struct SubjectData {
+    id: String,
+    /// Predicates mapped to their values
+    /// Each predicate has a list of (list_index, triple) pairs
+    predicates: BTreeMap<String, Vec<(Option<i32>, fluree_graph_ir::Triple)>>,
+}
+
+impl SubjectData {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            predicates: BTreeMap::new(),
+        }
+    }
+
+    fn add_triple(&mut self, triple: &fluree_graph_ir::Triple) {
+        let pred_iri = match &triple.p {
+            Term::Iri(iri) => iri.to_string(),
+            _ => return, // Predicate must be IRI
+        };
+
+        self.predicates
+            .entry(pred_iri)
+            .or_default()
+            .push((triple.list_index, triple.clone()));
+    }
+
+    fn into_jsonld_node(
+        self,
+        config: &JsonLdFormatConfig,
+        bnode_renamer: &mut BlankNodeRenamer,
+        reifiers: &HashMap<&fluree_graph_ir::Triple, Vec<&Term>>,
+        collections: &Collections<'_>,
+    ) -> Result<Map<String, JsonValue>, LiteralAsNode> {
+        let mut node = Map::new();
+        node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
+
+        for (pred_iri, triples) in self.predicates {
+            // Check if this predicate is a list (any triple has list_index)
+            let is_list = triples.iter().any(|(idx, _)| idx.is_some());
+
+            // Handle rdf:type specially. `@type` holds only IRIs, so an
+            // annotated type, or a list, is written as an `rdf:type` property.
+            if pred_iri == dt_iri::RDF_TYPE && config.type_handling.use_at_type() {
+                let mut types = HashSet::new();
+                for (_, triple) in &triples {
+                    let rs = reifiers.get(triple);
+                    if rs.is_none() && !collections.heads.contains_key(&triple.o) {
+                        add_type_value(&mut node, &triple.o, config, bnode_renamer, &mut types);
+                        continue;
+                    }
+                    let mut obj = collections.object(&triple.o, config, bnode_renamer);
+                    if let Some(rs) = rs {
+                        obj = annotate(obj, rs, bnode_renamer, config)?;
+                    }
+                    let pred_key = config.compact_vocab_iri(&pred_iri);
+                    add_property(&mut node, &pred_key, obj);
+                }
+                continue;
+            }
+
+            let pred_key = config.compact_vocab_iri(&pred_iri);
+
+            if is_list {
+                // Format as @list
+                let list_value = format_list_value(&triples, config, bnode_renamer);
+                node.insert(pred_key, list_value);
+            } else {
+                // Normal multi-valued predicate. Every triple reaching this
+                // point is emitted: the graph is the unit of RDF set
+                // semantics, so callers that need uniqueness apply
+                // `Graph::canonicalize()` before formatting. Deduplicating
+                // here instead would have to compare rendered JSON, and
+                // rendering is lossy — the inferable datatypes all collapse to
+                // bare scalars, so `"1"^^xsd:integer` and `"1"^^xsd:long` are
+                // indistinguishable once rendered despite being distinct RDF
+                // terms.
+                for (_, triple) in triples {
+                    let mut obj_val = collections.object(&triple.o, config, bnode_renamer);
+                    if let Some(rs) = reifiers.get(&triple) {
+                        obj_val = annotate(obj_val, rs, bnode_renamer, config)?;
+                    }
+                    add_property(&mut node, &pred_key, obj_val);
+                }
+            }
+        }
+
+        Ok(node)
+    }
+}
+
+impl Collections<'_> {
+    /// `term` as an object value, a collection head as `{"@list": [...]}`.
+    fn object(
+        &self,
+        term: &Term,
+        config: &JsonLdFormatConfig,
+        bnode_renamer: &mut BlankNodeRenamer,
+    ) -> JsonValue {
+        match self.heads.get(term) {
+            Some(items) => {
+                let items: Vec<JsonValue> = items
+                    .iter()
+                    .map(|item| self.object(item, config, bnode_renamer))
+                    .collect();
+                json!({ "@list": items })
+            }
+            None => term_to_object(term, config, bnode_renamer),
+        }
+    }
+}
+
+/// Format a list of triples as a JSON-LD @list value
+fn format_list_value(
+    triples: &[(Option<i32>, fluree_graph_ir::Triple)],
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> JsonValue {
+    // Sort by list index
+    let mut sorted: Vec<_> = triples
+        .iter()
+        .filter_map(|(idx, t)| idx.map(|i| (i, t)))
+        .collect();
+    sorted.sort_by_key(|(i, _)| *i);
+
+    // Build list array
+    let list_items: Vec<JsonValue> = sorted
+        .into_iter()
+        .map(|(_, triple)| term_to_object(&triple.o, config, bnode_renamer))
+        .collect();
+
+    json!({"@list": list_items})
+}
+
+/// Wrap all non-@id, non-@type values in arrays
+///
+/// Skips values that are already @list objects (they should not be wrapped).
+fn wrap_values_in_arrays(node: &mut Map<String, JsonValue>) {
+    let keys: Vec<String> = node
+        .keys()
+        .filter(|k| *k != "@id" && *k != "@type")
+        .cloned()
+        .collect();
+
+    for key in keys {
+        if let Some(value) = node.get_mut(&key) {
+            // Skip if already an array
+            if value.is_array() {
+                continue;
+            }
+
+            // Skip @list objects - they shouldn't be wrapped in arrays
+            if let Some(obj) = value.as_object() {
+                if obj.contains_key("@list") {
+                    continue;
+                }
+            }
+
+            let v = std::mem::replace(value, JsonValue::Null);
+            *value = JsonValue::Array(vec![v]);
+        }
+    }
+}
+
+/// Convert a term to a subject key string
+fn term_to_subject_key(
+    term: &Term,
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> Result<String, LiteralAsNode> {
+    match term {
+        Term::Iri(iri) => Ok(config.compact_id_iri(iri)),
+        Term::BlankNode(id) => Ok(bnode_renamer.rename(id)),
+        Term::Literal { .. } => Err(LiteralAsNode),
+    }
+}
+
+/// Convert a term to a JSON-LD object value
+fn term_to_object(
+    term: &Term,
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+) -> JsonValue {
+    match term {
+        Term::Iri(iri) => {
+            json!({"@id": config.compact_id_iri(iri)})
+        }
+        Term::BlankNode(id) => {
+            json!({"@id": bnode_renamer.rename(id)})
+        }
+        Term::Literal {
+            value,
+            datatype,
+            language,
+        } => format_literal(value, datatype, language.as_deref()),
+    }
+}
+
+/// Format a literal value as JSON-LD
+fn format_literal(value: &LiteralValue, datatype: &Datatype, language: Option<&str>) -> JsonValue {
+    // Handle language-tagged strings
+    if let Some(lang) = language {
+        return json!({
+            "@value": literal_value_to_json(value),
+            "@language": lang
+        });
+    }
+
+    // Handle values with inferable types (output as plain JSON values)
+    match value {
+        LiteralValue::Boolean(b) => json!(b),
+        LiteralValue::Integer(i) => json!(i),
+        LiteralValue::Double(d) => {
+            if d.is_nan() {
+                json!({"@value": "NaN", "@type": dt_iri::XSD_DOUBLE})
+            } else if d.is_infinite() {
+                let s = if d.is_sign_positive() { "INF" } else { "-INF" };
+                json!({"@value": s, "@type": dt_iri::XSD_DOUBLE})
+            } else {
+                json!(d)
+            }
+        }
+        LiteralValue::String(s) => {
+            // Plain strings: output without datatype annotation
+            if datatype.is_xsd_string() {
+                json!(s.as_ref())
+            } else {
+                // Typed string: include datatype
+                json!({
+                    "@value": s.as_ref(),
+                    "@type": datatype.as_iri()
+                })
+            }
+        }
+        LiteralValue::Json(canonical_json) => {
+            // Parse the canonical JSON string back to a Value
+            let parsed: JsonValue = serde_json::from_str(canonical_json).unwrap_or_else(|_| {
+                // Fallback: treat as string if parsing fails
+                JsonValue::String(canonical_json.to_string())
+            });
+            json!({
+                "@value": parsed,
+                "@type": "@json"
+            })
+        }
+    }
+}
+
+/// Convert a LiteralValue to a plain JSON value (for @value field)
+fn literal_value_to_json(value: &LiteralValue) -> JsonValue {
+    match value {
+        LiteralValue::String(s) => json!(s.as_ref()),
+        LiteralValue::Boolean(b) => json!(b),
+        LiteralValue::Integer(i) => json!(i),
+        LiteralValue::Double(d) => json!(d),
+        LiteralValue::Json(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string()))
+        }
+    }
+}
+
+/// Add a @type value to a node, once. `seen` holds the node's types once it
+/// has two, so a node with many types costs one lookup per type, not a scan
+/// of the ones before it.
+fn add_type_value(
+    node: &mut Map<String, JsonValue>,
+    object: &Term,
+    config: &JsonLdFormatConfig,
+    bnode_renamer: &mut BlankNodeRenamer,
+    seen: &mut HashSet<String>,
+) {
+    // Extract the type IRI
+    let type_iri = match object {
+        Term::Iri(iri) => config.compact_vocab_iri(iri),
+        Term::BlankNode(id) => bnode_renamer.rename(id),
+        Term::Literal { .. } => return, // Types should be IRIs
+    };
+
+    match node.get_mut("@type") {
+        None => {
+            // First type: insert as string
+            node.insert("@type".to_string(), JsonValue::String(type_iri));
+        }
+        Some(JsonValue::Array(arr)) => {
+            // Already an array: push if not duplicate
+            if seen.insert(type_iri.clone()) {
+                arr.push(JsonValue::String(type_iri));
+            }
+        }
+        Some(existing) => {
+            // Single value: convert to array if different
+            let prev = existing.as_str().unwrap_or_default().to_string();
+            if prev != type_iri {
+                seen.insert(prev.clone());
+                seen.insert(type_iri.clone());
+                *existing =
+                    JsonValue::Array(vec![JsonValue::String(prev), JsonValue::String(type_iri)]);
+            }
+        }
+    }
+}
+
+/// Add a property to a node, preserving duplicates as arrays
+fn add_property(node: &mut Map<String, JsonValue>, predicate: &str, value: JsonValue) {
+    match node.get_mut(predicate) {
+        None => {
+            // First value for this predicate
+            node.insert(predicate.to_string(), value);
+        }
+        Some(JsonValue::Array(arr)) => {
+            // Already an array: push
+            arr.push(value);
+        }
+        Some(existing) => {
+            // Single value: convert to array
+            let prev = std::mem::replace(existing, JsonValue::Null);
+            *existing = JsonValue::Array(vec![prev, value]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_graph_ir::Term;
+    use fluree_vocab::rdf;
+    use pretty_assertions::assert_eq;
+
+    fn make_simple_graph() -> Graph {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Alice"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri(rdf::TYPE),
+            Term::iri("http://xmlns.com/foaf/0.1/Person"),
+        );
+
+        graph.sort();
+        graph
+    }
+
+    #[test]
+    fn test_format_simple_graph() {
+        let graph = make_simple_graph();
+        let config = JsonLdFormatConfig::default();
+
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        assert!(result.get("@graph").is_some());
+        let graph_arr = result["@graph"].as_array().unwrap();
+        assert_eq!(graph_arr.len(), 1);
+
+        let node = &graph_arr[0];
+        assert_eq!(node["@id"], "http://example.org/alice");
+    }
+
+    #[test]
+    fn test_format_with_type_as_at_type() {
+        let graph = make_simple_graph();
+        let config = JsonLdFormatConfig::default().with_type_handling(TypeHandling::AsAtType);
+
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+        assert_eq!(node["@type"], "http://xmlns.com/foaf/0.1/Person");
+        // Should not have rdf:type
+        assert!(node.get(rdf::TYPE).is_none());
+    }
+
+    #[test]
+    fn test_format_with_type_as_rdf_type() {
+        let graph = make_simple_graph();
+        let config = JsonLdFormatConfig::default().with_type_handling(TypeHandling::AsRdfType);
+
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+        // Should NOT have @type
+        assert!(node.get("@type").is_none());
+        // Should have rdf:type
+        assert!(node.get(rdf::TYPE).is_some());
+    }
+
+    #[test]
+    fn test_format_with_context() {
+        let graph = make_simple_graph();
+        let context = json!({"foaf": "http://xmlns.com/foaf/0.1/"});
+        let config =
+            JsonLdFormatConfig::default().with_context_policy(ContextPolicy::UseOriginal(context));
+
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        assert!(result.get("@context").is_some());
+        assert_eq!(result["@context"]["foaf"], "http://xmlns.com/foaf/0.1/");
+    }
+
+    #[test]
+    fn test_format_with_compactor() {
+        let graph = make_simple_graph();
+        let config = JsonLdFormatConfig::default().with_compactor(|iri| {
+            if let Some(suffix) = iri.strip_prefix("http://xmlns.com/foaf/0.1/") {
+                format!("foaf:{suffix}")
+            } else if let Some(suffix) = iri.strip_prefix("http://example.org/") {
+                format!("ex:{suffix}")
+            } else {
+                iri.to_string()
+            }
+        });
+
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+        assert_eq!(node["@id"], "ex:alice");
+        assert_eq!(node["@type"], "foaf:Person");
+        assert!(node.get("foaf:name").is_some());
+    }
+
+    #[test]
+    fn test_format_multiple_types() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri(rdf::TYPE),
+            Term::iri("http://xmlns.com/foaf/0.1/Person"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri(rdf::TYPE),
+            Term::iri("http://xmlns.com/foaf/0.1/Agent"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let types = &result["@graph"][0]["@type"];
+        assert!(types.is_array());
+        let arr = types.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    /// A node's types are written once each, in time linear in their number:
+    /// 200k of them take well under a second, where a scan of the types
+    /// before each one takes minutes.
+    #[test]
+    fn many_types_are_written_once_each_in_linear_time() {
+        const N: usize = 200_000;
+        let limit = std::time::Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let s = || Term::iri("http://example.org/s");
+            let class = |i: usize| Term::iri(format!("http://example.org/C{i}"));
+            let mut graph = Graph::new();
+            for i in 0..N {
+                graph.add_triple(s(), Term::iri(rdf::TYPE), class(i));
+            }
+            // Not canonicalized, so the repeat reaches the writer.
+            graph.add_triple(s(), Term::iri(rdf::TYPE), class(0));
+            let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+            let types = result["@graph"][0]["@type"].as_array().cloned();
+            let _ = tx.send(types);
+        });
+        let types = rx
+            .recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("writing the types ran past {limit:?}"))
+            .expect("an array of types");
+        assert_eq!(types.len(), N);
+        assert_eq!(types[0], "http://example.org/C0");
+        assert_eq!(types[N - 1], format!("http://example.org/C{}", N - 1));
+    }
+
+    #[test]
+    fn test_format_multiple_values_same_predicate() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Al"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Ali"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let nicks = &result["@graph"][0]["http://xmlns.com/foaf/0.1/nick"];
+        assert!(nicks.is_array());
+        let arr = nicks.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn test_format_language_tagged_string() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::lang_string("Alicia", "es"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let name = &result["@graph"][0]["http://xmlns.com/foaf/0.1/name"];
+        assert_eq!(name["@value"], "Alicia");
+        assert_eq!(name["@language"], "es");
+    }
+
+    #[test]
+    fn test_format_typed_literal() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/age"),
+            Term::integer(30),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let age = &result["@graph"][0]["http://xmlns.com/foaf/0.1/age"];
+        // Integer should be output as plain JSON number
+        assert_eq!(age, &json!(30));
+    }
+
+    #[test]
+    fn test_format_blank_node_subject() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::blank("person1"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Unknown"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+        assert_eq!(node["@id"], "_:person1");
+    }
+
+    #[test]
+    fn test_format_blank_node_object() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/knows"),
+            Term::blank("person1"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let knows = &result["@graph"][0]["http://xmlns.com/foaf/0.1/knows"];
+        assert_eq!(knows["@id"], "_:person1");
+    }
+
+    /// A chain of unnamed `rdf:first`/`rdf:rest` cells is written as `@list`,
+    /// lists of lists included, and its cells are not nodes.
+    #[test]
+    fn rdf_collections_are_written_as_lists() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let cell = |l: &str| Term::blank(l);
+        let first = || Term::iri(rdf::FIRST);
+        let rest = || Term::iri(rdf::REST);
+        let mut graph = Graph::new();
+        graph.add_triple(ex("s"), ex("items"), cell("c0"));
+        graph.add_triple(cell("c0"), first(), Term::integer(1));
+        graph.add_triple(cell("c0"), rest(), cell("c1"));
+        graph.add_triple(cell("c1"), first(), cell("inner"));
+        graph.add_triple(cell("c1"), rest(), Term::iri(rdf::NIL));
+        graph.add_triple(cell("inner"), first(), ex("a"));
+        graph.add_triple(cell("inner"), rest(), Term::iri(rdf::NIL));
+        graph.sort();
+
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        assert_eq!(
+            result["@graph"],
+            json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/items": {"@list": [
+                    1,
+                    {"@list": [{"@id": "http://example.org/a"}]}
+                ]}
+            }])
+        );
+    }
+
+    /// A collection named only from its own cells, or from a cycle of
+    /// collections, has nowhere to be written inline: it keeps its triples.
+    #[test]
+    fn unanchored_collections_keep_their_triples() {
+        let cell = |l: &str| Term::blank(l);
+        let (first, rest, nil) = (
+            || Term::iri(rdf::FIRST),
+            || Term::iri(rdf::REST),
+            || Term::iri(rdf::NIL),
+        );
+        let mut graph = Graph::new();
+        graph.add_triple(cell("a"), first(), cell("a"));
+        graph.add_triple(cell("a"), rest(), nil());
+        graph.add_triple(cell("b"), first(), cell("c"));
+        graph.add_triple(cell("b"), rest(), nil());
+        graph.add_triple(cell("c"), first(), cell("b"));
+        graph.add_triple(cell("c"), rest(), nil());
+        graph.sort();
+
+        let result = format_jsonld(&graph, &JsonLdFormatConfig::default()).unwrap();
+        assert_eq!(
+            result["@graph"].as_array().map(Vec::len),
+            Some(3),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn test_format_nan_and_infinity() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/test"),
+            Term::iri("http://example.org/nan"),
+            Term::double(f64::NAN),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/test"),
+            Term::iri("http://example.org/inf"),
+            Term::double(f64::INFINITY),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/test"),
+            Term::iri("http://example.org/neginf"),
+            Term::double(f64::NEG_INFINITY),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+
+        let nan = &node["http://example.org/nan"];
+        assert_eq!(nan["@value"], "NaN");
+
+        let inf = &node["http://example.org/inf"];
+        assert_eq!(inf["@value"], "INF");
+
+        let neginf = &node["http://example.org/neginf"];
+        assert_eq!(neginf["@value"], "-INF");
+    }
+
+    #[test]
+    fn test_format_json_literal() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/test"),
+            Term::iri("http://example.org/data"),
+            Term::json(r#"{"key":"value"}"#),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let data = &result["@graph"][0]["http://example.org/data"];
+        assert_eq!(data["@type"], "@json");
+        assert!(data["@value"].is_object());
+        assert_eq!(data["@value"]["key"], "value");
+    }
+
+    // New tests for BlankNodePolicy
+
+    #[test]
+    fn test_blank_node_policy_deterministic() {
+        let mut graph = Graph::new();
+
+        // Add triples with different blank node IDs
+        graph.add_triple(
+            Term::blank("xyz123"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Person 1"),
+        );
+
+        graph.add_triple(
+            Term::blank("abc456"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Person 2"),
+        );
+
+        // xyz comes after abc in sort order
+        graph.sort();
+
+        let config =
+            JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::Deterministic);
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let nodes = result["@graph"].as_array().unwrap();
+        // After sorting, abc comes before xyz, so abc becomes _:b0
+        assert_eq!(nodes[0]["@id"], "_:b0");
+        assert_eq!(nodes[1]["@id"], "_:b1");
+    }
+
+    #[test]
+    fn test_blank_node_policy_preserve_labeled() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::blank("myCustomLabel"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Person"),
+        );
+
+        graph.sort();
+
+        let config =
+            JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::PreserveLabeled);
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let node = &result["@graph"][0];
+        assert_eq!(node["@id"], "_:myCustomLabel");
+    }
+
+    // New tests for multicardinal_arrays and dedupe_values
+
+    #[test]
+    fn test_multicardinal_arrays() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Alice"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default().with_multicardinal_arrays(true);
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let name = &result["@graph"][0]["http://xmlns.com/foaf/0.1/name"];
+        // Should be an array even with single value
+        assert!(name.is_array());
+        assert_eq!(name.as_array().unwrap().len(), 1);
+        assert_eq!(name[0], "Alice");
+    }
+
+    /// Duplicate triples are collapsed by `Graph::canonicalize()` — the graph
+    /// is the unit of RDF set semantics. The formatter emits what it is given.
+    #[test]
+    fn test_canonicalized_graph_has_no_duplicate_values() {
+        let mut graph = Graph::new();
+
+        // Add duplicate values
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Al"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Al"), // duplicate
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Ali"),
+        );
+
+        graph.canonicalize();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        let nicks = &result["@graph"][0]["http://xmlns.com/foaf/0.1/nick"];
+        assert!(nicks.is_array());
+        let arr = nicks.as_array().unwrap();
+        // Should have 2 values, not 3
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn reifiers_render_as_annotation() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut g = Graph::new();
+        g.add_triple(ex("alice"), ex("knows"), ex("bob"));
+        g.add_triple(ex("alice"), ex("name"), Term::string("Alice"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Person"));
+        g.add_triple(ex("alice"), Term::iri(rdf::TYPE), ex("Agent"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c1"));
+        g.add_reification(ex("alice"), ex("knows"), ex("bob"), ex("c2"));
+        g.add_reification(ex("alice"), ex("name"), Term::string("Alice"), ex("c3"));
+        g.add_reification(ex("alice"), Term::iri(rdf::TYPE), ex("Person"), ex("c4"));
+        g.canonicalize();
+
+        let node = &format_jsonld(&g, &JsonLdFormatConfig::default()).unwrap()["@graph"][0];
+        let p = |l: &str| format!("http://example.org/{l}");
+        assert_eq!(
+            node[p("knows")],
+            json!({"@id": p("bob"), "@annotation": [{"@id": p("c1")}, {"@id": p("c2")}]})
+        );
+        // A plain literal becomes a value object to carry the annotation.
+        assert_eq!(
+            node[p("name")],
+            json!({"@value": "Alice", "@annotation": {"@id": p("c3")}})
+        );
+        // `@type` cannot carry one: the annotated type is an rdf:type value,
+        // the unannotated one stays in `@type`.
+        assert_eq!(node["@type"], json!(p("Agent")));
+        assert_eq!(
+            node[rdf::TYPE],
+            json!({"@id": p("Person"), "@annotation": {"@id": p("c4")}})
+        );
+    }
+
+    /// A literal where a node belongs is an error, not a panic.
+    #[test]
+    fn a_literal_node_is_refused() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let config = JsonLdFormatConfig::default();
+
+        let mut subject = Graph::new();
+        subject.add_triple(Term::string("s"), ex("p"), ex("o"));
+        assert_eq!(format_jsonld(&subject, &config), Err(LiteralAsNode));
+
+        let mut reifier = Graph::new();
+        reifier.add_triple(ex("s"), ex("p"), ex("o"));
+        reifier.add_reification(ex("s"), ex("p"), ex("o"), Term::string("r"));
+        reifier.canonicalize();
+        assert_eq!(format_jsonld(&reifier, &config), Err(LiteralAsNode));
+
+        let mut named = Dataset::new();
+        named
+            .graph_mut(Some(&Term::string("g")))
+            .add_triple(ex("s"), ex("p"), ex("o"));
+        assert_eq!(format_jsonld_dataset(&named, &config), Err(LiteralAsNode));
+    }
+
+    #[test]
+    fn dataset_named_graphs_share_blank_node_labels() {
+        let ex = |l: &str| Term::iri(format!("http://example.org/{l}"));
+        let mut d = Dataset::new();
+        d.graph_mut(None)
+            .add_triple(ex("a"), ex("p"), Term::blank("shared"));
+        d.graph_mut(Some(&ex("g")))
+            .add_triple(Term::blank("shared"), ex("q"), Term::string("x"));
+        d.canonicalize();
+        let config =
+            JsonLdFormatConfig::default().with_blank_node_policy(BlankNodePolicy::Deterministic);
+        let doc = format_jsonld_dataset(&d, &config).unwrap();
+        let nodes = doc["@graph"].as_array().unwrap();
+        let label = nodes[0]["http://example.org/p"]["@id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let graph_node = nodes
+            .iter()
+            .find(|n| n["@id"] == "http://example.org/g")
+            .unwrap_or_else(|| panic!("no named graph node: {doc}"));
+        assert_eq!(graph_node["@graph"][0]["@id"], json!(label), "{doc}");
+
+        // No named graphs: the same document as the default graph alone.
+        let only = Dataset::from(d.default.clone());
+        assert_eq!(
+            format_jsonld_dataset(&only, &config).unwrap(),
+            format_jsonld(&d.default, &config).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_construct_parity_mode() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Alice"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Al"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/nick"),
+            Term::string("Al"), // duplicate
+        );
+
+        graph.canonicalize();
+
+        // Construct mode: singletons unwrapped; uniqueness from canonicalize
+        let config = JsonLdFormatConfig::default().with_multicardinal_arrays(false);
+
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        // name should be scalar (singleton unwrapped)
+        assert!(node["http://xmlns.com/foaf/0.1/name"].is_string());
+        assert_eq!(node["http://xmlns.com/foaf/0.1/name"], "Alice");
+
+        // nick should be scalar with deduplicated value
+        let nicks = &node["http://xmlns.com/foaf/0.1/nick"];
+        assert!(nicks.is_string());
+        assert_eq!(nicks, "Al"); // Only "Al" (deduplicated)
+    }
+
+    #[test]
+    fn test_expanded_graph_config() {
+        let mut graph = Graph::new();
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri(rdf::TYPE),
+            Term::iri("http://xmlns.com/foaf/0.1/Person"),
+        );
+
+        graph.add_triple(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://xmlns.com/foaf/0.1/name"),
+            Term::string("Alice"),
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::expanded_graph();
+        let result = format_jsonld(&graph, &config).unwrap();
+
+        // No @context
+        assert!(result.get("@context").is_none());
+
+        let node = &result["@graph"][0];
+
+        // Fully expanded IRI
+        assert_eq!(node["@id"], "http://example.org/alice");
+        assert_eq!(node["@type"], "http://xmlns.com/foaf/0.1/Person");
+
+        // Property with expanded IRI key
+        assert!(node.get("http://xmlns.com/foaf/0.1/name").is_some());
+    }
+
+    // =========================================================================
+    // @list formatting tests
+    // =========================================================================
+
+    #[test]
+    fn test_list_with_scalar_literals() {
+        let mut graph = Graph::new();
+
+        // Add list items with indices (out of order to test sorting)
+        graph.add_list_item(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://example.org/favorites"),
+            Term::string("Charlie"),
+            2,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://example.org/favorites"),
+            Term::string("Alice"),
+            0,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/alice"),
+            Term::iri("http://example.org/favorites"),
+            Term::string("Bob"),
+            1,
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        // Should have @list with items in order
+        let favorites = &node["http://example.org/favorites"];
+        assert!(
+            favorites.get("@list").is_some(),
+            "Should have @list container"
+        );
+
+        let list = favorites["@list"].as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], "Alice");
+        assert_eq!(list[1], "Bob");
+        assert_eq!(list[2], "Charlie");
+    }
+
+    #[test]
+    fn test_list_with_iri_objects() {
+        let mut graph = Graph::new();
+
+        graph.add_list_item(
+            Term::iri("http://example.org/collection"),
+            Term::iri("http://example.org/members"),
+            Term::iri("http://example.org/bob"),
+            1,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/collection"),
+            Term::iri("http://example.org/members"),
+            Term::iri("http://example.org/alice"),
+            0,
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        let members = &node["http://example.org/members"];
+        let list = members["@list"].as_array().unwrap();
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["@id"], "http://example.org/alice");
+        assert_eq!(list[1]["@id"], "http://example.org/bob");
+    }
+
+    #[test]
+    fn test_list_preserves_duplicates() {
+        let mut graph = Graph::new();
+
+        // Same value at different indices - must be preserved
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("repeat"),
+            0,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("middle"),
+            1,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("repeat"),
+            2,
+        );
+
+        graph.sort();
+
+        // List items are index-distinguished, so a repeated value is a
+        // distinct triple and survives canonicalization.
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        let list = node["http://example.org/p"]["@list"].as_array().unwrap();
+        assert_eq!(
+            list.len(),
+            3,
+            "List should preserve all items including duplicates"
+        );
+        assert_eq!(list[0], "repeat");
+        assert_eq!(list[1], "middle");
+        assert_eq!(list[2], "repeat");
+    }
+
+    #[test]
+    fn test_list_with_typed_literals() {
+        use fluree_graph_ir::{Datatype, LiteralValue};
+
+        let mut graph = Graph::new();
+
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/numbers"),
+            Term::Literal {
+                value: LiteralValue::Integer(42),
+                datatype: Datatype::xsd_integer(),
+                language: None,
+            },
+            0,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/numbers"),
+            Term::Literal {
+                value: LiteralValue::Integer(100),
+                datatype: Datatype::xsd_integer(),
+                language: None,
+            },
+            1,
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        let list = node["http://example.org/numbers"]["@list"]
+            .as_array()
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], 42);
+        assert_eq!(list[1], 100);
+    }
+
+    #[test]
+    fn test_list_single_item() {
+        let mut graph = Graph::new();
+
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("only"),
+            0,
+        );
+
+        graph.sort();
+
+        let config = JsonLdFormatConfig::default();
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        // Even single-item should be @list
+        let list = node["http://example.org/p"]["@list"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], "only");
+    }
+
+    #[test]
+    fn test_list_not_wrapped_in_array() {
+        let mut graph = Graph::new();
+
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("a"),
+            0,
+        );
+        graph.add_list_item(
+            Term::iri("http://example.org/s"),
+            Term::iri("http://example.org/p"),
+            Term::string("b"),
+            1,
+        );
+
+        graph.sort();
+
+        // Even with multicardinal_arrays, @list should not be wrapped
+        let config = JsonLdFormatConfig::default().with_multicardinal_arrays(true);
+        let result = format_jsonld(&graph, &config).unwrap();
+        let node = &result["@graph"][0];
+
+        // Should be {"@list": [...]} not [{"@list": [...]}]
+        let prop = &node["http://example.org/p"];
+        assert!(prop.is_object(), "Should be object, not array");
+        assert!(prop.get("@list").is_some(), "Should have @list key");
+    }
+}

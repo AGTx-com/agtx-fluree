@@ -1,0 +1,288 @@
+[package]
+name = "fluree-db-server"
+description = "HTTP REST API server for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+autotests = false
+
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "fluree-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "fluree-events-token"
+path = "src/bin/fluree_events_token.rs"
+
+[lib]
+name = "fluree_db_server"
+path = "src/lib.rs"
+
+[features]
+default = ["native", "credential", "iceberg", "sql", "delta", "shacl", "bolt", "graphql", "mimalloc"]
+native = ["fluree-db-api/native"]
+# AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
+aws = ["fluree-db-api/aws"]
+# DID/JWS/VerifiableCredential support for signed requests
+# When disabled, signed requests pass through as regular JSON bodies
+credential = ["fluree-db-api/credential"]
+# SHACL constraint validation at transaction time
+shacl = ["fluree-db-api/shacl"]
+# GraphQL endpoints over the schema derived from each ledger's data
+graphql = ["fluree-db-api/graphql"]
+# Enable OIDC JWT verification via JWKS (RS256 tokens from external IdPs)
+oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
+# Iceberg / R2RML graph source support
+iceberg = ["fluree-db-api/iceberg"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint)
+sql = ["iceberg", "fluree-db-api/sql"]
+# Delta Lake graph sources (R2RML over Delta tables). Links Delta Kernel and
+# `object_store`, including a second reqwest major; builds that do not read
+# Delta tables can drop it with `default-features = false`.
+delta = ["iceberg", "fluree-db-api/delta"]
+# Use mimalloc as the global allocator. Default: better multicore allocation
+# throughput for the allocation-heavy query/materialization paths (e.g.
+# R2RML/Iceberg scans), and under sustained writes with index builds the system
+# allocator keeps most of the memory the process frees.
+mimalloc = ["dep:mimalloc"]
+# Enable Swagger UI endpoint (requires network during build to download assets)
+swagger-ui = ["dep:utoipa-swagger-ui"]
+# Enable OpenTelemetry tracing (optional)
+otel = [
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+]
+# Replicate writes through a Raft cluster. Mounts the follower-forward
+# middleware on leader-only routes and exposes the inter-node RPC +
+# cluster-admin routers on a separate private listener.
+raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
+# Bolt protocol listener (Neo4j drivers speak to the openCypher surface).
+# Default on — the listener only binds when bolt_listen_addr is configured,
+# so runtime config is the real gate; exclude the feature only for minimal
+# builds. See docs/api/bolt.md.
+bolt = ["dep:fluree-db-bolt"]
+
+[dependencies]
+# Optional global allocator (see the `mimalloc` feature).
+mimalloc = { workspace = true, optional = true }
+# Fluree DB crates
+fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-bolt = { path = "../fluree-db-bolt", optional = true }
+fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-consensus = { path = "../fluree-db-consensus" }
+fluree-db-credential = { path = "../fluree-db-credential" }
+# Optional; pulled in by the `raft` feature for the leader-aware
+# indexer launcher in `crate::raft::spawn_leader_watcher`'s closure.
+fluree-db-indexer = { path = "../fluree-db-indexer", optional = true }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+fluree-db-peer = { path = "../fluree-db-peer" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-sse = { path = "../fluree-sse" }
+fluree-vocab = { path = "../fluree-vocab" }
+
+# Async trait macros
+async-trait = { workspace = true }
+
+# HTTP framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = "0.7"
+
+# Error handling
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = [
+    "grpc-tonic",
+    "http-proto",
+] }
+opentelemetry_sdk = { workspace = true, optional = true, features = [
+    "rt-tokio",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+] }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+parking_lot = "0.12"
+
+# CLI
+clap = { workspace = true }
+
+# Config file support
+toml = "0.8"
+
+# API documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true, optional = true }
+
+# HTTP types
+http = { workspace = true }
+bytes = { workspace = true }
+
+# Time tracking
+chrono = { workspace = true }
+
+# Cryptography
+sha2 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { version = "2.1" }
+bs58 = "0.5"
+
+# Encoding
+base64 = "0.22"
+ahash = "0.8.12"
+ciborium = "0.2" # CBOR encoding for policy-filtered flakes transport
+
+# JWT verification (OIDC/JWKS path)
+jsonwebtoken = { workspace = true, optional = true }
+
+# Shell expansion for token CLI
+shellexpand = "3"
+
+# HTTP client for peer mode (forwarding and SSE subscription)
+reqwest = { workspace = true, features = ["stream"] }
+
+# URL encoding for query params
+urlencoding = { workspace = true }
+
+# Random for jitter in backoff
+rand = { workspace = true }
+
+# MCP (Model Context Protocol) server support
+rmcp = { workspace = true }
+schemars = { workspace = true }
+
+# Async cancellation token for graceful shutdown
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+
+# Body-length-limit error classification for the request-body cap.
+http-body-util = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { workspace = true, features = ["test-util"] }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tempfile = "3"
+wiremock = { workspace = true }
+indexmap = { workspace = true }
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "policy_http"
+harness = false
+required-features = ["native", "credential"]
+
+[[bench]]
+name = "dataset_http"
+harness = false
+required-features = ["native", "credential"]
+
+# Integration tests are grouped into grp_* harnesses so the crate links a
+# handful of test binaries instead of one per tests/*.rs file. `autotests =
+# false` above is what stops each file from also becoming its own binary;
+# the test files themselves are unchanged, pulled in via #[path]/mod.
+#
+# `raft` is the only non-default feature here (default = native, credential,
+# iceberg, shacl, bolt), so grp_raft is the only harness that compiles to an
+# empty binary on a default build. The rest group by domain, not by feature.
+#
+# tests/harness_coverage.rs fails if any tests/*.rs is neither pulled into a
+# harness nor declared below — without it, `autotests = false` would let a new
+# integration file silently never run.
+
+# Its own target, not a harness member: as a member, deleting the one #[path]
+# line that wires it in would silently stop it compiling — an orphan of exactly
+# the kind it exists to catch.
+[[test]]
+name = "harness_coverage"
+path = "tests/harness_coverage.rs"
+
+[[test]]
+name = "grp_http"
+path = "tests/grp_http.rs"
+
+[[test]]
+name = "grp_query"
+path = "tests/grp_query.rs"
+
+[[test]]
+name = "grp_proxy"
+path = "tests/grp_proxy.rs"
+
+[[test]]
+name = "grp_policy"
+path = "tests/grp_policy.rs"
+
+[[test]]
+name = "grp_search"
+path = "tests/grp_search.rs"
+
+[[test]]
+name = "grp_raft"
+path = "tests/grp_raft.rs"
+
+[[test]]
+name = "grp_bolt"
+path = "tests/grp_bolt.rs"
+
+# Standalone: their assertions are about instrumentation. Both install a
+# tracing subscriber and assert on the events captured through it. Tracing's
+# callsite-interest cache is process-global while the capture is thread-local,
+# so those assertions are only reliable when the test is alone in its process
+# under bare `cargo test`. Same rule fluree-db-api follows — see
+# docs/contributing/tests.md.
+[[test]]
+name = "telemetry_test"
+path = "tests/telemetry_test.rs"
+
+# Own process: initializes the global subscriber and OTLP provider.
+[[test]]
+name = "otel_http_export"
+path = "tests/otel_http_export.rs"
+required-features = ["otel"]
+
+[[test]]
+name = "multi_query_tracing_integration"
+path = "tests/multi_query_tracing_integration.rs"
+
+# Standalone for the same reason as `telemetry_test`: it asserts on captured events.
+[[test]]
+name = "graph_source_query_logging"
+path = "tests/graph_source_query_logging.rs"
+
+# Standalone for the same reason: it sets `FLUREE_EXPORT_ANNOTATION_SCAN` to
+# select the export's fallback annotation source, and an env var is
+# process-global while the assertions around it are per-test.
+[[test]]
+name = "export_scan_source"
+path = "tests/export_scan_source.rs"

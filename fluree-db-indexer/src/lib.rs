@@ -1,0 +1,641 @@
+//! # Fluree DB Indexer
+//!
+//! Index building for Fluree DB. This crate provides:
+//!
+//! - Binary columnar index building (`run_index` module)
+//! - Background indexing orchestration
+//! - Namespace delta replay
+//! - Garbage collection support
+//!
+//! ## Design
+//!
+//! The indexer supports two deployment modes:
+//!
+//! 1. **Embedded**: Background indexing within the main process
+//! 2. **External**: Standalone Lambda-style indexer
+//!
+//! The binary index pipeline produces FIR6/FBR3/FLI3 columnar index artifacts.
+//!
+//! ## Build Pipeline Modules
+//!
+//! The actual build pipelines live in [`build`] sub-modules:
+//! - [`build::rebuild`]: Full index rebuild from genesis (Phase A..F)
+//! - [`build::incremental`]: Incremental index update (Phase 1..5)
+//! - [`build::upload`]: CAS upload primitives + index artifact upload
+//! - [`build::upload_dicts`]: Dictionary flat-file upload
+//! - [`build::spatial`]: Spatial index building
+//! - [`build::root_assembly`]: Common root finalization
+//! - [`build::commit_chain`]: Commit chain walking
+
+mod build;
+pub mod config;
+pub mod drop;
+pub mod error;
+pub mod fuel;
+pub mod fulltext_hook;
+pub mod gc;
+/// The per-(graph, property) cardinality sketch: the stats kernel's
+/// 256-register HyperLogLog. Persisted by [`stats::sketch_cas`].
+pub mod hll {
+    pub use fluree_db_stats::Hll256 as HllSketch256;
+}
+pub mod mem;
+pub mod orchestrator;
+pub mod run_index;
+pub mod spatial_hook;
+pub mod stats;
+
+// Re-export main types
+pub use config::{
+    AttachmentEventCoverage, AttachmentEventsProvider, ConfiguredFulltextProperty,
+    ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig, WarmCacheSource,
+    DEFAULT_CATCHUP_INTERVAL_SECS,
+};
+pub use drop::collect_ledger_cids;
+pub use error::{IndexerError, Result};
+pub use gc::{
+    clean_garbage, current_sibling_heads, execute_sweep, nested_ledgers, nested_prefixes,
+    plan_garbage, plan_sweep, release_garbage_plan, shared_blob_policy_for,
+    shared_refs_of_branches, siblings_of, write_garbage_record, BranchIndexHead,
+    CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord, SharedBlobPolicy,
+    SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES,
+    DEFAULT_MIN_TIME_GARBAGE_MINS,
+};
+pub use orchestrator::{
+    current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
+    GcGuard, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
+    IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
+};
+#[cfg(feature = "embedded-orchestrator")]
+pub use orchestrator::{
+    maybe_refresh_after_commit, require_refresh_before_commit, PostCommitIndexResult,
+};
+pub use stats::{IndexStatsHook, NoOpStatsHook, StatsArtifacts, StatsSummary};
+
+// Re-export build pipeline types
+pub use build::types::{UploadedDicts, UploadedIndexes};
+
+// Re-export build pipeline types
+pub use run_index::build::build_from_commits::{
+    build_indexes_from_commits, build_indexes_from_remapped_commits, BuildConfig, BuildResult,
+    CommitInput, BUILD_STAGE_LINK_RUNS, BUILD_STAGE_MERGE, BUILD_STAGE_REMAP,
+};
+
+use fluree_db_core::ContentStore;
+use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
+use tracing::Instrument;
+
+/// Result of building an index
+#[derive(Debug, Clone)]
+pub struct IndexResult {
+    /// Content identifier of the index root (derived from SHA-256 of root bytes).
+    pub root_id: fluree_db_core::ContentId,
+    /// Transaction time the index is current through
+    pub index_t: i64,
+    /// Ledger ID (name:branch format)
+    pub ledger_id: fluree_db_core::LedgerId,
+    /// Index build statistics
+    pub stats: IndexStats,
+    /// Total fuel charged for this build. `Some(_)` when fuel tracking was
+    /// enabled at the entry point (see [`build_index_for_record_with_tracker`]),
+    /// `None` when the build went through the plain non-tracking API. An
+    /// already-current build reports `Some(0.0)` if tracking was enabled.
+    pub fuel: Option<f64>,
+}
+
+/// Statistics from index building
+#[derive(Debug, Clone, Default)]
+pub struct IndexStats {
+    /// Total number of flakes in the index (after dedup)
+    pub flake_count: usize,
+    /// Number of leaf nodes created
+    pub leaf_count: usize,
+    /// Number of branch nodes created
+    pub branch_count: usize,
+    /// Total bytes written
+    pub total_bytes: usize,
+}
+
+/// Current index version for compatibility checking
+pub const CURRENT_INDEX_VERSION: i32 = 2;
+
+/// Build a binary index from an existing nameservice record.
+///
+/// This is the main index-build implementation once the caller already has an
+/// up-to-date [`fluree_db_nameservice::NsRecord`]. It preserves the same
+/// refresh-first behavior as [`build_index_for_ledger`], but skips the extra
+/// nameservice lookup.
+pub async fn build_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    build_index_for_record_with_tracker(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record,
+        config,
+    )
+    .await
+}
+
+/// Same as [`build_index_for_record`], but wraps `content_store` in a
+/// [`crate::fuel::MeteredContentStore`] for the duration of the build and
+/// charges fuel against `tracker`. Pass a fuel-enabled, no-limit tracker
+/// created at the API boundary; the indexer never enforces a fuel limit
+/// (measurement only).
+pub async fn build_index_for_record_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    record: &fluree_db_nameservice::NsRecord,
+    mut config: IndexerConfig,
+) -> Result<IndexResult> {
+    let content_store: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
+    let ledger_id = record.ledger_id.as_str();
+
+    // If a config provider is attached, let it refresh the per-run
+    // `fulltext_configured_properties` from the live ledger state. This is
+    // the hook that keeps background / incremental indexing in sync with
+    // `f:fullTextDefaults` changes committed after process start.
+    if let Some(provider) = config.fulltext_config_provider.clone() {
+        config.fulltext_configured_properties =
+            provider.fulltext_configured_properties(ledger_id).await;
+    }
+    let correlation = crate::orchestrator::current_index_request_correlation();
+    let span = tracing::debug_span!(
+        "index_build",
+        ledger_id = ledger_id,
+        request_id = correlation
+            .as_ref()
+            .and_then(|ctx| ctx.request_id.as_deref()),
+        trace_id = correlation.as_ref().and_then(|ctx| ctx.trace_id.as_deref()),
+        trigger_operation = correlation
+            .as_ref()
+            .and_then(|ctx| ctx.operation.as_deref()),
+    );
+    async move {
+        let commit_gap = record.commit_t - record.index_t;
+
+        tracing::info!(
+            ledger_id = ledger_id,
+            index_t = record.index_t,
+            commit_t = record.commit_t,
+            commit_gap,
+            has_index = record.index_head_id.is_some(),
+            incremental_enabled = config.incremental_enabled,
+            incremental_max_commits = config.incremental_max_commits,
+            "loaded ledger state for index build"
+        );
+
+        // If index is already current, return it. Report fuel as Some(0.0)
+        // when tracking is enabled (no CAS work was done) so callers can
+        // distinguish "no work" from "not tracked".
+        if let Some(ref root_id) = record.index_head_id {
+            if record.index_t >= record.commit_t {
+                tracing::info!(
+                    ledger_id = ledger_id,
+                    index_t = record.index_t,
+                    commit_t = record.commit_t,
+                    "index already current; returning existing root"
+                );
+                let fuel = tracker.tracks_fuel().then_some(0.0);
+                return Ok(IndexResult {
+                    root_id: root_id.clone(),
+                    index_t: record.index_t,
+                    ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
+                    stats: IndexStats::default(),
+                    fuel,
+                });
+            }
+        }
+
+        // Try incremental indexing if conditions are met.
+        let can_incremental = config.incremental_enabled
+            && record.index_head_id.is_some()
+            && record.index_t > 0
+            && commit_gap <= config.incremental_max_commits as i64;
+
+        if can_incremental {
+            tracing::info!(
+                from_t = record.index_t,
+                to_t = record.commit_t,
+                commit_gap = commit_gap,
+                "attempting incremental index"
+            );
+
+            match incremental_index(
+                content_store.clone(),
+                tracker.clone(),
+                ledger_id,
+                record,
+                config.clone(),
+            )
+            .await
+            {
+                Ok(mut result) => {
+                    result.fuel = tally_fuel(&tracker);
+                    return Ok(result);
+                }
+                // A full rebuild resolves the same commit and fails the same way.
+                Err(e) if !e.is_retryable() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "incremental indexing failed, falling back to full rebuild"
+                    );
+                }
+            }
+        } else if config.incremental_enabled && record.index_head_id.is_some() && record.index_t > 0
+        {
+            tracing::info!(
+                commit_gap = commit_gap,
+                max = config.incremental_max_commits,
+                "commit gap exceeds incremental limit, using full rebuild"
+            );
+        }
+
+        tracing::info!(
+            ledger_id = ledger_id,
+            index_t = record.index_t,
+            commit_t = record.commit_t,
+            commit_gap,
+            "starting full rebuild path"
+        );
+        let mut result = build::rebuild::rebuild_index_from_commits(
+            content_store,
+            tracker.clone(),
+            ledger_id,
+            record,
+            config,
+        )
+        .await?;
+        result.fuel = tally_fuel(&tracker);
+        Ok(result)
+    }
+    .instrument(span)
+    .await
+}
+
+/// Snapshot the tracker's current decimal fuel total, or `None` when fuel
+/// tracking was not enabled at this tracker (so callers can distinguish
+/// "no work" from "not tracked").
+fn tally_fuel(tracker: &fluree_db_core::tracking::Tracker) -> Option<f64> {
+    tracker.tally().and_then(|t| t.fuel)
+}
+
+/// External indexer entry point
+///
+/// Builds a binary columnar index from the commit chain. The pipeline:
+/// 1. Walks the commit chain and generates sorted run files
+/// 2. Builds per-graph leaf/branch indexes for all sort orders
+/// 3. Creates an FIR6 root descriptor and writes it to storage
+///
+/// Returns early if the index is already current (no work needed).
+/// Use `rebuild_index_from_commits` directly to force a rebuild regardless.
+pub async fn build_index_for_ledger(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    nameservice: &dyn NameServiceLookup,
+    ledger_id: &str,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    build_index_for_ledger_with_tracker(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        nameservice,
+        ledger_id,
+        config,
+    )
+    .await
+}
+
+/// Same as [`build_index_for_ledger`], but takes a fuel tracker; see
+/// [`build_index_for_record_with_tracker`] for the semantics.
+pub async fn build_index_for_ledger_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    nameservice: &dyn NameServiceLookup,
+    ledger_id: &str,
+    mut config: IndexerConfig,
+) -> Result<IndexResult> {
+    let record = nameservice
+        .lookup(ledger_id)
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?
+        .ok_or_else(|| IndexerError::LedgerNotFound(ledger_id.to_string()))?;
+
+    // CLI / one-shot path: the commit-CID index optimization is opt-in for the
+    // background orchestrator (which holds the richer `IndexingNameService`
+    // surface and can call `pending_commit_cids`). This convenience entrypoint
+    // takes only the read trait, so the incremental path falls back to the
+    // serial commit-DAG walk — correctness-preserving, just an unmeasured
+    // micro-optimization away.
+    config.pending_commit_cids = None;
+    let _ = record.index_t;
+
+    build_index_for_record_with_tracker(content_store, tracker, &record, config).await
+}
+
+/// Build a binary index from an existing nameservice record.
+///
+/// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
+/// the "already current" early-return check. Use this when you already have
+/// the `NsRecord` and want to force a rebuild (e.g., `reindex`).
+///
+/// See [`build::rebuild::rebuild_index_from_commits`] for the full pipeline.
+pub async fn rebuild_index_from_commits(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    build::rebuild::rebuild_index_from_commits(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await
+}
+
+/// Same as [`rebuild_index_from_commits`], but wraps `content_store` in a
+/// [`crate::fuel::MeteredContentStore`] so the rebuild's CAS writes are
+/// billed against `tracker`, and stamps the resulting [`IndexResult::fuel`]
+/// with the tracker's final tally.
+pub async fn rebuild_index_from_commits_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    let metered: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
+    let mut result = build::rebuild::rebuild_index_from_commits(
+        metered,
+        tracker.clone(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await?;
+    result.fuel = tally_fuel(&tracker);
+    Ok(result)
+}
+
+/// Like [`rebuild_index_from_commits`], but accepts a caller-provided
+/// [`ContentStore`] for reading commit blobs. Use this when commit history
+/// spans multiple storage namespaces (e.g. rebasing a branch whose commit
+/// chain falls through to parent namespaces via `BranchedContentStore`).
+pub async fn rebuild_index_from_commits_with_store<C>(
+    commit_store: C,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult>
+where
+    C: ContentStore + Clone + Send + Sync + 'static,
+{
+    build::rebuild::rebuild_index_from_commits_with_store(
+        commit_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await
+}
+
+/// Build `record`'s index incrementally over its published index, as
+/// [`build_index_for_record`] tries first, but with no fallback to a full
+/// rebuild: an incremental failure is returned. For tests that must know the
+/// incremental path ran. Only with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub async fn build_incremental_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    incremental_index(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
+/// Incremental index from an existing FIR6 root.
+///
+/// Loads the existing `IndexRoot`, resolves only new commits, merges
+/// novelty into affected FLI3 leaves, and publishes a new FIR6 root.
+async fn incremental_index(
+    content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    build::incremental::incremental_index(content_store, tracker, ledger_id, record, config).await
+}
+
+/// Merge already-resolved `novelty` into its base root and write the new
+/// root: the phases of an incremental build after commit resolution.
+///
+/// For a caller that produces novelty itself rather than from the commits
+/// after the published index — a bulk import into an existing ledger.
+/// `base_root_id` is the published root `novelty.base_root` derives from,
+/// and `replaced_cids` its artifacts the caller already superseded.
+pub async fn index_novelty(
+    content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    ledger_id: &str,
+    base_root_id: fluree_db_core::ContentId,
+    novelty: run_index::IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<fluree_db_core::ContentId>,
+) -> Result<IndexResult> {
+    build::incremental::index_novelty(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        replaced_cids,
+    )
+    .await
+}
+
+pub use build::dict_extend::extend_dicts;
+pub use build::incremental::{predicate_sids, DictNoveltyUpdate};
+pub use build::upload_dicts::{upload_numbig_arenas_from_disk, upload_vector_arenas_from_disk};
+
+/// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.
+pub async fn upload_indexes_to_cas(
+    content_store: &dyn fluree_db_core::ContentStore,
+    build_result: &BuildResult,
+) -> Result<UploadedIndexes> {
+    build::upload::upload_indexes_to_cas(
+        content_store,
+        &fluree_db_core::tracking::Tracker::disabled(),
+        build_result,
+    )
+    .await
+}
+
+/// Upload dictionary artifacts from persisted flat files to CAS.
+pub async fn upload_dicts_from_disk(
+    content_store: &dyn fluree_db_core::ContentStore,
+    run_dir: &std::path::Path,
+    namespace_codes: &std::collections::HashMap<u16, String>,
+    trust_sorted_order_invariants: bool,
+) -> Result<UploadedDicts> {
+    build::upload_dicts::upload_dicts_from_disk(
+        content_store,
+        run_dir,
+        namespace_codes,
+        trust_sorted_order_invariants,
+    )
+    .await
+}
+
+/// Refuse to publish a build of `built` whose head is no longer on the
+/// branch's line: a rebase moved the branch while it was built. Published,
+/// the index would serve the replaced line under the new head, and when the
+/// rebase left the head at the index's `t`, no later build would replace it.
+/// Walks the commits the branch gained during the build, usually none.
+pub async fn refuse_build_off_the_line(
+    nameservice: &dyn NameServiceLookup,
+    cs: &dyn ContentStore,
+    built: &fluree_db_nameservice::NsRecord,
+) -> Result<()> {
+    let Some(built_head) = built.commit_head_id.as_ref() else {
+        return Ok(());
+    };
+    let current = nameservice
+        .lookup(built.ledger_id.as_str())
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+    let Some(current_head) = current.as_ref().and_then(|r| r.commit_head_id.as_ref()) else {
+        return Ok(());
+    };
+    if current_head == built_head {
+        return Ok(());
+    }
+    let line =
+        fluree_db_core::collect_first_parent_cids(cs, current_head, built.commit_t - 1).await?;
+    match line.last() {
+        Some((t, cid)) if *t == built.commit_t && cid == built_head => Ok(()),
+        _ => Err(IndexerError::Other(format!(
+            "the branch moved off the built head {built_head} at t={} during the build",
+            built.commit_t
+        ))),
+    }
+}
+
+/// Publish index result to nameservice. Takes the narrower
+/// [`IndexPublisher`] surface because the index head is the only
+/// nameservice write the indexer ever makes — that way embedders
+/// (notably the Raft cluster's `RaftIndexPublisher`) can implement
+/// just this trait without faking commit / lifecycle writes they
+/// don't drive.
+///
+/// The artifacts are flushed through `store` first. Index output is
+/// written at page-cache durability, so without this the pointer,
+/// which is durable, could name files that never reached the device.
+pub async fn publish_index_result(
+    store: &dyn ContentStore,
+    publisher: &dyn IndexPublisher,
+    result: &IndexResult,
+) -> Result<()> {
+    store.sync().await.map_err(|e| {
+        IndexerError::Core(fluree_db_core::Error::io(format!(
+            "flush index artifacts: {e}"
+        )))
+    })?;
+    publisher
+        .publish_index(&result.ledger_id, result.index_t, &result.root_id)
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_stats_default() {
+        let stats = IndexStats::default();
+        assert_eq!(stats.flake_count, 0);
+        assert_eq!(stats.leaf_count, 0);
+        assert_eq!(stats.branch_count, 0);
+        assert_eq!(stats.total_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod publish_barrier_tests {
+    use super::*;
+    use fluree_db_core::{ContentId, ContentKind, FileStorage, StorageContentStore};
+    use fluree_db_nameservice::IndexPublisher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A publisher that records how many flushes the storage had issued at
+    /// the moment the pointer was published.
+    #[derive(Debug)]
+    struct FlushesAtPublish {
+        storage: FileStorage,
+        seen: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl IndexPublisher for FlushesAtPublish {
+        async fn publish_index(
+            &self,
+            _ledger_id: &str,
+            _index_t: i64,
+            _index_id: &ContentId,
+        ) -> fluree_db_nameservice::Result<()> {
+            self.seen
+                .store(self.storage.fsyncs_issued(), Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// The pointer is durable; the artifacts it names must be on the device
+    /// before it is published. Remove the flush in `publish_index_result`
+    /// and this fails.
+    #[tokio::test]
+    async fn the_pointer_is_published_only_after_its_artifacts_are_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path());
+        let store = StorageContentStore::new(storage.clone(), "l:main".to_string(), "file");
+        let root_id = store.put(ContentKind::IndexRoot, b"root").await.unwrap();
+        store.put(ContentKind::IndexLeaf, b"leaf").await.unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0, "derived writes do not flush");
+
+        let publisher = FlushesAtPublish {
+            storage: storage.clone(),
+            seen: AtomicU64::new(0),
+        };
+        let result = IndexResult {
+            root_id,
+            index_t: 1,
+            ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
+            stats: IndexStats::default(),
+            fuel: None,
+        };
+        publish_index_result(&store, &publisher, &result)
+            .await
+            .unwrap();
+        assert!(
+            publisher.seen.load(Ordering::Relaxed) >= 2,
+            "both artifacts and their directories were flushed before publish, saw {}",
+            publisher.seen.load(Ordering::Relaxed)
+        );
+    }
+}

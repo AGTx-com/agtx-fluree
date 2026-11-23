@@ -1,0 +1,798 @@
+//! Policy f:query integration tests
+//!
+//! Tests f:query policy evaluation using the main query parser/IR.
+//!
+//! These tests verify that the refactored policy query execution:
+//! 1. Uses the main query parser (not a bespoke policy parser)
+//! 2. Supports FILTER expressions
+//! 3. Properly injects ?$this and ?$identity
+
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree};
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
+
+/// Diagnostic test: verify basic policy mechanism works with f:allow: true
+#[tokio::test]
+async fn policy_baseline_allow_true() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "policy/baseline:main");
+    let txn = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            { "@id": "ex:item1", "@type": "ex:Item", "ex:name": "Item One" }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Policy with f:allow: true - should allow everything
+    let policy = json!([{
+        "@id": "ex:allowPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:allow": true
+    }]);
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "from": "policy/baseline:main",
+        "opts": {
+            "policy": policy,
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree.ledger("policy/baseline:main").await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Item One"])),
+        "f:allow: true should allow all items"
+    );
+}
+
+/// Helper to seed simple classified data
+async fn seed_classified_data(fluree: &MemoryFluree, ledger_id: &str) {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+
+    let txn = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:item-public",
+                "@type": "ex:Item",
+                "ex:name": "Public Item",
+                "ex:level": 0
+            },
+            {
+                "@id": "ex:item-secret",
+                "@type": "ex:Item",
+                "ex:name": "Secret Item",
+                "ex:level": 5
+            },
+            {
+                "@id": "ex:item-topsecret",
+                "@type": "ex:Item",
+                "ex:name": "Top Secret Item",
+                "ex:level": 10
+            }
+        ]
+    });
+
+    let _ = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("seed should succeed");
+}
+
+/// Tests that f:query with a simple WHERE pattern works.
+///
+/// This is a baseline test that the main parser is being used for f:query.
+/// The policy allows viewing items where ?$this has ex:level = 0.
+#[tokio::test]
+async fn policy_fquery_simple_where_pattern() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    seed_classified_data(&fluree, "policy/fquery-simple:main").await;
+
+    // Policy that allows only items with level = 0
+    let policy = json!([{
+        "@id": "ex:levelPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // Simple f:query - only allow if ?$this has level 0
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:level": 0 }]
+            }
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-simple:main",
+        "opts": {
+            "policy": policy,
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-simple:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only "Public Item" (level=0) should be visible
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Public Item"])),
+        "Only items with level=0 should be visible"
+    );
+}
+
+/// Tests that f:query with FILTER expressions works.
+///
+/// Key test: FILTER should work in policy queries
+/// because we now use the main query parser instead of a bespoke policy parser.
+#[tokio::test]
+async fn policy_fquery_with_filter_expression() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    seed_classified_data(&fluree, "policy/fquery-filter:main").await;
+
+    // Policy that allows items where level < 3 (using FILTER)
+    let policy = json!([{
+        "@id": "ex:levelPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // f:query with FILTER - allow if ?$this.level < 3
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [
+                    { "@id": "?$this", "ex:level": "?level" },
+                    ["filter", "(< ?level 3)"]
+                ]
+            }
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-filter:main",
+        "opts": {
+            "policy": policy,
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-filter:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only "Public Item" (level=0) should be visible; level < 3
+    // "Secret Item" (level=5) and "Top Secret Item" (level=10) should be filtered out
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Public Item"])),
+        "Only items with level < 3 should be visible (FILTER in f:query)"
+    );
+}
+
+/// Tests that default-allow works when NO policy applies.
+///
+/// default-allow only applies when NO policies apply to a flake.
+/// When policies DO apply but their f:query returns no results, that's a deny.
+#[tokio::test]
+async fn policy_fquery_default_allow_fallback() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    seed_classified_data(&fluree, "policy/fquery-default:main").await;
+
+    // Policy with f:query that will never match (level = 999) and NO targeting.
+    // Since there's no targeting (f:onProperty, f:onSubject, f:onClass), this is
+    // a "default" policy that APPLIES to ALL flakes. The f:query just won't return results.
+    let policy_no_targeting = json!([{
+        "@id": "ex:impossiblePolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:level": 999 }]
+            }
+        }
+    }]);
+
+    // Query with default-allow: true BUT policy DOES apply (just returns false)
+    // Expected: DENY because the policy applies and its f:query returned false
+    let query_with_applicable_policy = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-default:main",
+        "opts": {
+            "policy": policy_no_targeting,
+            "default-allow": true
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result = fluree
+        .query_connection(&query_with_applicable_policy)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-default:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // The policy APPLIED (it ran its f:query), but the query returned false.
+    // Therefore the policy didn't "allow", and default-allow doesn't override this.
+    // Semantics: default-allow only applies when NO policies apply.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([])),
+        "When a policy applies but its f:query returns false, items are denied (default-allow doesn't override)"
+    );
+
+    // Now test with a policy that has TARGETING that won't match our items' properties.
+    // This policy only targets property "ex:nonexistent", so it won't apply to ex:name flakes.
+    // NOTE: We use full IRIs in policy targeting because the policy builder doesn't expand
+    // compact IRIs from the query context.
+    let policy_with_targeting = json!([{
+        "@id": "http://example.org/ns/targetedPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": { "@id": "http://example.org/ns/nonexistent" },
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:level": 999 }]
+            }
+        }
+    }]);
+
+    // Query with default-allow: true AND policy that doesn't apply
+    // Expected: ALLOW (default-allow) because the policy doesn't target ex:name
+    let query_no_applicable_policy = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-default:main",
+        "opts": {
+            "policy": policy_with_targeting.clone(),
+            "default-allow": true
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result_allow = fluree
+        .query_connection(&query_no_applicable_policy)
+        .await
+        .expect("query_connection");
+    let jsonld_allow = result_allow.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // The policy doesn't apply (targets ex:nonexistent, not ex:name), so default-allow kicks in
+    assert_eq!(
+        normalize_rows(&jsonld_allow),
+        normalize_rows(&json!(["Public Item", "Secret Item", "Top Secret Item"])),
+        "When NO policy applies, default-allow: true allows all items"
+    );
+
+    // Same policy with default-allow: false
+    let query_deny = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-default:main",
+        "opts": {
+            "policy": policy_with_targeting,
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result_deny = fluree
+        .query_connection(&query_deny)
+        .await
+        .expect("query_connection");
+    let jsonld_deny = result_deny.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // The policy doesn't apply, and default-allow is false
+    assert_eq!(
+        normalize_rows(&jsonld_deny),
+        normalize_rows(&json!([])),
+        "When NO policy applies and default-allow: false, items are denied"
+    );
+}
+
+/// Tests that empty f:query {} allows access (matches anything).
+///
+/// An empty WHERE clause in f:query should succeed, allowing access.
+/// This is used as a "default allow view" pattern.
+#[tokio::test]
+async fn policy_fquery_empty_where_allows() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    seed_classified_data(&fluree, "policy/fquery-empty:main").await;
+
+    // Policy with empty f:query - should allow everything
+    let policy = json!([{
+        "@id": "ex:allowAllPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // Empty f:query - should succeed for everything
+        "f:query": {
+            "@type": "@json",
+            "@value": {}
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/"
+        },
+        "from": "policy/fquery-empty:main",
+        "opts": {
+            "policy": policy,
+            "default-allow": false
+        },
+        "select": "?name",
+        "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-empty:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Empty f:query should allow all items
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!(["Public Item", "Secret Item", "Top Secret Item"])),
+        "Empty f:query should allow all items"
+    );
+}
+
+/// Property-path traversal must enforce view policy on the edges it reads:
+/// hidden edges are not traversed, so nodes reachable only through them are not
+/// emitted. Regression for the V1 leak (the property-path operator read raw
+/// edges via `range_with_overlay` with no policy filtering).
+#[tokio::test]
+async fn policy_property_path_filters_hidden_edges() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = genesis_ledger(&fluree, "policy/fquery-path:main");
+    // Chain a -> b -> c -> d. Only ex:a can share, so only the a->b edge is
+    // viewable; the b->c and c->d edges are hidden.
+    let seed = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            { "@id": "ex:a", "ex:canShare": true, "ex:knows": { "@id": "ex:b" } },
+            { "@id": "ex:b", "ex:knows": { "@id": "ex:c" } },
+            { "@id": "ex:c", "ex:knows": { "@id": "ex:d" } }
+        ]
+    });
+    let _ = fluree
+        .insert(ledger, &seed)
+        .await
+        .expect("seed should succeed");
+
+    let policy = json!([{
+        "@id": "ex:knowsPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // Only governs ex:knows edges; an edge is viewable iff its subject can share.
+        "f:onProperty": [{ "@id": "http://example.org/ns/knows" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:canShare": true }]
+            }
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "knowsPlus": { "@path": "ex:knows+" }
+        },
+        "from": "policy/fquery-path:main",
+        "opts": { "policy": policy, "default-allow": false },
+        "where": [{ "@id": "ex:a", "knowsPlus": "?who" }],
+        "select": ["?who"]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-path:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only ex:b is reachable. Without edge filtering the traversal would walk
+    // the hidden b->c and c->d edges and leak ex:c and ex:d.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:b"]])),
+        "property path must not traverse hidden edges; got: {jsonld:#?}"
+    );
+}
+
+/// C1 regression: required policies are AND gates. When two REQUIRED view
+/// policies target the same flake — one `f:allow: true` and one `f:query` that
+/// returns no rows — access must be DENIED regardless of policy order. The old
+/// combining algorithm returned on the first Allow (OR semantics), so a required
+/// failing query could be bypassed by a co-located required allow that happened
+/// to be evaluated first (order-dependent fail-open).
+#[tokio::test]
+async fn required_policies_are_and_gated() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/required-and:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:item1", "@type": "ex:Item", "ex:secret": "classified"}]
+    });
+    fluree.insert(ledger0, &seed).await.unwrap();
+
+    let req_allow = json!({
+        "@id": "ex:reqAllow",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:allow": true
+    });
+    // A required gate whose f:query never matches → returns no rows → a gate
+    // that "applied but did not permit", so access must be denied.
+    let req_query_false = json!({
+        "@id": "ex:reqQueryFalse",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:query": serde_json::to_string(&json!({
+            "where": {"@id": "?$this", "http://example.org/ns/nonexistent": "?x"}
+        })).unwrap()
+    });
+
+    // Order A: [allow, query-false] — the old code returned at the first allow.
+    let q_a = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_allow.clone(), req_query_false.clone()], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_a = normalize_rows(
+        &fluree
+            .query_connection(&q_a)
+            .await
+            .expect("query A")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_a,
+        normalize_rows(&json!([])),
+        "a failing required f:query must deny even after a required allow, got {rows_a:?}"
+    );
+
+    // Order B: [query-false, allow] — must also deny (order-independent).
+    let q_b = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_query_false, req_allow], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_b = normalize_rows(
+        &fluree
+            .query_connection(&q_b)
+            .await
+            .expect("query B")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_b,
+        normalize_rows(&json!([])),
+        "required AND gate must be order-independent, got {rows_b:?}"
+    );
+}
+
+/// Tests that a `@path` context term (property path) works inside `f:query`,
+/// exercised through the production shape: policies STORED in the ledger
+/// under a policy class, request carrying `identity` (bind-only) +
+/// `policy-class` (selects the policy set).
+///
+/// This is the storage form governance tooling uses for relationship gates
+/// ("I can see entities I'm connected to via path P"): the author's path
+/// expression is kept verbatim as an `@path` term in the policy query's own
+/// `@context`, instead of being pre-expanded client-side into anchored
+/// where-patterns. Enforcement must follow the path — here
+/// `ex:memberOf/^ex:team`: the identity is a member of a team, and the
+/// entity belongs (via `ex:team`) to that same team.
+#[tokio::test]
+async fn policy_fquery_with_path_context_term() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "policy/fquery-path:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let u1 = "http://example.org/identity/u1";
+    let u2 = "http://example.org/identity/u2";
+
+    // Angle-bracket absolute-IRI form — exactly what `fluree model access
+    // enable --connected` stores (the path survives verbatim in @path).
+    let gate = serde_json::to_string(&json!({
+        "@context": {
+            "connected": {
+                "@path": "<http://example.org/ns/memberOf>/^<http://example.org/ns/team>"
+            }
+        },
+        "where": [
+            { "@id": "?$identity", "connected": { "@id": "?$this" } }
+        ]
+    }))
+    .unwrap();
+
+    let txn = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            { "@id": "ex:teamA", "@type": "ex:Team", "ex:name": "Alpha" },
+            { "@id": "ex:teamB", "@type": "ex:Team", "ex:name": "Beta" },
+            { "@id": u1, "ex:memberOf": { "@id": "ex:teamA" } },
+            { "@id": u2, "ex:memberOf": { "@id": "ex:teamB" } },
+            {
+                "@id": "ex:item-alpha",
+                "@type": "ex:Item",
+                "ex:name": "Alpha Item",
+                "ex:team": { "@id": "ex:teamA" }
+            },
+            {
+                "@id": "ex:item-beta",
+                "@type": "ex:Item",
+                "ex:name": "Beta Item",
+                "ex:team": { "@id": "ex:teamB" }
+            },
+            // The gate as governance tooling stores it: a classed view
+            // policy whose f:query holds ONE triple over an @path term —
+            // the author's path string survives verbatim in the artifact.
+            {
+                "@id": "ex:connected-view",
+                "@type": ["f:AccessPolicy", "ex:ConnectedAccess"],
+                "f:action": { "@id": "f:view" },
+                "f:query": gate
+            }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    let items_visible_to = |identity: &'static str| {
+        let query = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "from": ledger_id,
+            "opts": {
+                "identity": identity,
+                "policy-class": ["http://example.org/ns/ConnectedAccess"],
+                "default-allow": false
+            },
+            "select": "?name",
+            "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+        });
+        let fluree = &fluree;
+        async move {
+            let result = fluree.query_connection(&query).await.expect("query");
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+        }
+    };
+
+    assert_eq!(
+        items_visible_to(u1).await,
+        normalize_rows(&json!(["Alpha Item"])),
+        "u1 (member of teamA) must see only teamA's item through the path gate"
+    );
+    assert_eq!(
+        items_visible_to(u2).await,
+        normalize_rows(&json!(["Beta Item"])),
+        "u2 (member of teamB) must see only teamB's item through the path gate"
+    );
+}
+
+/// Re-running `fluree model access enable` with `--connected` must actually
+/// narrow a previously allow-all read profile. The CLI installs policies with
+/// an atomic replace transaction (wildcard-delete the owned policy ids +
+/// insert the fresh compilation) — byte-for-byte the shape tested here.
+///
+/// This pins the failure mode the replace semantics exist to prevent: the
+/// policy loader gives `f:allow` precedence over `f:query`, so a
+/// property-merge upsert that left the old `f:allow: true` on the view
+/// policy would silently disable the new relationship gate and keep the
+/// policy allow-all.
+#[tokio::test]
+async fn policy_replace_swaps_allow_for_path_gate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "policy/replace-gate:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let u1 = "http://example.org/identity/u1";
+    let class = "http://example.org/ns/Item/access/read";
+    let view_id = format!("{class}/view");
+    let write_id = format!("{class}/write");
+
+    // Data + the scaffolder's FIRST compilation: a plain read profile
+    // (f:allow: true view policy on the class).
+    let seed = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            { "@id": "ex:teamA", "@type": "ex:Team" },
+            { "@id": "ex:teamB", "@type": "ex:Team" },
+            { "@id": u1, "ex:memberOf": { "@id": "ex:teamA" } },
+            {
+                "@id": "ex:item-alpha",
+                "@type": "ex:Item",
+                "ex:name": "Alpha Item",
+                "ex:team": { "@id": "ex:teamA" }
+            },
+            {
+                "@id": "ex:item-beta",
+                "@type": "ex:Item",
+                "ex:name": "Beta Item",
+                "ex:team": { "@id": "ex:teamB" }
+            },
+            {
+                "@id": class,
+                "@type": "http://www.w3.org/2000/01/rdf-schema#Class"
+            },
+            {
+                "@id": view_id,
+                "@type": ["f:AccessPolicy", class],
+                "f:action": { "@id": "f:view" },
+                "f:onClass": { "@id": "ex:Item" },
+                "f:allow": true
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.expect("seed").ledger;
+
+    let items_visible_to_u1 = || {
+        let query = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "from": ledger_id,
+            "opts": {
+                "identity": u1,
+                "policy-class": [class],
+                "default-allow": false
+            },
+            "select": "?name",
+            "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+        });
+        let fluree = &fluree;
+        async move {
+            let result = fluree.query_connection(&query).await.expect("query");
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+        }
+    };
+
+    assert_eq!(
+        items_visible_to_u1().await,
+        normalize_rows(&json!(["Alpha Item", "Beta Item"])),
+        "plain read profile must be allow-all before the switch"
+    );
+
+    // The SECOND compilation: same profile with --connected. The CLI's
+    // replace transaction — optional wildcard match + delete on both owned
+    // policy ids, insert the fresh nodes ({class}/write is owned even
+    // though read never emits it).
+    let gate = serde_json::to_string(&json!({
+        "@context": {
+            "connected": {
+                "@path": "<http://example.org/ns/memberOf>/^<http://example.org/ns/team>"
+            }
+        },
+        "where": [
+            { "@id": "?$identity", "connected": { "@id": "?$this" } }
+        ]
+    }))
+    .unwrap();
+    let replace = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "where": [
+            ["optional", { "@id": view_id, "?p0": "?o0" }],
+            ["optional", { "@id": write_id, "?p1": "?o1" }]
+        ],
+        "delete": [
+            { "@id": view_id, "?p0": "?o0" },
+            { "@id": write_id, "?p1": "?o1" }
+        ],
+        "insert": [
+            {
+                "@id": class,
+                "@type": "http://www.w3.org/2000/01/rdf-schema#Class"
+            },
+            {
+                "@id": view_id,
+                "@type": ["f:AccessPolicy", class],
+                "f:action": { "@id": "f:view" },
+                "f:onClass": { "@id": "http://example.org/ns/Item" },
+                "f:query": gate
+            }
+        ]
+    });
+    let _ = fluree.update(ledger, &replace).await.expect("replace");
+
+    // The stale f:allow is gone, so the gate governs: u1 sees only the
+    // item connected to their team.
+    assert_eq!(
+        items_visible_to_u1().await,
+        normalize_rows(&json!(["Alpha Item"])),
+        "after the switch the relationship gate must govern — a stale \
+         f:allow would keep this allow-all"
+    );
+}

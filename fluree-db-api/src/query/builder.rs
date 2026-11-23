@@ -1,0 +1,2129 @@
+//! Query builders: context-first, compile-time-safe query construction.
+//!
+//! Three separate builder types, one per target:
+//! - [`ViewQueryBuilder`] — query a single graph/view
+//! - [`DatasetQueryBuilder`] — query a composed dataset
+//! - [`FromQueryBuilder`] — FROM-driven query (query body specifies ledgers)
+//!
+//! # Design
+//!
+//! - **Infallible setters**: All setters return `Self`; errors are accumulated
+//!   and reported at `.execute()` / `.validate()`.
+//! - **Compile-time target safety**: `.policy()` is only on `FromQueryBuilder`.
+//! - **Composition**: All builders share `QueryCore` for common fields.
+
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
+
+use crate::error::{BuilderError, BuilderErrors};
+use crate::format::FormatterConfig;
+use crate::query::connection::FormatTarget;
+#[cfg(feature = "iceberg")]
+use crate::query::helpers::parse_dataset_spec;
+use crate::query::result_cache::{
+    jsonld_requests_result_cache, PendingInsert, Rendering, ResultCacheOutcome, ResultCacheStatus,
+    ViewAnswer,
+};
+use crate::view::{DataSetDb, GraphDb, QueryInput};
+use crate::{
+    ApiError, Fluree, GovernanceOptions, PolicyContext, QueryExecutionOptions, QueryResult, Result,
+    TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
+};
+
+use fluree_db_core::VerifiedIdentity;
+use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+
+// ============================================================================
+// GraphSourceMode
+// ============================================================================
+
+/// Graph source integration mode for query builders.
+#[derive(Debug, Clone, Default)]
+pub enum GraphSourceMode {
+    /// No graph source integration (default).
+    #[default]
+    None,
+    /// Enable R2RML/Iceberg support (feature-gated).
+    #[cfg(feature = "iceberg")]
+    R2rml,
+}
+
+// ============================================================================
+// QueryCore (shared, private)
+// ============================================================================
+
+/// Shared fields across all three query builders.
+///
+/// Not exported. Each builder contains one and delegates shared setters to it.
+pub(crate) struct QueryCore<'a> {
+    pub(crate) input: Option<QueryInput<'a>>,
+    pub(crate) tracking: Option<TrackingOptions>,
+    pub(crate) format: Option<FormatterConfig>,
+    pub(crate) graph_sources: GraphSourceMode,
+    /// Read through [`Self::execution`], which adds what the format owes.
+    execution: QueryExecutionOptions,
+    pub(crate) r2rml: Option<(
+        Arc<dyn R2rmlProvider + 'a>,
+        Arc<dyn R2rmlTableProvider + 'a>,
+    )>,
+    errors: Vec<BuilderError>,
+}
+
+impl<'a> QueryCore<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            input: None,
+            tracking: None,
+            format: None,
+            graph_sources: GraphSourceMode::None,
+            execution: QueryExecutionOptions::default(),
+            r2rml: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_jsonld(&mut self, json: &'a JsonValue) {
+        if self.input.is_some() {
+            self.errors.push(BuilderError::Conflict {
+                field: "input",
+                message: "query input already set; cannot call .jsonld() after .sparql() or another .jsonld()".into(),
+            });
+            return;
+        }
+        self.input = Some(QueryInput::JsonLd(json));
+    }
+
+    pub(crate) fn set_sparql(&mut self, sparql: &'a str) {
+        if self.input.is_some() {
+            self.errors.push(BuilderError::Conflict {
+                field: "input",
+                message: "query input already set; cannot call .sparql() after .jsonld() or another .sparql()".into(),
+            });
+            return;
+        }
+        self.input = Some(QueryInput::Sparql(sparql));
+    }
+
+    pub(crate) fn set_tracking(&mut self, opts: TrackingOptions) {
+        self.tracking = Some(opts);
+    }
+
+    pub(crate) fn set_track_all(&mut self) {
+        self.tracking = Some(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: true,
+            max_fuel: None,
+        });
+    }
+
+    pub(crate) fn set_format(&mut self, config: FormatterConfig) {
+        self.format = Some(config);
+    }
+
+    pub(crate) fn set_cancellation(&mut self, cancellation: fluree_db_core::QueryCancellation) {
+        self.execution.cancellation = Some(cancellation);
+    }
+
+    pub(crate) fn set_execution_options(&mut self, options: QueryExecutionOptions) {
+        self.execution = options;
+    }
+
+    /// The options to execute with: the caller's, plus deterministic
+    /// graph-source scans when the format answers with a prefix of the rows
+    /// that a client continues with OFFSET (a byte-budgeted AgentJson
+    /// response; see [`FormatterConfig::pages_rows`]). That page is cut after
+    /// the query runs, where the planner cannot see it, and the page after it
+    /// carries an OFFSET, so both must read the rows in one order. Read here,
+    /// at execution, so the order of `.format()` and `.execution_options()`
+    /// on the builder does not matter.
+    pub(crate) fn execution(&self) -> QueryExecutionOptions {
+        let mut execution = self.execution.clone();
+        if self
+            .format
+            .as_ref()
+            .is_some_and(FormatterConfig::pages_rows)
+        {
+            execution.deterministic_scans = true;
+        }
+        execution
+    }
+
+    /// The server-verified identity the caller attached, if any.
+    pub(crate) fn server_identity(&self) -> Option<&VerifiedIdentity> {
+        self.execution.server_identity.as_ref()
+    }
+
+    pub(crate) fn set_params(&mut self, params: fluree_db_sparql::ParamMap) {
+        self.execution = std::mem::take(&mut self.execution).with_params(params);
+    }
+
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn set_r2rml(&mut self) {
+        self.graph_sources = GraphSourceMode::R2rml;
+    }
+
+    /// Validate that required fields are set. Returns accumulated errors.
+    pub(crate) fn validate(&self) -> Vec<BuilderError> {
+        let mut errs = self.errors.clone();
+        if self.input.is_none() {
+            errs.push(BuilderError::Missing {
+                field: "input",
+                hint: "call .jsonld(&query) or .sparql(\"SELECT ...\")",
+            });
+        }
+
+        match self.graph_sources {
+            GraphSourceMode::None => {}
+            #[cfg(feature = "iceberg")]
+            GraphSourceMode::R2rml => {
+                if self.r2rml.is_none() {
+                    errs.push(BuilderError::Invalid {
+                        field: "graph_sources",
+                        message: "R2RML mode requires an R2RML provider; call .with_r2rml() on a Fluree instance whose nameservice implements GraphSourcePublisher".into(),
+                    });
+                }
+            }
+        }
+
+        errs
+    }
+
+    /// Default format config based on input type.
+    pub(crate) fn default_format(&self) -> FormatterConfig {
+        match &self.input {
+            Some(QueryInput::Sparql(_)) => FormatterConfig::sparql_json(),
+            _ => FormatterConfig::jsonld(),
+        }
+    }
+}
+
+// ============================================================================
+// ViewQueryBuilder
+// ============================================================================
+
+/// Builder for queries against a single graph/view.
+///
+/// Created via [`GraphDb::query()`].
+///
+/// # Example
+///
+/// ```ignore
+/// let graph = fluree.db("mydb:main").await?;
+/// let result = graph.query(&fluree)
+///     .jsonld(&query)
+///     .execute().await?;
+/// ```
+pub struct ViewQueryBuilder<'a> {
+    fluree: &'a Fluree,
+    view: &'a GraphDb,
+    core: QueryCore<'a>,
+    result_cache: Option<&'a ResultCacheOutcome>,
+}
+
+/// What the result cache did for a formatted terminal's query, and where to
+/// report it.
+struct CacheRun<'a> {
+    outcome: Option<&'a ResultCacheOutcome>,
+    status: ResultCacheStatus,
+}
+
+impl<'a> ViewQueryBuilder<'a> {
+    /// Create a new builder (called by `GraphDb::query()`).
+    pub(crate) fn new(fluree: &'a Fluree, view: &'a GraphDb) -> Self {
+        Self {
+            fluree,
+            view,
+            core: QueryCore::new(),
+            result_cache: None,
+        }
+    }
+
+    /// Answer from the query-result cache when a stored answer matches this
+    /// request and the view's ledger state, and store the answer otherwise.
+    /// `outcome` reports which happened. A JSON-LD query can opt in with
+    /// `"opts": {"cache": true}` instead.
+    ///
+    /// Applies to `execute_formatted`, `execute_formatted_string` and
+    /// `execute_formatted_json_bytes`.
+    pub fn result_cache(mut self, outcome: &'a ResultCacheOutcome) -> Self {
+        self.result_cache = Some(outcome);
+        self
+    }
+
+    /// The answer for a formatted terminal: through the result cache when the
+    /// request opted in, as `execute` runs it otherwise.
+    async fn formatted_answer(
+        &mut self,
+        rendering: Rendering,
+    ) -> Result<(FormatterConfig, ViewAnswer, Option<CacheRun<'a>>)> {
+        let r2rml = self.core.r2rml.take();
+        // Before the format is taken: a paging format makes scans deterministic.
+        let execution = self.core.execution();
+        let format = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let input = self.core.input.take().expect("validated");
+        let opted_in = match (self.result_cache, input) {
+            (Some(outcome), _) => Some(Some(outcome)),
+            (None, QueryInput::JsonLd(json)) if jsonld_requests_result_cache(json) => Some(None),
+            (None, _) => None,
+        };
+        let fresh = |result| ViewAnswer::Fresh {
+            result: Box::new(result),
+            insert: None,
+        };
+        match (r2rml.as_ref(), opted_in) {
+            (Some((provider, table_provider)), opted_in) => {
+                let result = self
+                    .fluree
+                    .query_view_with_r2rml_options(
+                        self.view,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await?;
+                let run = opted_in.map(|outcome| CacheRun {
+                    outcome,
+                    status: ResultCacheStatus::Bypass("graph source"),
+                });
+                Ok((format, fresh(result), run))
+            }
+            (None, Some(outcome)) => {
+                let (answer, status) = self
+                    .fluree
+                    .query_view_for_cache(self.view, input, execution, &format, rendering)
+                    .await?;
+                Ok((format, answer, Some(CacheRun { outcome, status })))
+            }
+            (None, None) => {
+                let result = self
+                    .fluree
+                    .query_with_options(self.view, input, execution)
+                    .await?;
+                Ok((format, fresh(result), None))
+            }
+        }
+    }
+
+    // --- Shared setters (delegated to QueryCore) ---
+
+    /// Set the query input as JSON-LD.
+    pub fn jsonld(mut self, json: &'a JsonValue) -> Self {
+        self.core.set_jsonld(json);
+        self
+    }
+
+    /// Set the query input as SPARQL.
+    pub fn sparql(mut self, sparql: &'a str) -> Self {
+        self.core.set_sparql(sparql);
+        self
+    }
+
+    /// Enable tracking of all metrics (fuel, time, policy).
+    pub fn track_all(mut self) -> Self {
+        self.core.set_track_all();
+        self
+    }
+
+    /// Set custom tracking options.
+    pub fn tracking(mut self, opts: TrackingOptions) -> Self {
+        self.core.set_tracking(opts);
+        self
+    }
+
+    /// Set format configuration (used by `.execute_formatted()`).
+    pub fn format(mut self, config: FormatterConfig) -> Self {
+        self.core.set_format(config);
+        self
+    }
+
+    /// Attach a cooperative cancellation handle.
+    pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
+        self
+    }
+
+    /// Enable R2RML/Iceberg support (feature-gated).
+    #[cfg(feature = "iceberg")]
+    pub fn with_r2rml(mut self) -> Self {
+        let shared = Arc::new(crate::graph_source::FlureeR2rmlProvider::new(self.fluree));
+        let provider: Arc<dyn R2rmlProvider + 'a> = shared.clone();
+        let table_provider: Arc<dyn R2rmlTableProvider + 'a> = shared;
+        self.core.r2rml = Some((provider, table_provider));
+        self.core.set_r2rml();
+        self
+    }
+
+    // --- Terminal operations ---
+
+    /// Validate builder configuration without executing.
+    ///
+    /// Returns all accumulated errors at once.
+    pub fn validate(&self) -> std::result::Result<(), BuilderErrors> {
+        let errs = self.core.validate();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(BuilderErrors(errs))
+        }
+    }
+
+    /// Execute the query and return raw `QueryResult`.
+    pub async fn execute(self) -> Result<QueryResult> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let mut core = self.core;
+        let r2rml = core.r2rml.take();
+        let execution = core.execution();
+        let input = core.input.take().unwrap(); // safe: validated
+        match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_view_with_r2rml_options(
+                        self.view,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await
+            }
+            None => {
+                self.fluree
+                    .query_with_options(self.view, input, execution)
+                    .await
+            }
+        }
+    }
+
+    /// Execute and return formatted JSON output.
+    ///
+    /// Uses `.format()` config if set, otherwise defaults based on input type
+    /// (JSON-LD for `.jsonld()`, SPARQL JSON for `.sparql()`).
+    pub async fn execute_formatted(mut self) -> Result<JsonValue> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+        let (format_config, answer, run) = self.formatted_answer(Rendering::JsonDom).await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                Ok(serde_json::from_slice(&bytes)?)
+            }
+            ViewAnswer::Fresh { result, insert } => {
+                let value = result
+                    .format_async_for_view(self.view, &format_config)
+                    .await?;
+                let bytes = match &insert {
+                    Some(_) => serde_json::to_vec(&value)?,
+                    None => Vec::new(),
+                };
+                finish_cache_run(self.fluree, run, insert, &bytes);
+                Ok(value)
+            }
+        }
+    }
+
+    /// [`Self::execute_formatted`], serialized: the bytes `serde_json` writes
+    /// for its value.
+    pub async fn execute_formatted_json_bytes(mut self) -> Result<Vec<u8>> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+        let (format_config, answer, run) = self.formatted_answer(Rendering::JsonDom).await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                Ok(bytes.to_vec())
+            }
+            ViewAnswer::Fresh { result, insert } => {
+                let value = result
+                    .format_async_for_view(self.view, &format_config)
+                    .await?;
+                let bytes = serde_json::to_vec(&value)?;
+                finish_cache_run(self.fluree, run, insert, &bytes);
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Execute and return formatted string output.
+    ///
+    /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
+    /// For JSON formats: produces serialized JSON string via async formatting
+    /// (supports expansion-aware policies-aware queries).
+    pub async fn execute_formatted_string(mut self) -> Result<String> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+        let (format_config, answer, run) = self.formatted_answer(Rendering::Text).await?;
+        match answer {
+            ViewAnswer::Cached(bytes) => {
+                finish_cache_run(self.fluree, run, None, &[]);
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|e| ApiError::internal(format!("cached query answer: {e}")))
+            }
+            ViewAnswer::Fresh { result, insert } => {
+                let text = crate::format::format_results_string_async(
+                    &result,
+                    &result.context,
+                    self.view.as_graph_db_ref(),
+                    &format_config,
+                    self.view.policy(),
+                )
+                .await
+                .map_err(ApiError::from)?;
+                finish_cache_run(self.fluree, run, insert, text.as_bytes());
+                Ok(text)
+            }
+        }
+    }
+
+    /// Execute with tracking (fuel, time, policy stats).
+    ///
+    /// Respects `.format()` config if set, otherwise defaults based on input type
+    /// (JSON-LD for `.jsonld()`, SPARQL JSON for `.sparql()`).
+    ///
+    /// Uses `.tracking()` options if set, otherwise defaults to all-enabled
+    /// (SPARQL) or opts-derived (JSON-LD).
+    pub async fn execute_tracked(
+        mut self,
+    ) -> std::result::Result<TrackedQueryResponse, TrackedErrorResponse> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            let msg = BuilderErrors(errs).to_string();
+            return Err(TrackedErrorResponse::new(400, msg, None));
+        }
+
+        let format_config = self.core.format.take();
+        let tracking = self.core.tracking.take();
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let input = self.core.input.take().unwrap();
+        match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_tracked_with_r2rml_options(
+                        self.view,
+                        input,
+                        format_config,
+                        tracking,
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
+                        execution,
+                    )
+                    .await
+            }
+            None => {
+                self.fluree
+                    .query_tracked_with_options(
+                        self.view,
+                        input,
+                        format_config,
+                        tracking,
+                        execution,
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+/// Store a fresh answer's `bytes` and report what the cache did.
+fn finish_cache_run(
+    fluree: &Fluree,
+    run: Option<CacheRun<'_>>,
+    insert: Option<PendingInsert>,
+    bytes: &[u8],
+) {
+    let Some(run) = run else { return };
+    let mut status = run.status;
+    if let Some(pending) = insert {
+        if !fluree.insert_result_cache(pending, bytes) {
+            status = ResultCacheStatus::Bypass("answer larger than a cache entry");
+        }
+    }
+    if let Some(outcome) = run.outcome {
+        outcome.set(status);
+    }
+}
+
+// ============================================================================
+// DatasetQueryBuilder
+// ============================================================================
+
+/// Builder for queries against a composed dataset (multiple graphs/views).
+///
+/// Created via [`DataSetDb::query()`].
+///
+/// # Example
+///
+/// ```ignore
+/// let dataset = DataSetDb::new()
+///     .with_default(view_a)
+///     .with_named("other", view_b);
+/// let result = dataset.query(&fluree)
+///     .jsonld(&query)
+///     .execute().await?;
+/// ```
+pub struct DatasetQueryBuilder<'a> {
+    fluree: &'a Fluree,
+    dataset: &'a DataSetDb,
+    core: QueryCore<'a>,
+}
+
+impl<'a> DatasetQueryBuilder<'a> {
+    /// Create a new builder (called by `DataSetDb::query()`).
+    pub(crate) fn new(fluree: &'a Fluree, dataset: &'a DataSetDb) -> Self {
+        Self {
+            fluree,
+            dataset,
+            core: QueryCore::new(),
+        }
+    }
+
+    // --- Shared setters ---
+
+    /// Set the query input as JSON-LD.
+    pub fn jsonld(mut self, json: &'a JsonValue) -> Self {
+        self.core.set_jsonld(json);
+        self
+    }
+
+    /// Set the query input as SPARQL.
+    pub fn sparql(mut self, sparql: &'a str) -> Self {
+        self.core.set_sparql(sparql);
+        self
+    }
+
+    /// Enable tracking of all metrics.
+    pub fn track_all(mut self) -> Self {
+        self.core.set_track_all();
+        self
+    }
+
+    /// Set custom tracking options.
+    pub fn tracking(mut self, opts: TrackingOptions) -> Self {
+        self.core.set_tracking(opts);
+        self
+    }
+
+    /// Set format configuration.
+    pub fn format(mut self, config: FormatterConfig) -> Self {
+        self.core.set_format(config);
+        self
+    }
+
+    /// Attach a cooperative cancellation handle.
+    pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
+        self
+    }
+
+    /// Enable R2RML/Iceberg support (feature-gated).
+    #[cfg(feature = "iceberg")]
+    pub fn with_r2rml(mut self) -> Self {
+        let shared = Arc::new(crate::graph_source::FlureeR2rmlProvider::new(self.fluree));
+        let provider: Arc<dyn R2rmlProvider + 'a> = shared.clone();
+        let table_provider: Arc<dyn R2rmlTableProvider + 'a> = shared;
+        self.core.r2rml = Some((provider, table_provider));
+        self.core.set_r2rml();
+        self
+    }
+
+    // --- Terminal operations ---
+
+    /// Validate builder configuration without executing.
+    pub fn validate(&self) -> std::result::Result<(), BuilderErrors> {
+        let errs = self.core.validate();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(BuilderErrors(errs))
+        }
+    }
+
+    /// Execute the query and return raw `QueryResult`.
+    pub async fn execute(self) -> Result<QueryResult> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let mut core = self.core;
+        let r2rml = core.r2rml.take();
+        let execution = core.execution();
+        let input = core.input.take().unwrap();
+        match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_dataset_with_r2rml_options(
+                        self.dataset,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await
+            }
+            None => {
+                self.fluree
+                    .query_dataset_with_options(self.dataset, input, execution)
+                    .await
+            }
+        }
+    }
+
+    /// Execute and return formatted JSON output.
+    ///
+    /// Uses `.format()` config if set, otherwise defaults based on input type.
+    pub async fn execute_formatted(mut self) -> Result<JsonValue> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let format_config = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let input = self.core.input.take().unwrap();
+        let result = match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_dataset_with_r2rml_options(
+                        self.dataset,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await?
+            }
+            None => {
+                self.fluree
+                    .query_dataset_with_options(self.dataset, input, execution)
+                    .await?
+            }
+        };
+
+        // Use primary view's db for formatting
+        if let Some(primary) = self.dataset.primary() {
+            Ok(result
+                .format_async_for_view(primary, &format_config)
+                .await?)
+        } else {
+            Err(ApiError::query("No primary view in dataset for formatting"))
+        }
+    }
+
+    /// Execute and return formatted string output.
+    ///
+    /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
+    /// For JSON formats: produces serialized JSON string via async formatting
+    /// (supports expansion-aware policies-aware queries).
+    pub async fn execute_formatted_string(mut self) -> Result<String> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let format_config = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let input = self.core.input.take().unwrap();
+        let result = match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_dataset_with_r2rml_options(
+                        self.dataset,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
+                    .await?
+            }
+            None => {
+                self.fluree
+                    .query_dataset_with_options(self.dataset, input, execution)
+                    .await?
+            }
+        };
+
+        if let Some(primary) = self.dataset.primary() {
+            crate::format::format_results_string_async(
+                &result,
+                &result.context,
+                primary.as_graph_db_ref(),
+                &format_config,
+                primary.policy(),
+            )
+            .await
+            .map_err(ApiError::from)
+        } else {
+            Err(ApiError::query("No primary view in dataset for formatting"))
+        }
+    }
+
+    /// Execute with tracking (fuel, time, policy stats).
+    ///
+    /// Respects `.format()` config if set, otherwise defaults based on input type.
+    ///
+    /// Uses `.tracking()` options if set, otherwise defaults to all-enabled
+    /// (SPARQL) or opts-derived (JSON-LD).
+    pub async fn execute_tracked(
+        mut self,
+    ) -> std::result::Result<TrackedQueryResponse, TrackedErrorResponse> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            let msg = BuilderErrors(errs).to_string();
+            return Err(TrackedErrorResponse::new(400, msg, None));
+        }
+
+        let format_config = self.core.format.take();
+        let tracking = self.core.tracking.take();
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let input = self.core.input.take().unwrap();
+        match r2rml.as_ref() {
+            Some((provider, table_provider)) => {
+                self.fluree
+                    .query_dataset_tracked_with_r2rml_options(
+                        self.dataset,
+                        input,
+                        format_config,
+                        tracking,
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
+                        execution,
+                    )
+                    .await
+            }
+            None => {
+                self.fluree
+                    .query_dataset_tracked_with_options(
+                        self.dataset,
+                        input,
+                        format_config,
+                        tracking,
+                        execution,
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+// ============================================================================
+// FromQueryBuilder
+// ============================================================================
+
+/// Builder for FROM-driven queries (query body specifies target ledgers).
+///
+/// Created via [`Fluree::query_from()`].
+///
+/// This is the only query builder that supports `.policy()`, because
+/// FROM-driven queries resolve ledgers at execution time from the connection
+/// and may need connection-level policy enforcement.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = fluree.query_from()
+///     .jsonld(&query_with_from)
+///     .policy(ctx)
+///     .execute().await?;
+/// ```
+pub struct FromQueryBuilder<'a> {
+    fluree: &'a Fluree,
+    core: QueryCore<'a>,
+    policy: Option<Arc<PolicyContext>>,
+    connection_opts: Option<GovernanceOptions>,
+    authorization: Option<&'a crate::PolicyAuthorization>,
+}
+
+/// The builder's graph-source providers in the borrowed form execution takes.
+#[allow(clippy::type_complexity)]
+fn providers<'s>(
+    r2rml: Option<&'s (
+        Arc<dyn R2rmlProvider + '_>,
+        Arc<dyn R2rmlTableProvider + '_>,
+    )>,
+) -> Option<crate::R2rmlProviders<'s>> {
+    r2rml.map(|(provider, table_provider)| crate::R2rmlProviders {
+        provider: provider.as_ref(),
+        table_provider: table_provider.as_ref(),
+    })
+}
+
+impl<'a> FromQueryBuilder<'a> {
+    /// Create a new builder (called by `Fluree::query_from()`).
+    pub(crate) fn new(fluree: &'a Fluree) -> Self {
+        Self {
+            fluree,
+            core: QueryCore::new(),
+            policy: None,
+            connection_opts: None,
+            authorization: None,
+        }
+    }
+
+    /// Route a subgraph ("crawl") projection over a single-source virtual
+    /// (R2RML) dataset through the R2RML operator instead of native binary-index
+    /// hydration — which has no flakes for a virtual dataset and returns `[]`
+    /// (the deployed "View Instances shows no instances" bug on the ledger-scoped
+    /// / connection query path).
+    ///
+    /// Returns `Ok(None)` — so the caller runs its normal formatting path
+    /// unchanged — for a non-crawl query (cheapest gate first), a query whose
+    /// dataset spec names anything other than exactly one graph (a federated
+    /// multi-source crawl must NOT collapse to a single source), or when the
+    /// resolved view is not graph-source-backed (a genuinely native ledger, which
+    /// `maybe_expand_crawl` filters out).
+    ///
+    /// `tracker` is a tracked request's tracker, which the crawl records its
+    /// fuel, time and policy into under its fuel limit; untracked terminals
+    /// pass `None`.
+    #[cfg(feature = "iceberg")]
+    async fn try_expand_crawl(
+        &self,
+        json: &JsonValue,
+        r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+        tracker: Option<&crate::Tracker>,
+        execution: &QueryExecutionOptions,
+        format_config: &FormatterConfig,
+    ) -> Result<Option<JsonValue>> {
+        // Cheapest possible gate: an ordinary (non-crawl) query pays only this.
+        if !crate::graph_source::crawl::is_wildcard_crawl(json) {
+            return Ok(None);
+        }
+        // Resolve the single target ledger from the query's own dataset spec. A
+        // crawl over a federated multi-source dataset must not collapse to one
+        // source, so bail unless exactly one graph is specified.
+        //
+        // This parse ignores `execution.ledger_times` (a multi-query envelope's
+        // snapshot): a crawl runs only on a graph source, and an envelope
+        // resolves every member as a ledger before it dispatches, so a crawl
+        // never runs under one.
+        let (spec, opts) = parse_dataset_spec(json)?;
+        if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
+            return Ok(None);
+        }
+        let alias = spec
+            .default_graphs
+            .first()
+            .or_else(|| spec.named_graphs.first())
+            .expect("exactly one graph checked above");
+        let view = self.fluree.load_view_from_source(alias).await?;
+        if view.graph_source_id.is_none() {
+            return Ok(None);
+        }
+        // Expansion executes a rewritten query against this view, so bind
+        // policy here before the original JSON options disappear.
+        let view = if let Some(policy) = &self.policy {
+            view.with_policy(Arc::clone(policy))
+        } else {
+            self.fluree
+                .apply_source_or_global_policy(view, alias, &opts)
+                .await?
+        };
+        crate::graph_source::crawl::maybe_expand_crawl(
+            self.fluree,
+            &view,
+            Some(json),
+            r2rml,
+            tracker,
+            execution.clone(),
+            format_config,
+        )
+        .await
+    }
+
+    // --- Shared setters ---
+
+    /// Set the query input as JSON-LD.
+    pub fn jsonld(mut self, json: &'a JsonValue) -> Self {
+        self.core.set_jsonld(json);
+        self
+    }
+
+    /// Set the query input as SPARQL.
+    pub fn sparql(mut self, sparql: &'a str) -> Self {
+        self.core.set_sparql(sparql);
+        self
+    }
+
+    /// Set format configuration.
+    pub fn format(mut self, config: FormatterConfig) -> Self {
+        self.core.set_format(config);
+        self
+    }
+
+    /// Enable tracking of all metrics (fuel, time, policy).
+    pub fn track_all(mut self) -> Self {
+        self.core.set_track_all();
+        self
+    }
+
+    /// Set custom tracking options.
+    pub fn tracking(mut self, opts: TrackingOptions) -> Self {
+        self.core.set_tracking(opts);
+        self
+    }
+
+    /// Attach a cooperative cancellation handle.
+    pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Bind SPARQL variables to values; see [`QueryExecutionOptions::with_params`].
+    pub fn params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.core.set_params(params);
+        self
+    }
+
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
+        self
+    }
+
+    /// Enable R2RML/Iceberg support (feature-gated).
+    #[cfg(feature = "iceberg")]
+    pub fn with_r2rml(mut self) -> Self {
+        let shared = Arc::new(crate::graph_source::FlureeR2rmlProvider::new(self.fluree));
+        let provider: Arc<dyn R2rmlProvider + 'a> = shared.clone();
+        let table_provider: Arc<dyn R2rmlTableProvider + 'a> = shared;
+        self.core.r2rml = Some((provider, table_provider));
+        self.core.set_r2rml();
+        self
+    }
+
+    // --- FromQueryBuilder-only setters ---
+
+    /// Set the policy context for this query.
+    ///
+    /// Only available on `FromQueryBuilder` — for view/dataset queries,
+    /// policy is applied at the view level (Tier 1).
+    pub fn policy(mut self, ctx: PolicyContext) -> Self {
+        if self.authorization.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
+        self.policy = Some(Arc::new(ctx));
+        self
+    }
+
+    /// Set connection options carrying policy inputs (identity / policy-class
+    /// / inline policy) that should be resolved into a `PolicyContext`
+    /// *internally*, against the query's own resolved dataset.
+    ///
+    /// This is the programmatic policy channel for **SPARQL**, which carries
+    /// only the pragma subset of JSON-LD's body `opts` (no inline `policy`
+    /// document). When set and the input is SPARQL, execution routes through
+    /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
+    /// `query_connection` opts→policy path), and the request's own
+    /// `# PRAGMA` policy selection is not consulted. For JSON-LD input it is a
+    /// no-op — JSON-LD carries its opts in the body. Takes precedence over
+    /// [`Self::policy`] when both are set.
+    pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
+        self.connection_opts = Some(opts);
+        self
+    }
+
+    /// Bind this request to host-verified policy selection. Caller JSON options,
+    /// source overrides and connection options cannot replace this selection.
+    /// The host must separately authorize every ledger named by the request.
+    pub fn authorization(mut self, authorization: &'a crate::PolicyAuthorization) -> Self {
+        if self.policy.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
+        self.authorization = Some(authorization);
+        self
+    }
+
+    fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        self.adopt_sparql_pragma_policy();
+        let Some(authorization) = self.authorization else {
+            return Ok(None);
+        };
+        self.connection_opts = Some(
+            authorization.constrain_options(
+                self.connection_opts
+                    .as_ref()
+                    .unwrap_or(&GovernanceOptions::default()),
+            ),
+        );
+        if let Some(QueryInput::JsonLd(json)) = self.core.input {
+            let mut json = json.clone();
+            authorization.apply_to_jsonld(&mut json)?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A SPARQL request's policy pragmas stand in for the body `opts` it has
+    /// no room for, unless the caller chose policy programmatically. Under
+    /// [`Self::authorization`] they are constrained like any request selection.
+    fn adopt_sparql_pragma_policy(&mut self) {
+        if self.connection_opts.is_some() || self.policy.is_some() {
+            return;
+        }
+        if let Some(QueryInput::Sparql(sparql)) = self.core.input {
+            let mut opts = GovernanceOptions::from_sparql(sparql);
+            if opts.has_any_policy_inputs() {
+                opts.server_identity = self.core.server_identity().cloned();
+                self.connection_opts = Some(opts);
+            }
+        }
+    }
+
+    // --- Terminal operations ---
+
+    /// Validate builder configuration without executing.
+    pub fn validate(&self) -> std::result::Result<(), BuilderErrors> {
+        let errs = self.core.validate();
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(BuilderErrors(errs))
+        }
+    }
+
+    /// Execute the query and return raw `QueryResult`.
+    ///
+    /// Resolves ledgers from the query body's `from` / `FROM` clauses,
+    /// applies policy if set, and executes.
+    pub async fn execute(mut self) -> Result<QueryResult> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let authorized_json = self.prepare_authorization()?;
+        let mut core = self.core;
+        let r2rml = core.r2rml.take();
+        let execution = core.execution();
+        let input = core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // SPARQL policy via connection opts (multi-query aliases): SPARQL has
+        // no body opts, so the merged envelope/sub opts arrive here. Takes
+        // precedence over `.policy()`; for JSON-LD input it's a no-op.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            return self
+                .fluree
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
+                .await;
+        }
+        match input {
+            QueryInput::JsonLd(json) => match &self.policy {
+                Some(policy) => match r2rml.as_ref() {
+                    Some((provider, table_provider)) => {
+                        self.fluree
+                            .query_connection_with_policy_and_r2rml_options(
+                                json,
+                                policy,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.fluree
+                            .query_connection_with_policy_options(json, policy, execution)
+                            .await
+                    }
+                },
+                None => match r2rml.as_ref() {
+                    Some((provider, table_provider)) => {
+                        self.fluree
+                            .query_connection_jsonld_with_r2rml_options(
+                                json,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.fluree
+                            .query_connection_with_options(json, execution)
+                            .await
+                    }
+                },
+            },
+            QueryInput::Sparql(sparql) => match &self.policy {
+                Some(policy) => match r2rml.as_ref() {
+                    Some((provider, table_provider)) => {
+                        self.fluree
+                            .query_connection_sparql_with_policy_and_r2rml_options(
+                                sparql,
+                                policy,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.fluree
+                            .query_connection_sparql_with_policy_options(sparql, policy, execution)
+                            .await
+                    }
+                },
+                None => match r2rml.as_ref() {
+                    Some((provider, table_provider)) => {
+                        self.fluree
+                            .query_connection_sparql_with_r2rml_options(
+                                sparql,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.fluree
+                            .query_connection_sparql_with_options(sparql, execution)
+                            .await
+                    }
+                },
+            },
+        }
+    }
+
+    /// Execute and return formatted JSON output.
+    ///
+    /// Uses `.format()` config if set, otherwise defaults based on input type
+    /// (JSON-LD for `.jsonld()`, SPARQL JSON for `.sparql()`).
+    pub async fn execute_formatted(self) -> Result<JsonValue> {
+        self.execute_formatted_with_advisories()
+            .await
+            .map(|(json, _)| json)
+    }
+
+    /// [`Self::execute_formatted`], with the query's advisories
+    /// ([`crate::QueryAdvisory`]) alongside the formatted result.
+    pub async fn execute_formatted_with_advisories(
+        mut self,
+    ) -> Result<(JsonValue, Vec<crate::QueryAdvisory>)> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let authorized_json = self.prepare_authorization()?;
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let format_config = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs, so it is routed through R2RML rather than native
+        // hydration (which returns `[]`). `as_jsonld()` borrows `input` (Copy),
+        // leaving it intact for the paths below.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, None, &execution, &format_config)
+                .await?
+            {
+                return Ok((expanded, Vec::new()));
+            }
+        }
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            let result = self
+                .fluree
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
+                .await?;
+            let ast = execution.parse_sparql(sparql, None)?;
+            let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
+                Ok((
+                    result
+                        .format_async(view.as_graph_db_ref(), &format_config)
+                        .await?,
+                    result.advisories.clone(),
+                ))
+            } else {
+                Err(ApiError::query("No graph specified for formatting"))
+            };
+        }
+        match input {
+            QueryInput::JsonLd(json) => {
+                let policy = self.policy.as_deref();
+                let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+                let (result, target) = self
+                    .fluree
+                    .query_connection_jsonld_returning_target_with_options(
+                        json,
+                        policy,
+                        r2rml_pair,
+                        execution.clone(),
+                    )
+                    .await?;
+                match target {
+                    // Multi-ledger: format hydration per home-ledger view so
+                    // cross-graph IRIs/properties decode correctly (issue #1259).
+                    FormatTarget::Dataset(dataset) => Ok((
+                        crate::format::format_results_async_dataset(
+                            &result,
+                            &result.context,
+                            &dataset,
+                            &format_config,
+                            None,
+                        )
+                        .await?,
+                        result.advisories.clone(),
+                    )),
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => Ok((
+                        crate::format::format_results_async(
+                            &result,
+                            &result.context,
+                            view.as_graph_db_ref(),
+                            &format_config,
+                            view.policy(),
+                            None,
+                        )
+                        .await?,
+                        result.advisories.clone(),
+                    )),
+                }
+            }
+            QueryInput::Sparql(sparql) => {
+                let result = match &self.policy {
+                    Some(policy) => match r2rml.as_ref() {
+                        Some((provider, table_provider)) => {
+                            self.fluree
+                                .query_connection_sparql_with_policy_and_r2rml_options(
+                                    sparql,
+                                    policy,
+                                    provider.as_ref(),
+                                    table_provider.as_ref(),
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            self.fluree
+                                .query_connection_sparql_with_policy_options(
+                                    sparql,
+                                    policy,
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                    },
+                    None => match r2rml.as_ref() {
+                        Some((provider, table_provider)) => {
+                            self.fluree
+                                .query_connection_sparql_with_r2rml_options(
+                                    sparql,
+                                    provider.as_ref(),
+                                    table_provider.as_ref(),
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            self.fluree
+                                .query_connection_sparql_with_options(sparql, execution.clone())
+                                .await?
+                        }
+                    },
+                };
+                let ast = execution.parse_sparql(sparql, None)?;
+                let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
+                    Ok((
+                        result
+                            .format_async(view.as_graph_db_ref(), &format_config)
+                            .await?,
+                        result.advisories.clone(),
+                    ))
+                } else {
+                    Err(ApiError::query("No graph specified for formatting"))
+                }
+            }
+        }
+    }
+
+    /// Execute and return formatted string output.
+    ///
+    /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
+    /// For JSON formats: produces serialized JSON string via async formatting
+    /// (supports hydration queries).
+    pub async fn execute_formatted_string(mut self) -> Result<String> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            return Err(ApiError::Builder(BuilderErrors(errs)));
+        }
+
+        let authorized_json = self.prepare_authorization()?;
+        let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution();
+        let format_config = self
+            .core
+            .format
+            .take()
+            .unwrap_or_else(|| self.core.default_format());
+        let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs; serialize the expanded documents to a string to
+        // match this terminal's return type.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, None, &execution, &format_config)
+                .await?
+            {
+                return serde_json::to_string(&expanded).map_err(ApiError::from);
+            }
+        }
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            let result = self
+                .fluree
+                .query_connection_sparql_with_opts_options(
+                    sparql,
+                    qc_opts,
+                    providers(r2rml.as_ref()),
+                    execution.clone(),
+                )
+                .await?;
+            let ast = execution.parse_sparql(sparql, None)?;
+            let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
+                let view = self.fluree.db_or_graph_source_for(alias).await?;
+                crate::format::format_results_string_async(
+                    &result,
+                    &result.context,
+                    view.as_graph_db_ref(),
+                    &format_config,
+                    None,
+                )
+                .await
+                .map_err(ApiError::from)
+            } else {
+                Err(ApiError::query("No graph specified for formatting"))
+            };
+        }
+        match input {
+            QueryInput::JsonLd(json) => {
+                let policy = self.policy.as_deref();
+                let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+                let (result, target) = self
+                    .fluree
+                    .query_connection_jsonld_returning_target_with_options(
+                        json,
+                        policy,
+                        r2rml_pair,
+                        execution.clone(),
+                    )
+                    .await?;
+                match target {
+                    // Multi-ledger: dataset-aware string formatting (issue #1259).
+                    FormatTarget::Dataset(dataset) => {
+                        crate::format::format_results_string_async_dataset(
+                            &result,
+                            &result.context,
+                            &dataset,
+                            &format_config,
+                            None,
+                        )
+                        .await
+                        .map_err(ApiError::from)
+                    }
+                    // Single-ledger: the view the query ran on, so hydration is
+                    // filtered by the policy that filtered the rows.
+                    FormatTarget::Single(view) => crate::format::format_results_string_async(
+                        &result,
+                        &result.context,
+                        view.as_graph_db_ref(),
+                        &format_config,
+                        view.policy(),
+                    )
+                    .await
+                    .map_err(ApiError::from),
+                }
+            }
+            QueryInput::Sparql(sparql) => {
+                let result = match &self.policy {
+                    Some(policy) => match r2rml.as_ref() {
+                        Some((provider, table_provider)) => {
+                            self.fluree
+                                .query_connection_sparql_with_policy_and_r2rml_options(
+                                    sparql,
+                                    policy,
+                                    provider.as_ref(),
+                                    table_provider.as_ref(),
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            self.fluree
+                                .query_connection_sparql_with_policy_options(
+                                    sparql,
+                                    policy,
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                    },
+                    None => match r2rml.as_ref() {
+                        Some((provider, table_provider)) => {
+                            self.fluree
+                                .query_connection_sparql_with_r2rml_options(
+                                    sparql,
+                                    provider.as_ref(),
+                                    table_provider.as_ref(),
+                                    execution.clone(),
+                                )
+                                .await?
+                        }
+                        None => {
+                            self.fluree
+                                .query_connection_sparql_with_options(sparql, execution.clone())
+                                .await?
+                        }
+                    },
+                };
+                let ast = execution.parse_sparql(sparql, None)?;
+                let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
+                    let view = self.fluree.db_or_graph_source_for(alias).await?;
+                    crate::format::format_results_string_async(
+                        &result,
+                        &result.context,
+                        view.as_graph_db_ref(),
+                        &format_config,
+                        None,
+                    )
+                    .await
+                    .map_err(ApiError::from)
+                } else {
+                    Err(ApiError::query("No graph specified for formatting"))
+                }
+            }
+        }
+    }
+
+    /// Execute with tracking (fuel, time, policy stats).
+    ///
+    /// When `.tracking()` or `.track_all()` has been called, the supplied
+    /// `TrackingOptions` are used. Otherwise the connection layer falls back
+    /// to its defaults (JSON-LD reads `opts.meta` / `opts.max-fuel` from the
+    /// query body; SPARQL defaults to all-enabled).
+    pub async fn execute_tracked(
+        mut self,
+    ) -> std::result::Result<TrackedQueryResponse, TrackedErrorResponse> {
+        let errs = self.core.validate();
+        if !errs.is_empty() {
+            let msg = BuilderErrors(errs).to_string();
+            return Err(TrackedErrorResponse::new(400, msg, None));
+        }
+
+        let authorized_json = self
+            .prepare_authorization()
+            .map_err(|e| TrackedErrorResponse::from_api(e, None))?;
+        let r2rml = self.core.r2rml.take();
+        let format_config = self.core.format.take();
+        let tracking = self.core.tracking.take();
+        let execution = self.core.execution();
+        let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // dispatching the tracked query. The crawl records into the request's
+        // tracker (its fuel limit included), so it reports fuel, time and
+        // policy as any tracked query does. Boxed like the dispatch futures
+        // below to keep this frame small (fluree/db#1408).
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            let fc = format_config
+                .clone()
+                .unwrap_or_else(|| self.core.default_format());
+            let tracker = crate::query::helpers::tracked_query_tracker(
+                &QueryInput::JsonLd(json),
+                &tracking,
+                None,
+            );
+            match Box::pin(self.try_expand_crawl(json, r2rml_pair, Some(&tracker), &execution, &fc))
+                .await
+            {
+                Ok(Some(expanded)) => {
+                    return Ok(TrackedQueryResponse::success(expanded, tracker.tally()));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(TrackedErrorResponse::from_api(e, tracker.tally())),
+            }
+        }
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            // Box the dispatched future: this async fn `.await`s one of ~9
+            // large `query_connection_*` futures, and (especially in debug
+            // builds) the compiler stores each awaited sub-future inline in
+            // this fn's state machine rather than overlapping the mutually
+            // exclusive arms. That inflated `execute_tracked`'s stack frame to
+            // ~470 KB, which — stacked with the deep ledger-load / novelty-
+            // rebuild chain — overflowed the default ~2 MB worker stack on a
+            // plain `select *` connection query (fluree/db#1408). Boxing moves
+            // the sub-future's state to the heap so the frame holds only a
+            // pointer.
+            return Box::pin(
+                self.fluree
+                    .query_connection_sparql_tracked_with_opts_options(
+                        sparql,
+                        qc_opts,
+                        format_config,
+                        tracking,
+                        providers(r2rml.as_ref()),
+                        execution.clone(),
+                    ),
+            )
+            .await;
+        }
+        // Dispatch to the chosen `query_connection_*` variant via a separate,
+        // non-inlined fn that RETURNS the boxed future. The large per-arm future
+        // is materialized transiently inside that helper's frame during
+        // `Box::pin`; the helper returns (and its frame is popped) before we
+        // await here, so that transient never coexists on the stack with the
+        // deep query / load / novelty-rebuild chain the future then drives.
+        // Constructed inline here instead, the dispatcher frame would reserve
+        // stack for the largest arm's future for the whole descent — one of the
+        // frames that overflowed the default ~2 MB worker stack on a plain
+        // `select *` connection query (fluree/db#1408).
+        self.dispatch_connection_query(input, format_config, tracking, execution, r2rml.as_ref())
+            .await
+    }
+
+    /// Build the boxed connection-query future for the chosen input / policy /
+    /// r2rml combination (helper for [`execute_tracked`](Self::execute_tracked)).
+    ///
+    /// Returns an already-heap-allocated future so the caller's frame holds only
+    /// a pointer while driving it. `#[inline(never)]` is load-bearing: it keeps
+    /// the transient materialization of the selected (large) arm future in this
+    /// short-lived frame instead of the caller's long-lived one — see the call
+    /// site and fluree/db#1408.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn dispatch_connection_query<'s>(
+        &'s self,
+        input: QueryInput<'s>,
+        format_config: Option<FormatterConfig>,
+        tracking: Option<TrackingOptions>,
+        execution: QueryExecutionOptions,
+        r2rml: Option<&'s (
+            Arc<dyn R2rmlProvider + 'a>,
+            Arc<dyn R2rmlTableProvider + 'a>,
+        )>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<TrackedQueryResponse, TrackedErrorResponse>,
+                > + Send
+                + 's,
+        >,
+    > {
+        // `let`-bind with the trait-object type so each arm's distinct
+        // `impl Future` unsize-coerces to the shared `dyn` future type.
+        let dispatched: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<TrackedQueryResponse, TrackedErrorResponse>,
+                    > + Send
+                    + 's,
+            >,
+        > = match input {
+            QueryInput::JsonLd(json) => match &self.policy {
+                Some(policy) => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
+                        self.fluree
+                            .query_connection_jsonld_tracked_with_policy_and_r2rml_options(
+                                json,
+                                policy,
+                                format_config,
+                                tracking,
+                                crate::R2rmlProviders {
+                                    provider: provider.as_ref(),
+                                    table_provider: table_provider.as_ref(),
+                                },
+                                execution,
+                            ),
+                    ),
+                    None => Box::pin(
+                        self.fluree
+                            .query_connection_jsonld_tracked_with_policy_options(
+                                json,
+                                policy,
+                                format_config,
+                                tracking,
+                                execution,
+                            ),
+                    ),
+                },
+                None => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
+                        self.fluree
+                            .query_connection_jsonld_tracked_with_r2rml_options(
+                                json,
+                                format_config,
+                                tracking,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            ),
+                    ),
+                    None => Box::pin(self.fluree.query_connection_jsonld_tracked_with_options(
+                        json,
+                        format_config,
+                        tracking,
+                        execution,
+                    )),
+                },
+            },
+            QueryInput::Sparql(sparql) => match &self.policy {
+                Some(policy) => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
+                        self.fluree
+                            .query_connection_sparql_tracked_with_policy_and_r2rml_options(
+                                sparql,
+                                policy,
+                                format_config,
+                                tracking,
+                                crate::R2rmlProviders {
+                                    provider: provider.as_ref(),
+                                    table_provider: table_provider.as_ref(),
+                                },
+                                execution,
+                            ),
+                    ),
+                    None => Box::pin(
+                        self.fluree
+                            .query_connection_sparql_tracked_with_policy_options(
+                                sparql,
+                                policy,
+                                format_config,
+                                tracking,
+                                execution,
+                            ),
+                    ),
+                },
+                None => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
+                        self.fluree
+                            .query_connection_sparql_tracked_with_r2rml_options(
+                                sparql,
+                                format_config,
+                                tracking,
+                                provider.as_ref(),
+                                table_provider.as_ref(),
+                                execution,
+                            ),
+                    ),
+                    None => Box::pin(self.fluree.query_connection_sparql_tracked_with_options(
+                        sparql,
+                        format_config,
+                        tracking,
+                        execution,
+                    )),
+                },
+            },
+        };
+        dispatched
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FlureeBuilder;
+    use serde_json::json;
+
+    /// A format that answers with a page of the rows, which the client
+    /// continues with OFFSET (AgentJson under a byte budget), makes the query
+    /// read graph-source tables in one order, however the builder was called:
+    /// `.format()` before or after `.execution_options()`. Other formats, and
+    /// AgentJson without a budget, leave the caller's options as they are.
+    #[test]
+    fn a_paged_format_executes_with_deterministic_scans() {
+        let paged = || FormatterConfig::agent_json().with_max_bytes(1_000);
+        let caller = || QueryExecutionOptions::default().with_trust_fk_refs(true);
+
+        let mut format_first = QueryCore::new();
+        format_first.set_format(paged());
+        format_first.set_execution_options(caller());
+        let mut options_first = QueryCore::new();
+        options_first.set_execution_options(caller());
+        options_first.set_format(paged());
+        for core in [&format_first, &options_first] {
+            let execution = core.execution();
+            assert!(execution.deterministic_scans);
+            assert!(execution.trust_fk_refs, "the caller's options are kept");
+        }
+
+        for format in [
+            None,
+            Some(FormatterConfig::agent_json()),
+            Some(FormatterConfig::jsonld().with_max_bytes(1_000)),
+        ] {
+            let mut core = QueryCore::new();
+            if let Some(format) = format.clone() {
+                core.set_format(format);
+            }
+            assert!(
+                !core.execution().deterministic_scans,
+                "{:?}",
+                format.map(|f| f.format)
+            );
+        }
+    }
+
+    // ========================================================================
+    // Validation tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_core_missing_input() {
+        let core = QueryCore::new();
+        let errs = core.validate();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            BuilderError::Missing { field, .. } => assert_eq!(*field, "input"),
+            _ => panic!("Expected Missing error"),
+        }
+    }
+
+    #[test]
+    fn test_query_core_jsonld_then_sparql_conflict() {
+        let json = json!({"select": ["?s"], "where": [{"@id": "?s"}]});
+        let mut core = QueryCore::new();
+        core.set_jsonld(&json);
+        core.set_sparql("SELECT ?s WHERE { ?s ?p ?o }");
+        let errs = core.validate();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            BuilderError::Conflict { field, .. } => assert_eq!(*field, "input"),
+            _ => panic!("Expected Conflict error"),
+        }
+    }
+
+    #[test]
+    fn test_query_core_sparql_then_jsonld_conflict() {
+        let json = json!({"select": ["?s"]});
+        let mut core = QueryCore::new();
+        core.set_sparql("SELECT ?s WHERE { ?s ?p ?o }");
+        core.set_jsonld(&json);
+        let errs = core.validate();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            BuilderError::Conflict { field, .. } => assert_eq!(*field, "input"),
+            _ => panic!("Expected Conflict error"),
+        }
+    }
+
+    #[test]
+    fn test_query_core_double_jsonld_conflict() {
+        let json1 = json!({"select": ["?s"]});
+        let json2 = json!({"select": ["?o"]});
+        let mut core = QueryCore::new();
+        core.set_jsonld(&json1);
+        core.set_jsonld(&json2);
+        let errs = core.validate();
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            BuilderError::Conflict { field, .. } => assert_eq!(*field, "input"),
+            _ => panic!("Expected Conflict error"),
+        }
+    }
+
+    #[test]
+    fn test_query_core_valid_jsonld() {
+        let json = json!({"select": ["?s"]});
+        let mut core = QueryCore::new();
+        core.set_jsonld(&json);
+        let errs = core.validate();
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn test_query_core_valid_sparql() {
+        let mut core = QueryCore::new();
+        core.set_sparql("SELECT ?s WHERE { ?s ?p ?o }");
+        let errs = core.validate();
+        assert!(errs.is_empty());
+    }
+
+    // ========================================================================
+    // Builder construction tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_view_query_builder_validate_missing_input() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        // We can't create a view without a ledger, so test validate on FromQueryBuilder instead
+        let builder = FromQueryBuilder::new(&fluree);
+        let result = builder.validate();
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert_eq!(errs.0.len(), 1);
+        assert!(matches!(
+            &errs.0[0],
+            BuilderError::Missing { field: "input", .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_from_query_builder_validate_with_input() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let query = json!({
+            "from": "test:main",
+            "select": ["?s"],
+            "where": [{"@id": "?s"}]
+        });
+        let builder = fluree.query_from().jsonld(&query);
+        let result = builder.validate();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_from_query_builder_validate_conflict() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let query = json!({"from": "test:main", "select": ["?s"]});
+        let builder = fluree
+            .query_from()
+            .jsonld(&query)
+            .sparql("SELECT ?s WHERE { ?s ?p ?o }");
+        let result = builder.validate();
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| matches!(e, BuilderError::Conflict { field: "input", .. })));
+    }
+
+    // ========================================================================
+    // Integration tests (requires async runtime)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_view_query_builder_execute() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        // Insert data so the query has something to find
+        let data = json!({"@context": {"ex": "http://example.org/"}, "insert": [{"@id": "ex:a", "ex:name": "Alice"}]});
+        let _result = fluree.update(ledger, &data).await.unwrap();
+
+        let view = fluree.db("testdb:main").await.unwrap();
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s"],
+            "where": [{"@id": "?s", "ex:name": "?name"}]
+        });
+
+        let result = view.query(&fluree).jsonld(&query).execute().await;
+        assert!(
+            result.is_ok(),
+            "ViewQueryBuilder execute failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_view_query_builder_sparql() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let _ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        let view = fluree.db("testdb:main").await.unwrap();
+        let result = view
+            .query(&fluree)
+            .sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .execute()
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_view_query_builder_missing_input_returns_error() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let _ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        let view = fluree.db("testdb:main").await.unwrap();
+        // No .jsonld() or .sparql() call
+        let result = view.query(&fluree).execute().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_from_query_builder_execute() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        // Insert data so the query has something to find
+        let data = json!({"@context": {"ex": "http://example.org/"}, "insert": [{"@id": "ex:a", "ex:name": "Alice"}]});
+        let _result = fluree.update(ledger, &data).await.unwrap();
+
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "testdb:main",
+            "select": ["?s"],
+            "where": [{"@id": "?s", "ex:name": "?name"}]
+        });
+
+        let result = fluree.query_from().jsonld(&query).execute().await;
+        assert!(
+            result.is_ok(),
+            "FromQueryBuilder execute failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_view_query_equivalence_with_convenience() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger("testdb").await.unwrap();
+
+        // Insert some data
+        let data = json!({
+            "@context": {"ex": "http://example.org/"},
+            "insert": [{"@id": "ex:a", "ex:name": "Alice"}]
+        });
+        let result = fluree.update(ledger, &data).await.unwrap();
+        let ledger = result.ledger;
+
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?name"],
+            "where": [{"@id": "?s", "ex:name": "?name"}]
+        });
+
+        // Via direct GraphDb query (preferred single-ledger API)
+        let db = crate::GraphDb::from_ledger_state(&ledger);
+        let result_direct = fluree.query(&db, &query).await.unwrap();
+
+        // Via builder
+        let view = fluree.db("testdb:main").await.unwrap();
+        let result_builder = view.query(&fluree).jsonld(&query).execute().await.unwrap();
+
+        // Both should produce results at the same t
+        assert_eq!(result_direct.t, result_builder.t);
+    }
+}

@@ -1,0 +1,2248 @@
+//! Ledger state combining indexed LedgerSnapshot with novelty overlay
+//!
+//! This crate provides `LedgerState` which combines:
+//! - A persisted `LedgerSnapshot` (the latest indexed state)
+//! - A `Novelty` overlay (uncommitted transactions since the last index)
+//!
+//! Together they provide a consistent view of the ledger at a specific point in time.
+//!
+//! # Types
+//!
+//! - [`LedgerState`] - Live ledger state (mutable, has novelty)
+//! - [`HistoricalLedgerView`] - Read-only view at a specific time (for time-travel)
+//! - [`StagedLedger`] - Staged transactions (uncommitted changes)
+//!
+//! # Example
+//!
+//! ```ignore
+//! use fluree_db_ledger::{LedgerState, HistoricalLedgerView};
+//!
+//! // Load current ledger state
+//! let state = LedgerState::load(&nameservice, "mydb:main", storage).await?;
+//! println!("Ledger at t={}", state.t());
+//!
+//! // Load historical view at t=50
+//! let view = HistoricalLedgerView::load_at(&ns, "mydb:main", storage, 50).await?;
+//! ```
+
+mod error;
+mod historical;
+mod staged;
+
+pub use error::{LedgerError, Result};
+pub use historical::{HeadDrops, HistoricalLedgerView};
+pub use staged::StagedLedger;
+
+use fluree_db_core::{
+    BranchedContentStore, CommitGraphLifecycle, ContentId, ContentStore, DictNovelty, Flake,
+    GraphDbRef, GraphId, LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
+};
+use fluree_db_nameservice::{NameServiceLookup, NsRecord};
+use fluree_db_novelty::{
+    drop_forged_commit_flakes, generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
+    stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id,
+    warn_if_forged_commit_flakes_dropped, Commit, Novelty,
+};
+use futures::StreamExt;
+use std::sync::Arc;
+
+/// Type-erased binary index store for query engine access.
+///
+/// Allows `LedgerState` to carry a `BinaryIndexStore` without
+/// depending on `fluree-db-indexer`. The API layer downcasts to
+/// the concrete type when building `ContextConfig` for queries.
+#[derive(Clone)]
+pub struct TypeErasedStore(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for TypeErasedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypeErasedStore").finish()
+    }
+}
+
+/// Configuration for novelty backpressure.
+///
+/// No `Default` impl — configuration policy (RAM-tiered sizing, env/flag
+/// resolution) lives at the API layer (`fluree-db-api::server_defaults`).
+/// Callers must construct this explicitly so a missing upstream wiring
+/// fails at compile time rather than silently using a hidden default.
+#[derive(Clone, Debug)]
+pub struct IndexConfig {
+    /// Soft threshold — triggers background indexing.
+    pub reindex_min_bytes: usize,
+    /// Hard threshold — blocks new commits until indexed.
+    pub reindex_max_bytes: usize,
+}
+
+/// Temporal metadata of the HEAD commit, tracked in memory so the commit
+/// build path can enforce event-time monotonicity and sticky dual-stamp
+/// emission with integer compares — no per-commit storage reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadTemporal {
+    /// HEAD commit's event time (`Commit.time`) as epoch milliseconds.
+    pub event_time_ms: i64,
+    /// HEAD commit's `db:receivedAt` txn-meta value (epoch milliseconds),
+    /// when present. `Some` means the ledger is in dual-stamp mode: once any
+    /// commit dual-stamps, all subsequent commits must too, so `@recorded:`
+    /// resolution stays exact from the flip point onward.
+    pub received_time_ms: Option<i64>,
+}
+
+impl HeadTemporal {
+    /// Whether the ledger is in sticky dual-stamp mode as of this commit.
+    pub fn dual_stamp(&self) -> bool {
+        self.received_time_ms.is_some()
+    }
+
+    /// Extract from a commit record. `None` when the commit has no
+    /// parseable `time` (legacy or malformed — callers fall back to
+    /// unguarded behavior rather than failing the load).
+    pub fn from_commit(commit: &Commit) -> Option<Self> {
+        let event_time_ms = fluree_db_novelty::iso_to_epoch_ms_opt(commit.time.as_deref()?)?;
+        let received_time_ms = commit.txn_meta.iter().find_map(|e| {
+            if e.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+                && e.predicate_name == fluree_vocab::db::RECEIVED_AT
+            {
+                match e.value {
+                    fluree_db_core::TxnMetaValue::Long(ms) => Some(ms),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+        Some(Self {
+            event_time_ms,
+            received_time_ms,
+        })
+    }
+}
+
+/// Ledger state combining indexed LedgerSnapshot with novelty overlay
+///
+/// Provides a consistent view of the ledger by combining:
+/// - The persisted index (LedgerSnapshot)
+/// - In-memory uncommitted changes (Novelty)
+#[derive(Debug, Clone)]
+pub struct LedgerState {
+    /// The indexed snapshot.
+    ///
+    /// `Arc`-wrapped so cloning a `LedgerState` (and deriving read views /
+    /// query snapshots from it — the per-query hot path) is a cheap refcount
+    /// bump rather than a deep copy of the namespace maps, stats, schema, and
+    /// graph registry. Mutations go through `Arc::make_mut` (copy-on-write),
+    /// which is fine because writers are rare and already serialized.
+    pub snapshot: Arc<LedgerSnapshot>,
+    /// In-memory overlay of uncommitted transactions
+    pub novelty: Arc<Novelty>,
+    /// Dictionary novelty layer for subjects and strings.
+    ///
+    /// Tracks novel dictionary entries introduced since the last index build.
+    /// Populated during commit, read during queries, reset at index application.
+    pub dict_novelty: Arc<DictNovelty>,
+    /// Shared cache of the current RDFS schema hierarchy (subclass /
+    /// subproperty closure over indexed + novelty state). Invalidated by
+    /// `Novelty::schema_epoch`; consumed by SHACL enforcement, policy
+    /// targeting, and rdfs query reasoning. `Arc`-shared so clones and read
+    /// views reuse one entry.
+    pub schema_hierarchy_cache: Arc<fluree_db_core::SchemaHierarchyCache>,
+    /// Cross-transaction compiled-SHACL cache slot. Type-erased (the ledger
+    /// crate stays SHACL-agnostic); owned and downcast by the API layer's
+    /// enforcement path, invalidated via `Novelty::shacl_epoch`. `Arc`-shared
+    /// and carried across commits like the hierarchy cache.
+    pub shacl_compile_cache: Arc<parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
+    /// Ledger-scoped runtime IDs for predicates and datatypes.
+    ///
+    /// Persisted IDs are seeded when a binary index store is attached; novelty-only
+    /// predicate/datatype SIDs are appended here during commit so query planning
+    /// and runtime stats share one stable identity space.
+    pub runtime_small_dicts: Arc<RuntimeSmallDicts>,
+    /// Content identifier of the head commit (identity).
+    ///
+    /// Set during commit (from the computed CID) and during ledger load
+    /// (derived from the commit blob hash).
+    pub head_commit_id: Option<ContentId>,
+    /// Content identifier of the current index root (identity).
+    ///
+    /// Set when an index is applied (from `IndexResult.root_id`) and during
+    /// ledger load (from `NsRecord.index_head_id`).
+    pub head_index_id: Option<ContentId>,
+    /// Nameservice record (if loaded via nameservice)
+    pub ns_record: Option<NsRecord>,
+    /// Type-erased binary index store (concrete type: `Arc<BinaryIndexStore>`).
+    ///
+    /// Set by `Fluree::ledger()` when a binary index is available. Used by
+    /// the query engine to enable `BinaryScanOperator` for IRI resolution.
+    pub binary_store: Option<TypeErasedStore>,
+    /// Type-erased spatial index providers, keyed by predicate IRI.
+    ///
+    /// Each entry is `Arc<dyn SpatialIndexProvider>`. Set by `Fluree::ledger()`
+    /// when spatial indexes are available in the binary index root.
+    pub spatial_indexes: Option<TypeErasedStore>,
+    /// Temporal metadata of the HEAD commit (event time + dual-stamp flag).
+    ///
+    /// `None` means "not yet observed" — the ledger was loaded with no
+    /// novelty walk (index == head), so the commit build path lazily fetches
+    /// the head commit once and caches the result here. Kept current by
+    /// `apply_single_commit` and the commit build path.
+    pub head_temporal: Option<HeadTemporal>,
+}
+
+/// Apply walked commits' graph lifecycles to `snapshot` in commit order — each
+/// commit's drops, then its revivals — given newest first, as walks yield
+/// them, after `apply_envelope_deltas` registered every graph they write.
+/// Returns each dropped graph's latest floor.
+pub(crate) fn apply_commit_lifecycles(
+    snapshot: &mut LedgerSnapshot,
+    newest_first: &[CommitGraphLifecycle],
+) -> std::collections::HashMap<fluree_db_core::GraphId, i64> {
+    let mut floors = std::collections::HashMap::new();
+    for lifecycle in newest_first.iter().rev() {
+        let g_ids = snapshot.graph_registry.graph_ids_of_drops(&lifecycle.drops);
+        snapshot.apply_graph_drops(&g_ids, lifecycle.t);
+        snapshot.revive_graphs(lifecycle.written.iter().map(String::as_str), lifecycle.t);
+        for g_id in g_ids {
+            floors.insert(g_id, lifecycle.t);
+        }
+    }
+    floors
+}
+
+/// Carry the drops `old`, a registry at the head, knows into `new`, the
+/// snapshot of an index root behind that head: the root knows the drops
+/// through its own `t`, the head those after it too. Matched by IRI, since a
+/// rebuilt root may number the graphs differently. A graph dropped after the
+/// root still has what it held before the drop counted in the root's
+/// statistics.
+fn carry_graph_drops(old: &fluree_db_core::GraphRegistry, new: &mut LedgerSnapshot) {
+    if !old.has_drops() {
+        return;
+    }
+    new.graph_registry.merge_graph_drops_by_iri(old);
+    let later = new.graph_registry.dropped_after(new.t);
+    new.forget_graph_stats(&later);
+}
+
+/// Take from `flakes`, committed at `t`, those of a graph a later drop took
+/// (`floors`, by graph), and return them. A drop's own commit writes after
+/// it, so its flakes stay.
+///
+/// Replaying them would show facts the drop took — and, novelty being a set,
+/// would also swallow the same facts written after the drop as restatements.
+pub(crate) fn take_dropped_flakes(
+    flakes: &mut Vec<Flake>,
+    t: i64,
+    floors: &std::collections::HashMap<fluree_db_core::GraphId, i64>,
+    reverse_graph: &std::collections::HashMap<fluree_db_core::Sid, fluree_db_core::GraphId>,
+) -> Vec<Flake> {
+    if !floors.values().any(|floor| t < *floor) {
+        return Vec::new();
+    }
+    let (kept, gone): (Vec<Flake>, Vec<Flake>) =
+        std::mem::take(flakes).into_iter().partition(|flake| {
+            let g_id = match &flake.g {
+                None => fluree_db_core::DEFAULT_GRAPH_ID,
+                Some(g_sid) => match reverse_graph.get(g_sid) {
+                    Some(g_id) => *g_id,
+                    None => return true,
+                },
+            };
+            floors.get(&g_id).is_none_or(|floor| t >= *floor)
+        });
+    *flakes = kept;
+    gone
+}
+
+/// The graph lifecycles of the commits after `index_t` on `head_cid`'s
+/// first-parent line, newest first, read from their envelopes alone.
+pub(crate) async fn window_lifecycles<C: ContentStore + ?Sized>(
+    store: &C,
+    head_cid: &ContentId,
+    index_t: i64,
+) -> Result<Vec<CommitGraphLifecycle>> {
+    let mut lifecycles = Vec::new();
+    let mut next = Some(head_cid.clone());
+    while let Some(cid) = next {
+        let envelope = fluree_db_core::load_commit_envelope_by_id(store, &cid).await?;
+        if envelope.t <= index_t {
+            break;
+        }
+        if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
+            lifecycles.push(CommitGraphLifecycle {
+                t: envelope.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            });
+        }
+        next = envelope.parents.into_iter().next();
+    }
+    Ok(lifecycles)
+}
+
+impl LedgerState {
+    /// Load a ledger from nameservice
+    ///
+    /// This is resilient to missing index - if the nameservice has commits
+    /// but no index yet, it creates a genesis LedgerSnapshot and loads all commits as novelty.
+    pub async fn load(
+        ns: &dyn NameServiceLookup,
+        ledger_id: &str,
+        backend: &StorageBackend,
+    ) -> Result<Self> {
+        let record = ns
+            .lookup(ledger_id)
+            .await?
+            // Backends that tombstone (the raft nameservice keeps serving
+            // retracted records so admin tooling can read the flag) must
+            // not let a dropped ledger LOAD: on the query path, retracted
+            // reads identically to not-found — matching the backends that
+            // hide the record outright. Without this, a raft-mode server
+            // re-loads and serves a dropped ledger the moment its cache
+            // eviction lands.
+            .filter(|r| !r.retracted)
+            .ok_or_else(|| LedgerError::not_found(ledger_id))?;
+        Self::load_record(ns, record, backend).await
+    }
+
+    /// Load the ledger at the heads `record` names, which need not be the
+    /// ones the nameservice holds yet: a writer can build the state it will
+    /// install before publishing the heads that state is at. `ns` is read
+    /// only for a branch's ancestry.
+    pub async fn load_record(
+        ns: &dyn NameServiceLookup,
+        record: NsRecord,
+        backend: &StorageBackend,
+    ) -> Result<Self> {
+        // For branched ledgers, build a recursive content store that falls
+        // back through the branch ancestry DAG. This avoids copying the
+        // commit chain when creating a branch — reads fall through to
+        // ancestor namespaces for pre-branch-point content.
+        if record.source_branch.is_some() {
+            let store = Self::build_branched_store(ns, &record, backend).await?;
+            return Self::load_with_store(store, record).await;
+        }
+
+        let store = backend.content_store(&record.ledger_id);
+        Self::load_with_store(store, record).await
+    }
+
+    /// Build a recursive `BranchedContentStore` by walking the branch ancestry.
+    ///
+    /// Delegates to [`fluree_db_nameservice::build_branched_store`] so the
+    /// ancestry walk lives in one place — `fluree-db-indexer` reaches the
+    /// same logic via the nameservice helpers without taking on a
+    /// `fluree-db-ledger` dependency.
+    pub async fn build_branched_store(
+        ns: &dyn NameServiceLookup,
+        record: &NsRecord,
+        backend: &StorageBackend,
+    ) -> Result<BranchedContentStore> {
+        Ok(fluree_db_nameservice::build_branched_store(backend, ns, record).await?)
+    }
+
+    /// Load ledger state using a given content store.
+    ///
+    /// Shared implementation used by `load` for both regular and branched
+    /// ledgers — the only difference is which `ContentStore` is provided.
+    pub async fn load_with_store<C: ContentStore + Clone + 'static>(
+        store: C,
+        record: NsRecord,
+    ) -> Result<Self> {
+        // Handle missing index (genesis fallback)
+        let (mut snapshot, mut dict_novelty) = match &record.index_head_id {
+            Some(index_cid) => {
+                let root_bytes = store.get(index_cid).await?;
+                let loaded = LedgerSnapshot::from_root(index_cid, &root_bytes)?;
+                let dn = DictNovelty::with_watermarks(
+                    loaded.subject_watermarks.clone(),
+                    loaded.string_watermark,
+                );
+                (loaded, dn)
+            }
+            None => (
+                LedgerSnapshot::genesis(&record.ledger_id),
+                DictNovelty::new_genesis(),
+            ),
+        };
+
+        // Re-stamp canonical ledger_id from the nameservice record.
+        //
+        // The index root bytes can carry the *source* ledger_id when the index
+        // was copied into a new namespace — this happens for branches
+        // (create_branch copies the source's index into the branch's namespace)
+        // and for pack import/clone into a differently-named destination. If
+        // we leave `snapshot.ledger_id` as-is, every subsequent nameservice
+        // lookup via `LedgerState::ledger_id()` would target the source's
+        // record instead of this ledger's, causing spurious CommitConflict
+        // errors on the first write after branching.
+        if snapshot.ledger_id != record.ledger_id {
+            snapshot.ledger_id = record.ledger_id.clone();
+        }
+
+        // Load novelty from commits since index_t
+        let head_commit_id = match &record.commit_head_id {
+            Some(head_cid) if record.commit_t > snapshot.t => {
+                let (novelty_overlay, head_id, head_temporal) = Self::load_novelty(
+                    store,
+                    head_cid,
+                    snapshot.t,
+                    &record.ledger_id,
+                    &mut snapshot,
+                    &mut dict_novelty,
+                )
+                .await?;
+                let head_index_id = record.index_head_id.clone();
+                let mut runtime_small_dicts = RuntimeSmallDicts::new();
+                runtime_small_dicts.populate_from_flakes_iter(
+                    novelty_overlay.iter_flakes(fluree_db_core::IndexType::Post),
+                );
+                return Ok(Self {
+                    snapshot: Arc::new(snapshot),
+                    novelty: Arc::new(novelty_overlay),
+                    dict_novelty: Arc::new(dict_novelty),
+                    schema_hierarchy_cache: Arc::new(
+                        fluree_db_core::SchemaHierarchyCache::default(),
+                    ),
+                    shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
+                    runtime_small_dicts: Arc::new(runtime_small_dicts),
+                    head_commit_id: head_id,
+                    head_index_id,
+                    ns_record: Some(record),
+                    binary_store: None,
+                    spatial_indexes: None,
+                    head_temporal,
+                });
+            }
+            _ => record.commit_head_id.clone(),
+        };
+
+        let head_index_id = record.index_head_id.clone();
+        let novelty_t = snapshot.t;
+        // Nothing after the index: the empty novelty is covered.
+        dict_novelty.mark_covered_through(novelty_t);
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            novelty: Arc::new(Novelty::new(novelty_t)),
+            dict_novelty: Arc::new(dict_novelty),
+            schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
+            shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
+            runtime_small_dicts: Arc::new(RuntimeSmallDicts::new()),
+            head_commit_id,
+            head_index_id,
+            ns_record: Some(record),
+            binary_store: None,
+            spatial_indexes: None,
+            // Index == head: no commit was walked, so the head's temporal
+            // metadata is unknown. The commit build path resolves it lazily
+            // (one head-commit fetch per loaded ledger, only when writing).
+            head_temporal: None,
+        })
+    }
+
+    /// Load novelty from commits since a given index_t.
+    ///
+    /// Walks the first-parent lineage backwards from `head_cid` using the
+    /// content store, collecting flakes for all commits with `t > index_t`.
+    /// Merge parents are not descended into: a merge commit carries the
+    /// folded flakes of the branch it merged, and that branch's commits are
+    /// stamped on its own clock.
+    ///
+    /// Envelope deltas (namespace codes, graph IRIs) are accumulated and applied
+    /// to the snapshot via `apply_envelope_deltas()` after the walk completes.
+    ///
+    /// Returns the novelty overlay, the head commit's ContentId, and the
+    /// head commit's temporal metadata (captured from the first streamed
+    /// commit — the walk is HEAD → oldest).
+    async fn load_novelty<C: ContentStore + Clone + 'static>(
+        store: C,
+        head_cid: &ContentId,
+        index_t: i64,
+        ledger_id: &str,
+        snapshot: &mut LedgerSnapshot,
+        dict_novelty: &mut DictNovelty,
+    ) -> Result<(Novelty, Option<ContentId>, Option<HeadTemporal>)> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut novelty = Novelty::new(index_t);
+        // Accumulate deltas across all commits.
+        // IMPORTANT: trace_commits streams HEAD → oldest (newest first).
+        // Namespace codes use `or_insert` so newer commits win.
+        // Graph IRIs are collected into a set — `apply_delta` dedupes & sorts.
+        let mut merged_ns_delta: HashMap<u16, String> = HashMap::new();
+        let mut all_graph_iris: HashSet<String> = HashSet::new();
+
+        // Deferred batch approach: collect (flakes, commit_t) batches during
+        // the HEAD→oldest walk, then replay oldest→newest after applying deltas.
+        // This is required because per-graph novelty routing needs reverse_graph,
+        // which depends on namespace_codes from apply_envelope_deltas().
+        let mut commit_batches: Vec<(Vec<Flake>, i64)> = Vec::new();
+        // Each commit's drops and the graphs it wrote, newest first like the
+        // walk: applied oldest first once the registry knows every graph.
+        let mut lifecycle: Vec<CommitGraphLifecycle> = Vec::new();
+
+        let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
+        futures::pin_mut!(stream);
+
+        let mut head_temporal: Option<HeadTemporal> = None;
+        let mut first_commit = true;
+        while let Some(result) = stream.next().await {
+            let commit = result?;
+
+            // The stream is HEAD → oldest, so the first commit is the head.
+            if first_commit {
+                head_temporal = HeadTemporal::from_commit(&commit);
+                first_commit = false;
+            }
+
+            // Collect flakes for deferred replay
+            let meta_flakes = generate_commit_flakes(&commit, ledger_id, commit.t);
+            let mut all_flakes = commit.flakes;
+            all_flakes.extend(meta_flakes);
+            commit_batches.push((all_flakes, commit.t));
+
+            // Accumulate ns_delta (newest wins via or_insert)
+            for (code, prefix) in commit.namespace_delta {
+                merged_ns_delta.entry(code).or_insert(prefix);
+            }
+
+            // Collect graph IRIs from graph_delta values
+            if !commit.graph_drops.is_empty() || !commit.graph_delta.is_empty() {
+                lifecycle.push(CommitGraphLifecycle {
+                    t: commit.t,
+                    drops: commit.graph_drops,
+                    written: commit.graph_delta.values().cloned().collect(),
+                });
+            }
+            for iri in commit.graph_delta.into_values() {
+                all_graph_iris.insert(iri);
+            }
+
+            // Extract ns_split_mode (immutable after user namespace allocation).
+            if let Some(mode) = commit.ns_split_mode {
+                snapshot.set_ns_split_mode(mode, commit.t)?;
+            }
+        }
+
+        // Apply all accumulated deltas to the snapshot in one shot.
+        snapshot.apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)?;
+
+        // Then each commit's drops and revivals, in commit order.
+        let floors = apply_commit_lifecycles(snapshot, &lifecycle);
+
+        // Stamp commit metadata flakes with txn-meta graph SID now that
+        // namespace_codes are complete — and, in the same pass, drop any flake
+        // that arrived from a commit *blob* already claiming commit provenance.
+        //
+        // Genuine commit records are regenerated from the envelope above with
+        // `g: None` and acquire the txn-meta Sid here; user transaction
+        // metadata rides the envelope's separate `txn_meta` field. So a blob
+        // flake that is already stamped and already in the `FLUREE_COMMIT`
+        // namespace is forged by construction. It matters because this replay
+        // routes by graph Sid with no index filter, which is what makes such a
+        // record *live* on a replica that has not indexed yet — precisely
+        // where `resolve_commit_prefix` reads. See #1846.
+        //
+        // Skipping the drop when `encode_iri` yields `None` is not fail-open,
+        // despite the shape: the `reverse_graph` seeding a few lines below is
+        // gated on the *same* expression, so a `None` also means no routing
+        // entry for the txn-meta graph Sid exists. A forged flake then has
+        // nowhere to route and cannot reach `TXN_META_GRAPH_ID` — the thing
+        // the drop protects against is unreachable in exactly the case the
+        // drop is skipped. The two must stay gated together; splitting them
+        // would turn this into a real fail-open.
+        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
+        if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
+            for (flakes, t) in &mut commit_batches {
+                let dropped = stamp_commit_flakes_dropping_forgeries(flakes, &g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, ledger_id, *t);
+            }
+        }
+
+        // Build reverse_graph now that namespace_codes and graph_registry are complete.
+        let mut reverse_graph = snapshot.build_reverse_graph()?;
+        // Ensure txn-meta graph is always routable for commit metadata flakes.
+        {
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
+            if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
+                reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
+            }
+        }
+
+        // Replay oldest→newest (walk was HEAD→oldest, so reverse).
+        commit_batches.reverse();
+
+        // A dropped graph's flakes from before its latest drop are not
+        // replayed, as the drop took them from novelty when it committed.
+        // Left in, they would also swallow the same facts written afterwards,
+        // which novelty's set semantics would read as restatements.
+        let mut forgotten: Vec<Flake> = Vec::new();
+        if !floors.is_empty() {
+            for (flakes, t) in &mut commit_batches {
+                forgotten.extend(take_dropped_flakes(flakes, *t, &floors, &reverse_graph));
+            }
+        }
+
+        // Populate dict_novelty in commit order so overlay translation can
+        // resolve IDs for unindexed commits. Doing this before bulk-apply
+        // matches the ordering invariants the per-commit `apply_commit`
+        // path used to provide.
+        for (flakes, _t) in &commit_batches {
+            dict_novelty.populate_from_flakes(flakes);
+        }
+        // A dropped flake's terms stay in the dictionary novelty, as they do
+        // when the drop commits: entries name terms, not facts.
+        dict_novelty.populate_from_flakes(&forgotten);
+
+        // Bulk-load mode: previously this loop called `Novelty::apply_commit`
+        // per commit, whose `merge_batch_into_index` is `O(target+batch)`
+        // per call, accumulating to `O(M·N̄)` over the chain. For a fresh
+        // reindex with thousands of commits that grew to many minutes on
+        // single-CPU lambdas. `bulk_apply_commits` instead does one
+        // identity-key sort + linear set-semantics dedup + four index
+        // sorts, totaling `O(N log N)` regardless of M.
+        novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
+        // Every commit after the index was populated above, oldest first.
+        dict_novelty.mark_covered_through(novelty.t);
+
+        Ok((novelty, Some(head_cid.clone()), head_temporal))
+    }
+
+    /// Create a new ledger state from components
+    pub fn new(snapshot: LedgerSnapshot, novelty: Novelty) -> Self {
+        let mut dict_novelty = DictNovelty::with_watermarks(
+            snapshot.subject_watermarks.clone(),
+            snapshot.string_watermark,
+        );
+        dict_novelty
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
+        dict_novelty.mark_covered_through(novelty.t);
+        let mut runtime_small_dicts = RuntimeSmallDicts::new();
+        runtime_small_dicts
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
+        Self {
+            snapshot: Arc::new(snapshot),
+            novelty: Arc::new(novelty),
+            dict_novelty: Arc::new(dict_novelty),
+            schema_hierarchy_cache: Arc::new(fluree_db_core::SchemaHierarchyCache::default()),
+            shacl_compile_cache: Arc::new(parking_lot::RwLock::new(None)),
+            runtime_small_dicts: Arc::new(runtime_small_dicts),
+            head_commit_id: None,
+            head_index_id: None,
+            ns_record: None,
+            binary_store: None,
+            spatial_indexes: None,
+            head_temporal: None,
+        }
+    }
+
+    /// Resolve the HEAD commit's temporal metadata, fetching the head commit
+    /// once if it wasn't observed during load (index == head, no novelty
+    /// walk). Called by the commit path before building a new commit so the
+    /// event-time monotonicity guard and dual-stamp decision are
+    /// authoritative; at most one storage read per loaded ledger, and only
+    /// when writing — pure readers never pay it.
+    pub async fn ensure_head_temporal<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+    ) -> Result<Option<HeadTemporal>> {
+        if self.head_temporal.is_none() {
+            if let Some(cid) = &self.head_commit_id {
+                let bytes = store.get(cid).await?;
+                let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+                    .map_err(|e| LedgerError::InvalidData(format!("head commit decode: {e}")))?;
+                self.head_temporal = HeadTemporal::from_commit(&commit);
+            }
+        }
+        Ok(self.head_temporal)
+    }
+
+    /// Get the current transaction time (max of index and novelty)
+    pub fn t(&self) -> i64 {
+        self.novelty.t.max(self.snapshot.t)
+    }
+
+    /// Get the indexed transaction time
+    pub fn index_t(&self) -> i64 {
+        self.snapshot.t
+    }
+
+    /// Get the ledger ID
+    pub fn ledger_id(&self) -> &fluree_db_core::LedgerId {
+        &self.snapshot.ledger_id
+    }
+
+    /// Check if novelty is at max capacity (should block new commits)
+    pub fn at_max_novelty(&self, config: &IndexConfig) -> bool {
+        self.novelty.size >= config.reindex_max_bytes
+    }
+
+    /// Check if novelty should trigger background indexing
+    pub fn should_reindex(&self, config: &IndexConfig) -> bool {
+        self.novelty.size >= config.reindex_min_bytes
+    }
+
+    /// Create a `GraphDbRef` bundling snapshot, graph id, overlay, and time.
+    ///
+    /// `t` is set to `max(novelty.t, snapshot.t)` — the correct upper bound
+    /// including all committed flakes.
+    pub fn as_graph_db_ref(&self, g_id: GraphId) -> GraphDbRef<'_> {
+        GraphDbRef::new(&self.snapshot, g_id, &*self.novelty, self.t())
+            .with_runtime_small_dicts(&self.runtime_small_dicts)
+    }
+
+    /// Get the novelty size in bytes
+    pub fn novelty_size(&self) -> usize {
+        self.novelty.size
+    }
+
+    /// Get the novelty epoch
+    pub fn epoch(&self) -> u64 {
+        self.novelty.epoch
+    }
+
+    /// Get a reference to the novelty overlay
+    pub fn novelty(&self) -> &Arc<Novelty> {
+        &self.novelty
+    }
+
+    /// Get current stats (indexed + novelty merged)
+    ///
+    /// Always returns an IndexStats, even for genesis/no-index ledgers.
+    /// Falls back to default stats and applies novelty deltas.
+    ///
+    /// This is the canonical way to get up-to-date statistics for a ledger,
+    /// as it includes both the indexed stats and any uncommitted changes
+    /// from the novelty layer.
+    pub fn current_stats(&self) -> fluree_db_core::IndexStats {
+        let indexed = self.snapshot.stats.clone().unwrap_or_default(); // IndexStats::default() for genesis/no-index
+        fluree_db_novelty::current_stats(&indexed, self.novelty.as_ref())
+    }
+
+    /// Apply a new index, updating LedgerSnapshot and pruning novelty
+    ///
+    /// # Semantics
+    ///
+    /// - The loaded LedgerSnapshot's `t` represents `index_t` (time the index is current through)
+    /// - Accepts if `new_index_t > current_index_t` (forward progress)
+    /// - Allows `new_index_t <= commit_t` (index catching up to commits)
+    /// - Equal-t with different CID: ignored (no-op) for now
+    /// - Prunes novelty up to `new_index_t`
+    ///
+    /// # Arguments
+    ///
+    /// * `index_id` - Content identifier of the new index root
+    ///
+    /// # Errors
+    ///
+    /// - `LedgerIdMismatch` if the new index is for a different ledger
+    /// - `StaleIndex` if the new index is older than the current index
+    /// - `Core` errors from loading the index
+    pub async fn apply_index(&mut self, index_id: &ContentId, cs: &dyn ContentStore) -> Result<()> {
+        let root_bytes = cs.get(index_id).await?;
+        let mut new_snapshot = LedgerSnapshot::from_root(index_id, &root_bytes)?;
+
+        // Verify ledger ID matches
+        if new_snapshot.ledger_id != self.snapshot.ledger_id {
+            return Err(LedgerError::ledger_id_mismatch(
+                &new_snapshot.ledger_id,
+                &self.snapshot.ledger_id,
+            ));
+        }
+
+        // Verify forward progress on index
+        let current_index_t = self.snapshot.t;
+        if new_snapshot.t < current_index_t {
+            return Err(LedgerError::stale_index(new_snapshot.t, current_index_t));
+        }
+        if new_snapshot.t == current_index_t {
+            // Equal-t: ignore (defer tie-break by hash to multi-indexer phase)
+            return Ok(());
+        }
+
+        // Clear novelty up to new index_t
+        let mut new_novelty = (*self.novelty).clone();
+        new_novelty.clear_up_to(new_snapshot.t);
+
+        // Reset dict_novelty with new watermarks from the index root
+        let mut new_dict_novelty = DictNovelty::with_watermarks(
+            new_snapshot.subject_watermarks.clone(),
+            new_snapshot.string_watermark,
+        );
+        // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
+        // so overlay translation can resolve newly-introduced subject/string IDs.
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        if has_remaining_novelty {
+            new_dict_novelty.populate_from_flakes_iter(
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
+            );
+        }
+        new_dict_novelty.mark_covered_through(new_novelty.t);
+
+        let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
+        if has_remaining_novelty {
+            new_runtime_small_dicts.populate_from_flakes_iter(
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
+            );
+        }
+
+        // Update state
+        carry_graph_drops(&self.snapshot.graph_registry, &mut new_snapshot);
+        self.snapshot = Arc::new(new_snapshot);
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
+        self.dict_novelty = Arc::new(new_dict_novelty);
+        self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
+        self.head_index_id = Some(index_id.clone());
+
+        // Update ns_record
+        if let Some(ref mut record) = self.ns_record {
+            record.index_head_id = Some(index_id.clone());
+            record.index_t = self.snapshot.t;
+        }
+
+        Ok(())
+    }
+
+    /// Apply a pre-loaded LedgerSnapshot as the new index.
+    ///
+    /// Same validation as `apply_index()` but takes an already-loaded LedgerSnapshot,
+    /// avoiding the storage I/O call. This enables the API level to:
+    /// 1. Read root bytes once
+    /// 2. Load `BinaryIndexStore` and attach `BinaryRangeProvider` to the LedgerSnapshot
+    /// 3. Apply the enriched LedgerSnapshot here in a brief, non-async swap
+    ///
+    /// The caller is responsible for ensuring the LedgerSnapshot has `range_provider` set
+    /// if it's a binary-only (v2) LedgerSnapshot.
+    pub fn apply_loaded_db(
+        &mut self,
+        new_snapshot: LedgerSnapshot,
+        index_id: Option<&ContentId>,
+    ) -> Result<()> {
+        // Verify ledger ID matches
+        if new_snapshot.ledger_id != self.snapshot.ledger_id {
+            return Err(LedgerError::ledger_id_mismatch(
+                &new_snapshot.ledger_id,
+                &self.snapshot.ledger_id,
+            ));
+        }
+
+        // Verify forward progress on index
+        let current_index_t = self.snapshot.t;
+        if new_snapshot.t < current_index_t {
+            return Err(LedgerError::stale_index(new_snapshot.t, current_index_t));
+        }
+        if new_snapshot.t == current_index_t {
+            return Ok(());
+        }
+
+        let phase = fluree_db_core::clock::Instant::now();
+        // Clear novelty up to new index_t
+        let mut new_novelty = (*self.novelty).clone();
+        new_novelty.clear_up_to(new_snapshot.t);
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        let novelty_us = phase.elapsed().as_micros() as u64;
+        let phase = fluree_db_core::clock::Instant::now();
+
+        // Preserve namespace codes and graph IRIs from commits still in novelty.
+        // The new snapshot from the index root only has codes/IRIs up to index_t.
+        // Post-index commits may have introduced new ones that the remaining
+        // novelty flakes still reference for encoding/decoding and graph routing.
+        let mut merged_snapshot = new_snapshot;
+        if has_remaining_novelty {
+            // Collect old graph IRIs before moving self.snapshot
+            let old_graph_iris: Vec<String> = self
+                .snapshot
+                .graph_registry
+                .iter_entries()
+                .map(|(_, iri)| iri.to_string())
+                .collect();
+
+            // Merge namespace codes: old entries not in new → carried forward.
+            // The new root's table is what the old one was at the index
+            // point, and codes are only ever added, so the old table is a
+            // superset and the entries to carry are exactly the extras.
+            // Nothing to do when the sizes agree; otherwise only the old
+            // entries above the new table's highest code can be missing —
+            // which keeps this proportional to the post-index commits, not
+            // to a ledger's tens of thousands of namespaces.
+            let old_codes = self.snapshot.namespaces();
+            if old_codes.len() != merged_snapshot.namespaces().len() {
+                let new_max = merged_snapshot
+                    .namespaces()
+                    .keys()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                for (code, prefix) in old_codes {
+                    if *code > new_max && !merged_snapshot.namespaces().contains_key(code) {
+                        merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                    }
+                }
+                // A table that still disagrees carries codes below the
+                // new maximum; take the slow path once rather than lose them.
+                if merged_snapshot.namespaces().len() != old_codes.len() {
+                    for (code, prefix) in old_codes {
+                        if !merged_snapshot.namespaces().contains_key(code) {
+                            merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                        }
+                    }
+                }
+            }
+
+            // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
+            merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
+        }
+        carry_graph_drops(&self.snapshot.graph_registry, &mut merged_snapshot);
+        // The old snapshot goes first: its range provider holds the
+        // dictionary novelty, and while it lives the retire below would copy
+        // the whole dictionary instead of trimming it in place.
+        self.snapshot = Arc::new(merged_snapshot);
+        // Freeing the flakes the trim dropped, often most of novelty, is the
+        // costliest part of an install when nothing else holds them, and it
+        // needs no lock: let a background thread do it.
+        drop_off_thread(std::mem::replace(&mut self.novelty, Arc::new(new_novelty)));
+        let merge_us = phase.elapsed().as_micros() as u64;
+        let phase = fluree_db_core::clock::Instant::now();
+
+        // The dictionary novelty: drop what the indexed commits introduced and
+        // renumber the rest above the new watermarks. A dictionary that
+        // cannot be trimmed (a placeholder, a layer) is rebuilt from the
+        // remaining flakes. Mutated through the field itself: a clone taken
+        // first would be a second reference, and the whole dictionary would
+        // be copied on every install whether or not a reader holds it.
+        let dict_shared = Arc::strong_count(&self.dict_novelty) > 1;
+        let retired = Arc::make_mut(&mut self.dict_novelty).retire_seen_through(
+            self.snapshot.t,
+            &self.snapshot.subject_watermarks,
+            self.snapshot.string_watermark,
+        );
+        let new_runtime_small_dicts = match retired {
+            Some(_) => Arc::clone(&self.runtime_small_dicts),
+            None => {
+                let mut rebuilt = DictNovelty::with_watermarks(
+                    self.snapshot.subject_watermarks.clone(),
+                    self.snapshot.string_watermark,
+                );
+                let mut runtime = RuntimeSmallDicts::new();
+                if has_remaining_novelty {
+                    rebuilt.populate_from_flakes_iter(
+                        self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
+                    );
+                    runtime.populate_from_flakes_iter(
+                        self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
+                    );
+                }
+                rebuilt.mark_covered_through(self.novelty.t);
+                self.dict_novelty = Arc::new(rebuilt);
+                Arc::new(runtime)
+            }
+        };
+        tracing::debug!(
+            target: "fluree::write_path",
+            ledger_id = %self.ledger_id(),
+            index_t = self.snapshot.t,
+            novelty_us,
+            merge_us,
+            retire_us = phase.elapsed().as_micros() as u64,
+            dict_shared,
+            ?retired,
+            "index install phases"
+        );
+
+        // Update state
+        self.runtime_small_dicts = new_runtime_small_dicts;
+        self.head_index_id = index_id.cloned();
+
+        // Update ns_record
+        if let Some(ref mut record) = self.ns_record {
+            record.index_head_id = index_id.cloned();
+            record.index_t = self.snapshot.t;
+        }
+
+        Ok(())
+    }
+
+    /// Overlay staged flakes as committed novelty at `t()+1` WITHOUT a
+    /// commit record — the in-memory "virtual commit" used by sequential
+    /// multi-operation SPARQL UPDATE staging (SPARQL 1.1 Update §3.1:
+    /// operation N+1's WHERE must observe operation N's effects, while the
+    /// whole request commits as ONE atomic commit — roadmap D-10).
+    ///
+    /// Applies the namespace/graph envelope deltas first so IRIs and named
+    /// graphs the flakes introduce resolve during the next operation's
+    /// staging, then routes the flakes into novelty exactly like a commit
+    /// apply (minus commit metadata, head identity, and temporal stamping).
+    ///
+    /// The resulting state is a **transient staging view only**: it carries
+    /// uncommitted data in novelty and must never be published, committed
+    /// from, or cached as the ledger's live state.
+    /// Plan this state's queries from `stats` (see
+    /// [`fluree_db_novelty::Novelty::pin_planner_stats`]).
+    pub fn pin_planner_stats(&mut self, stats: Arc<fluree_db_core::StatsView>) {
+        Arc::make_mut(&mut self.novelty).pin_planner_stats(stats);
+    }
+
+    pub fn apply_staged_flakes_for_sequential_staging(
+        &mut self,
+        flakes: Vec<Flake>,
+        ns_delta: &std::collections::HashMap<u16, String>,
+        graph_iris: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<()> {
+        // Envelope deltas first: novelty routing below and the next
+        // operation's WHERE/IRI encoding both need the new namespaces and
+        // graph registrations. Applied even when `flakes` is empty (an op
+        // whose WHERE matched nothing still established its allocations).
+        Arc::make_mut(&mut self.snapshot).apply_envelope_deltas(ns_delta, graph_iris)?;
+
+        if flakes.is_empty() {
+            return Ok(());
+        }
+
+        let next_t = self.t() + 1;
+        let reverse_graph = self.snapshot.build_reverse_graph()?;
+
+        // Validate the batch before mutating: `apply_commit` is atomic, but
+        // dict/small-dict population below is not — keep the all-or-nothing
+        // shape `apply_single_commit` provides.
+        self.novelty.can_apply(&flakes, &reverse_graph)?;
+
+        let covered = self.dict_novelty.covers(self.novelty.t);
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
+        Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
+        Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
+
+        Ok(())
+    }
+
+    /// Apply a commit's graph drops at `t`, ahead of its own flakes (see
+    /// `Commit::graph_drops`): the registry marks them, their index
+    /// statistics go, and novelty forgets every flake they hold and every
+    /// annotation of their edges.
+    ///
+    /// What the index holds of them is left to the caller, which owns the
+    /// store type: `fluree_db_transact::hide_dropped_graphs` swaps in a store
+    /// without them.
+    pub fn apply_graph_drops(&mut self, g_ids: &[fluree_db_core::GraphId], t: i64) {
+        if g_ids.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.snapshot).apply_graph_drops(g_ids, t);
+        let novelty = Arc::make_mut(&mut self.novelty);
+        novelty.drop_graphs(g_ids);
+        if novelty.attachments.has_annotations() {
+            let graphs: Vec<Option<fluree_db_core::Sid>> = g_ids
+                .iter()
+                .filter_map(|g_id| {
+                    if *g_id == fluree_db_core::DEFAULT_GRAPH_ID {
+                        return Some(None);
+                    }
+                    let iri = self.snapshot.graph_registry.iri_for_graph_id(*g_id)?;
+                    self.snapshot.encode_iri(iri).map(Some)
+                })
+                .collect();
+            novelty.attachments.forget_graphs(&graphs);
+        }
+    }
+
+    /// Record that a commit at `t` wrote `graph_iris` after its drops: each
+    /// dropped graph among them exists again. Leaves the snapshot unshared
+    /// when none is dropped, which is nearly always.
+    pub fn revive_graphs<'a>(
+        &mut self,
+        graph_iris: impl IntoIterator<Item = &'a str> + Clone,
+        t: i64,
+    ) {
+        if self
+            .snapshot
+            .graph_registry
+            .would_revive(graph_iris.clone())
+        {
+            Arc::make_mut(&mut self.snapshot).revive_graphs(graph_iris, t);
+        }
+    }
+
+    /// Apply a commit's drops, then the revivals its graph delta records,
+    /// ahead of its flakes. The caller must register the envelope's graphs
+    /// first and hide dropped graphs from its concrete index store afterward.
+    /// Shared by peer catch-up and commit transfer.
+    pub fn apply_commit_graph_lifecycle(&mut self, commit: &Commit) {
+        let dropped = self
+            .snapshot
+            .graph_registry
+            .graph_ids_of_drops(&commit.graph_drops);
+        self.apply_graph_drops(&dropped, commit.t);
+        self.revive_graphs(commit.graph_delta.values().map(String::as_str), commit.t);
+    }
+
+    /// Apply a single commit to the existing ledger state (incremental update).
+    ///
+    /// This is the fast path for `UpdatePlan::CommitCatchUp` — loads one commit's
+    /// flakes and merges them into the existing novelty without re-walking the
+    /// entire commit chain.
+    ///
+    /// Reuses the same delta-accumulation logic as `load_novelty()` but for a
+    /// single commit, avoiding the stream/batch machinery.
+    pub fn apply_single_commit(&mut self, commit: Commit, ledger_id: &str) -> Result<()> {
+        let commit_t = commit.t;
+        let current_t = self.t();
+
+        // Guard: commit must have a valid CID
+        let commit_id = commit.id.clone().ok_or_else(|| {
+            LedgerError::InvalidData(format!(
+                "Cannot apply commit at t={commit_t}: missing content ID"
+            ))
+        })?;
+
+        // Guard: commit.t must be exactly current_t + 1 (monotonic, no gaps)
+        if commit_t != current_t + 1 {
+            return Err(LedgerError::InvalidData(format!(
+                "Cannot apply commit at t={commit_t}: expected t={}, current t={current_t}",
+                current_t + 1
+            )));
+        }
+
+        // Event time should be monotonically non-decreasing along the chain, so
+        // `@iso:`/`@recorded:` resolution stays exact. This is the *replay* path
+        // (incremental catch-up over already-durable commits): the build path
+        // (`resolve_commit_times`) rejects a *new* commit that violates this, but
+        // here the history is immutable and may predate the invariant (a pre-PR
+        // ledger with an NTP step-back or a raft leadership handoff between
+        // skewed clocks). Wedging catch-up can't fix history it can't change, so
+        // warn and continue — resolution across such a point may be approximate.
+        // (The full-reload path has no guard either; this keeps them consistent.)
+        let commit_temporal = HeadTemporal::from_commit(&commit);
+        if let (Some(prev), Some(new)) = (self.head_temporal, commit_temporal) {
+            if new.event_time_ms < prev.event_time_ms {
+                tracing::warn!(
+                    commit_t,
+                    new_event_time_ms = new.event_time_ms,
+                    prev_event_time_ms = prev.event_time_ms,
+                    "applying commit whose event time predates the head; wall-clock \
+                     (@iso:/@recorded:) resolution may be approximate across this point"
+                );
+            }
+            if prev.dual_stamp() && !new.dual_stamp() {
+                tracing::warn!(
+                    commit_t,
+                    "applying a post-flip commit without db:receivedAt; @recorded: \
+                     resolution may be approximate across this point"
+                );
+            }
+        }
+
+        // Apply ns_split_mode first (immutable after user namespace allocation).
+        // Must happen before apply_envelope_deltas so that a genesis commit
+        // declaring a non-default mode doesn't fail the immutability check
+        // when its namespace codes are inserted under the wrong mode.
+        if let Some(mode) = commit.ns_split_mode {
+            Arc::make_mut(&mut self.snapshot).set_ns_split_mode(mode, commit_t)?;
+        }
+
+        // Apply namespace + graph deltas to snapshot
+        Arc::make_mut(&mut self.snapshot)
+            .apply_envelope_deltas(&commit.namespace_delta, commit.graph_delta.values())?;
+        // Then the commit's drops, ahead of its own flakes, and the dropped
+        // graphs it writes again.
+        self.apply_commit_graph_lifecycle(&commit);
+
+        // Generate commit metadata flakes
+        let mut meta_flakes = generate_commit_flakes(&commit, ledger_id, commit_t);
+
+        // Stamp txn-meta graph SID on metadata flakes
+        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
+        if let Some(g_sid) = self.snapshot.encode_iri(&txn_meta_iri) {
+            stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
+        }
+
+        // Combine data flakes + metadata flakes. The blob's own flakes are
+        // screened first: a flake claiming commit provenance cannot have come
+        // from any legitimate writer (see `load_novelty` above, and #1846).
+        let mut all_flakes = commit.flakes;
+        if let Some(g_sid) = self.snapshot.encode_iri(&txn_meta_iri) {
+            let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
+            warn_if_forged_commit_flakes_dropped(dropped, ledger_id, commit_t);
+        }
+        all_flakes.extend(meta_flakes);
+
+        // Build reverse_graph for per-graph novelty routing
+        let mut reverse_graph = self.snapshot.build_reverse_graph()?;
+        // Ensure txn-meta graph is always routable
+        if let Some(g_sid) = self.snapshot.encode_iri(&txn_meta_iri) {
+            reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
+        }
+
+        // Validate the batch before mutating any state: this state may be the
+        // live, cache-shared ledger under a write lock, so a routing/overflow
+        // error must not leave it partially updated. After can_apply succeeds the
+        // in-place extends below are all infallible, restoring the all-or-nothing
+        // semantics the previous clone-then-swap provided — without the clone.
+        self.novelty.can_apply(&all_flakes, &reverse_graph)?;
+
+        // Ownership probe: if a range provider is still attached it co-holds Arc
+        // clones of these dicts (strong_count >= 2) and the `make_mut` below
+        // deep-clones them every commit — the O(novelty) post-reindex regression.
+        // The caller (LedgerManager commit loop) detaches the provider before this
+        // runs, so the steady-state count should be 1. Debug-level + dedicated
+        // target (`RUST_LOG=fluree::cow_probe=debug`) so it stays silent otherwise.
+        tracing::debug!(
+            target: "fluree::cow_probe",
+            dict_novelty_strong = Arc::strong_count(&self.dict_novelty),
+            runtime_small_dicts_strong = Arc::strong_count(&self.runtime_small_dicts),
+            provider_attached = self.snapshot.range_provider.is_some(),
+            "apply_single_commit dict ownership before make_mut"
+        );
+
+        // Extend dict_novelty / small dicts / novelty in place when this state
+        // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
+        // cache still holds the prior Arc. Matches the snapshot handling above and
+        // avoids the unconditional deep clone the previous clone-then-swap forced.
+        let covered = self.dict_novelty.covers(self.novelty.t);
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
+        Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
+        Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        if covered {
+            Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
+
+        // Update state
+        self.head_commit_id = Some(commit_id.clone());
+        if commit_temporal.is_some() {
+            self.head_temporal = commit_temporal;
+        }
+
+        // Update ns_record
+        if let Some(ref mut record) = self.ns_record {
+            record.commit_head_id = Some(commit_id);
+            record.commit_t = commit_t;
+        }
+
+        Ok(())
+    }
+
+    /// Check nameservice for newer index and apply if available
+    ///
+    /// Returns `true` if a newer index was applied, `false` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if the ledger is not in the nameservice
+    /// - `MissingIndexAddress` if nameservice has index_t but no index CID
+    /// - Other errors from `apply_index`
+    pub async fn maybe_apply_newer_index(
+        &mut self,
+        ns: &dyn NameServiceLookup,
+        cs: &dyn ContentStore,
+    ) -> Result<bool> {
+        let record = ns
+            .lookup(&self.snapshot.ledger_id)
+            .await?
+            .ok_or_else(|| LedgerError::not_found(&self.snapshot.ledger_id))?;
+
+        // Only apply if there's a newer index AND it has a CID
+        if record.index_t > self.snapshot.t {
+            let index_id = record.index_head_id.as_ref().ok_or_else(|| {
+                LedgerError::missing_index_id(&self.snapshot.ledger_id, record.index_t)
+            })?;
+            self.apply_index(index_id, cs).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Check if indexing should be triggered and return the alias if so
+    ///
+    /// This is a convenience method for use after committing transactions.
+    /// It checks if novelty has exceeded the soft threshold (reindex_min_bytes)
+    /// and returns `Some(alias)` if indexing should be triggered.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After committing a transaction:
+    /// if let Some(alias) = ledger.maybe_trigger_index(&index_config) {
+    ///     // Trigger background indexing
+    ///     indexer_handle.trigger(alias);
+    /// }
+    /// ```
+    ///
+    /// For blocking scenarios where indexing must complete before proceeding,
+    /// check `at_max_novelty()` instead and wait for indexing to complete.
+    pub fn maybe_trigger_index(&self, config: &IndexConfig) -> Option<&str> {
+        if self.should_reindex(config) {
+            Some(self.ledger_id())
+        } else {
+            None
+        }
+    }
+
+    /// Check if at max novelty and return alias for blocking scenarios
+    ///
+    /// This is for use in blocking scenarios where a commit should wait
+    /// for indexing to complete before proceeding.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Before committing when novelty is at max:
+    /// if let Some(alias) = ledger.require_index(&index_config) {
+    ///     // Trigger and wait for indexing
+    ///     let result = indexer_handle.trigger_and_wait(alias).await?;
+    ///     ledger.apply_index(&result.root_id, &content_store).await?;
+    /// }
+    /// ```
+    pub fn require_index(&self, config: &IndexConfig) -> Option<&str> {
+        if self.at_max_novelty(config) {
+            Some(self.ledger_id())
+        } else {
+            None
+        }
+    }
+}
+
+/// Drop `value` on a short-lived thread, so the caller (holding a ledger
+/// lock) does not pay for freeing it. Dropped in place where threads are
+/// unavailable or cannot be spawned.
+fn drop_off_thread<T: Send + 'static>(value: T) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // A failed spawn hands the closure, and so `value`, back to be dropped.
+        let _ = std::thread::Builder::new()
+            .name("fluree-drop".into())
+            .spawn(move || drop(value));
+    }
+    #[cfg(target_arch = "wasm32")]
+    drop(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::{
+        content_store_for, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
+    };
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use std::collections::HashMap;
+
+    fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
+        Flake::new(
+            Sid::new(s, format!("s{s}")),
+            Sid::new(p, format!("p{p}")),
+            FlakeValue::Long(o),
+            Sid::new(2, "long"),
+            t,
+            true,
+            None,
+        )
+    }
+
+    /// Helper: build minimal FIR6 root bytes for testing.
+    ///
+    /// This must be decodable by `fluree_db_core::LedgerSnapshot::from_root_bytes()`,
+    /// which parses FIR6 metadata beyond the header (namespace table, dict refs,
+    /// watermarks, routing tables, etc.). We therefore include the full required
+    /// FIR6 metadata *skeleton* with empty counts for all variable-length sections.
+    fn build_test_fir6(ledger_id: &str, index_t: i64) -> Vec<u8> {
+        build_test_fir6_with_base(ledger_id, index_t, 0)
+    }
+
+    /// Variant of `build_test_fir6` that lets callers vary `base_t`.
+    /// Used by `test_apply_index_equal_t_noop` to produce two FIR6
+    /// blobs with the same `index_t` but different CIDs without
+    /// resorting to trailing-byte padding (which the strict
+    /// `FIR6: trailing bytes after the last section` check rejects).
+    fn build_test_fir6_with_base(ledger_id: &str, index_t: i64, base_t: i64) -> Vec<u8> {
+        // Mirror `fluree-db-core::db::decode_fir6_metadata` exactly.
+        // The decoder now enforces a strict trailing-byte check
+        // (`FIR6: trailing bytes after the last section`), so any
+        // section that doesn't exactly match what the decoder reads
+        // will surface either as truncation or trailing-byte error.
+        // Keep this skeleton in lockstep with the decoder.
+        let mut buf = Vec::with_capacity(128);
+        // ---- header ----
+        buf.extend_from_slice(b"FIR6"); // magic (4)
+        buf.push(1); // version (1)
+        buf.push(0); // flags (1) — no optional sections
+        buf.extend_from_slice(&0u16.to_le_bytes()); // pad (2)
+        buf.extend_from_slice(&index_t.to_le_bytes()); // index_t (8)
+        buf.extend_from_slice(&base_t.to_le_bytes()); // base_t (8)
+                                                      // ledger_id (u16 length prefix + UTF-8 bytes)
+        let lid = ledger_id.as_bytes();
+        buf.extend_from_slice(&(lid.len() as u16).to_le_bytes());
+        buf.extend_from_slice(lid);
+
+        // ---- metadata skeleton, all empty ----
+        buf.push(0); // subject_id_encoding (u8)
+        buf.push(0); // ns_split_mode_byte (u8) — decoder requires this
+
+        buf.extend_from_slice(&0u16.to_le_bytes()); // ns_count = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // pred_count = 0
+
+        // graph_iris / datatype_iris / language_tags: string arrays (u16 count + entries)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // graph_iris = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // datatype_iris = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // language_tags = 0
+
+        // skip_dict_pack_refs: string forward packs sp_count + subject forward packs ns_count
+        buf.extend_from_slice(&0u16.to_le_bytes()); // string pack sp_count = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // subject pack ns_count = 0
+
+        // skip_dict_tree_refs (subject reverse): branch CID (u16 len + bytes) + leaf_count u32
+        buf.extend_from_slice(&0u16.to_le_bytes()); // branch CID len = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count = 0
+
+        // skip_dict_tree_refs (string reverse): same shape
+        buf.extend_from_slice(&0u16.to_le_bytes()); // branch CID len = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count = 0
+
+        // per-graph specialty arenas: arena_count = 0
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        // watermarks
+        buf.extend_from_slice(&0u16.to_le_bytes()); // wm_count = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // string_watermark = 0
+
+        // cumulative commit stats (3 × u64)
+        buf.extend_from_slice(&0u64.to_le_bytes()); // total_commit_size
+        buf.extend_from_slice(&0u64.to_le_bytes()); // total_asserts
+        buf.extend_from_slice(&0u64.to_le_bytes()); // total_retracts
+
+        // o_type table
+        buf.extend_from_slice(&0u32.to_le_bytes()); // otype_count = 0
+
+        // default graph routing
+        buf.push(0); // default_order_count = 0
+
+        // named graph routing
+        buf.extend_from_slice(&0u16.to_le_bytes()); // named_count = 0
+
+        // No optional sections (flags=0); no annotation_index section.
+        // The strict trailing-byte check requires exactly zero bytes
+        // beyond this point.
+
+        buf
+    }
+
+    /// Helper: store FIR6 root bytes via the content store and return the CID.
+    async fn store_index_root(storage: &MemoryStorage, ledger_id: &str, index_t: i64) -> ContentId {
+        let store = content_store_for(storage.clone(), ledger_id);
+        let bytes = build_test_fir6(ledger_id, index_t);
+        store.put(ContentKind::IndexRoot, &bytes).await.unwrap()
+    }
+
+    /// Helper: store a commit blob via the content store and return the CID.
+    async fn store_commit(
+        storage: &MemoryStorage,
+        ledger_id: &str,
+        commit: &fluree_db_novelty::Commit,
+    ) -> ContentId {
+        let store = content_store_for(storage.clone(), ledger_id);
+        let blob = fluree_db_core::commit::codec::write_commit(commit, false, None).unwrap();
+        store.put(ContentKind::Commit, &blob.bytes).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ledger_state_new() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1)], 1, &HashMap::new())
+            .unwrap();
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        assert_eq!(state.ledger_id(), "test:main");
+        assert_eq!(state.index_t(), 0);
+        assert_eq!(state.t(), 1);
+        assert_eq!(state.epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ledger_state_backpressure() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        let mut novelty = Novelty::new(0);
+        // Add some flakes to increase size
+        for i in 0..100 {
+            novelty
+                .apply_commit(vec![make_flake(i, 1, i as i64, 1)], 1, &HashMap::new())
+                .unwrap();
+        }
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        let small_config = IndexConfig {
+            reindex_min_bytes: 100,
+            reindex_max_bytes: 1000,
+        };
+
+        assert!(state.novelty_size() > 0);
+        assert!(state.should_reindex(&small_config));
+        assert!(state.at_max_novelty(&small_config));
+    }
+
+    #[tokio::test]
+    async fn test_ledger_state_load_genesis() {
+        use fluree_db_nameservice::{CasResult, RefPublisher, RefValue};
+
+        async fn publish_commit(ns: &impl RefPublisher, ledger_id: &str, t: i64, cid: &ContentId) {
+            let new = RefValue {
+                id: Some(cid.clone()),
+                t,
+            };
+            match ns.fast_forward_commit(ledger_id, &new, 3).await.unwrap() {
+                CasResult::Updated => {}
+                CasResult::Conflict { actual } => {
+                    assert!(
+                        actual.as_ref().map(|r| r.t).unwrap_or(0) >= t,
+                        "unexpected commit publish conflict: {actual:?}"
+                    );
+                }
+            }
+        }
+
+        let ns = MemoryNameService::new();
+        let storage = MemoryStorage::new();
+
+        // Create a commit and store it via CAS
+        let commit = fluree_db_novelty::Commit::new(1, vec![make_flake(1, 1, 100, 1)]);
+        let cid = store_commit(&storage, "test:main", &commit).await;
+
+        // Publish to nameservice (no index)
+        publish_commit(&ns, "test:main", 1, &cid).await;
+
+        // Load ledger - should use genesis since no index exists
+        let backend = StorageBackend::Managed(std::sync::Arc::new(storage));
+        let state = LedgerState::load(&ns, "test:main", &backend).await.unwrap();
+
+        assert_eq!(state.ledger_id(), "test:main");
+        assert_eq!(state.index_t(), 0); // Genesis
+        assert_eq!(state.t(), 1); // From commit
+                                  // 1 data flake + 6 commit metadata flakes (db#address, db#alias, db#t, db#asserts, db#retracts, db#size)
+        assert_eq!(state.novelty.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_apply_index_success() {
+        use fluree_db_core::IndexType;
+
+        let storage = MemoryStorage::new();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        // Create novelty with flakes at t=1 and t=2
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1)], 1, &HashMap::new())
+            .unwrap();
+        novelty
+            .apply_commit(vec![make_flake(2, 1, 200, 2)], 2, &HashMap::new())
+            .unwrap();
+
+        let mut state = LedgerState::new(snapshot, novelty);
+        assert_eq!(state.index_t(), 0);
+        // Check active flakes via index iterator (arena has 2, and 2 are active)
+        assert_eq!(state.novelty.iter_index(IndexType::Spot).count(), 2);
+
+        // Create an FIR6 index root at t=1 and store via CAS
+        let index_cid = store_index_root(&storage, "test:main", 1).await;
+        let store = content_store_for(storage.clone(), "test:main");
+
+        // Apply the index
+        state.apply_index(&index_cid, &store).await.unwrap();
+
+        // Index should now be at t=1
+        assert_eq!(state.index_t(), 1);
+        // Novelty at t=1 should be cleared, only t=2 remains in the index vectors
+        // (arena still has 2 flakes but only 1 is active)
+        assert_eq!(state.novelty.iter_index(IndexType::Spot).count(), 1);
+    }
+
+    #[test]
+    fn test_apply_loaded_db_repopulates_dict_novelty_for_remaining_overlay_strings() {
+        use fluree_db_core::IndexType;
+
+        // Scenario:
+        // - Index exists at t=1 with string watermark=1
+        // - Two commits happen: t=2 adds string "a" (becomes id=2), t=3 adds string "b" (id=3)
+        // - A newer index arrives at t=2 (string watermark=2) but commit t=3 remains in novelty
+        // - apply_loaded_db must reset watermarks AND repopulate DictNovelty from remaining novelty
+        //   so string id 3 is still resolvable (otherwise decode fails with "string id 3 not found").
+
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        snapshot.string_watermark = 1;
+
+        let mut state = LedgerState::new(snapshot, Novelty::new(1));
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+
+        let s = Sid::new(0, "ex:s");
+        let p = Sid::new(0, "ex:p");
+        let dt = Sid::new(2, "string"); // xsd:string (default namespace codes)
+
+        let flakes_t2 = vec![Flake::new(
+            s.clone(),
+            p.clone(),
+            FlakeValue::String("a".to_string()),
+            dt.clone(),
+            2,
+            true,
+            None,
+        )];
+        Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes_t2);
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t2, 2, &reverse_graph)
+            .unwrap();
+
+        let flakes_t3 = vec![Flake::new(
+            s,
+            p,
+            FlakeValue::String("b".to_string()),
+            dt,
+            3,
+            true,
+            None,
+        )];
+        Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes_t3);
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t3, 3, &reverse_graph)
+            .unwrap();
+
+        // Sanity: both novelty strings exist before applying the new index.
+        assert_eq!(state.dict_novelty.strings.find_string("a"), Some(2));
+        assert_eq!(state.dict_novelty.strings.find_string("b"), Some(3));
+        assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+
+        // Apply a newer index snapshot at t=2 (string watermark=2), leaving commit t=3 in novelty.
+        let mut new_snapshot = LedgerSnapshot::genesis("test:main");
+        new_snapshot.t = 2;
+        new_snapshot.string_watermark = 2;
+        state.apply_loaded_db(new_snapshot, None).unwrap();
+
+        // Novelty at t<=2 cleared; t=3 remains active.
+        assert_eq!(state.novelty.iter_index(IndexType::Spot).count(), 1);
+
+        // Regression assertion:
+        // With watermark=2, the remaining novelty string must still resolve at id=3.
+        // Before the fix, apply_loaded_db reset dict_novelty and lost this mapping.
+        assert_eq!(state.dict_novelty.strings.watermark(), 2);
+        assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_index_address_mismatch() {
+        let storage = MemoryStorage::new();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+
+        let mut state = LedgerState::new(snapshot, novelty);
+
+        // Create an FIR6 root for a different ledger, but store under test:main's CAS space
+        let bytes = build_test_fir6("other:ledger", 1);
+        let store = content_store_for(storage.clone(), "test:main");
+        let index_cid = store.put(ContentKind::IndexRoot, &bytes).await.unwrap();
+
+        // Should fail with ledger ID mismatch
+        let result = state.apply_index(&index_cid, &store).await;
+        assert!(matches!(result, Err(LedgerError::LedgerIdMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_apply_index_stale() {
+        let storage = MemoryStorage::new();
+
+        // Create an FIR6 root at t=2
+        let index_cid_t2 = store_index_root(&storage, "test:main", 2).await;
+
+        // Load the LedgerSnapshot from CAS for current state
+        let store = content_store_for(storage.clone(), "test:main");
+        let root_bytes = store.get(&index_cid_t2).await.unwrap();
+        let snapshot = LedgerSnapshot::from_root_bytes(&root_bytes).unwrap();
+        let novelty = Novelty::new(2);
+        let mut state = LedgerState::new(snapshot, novelty);
+        assert_eq!(state.index_t(), 2);
+
+        // Create an older FIR6 root at t=1
+        let index_cid_t1 = store_index_root(&storage, "test:main", 1).await;
+
+        // Should fail with stale index error
+        let cs = content_store_for(storage.clone(), "test:main");
+        let result = state.apply_index(&index_cid_t1, &cs).await;
+        assert!(matches!(result, Err(LedgerError::StaleIndex { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_apply_index_equal_t_noop() {
+        let storage = MemoryStorage::new();
+
+        // Create an FIR6 root at t=1
+        let index_cid = store_index_root(&storage, "test:main", 1).await;
+
+        // Load LedgerSnapshot from CAS
+        let store = content_store_for(storage.clone(), "test:main");
+        let root_bytes = store.get(&index_cid).await.unwrap();
+        let snapshot = LedgerSnapshot::from_root_bytes(&root_bytes).unwrap();
+        let novelty = Novelty::new(1);
+        let mut state = LedgerState::new(snapshot, novelty);
+
+        // Create another FIR6 root at same index_t but a different
+        // base_t so the bytes differ (and so does the CID). We can't
+        // append trailing bytes — the FIR6 decoder enforces strict
+        // trailing-byte validation now.
+        let store2 = content_store_for(storage.clone(), "test:main");
+        let bytes2 = build_test_fir6_with_base("test:main", 1, /* base_t */ 7);
+        let index_cid_same = store2.put(ContentKind::IndexRoot, &bytes2).await.unwrap();
+
+        // Should succeed as no-op (equal t)
+        let cs = content_store_for(storage.clone(), "test:main");
+        let result = state.apply_index(&index_cid_same, &cs).await;
+        assert!(result.is_ok());
+        // Index_t should still be 1
+        assert_eq!(state.index_t(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_trigger_index_below_threshold() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        let config = IndexConfig {
+            reindex_min_bytes: 1000,
+            reindex_max_bytes: 10000,
+        };
+
+        // No data, so below threshold
+        let result = state.maybe_trigger_index(&config);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_trigger_index_above_threshold() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        // Add some flakes to increase size
+        let mut novelty = Novelty::new(0);
+        for i in 0..100 {
+            novelty
+                .apply_commit(vec![make_flake(i, 1, i as i64, 1)], 1, &HashMap::new())
+                .unwrap();
+        }
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        let config = IndexConfig {
+            reindex_min_bytes: 100, // Low threshold to trigger
+            reindex_max_bytes: 10000,
+        };
+
+        // Above min threshold
+        let result = state.maybe_trigger_index(&config);
+        assert_eq!(result, Some("test:main"));
+    }
+
+    #[tokio::test]
+    async fn test_require_index_below_max() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        let mut novelty = Novelty::new(0);
+        for i in 0..10 {
+            novelty
+                .apply_commit(vec![make_flake(i, 1, i as i64, 1)], 1, &HashMap::new())
+                .unwrap();
+        }
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        let config = IndexConfig {
+            reindex_min_bytes: 100,
+            reindex_max_bytes: 10000, // High max threshold
+        };
+
+        // Below max threshold - should not require
+        let result = state.require_index(&config);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_require_index_at_max() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        let mut novelty = Novelty::new(0);
+        for i in 0..100 {
+            novelty
+                .apply_commit(vec![make_flake(i, 1, i as i64, 1)], 1, &HashMap::new())
+                .unwrap();
+        }
+
+        let state = LedgerState::new(snapshot, novelty);
+
+        let config = IndexConfig {
+            reindex_min_bytes: 100,
+            reindex_max_bytes: 100, // Low max threshold to trigger
+        };
+
+        // Above max threshold - should require
+        let result = state.require_index(&config);
+        assert_eq!(result, Some("test:main"));
+    }
+
+    // ========================================================================
+    // apply_single_commit tests
+    // ========================================================================
+
+    fn make_test_commit_id(label: &str) -> ContentId {
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    #[test]
+    fn test_apply_single_commit_happy_path() {
+        use fluree_db_core::IndexType;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+        assert_eq!(state.t(), 0);
+
+        // Build a commit at t=1
+        let commit = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"));
+
+        state.apply_single_commit(commit, "test:main").unwrap();
+
+        assert_eq!(state.t(), 1);
+        assert_eq!(state.head_commit_id, Some(make_test_commit_id("commit:1")));
+        // Should have at least our data flake plus commit metadata flakes
+        assert!(state.novelty.iter_index(IndexType::Spot).count() >= 1);
+    }
+
+    #[test]
+    fn test_apply_single_commit_multiple_sequential() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Apply t=1
+        let c1 = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"));
+        state.apply_single_commit(c1, "test:main").unwrap();
+        assert_eq!(state.t(), 1);
+
+        // Apply t=2
+        let c2 = Commit::new(2, vec![make_flake(11, 1, 200, 2)])
+            .with_id(make_test_commit_id("commit:2"));
+        state.apply_single_commit(c2, "test:main").unwrap();
+        assert_eq!(state.t(), 2);
+        assert_eq!(state.head_commit_id, Some(make_test_commit_id("commit:2")));
+    }
+
+    #[test]
+    fn test_apply_single_commit_rejects_missing_cid() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Commit without an id
+        let commit = Commit::new(1, vec![make_flake(10, 1, 100, 1)]);
+        let result = state.apply_single_commit(commit, "test:main");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LedgerError::InvalidData(_)),
+            "expected InvalidData, got: {err}"
+        );
+        assert!(err.to_string().contains("missing content ID"));
+        // State should not have changed
+        assert_eq!(state.t(), 0);
+    }
+
+    #[test]
+    fn test_apply_single_commit_tolerates_backwards_event_time() {
+        // Replay/catch-up over already-durable commits must not wedge on a
+        // non-monotonic event time (clock skew / pre-invariant history). The
+        // build path rejects new violations; this path warns and continues.
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        let c1 = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"))
+            .with_time("2026-01-02T00:00:00Z");
+        state.apply_single_commit(c1, "test:main").unwrap();
+
+        // c2's event time steps backwards relative to c1 — must still apply.
+        let c2 = Commit::new(2, vec![make_flake(11, 1, 200, 2)])
+            .with_id(make_test_commit_id("commit:2"))
+            .with_time("2026-01-01T00:00:00Z");
+        state
+            .apply_single_commit(c2, "test:main")
+            .expect("replay must tolerate a backwards event time");
+        assert_eq!(state.t(), 2);
+    }
+
+    #[test]
+    fn test_apply_single_commit_rejects_non_monotonic_skip() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Try to apply t=3 when current is t=0 (should be t=1)
+        let commit = Commit::new(3, vec![make_flake(10, 1, 100, 3)])
+            .with_id(make_test_commit_id("commit:3"));
+        let result = state.apply_single_commit(commit, "test:main");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LedgerError::InvalidData(_)),
+            "expected InvalidData, got: {err}"
+        );
+        assert!(err.to_string().contains("expected t=1"));
+        assert_eq!(state.t(), 0);
+    }
+
+    #[test]
+    fn test_apply_single_commit_rejects_duplicate_t() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Apply t=1 successfully
+        let c1 = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"));
+        state.apply_single_commit(c1, "test:main").unwrap();
+
+        // Try to apply t=1 again
+        let c1_dup = Commit::new(1, vec![make_flake(11, 1, 200, 1)])
+            .with_id(make_test_commit_id("commit:1-dup"));
+        let result = state.apply_single_commit(c1_dup, "test:main");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected t=2"));
+        assert_eq!(state.t(), 1); // unchanged
+    }
+
+    #[test]
+    fn test_apply_single_commit_updates_ns_record() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Set up an ns_record
+        state.ns_record = Some(NsRecord::new("test:main"));
+
+        let commit = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"));
+        state.apply_single_commit(commit, "test:main").unwrap();
+
+        let record = state.ns_record.as_ref().unwrap();
+        assert_eq!(record.commit_t, 1);
+        assert_eq!(record.commit_head_id, Some(make_test_commit_id("commit:1")));
+    }
+
+    #[test]
+    fn test_apply_single_commit_with_namespace_delta() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Commit that introduces a new namespace code
+        let mut ns_delta = HashMap::new();
+        ns_delta.insert(100u16, "http://example.org/ns/".to_string());
+
+        let mut commit = Commit::new(1, vec![make_flake(10, 1, 100, 1)])
+            .with_id(make_test_commit_id("commit:1"))
+            .with_namespace_delta(ns_delta);
+        // Also add a graph_delta to test graph routing
+        commit
+            .graph_delta
+            .insert(3, "http://example.org/graph/test".to_string());
+
+        state.apply_single_commit(commit, "test:main").unwrap();
+
+        // Namespace code should be in snapshot
+        assert_eq!(
+            state.snapshot.namespaces().get(&100),
+            Some(&"http://example.org/ns/".to_string())
+        );
+        // Graph should be registered
+        assert!(state
+            .snapshot
+            .graph_registry
+            .iter_entries()
+            .any(|(_, iri)| iri == "http://example.org/graph/test"));
+    }
+
+    /// An index publish drops the dictionary entries the indexed commits
+    /// introduced, keeps the rest resolvable above the new watermarks, and
+    /// leaves the runtime dictionaries alone.
+    #[test]
+    fn apply_loaded_db_retires_indexed_dictionary_entries() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        snapshot.string_watermark = 1;
+        let mut state = LedgerState::new(snapshot, Novelty::new(1));
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let (s, p, dt) = (
+            Sid::new(0, "ex:s"),
+            Sid::new(0, "ex:p"),
+            Sid::new(2, "string"),
+        );
+        let flake = |o: &str, t: i64| {
+            Flake::new(
+                s.clone(),
+                p.clone(),
+                FlakeValue::String(o.to_string()),
+                dt.clone(),
+                t,
+                true,
+                None,
+            )
+        };
+        // Deliberately out of commit order: the retire keys on each entry's
+        // own commit, not on ids.
+        for (o, t) in [("b", 3), ("a", 2)] {
+            let flakes = vec![flake(o, t)];
+            Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes);
+            Arc::make_mut(&mut state.novelty)
+                .apply_commit(flakes, t, &reverse_graph)
+                .unwrap();
+        }
+        assert_eq!(state.dict_novelty.strings.find_string("b"), Some(2));
+        assert_eq!(state.dict_novelty.strings.find_string("a"), Some(3));
+
+        // Index at t=2: it persisted "ex:s" (local id 1) and "a" (string 2).
+        let mut indexed = LedgerSnapshot::genesis("test:main");
+        indexed.t = 2;
+        indexed.subject_watermarks = vec![1];
+        indexed.string_watermark = 2;
+        state.apply_loaded_db(indexed, None).unwrap();
+
+        assert_eq!(state.dict_novelty.subjects.find_subject(0, "ex:s"), None);
+        assert_eq!(state.dict_novelty.strings.find_string("a"), None);
+        assert_eq!(
+            state.dict_novelty.strings.find_string("b"),
+            Some(3),
+            "kept above the new watermark"
+        );
+        assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+        assert_eq!(state.dict_novelty.strings.watermark(), 2);
+        assert_eq!(state.index_t(), 2);
+        assert_eq!(
+            state
+                .novelty
+                .iter_index(fluree_db_core::IndexType::Spot)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_apply_single_commit_populates_dict_novelty() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Commit with a string flake
+        let s = Sid::new(0, "ex:s1");
+        let p = Sid::new(0, "ex:p1");
+        let dt = Sid::new(2, "string");
+        let flake = Flake::new(
+            s,
+            p,
+            FlakeValue::String("hello world".to_string()),
+            dt,
+            1,
+            true,
+            None,
+        );
+
+        let commit = Commit::new(1, vec![flake]).with_id(make_test_commit_id("commit:1"));
+        state.apply_single_commit(commit, "test:main").unwrap();
+
+        // dict_novelty should have the string
+        assert!(state
+            .dict_novelty
+            .strings
+            .find_string("hello world")
+            .is_some());
+    }
+
+    // ========================================================================
+    // apply_loaded_db envelope delta preservation tests
+    // ========================================================================
+
+    #[test]
+    fn test_apply_loaded_db_preserves_namespace_codes_from_remaining_novelty() {
+        // Scenario:
+        // - Genesis snapshot has default namespace codes
+        // - Commit at t=1 introduces namespace code 100 → "http://example.org/ns/"
+        // - Commit at t=2 adds data using that namespace
+        // - An index arrives at t=1 (new snapshot without code 100)
+        // - After apply_loaded_db, code 100 must still be in snapshot for t=2 novelty
+
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 0;
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Simulate commit t=1: add namespace code + flake
+        Arc::make_mut(&mut state.snapshot)
+            .insert_namespace_code(100, "http://example.org/ns/".to_string())
+            .unwrap();
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let flakes_t1 = vec![make_flake(10, 1, 100, 1)];
+        Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes_t1);
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t1, 1, &reverse_graph)
+            .unwrap();
+
+        // Simulate commit t=2: another flake
+        let flakes_t2 = vec![make_flake(11, 1, 200, 2)];
+        Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes_t2);
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t2, 2, &reverse_graph)
+            .unwrap();
+
+        assert_eq!(state.t(), 2);
+
+        // Apply index at t=1 — new snapshot won't have code 100
+        let mut new_snapshot = LedgerSnapshot::genesis("test:main");
+        new_snapshot.t = 1;
+        state.apply_loaded_db(new_snapshot, None).unwrap();
+
+        // Novelty at t=1 cleared, t=2 remains
+        assert_eq!(state.index_t(), 1);
+
+        // Key assertion: namespace code 100 must be preserved because
+        // remaining novelty (t=2) may reference subjects/predicates using it
+        assert_eq!(
+            state.snapshot.namespaces().get(&100),
+            Some(&"http://example.org/ns/".to_string()),
+            "namespace code from post-index commit should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_apply_loaded_db_preserves_graph_iris_from_remaining_novelty() {
+        use fluree_db_core::IndexType;
+
+        // Scenario:
+        // - Commit at t=1 introduces a named graph "http://example.org/graph/test"
+        // - Commit at t=2 adds data to that graph
+        // - Index arrives at t=1 (new snapshot without the custom graph)
+        // - After apply_loaded_db, the graph must still be registered for t=2 routing
+
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 0;
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Register a custom graph in the old snapshot (simulating commit t=1)
+        let graph_iri = "http://example.org/graph/test";
+        Arc::make_mut(&mut state.snapshot)
+            .graph_registry
+            .apply_delta(&[graph_iri.to_string()]);
+
+        // Verify graph was registered
+        let has_graph_before = state
+            .snapshot
+            .graph_registry
+            .iter_entries()
+            .any(|(_, iri)| iri == graph_iri);
+        assert!(has_graph_before, "graph should be registered before index");
+
+        // Add novelty at t=1 and t=2
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let flakes_t1 = vec![make_flake(10, 1, 100, 1)];
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t1, 1, &reverse_graph)
+            .unwrap();
+        let flakes_t2 = vec![make_flake(11, 1, 200, 2)];
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t2, 2, &reverse_graph)
+            .unwrap();
+
+        // Apply index at t=1 — new snapshot won't have the custom graph
+        let mut new_snapshot = LedgerSnapshot::genesis("test:main");
+        new_snapshot.t = 1;
+        state.apply_loaded_db(new_snapshot, None).unwrap();
+
+        // Remaining novelty at t=2 exists
+        assert_eq!(state.novelty.iter_index(IndexType::Spot).count(), 1);
+
+        // Key assertion: graph IRI must survive for t=2 routing
+        let has_graph_after = state
+            .snapshot
+            .graph_registry
+            .iter_entries()
+            .any(|(_, iri)| iri == graph_iri);
+        assert!(
+            has_graph_after,
+            "graph IRI from post-index commit should be preserved in registry"
+        );
+    }
+
+    #[test]
+    fn test_apply_loaded_db_does_not_merge_when_novelty_empty() {
+        use fluree_db_core::IndexType;
+
+        // When all novelty is absorbed by the new index, no merging of old
+        // snapshot namespace codes/graph IRIs should occur.
+
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 0;
+        let mut state = LedgerState::new(snapshot, Novelty::new(0));
+
+        // Add custom namespace to old snapshot
+        Arc::make_mut(&mut state.snapshot)
+            .insert_namespace_code(200, "http://old.example.org/".to_string())
+            .unwrap();
+
+        // Add novelty at t=1 only
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let flakes_t1 = vec![make_flake(10, 1, 100, 1)];
+        Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes_t1, 1, &reverse_graph)
+            .unwrap();
+
+        // Apply index at t=1 — absorbs all novelty
+        let mut new_snapshot = LedgerSnapshot::genesis("test:main");
+        new_snapshot.t = 1;
+        state.apply_loaded_db(new_snapshot, None).unwrap();
+
+        // All novelty at t<=1 should be cleared (no active flakes remain)
+        assert_eq!(
+            state.novelty.iter_index(IndexType::Spot).count(),
+            0,
+            "all novelty should be absorbed by the index"
+        );
+
+        // Old namespace code 200 should NOT be carried forward since
+        // there's no remaining novelty that needs it
+        assert!(
+            !state.snapshot.namespaces().contains_key(&200),
+            "old namespace codes should not leak into new snapshot when novelty is empty"
+        );
+    }
+
+    /// A rebuilt root numbers the graphs as it met them, which need not be
+    /// the order the state registered them in: the drops the state knows go
+    /// to the same graphs by IRI.
+    #[test]
+    fn installing_a_renumbered_root_keeps_drops_on_their_graphs() {
+        let (a, z) = ("http://example.org/a", "http://example.org/z");
+        let mut state = LedgerState::new(LedgerSnapshot::genesis("test:main"), Novelty::new(0));
+        let snapshot = Arc::make_mut(&mut state.snapshot);
+        snapshot.graph_registry.apply_delta([a, z]);
+        let dropped = snapshot.graph_registry.assigned_graph_id(a).unwrap();
+        snapshot.apply_graph_drops(&[dropped], 2);
+
+        let mut rebuilt = LedgerSnapshot::genesis("test:main");
+        rebuilt.t = 1;
+        rebuilt.graph_registry.apply_delta([z]);
+        rebuilt.graph_registry.apply_delta([a]);
+        state.apply_loaded_db(rebuilt, None).unwrap();
+
+        let registry = &state.snapshot.graph_registry;
+        assert!(registry.is_dropped(registry.assigned_graph_id(a).unwrap()));
+        assert!(!registry.is_dropped(registry.assigned_graph_id(z).unwrap()));
+    }
+}

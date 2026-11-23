@@ -1,0 +1,4130 @@
+//! Connection-level ledger state caching
+//!
+//! Provides `LedgerManager` for caching loaded ledger state across queries and transactions.
+//! This enables:
+//! - Reusing cached ledger state (no reload per request)
+//! - Freshness checking with pluggable watermark sources
+//! - Idle eviction to manage memory
+//! - Single-flight loading (concurrent requests share one I/O operation)
+//!
+//! # Architecture
+//!
+//! - `LedgerHandle`: Cheap cloneable reference to cached ledger state
+//! - `LedgerManager`: Connection-level cache with single-flight loading
+//! - `FreshnessSource`: Trait for sources that provide remote watermark info
+//!
+//! # Thread Safety
+//!
+//! - Queries get cheap clones via `snapshot()` (brief lock, then released)
+//! - Transactions serialize via `lock_for_write()` (hold lock for stage+commit)
+//! - Manager lock is released during I/O (no blocking other ledgers)
+
+use fluree_db_core::clock::Instant;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use std::path::PathBuf;
+
+use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
+use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
+use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::ledger_config::LedgerConfig;
+use fluree_db_core::trace_first_parent_commits_by_id;
+use fluree_db_core::{ContentId, ContentStore, LedgerId, Sid, StorageBackend};
+use fluree_db_ledger::{LedgerState, TypeErasedStore};
+use fluree_db_nameservice::NsRecord;
+use rustc_hash::FxHashSet;
+use std::collections::VecDeque;
+use tokio::sync::{oneshot, RwLock};
+
+use crate::error::{ApiError, Result};
+use crate::ledger_view::{GraphNames, LedgerView};
+
+// ============================================================================
+// Monotonic Clock for Eviction
+// ============================================================================
+
+/// Global process start time for monotonic timing
+///
+/// Using `Instant` avoids issues with NTP clock adjustments that can affect
+/// `SystemTime`. All eviction TTL calculations are based on elapsed time
+/// from this anchor point.
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Get monotonic seconds since process start
+///
+/// Returns elapsed seconds from a fixed anchor point, avoiding NTP drift.
+fn monotonic_secs() -> u64 {
+    let start = PROCESS_START.get_or_init(Instant::now);
+    start.elapsed().as_secs()
+}
+
+// ============================================================================
+// LedgerWriteGuard - Holds mutex for transaction duration
+// ============================================================================
+
+/// Write guard that holds the ledger mutex for transaction duration
+///
+/// Transactions hold this guard across stage+commit to serialize writes
+/// to the same ledger.
+pub struct LedgerWriteGuard {
+    ledger: LedgerHandle,
+    guard: tokio::sync::OwnedRwLockWriteGuard<LedgerState>,
+    _writer: tokio::sync::OwnedMutexGuard<()>,
+    acquired: Instant,
+}
+
+impl LedgerWriteGuard {
+    /// Get the ledger whose write lock this guard holds.
+    pub fn ledger(&self) -> &LedgerHandle {
+        &self.ledger
+    }
+
+    /// Start a new line for the state this guard is about to install, which
+    /// is not a commit on the cached line (a rebase's result): an index
+    /// install planned on the old line is then not made on it.
+    pub(crate) fn start_line(&mut self) {
+        self.ledger
+            .inner
+            .line
+            .store(Line::fresh(), Ordering::Release);
+    }
+
+    /// Get reference to current state
+    pub fn state(&self) -> &LedgerState {
+        &self.guard
+    }
+
+    /// How long this guard has held the ledger's write lock.
+    pub fn held_for(&self) -> Duration {
+        self.acquired.elapsed()
+    }
+
+    /// Clone current state for passing to stage (which consumes by value)
+    pub fn clone_state(&self) -> LedgerState {
+        self.guard.clone()
+    }
+
+    /// Clone current state to stage a transaction on, after the tiered
+    /// compaction a query [`LedgerHandle::snapshot`] runs. Staging reads
+    /// novelty — a DELETE's WHERE, an upsert's prior values — and each read
+    /// searches every segment, so a writer that never queries would stage
+    /// against one segment per commit since the last index.
+    pub fn clone_state_for_staging(&mut self) -> LedgerState {
+        let tier_width = self.ledger.inner.tier_width.load(Ordering::Relaxed);
+        compact_novelty(&mut self.guard, tier_width, "staging");
+        self.guard.clone()
+    }
+
+    /// Get mutable reference to current state for in-place updates
+    pub fn state_mut(&mut self) -> &mut LedgerState {
+        &mut self.guard
+    }
+
+    /// Replace state with new state after successful commit
+    pub fn replace(&mut self, new_state: LedgerState) {
+        *self.guard = new_state;
+    }
+}
+
+/// Holds a ledger's writers off while its state stays readable; see
+/// [`LedgerHandle::exclude_writers`].
+pub struct WriterExclusion {
+    ledger: LedgerHandle,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl WriterExclusion {
+    /// Take the state lock as well, to install a new state.
+    pub async fn lock_state(self) -> LedgerWriteGuard {
+        LedgerWriteGuard {
+            guard: Arc::clone(&self.ledger.inner.state).write_owned().await,
+            ledger: self.ledger,
+            _writer: self.writer,
+            acquired: Instant::now(),
+        }
+    }
+}
+
+/// Merge `state`'s full novelty size classes: bounded, incremental merges that
+/// keep segment fan-out logarithmic in the commits since the index. Does
+/// nothing unless a class is full or `tier_width < 2`.
+fn compact_novelty(state: &mut LedgerState, tier_width: usize, trigger: &'static str) {
+    if tier_width < 2 || !state.novelty.needs_tier_compaction(tier_width) {
+        return;
+    }
+    let pre = state.novelty.max_segment_count();
+    let started = Instant::now();
+    let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
+    tracing::debug!(
+        merges,
+        pre_max_segments = pre,
+        post_max_segments = state.novelty.max_segment_count(),
+        tier_width,
+        trigger,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "novelty tier compaction"
+    );
+}
+
+// ============================================================================
+// GuardedStagedCommit - StagedCommit + held ledger write guard
+// ============================================================================
+
+/// A [`StagedCommit`] paired with the [`LedgerWriteGuard`] that
+/// serialized its construction. The guard stays held across the
+/// caller's apply step so concurrent transactions don't slip a write
+/// in between staging and apply.
+///
+/// `write_guard` is `Option` because some build paths run without a
+/// [`LedgerManager`] (embedded use with no shared cache); in those
+/// cases there's nothing to serialize against and `None` is correct.
+///
+/// Used as the `Option<GuardedStagedCommit>` apply payload on
+/// [`StagedRevert`](crate::StagedRevert), and (when wired up) the
+/// merge / rebase / push staged shapes.
+///
+/// [`StagedCommit`]: fluree_db_transact::StagedCommit
+/// [`LedgerManager`]: crate::LedgerManager
+pub struct GuardedStagedCommit {
+    pub write_guard: Option<LedgerWriteGuard>,
+    pub staged: fluree_db_transact::StagedCommit,
+}
+
+// ============================================================================
+// LedgerHandle - Cheap cloneable reference to cached state
+// ============================================================================
+
+/// Handle to a cached ledger state - cheap to clone
+///
+/// Provides access to cached ledger state for queries and transactions.
+/// Multiple handles can reference the same cached state (via Arc).
+pub struct LedgerHandle {
+    inner: Arc<LedgerHandleInner>,
+}
+
+// Manual Clone impl to avoid requiring S: Clone, C: Clone bounds
+// (Arc<T> is Clone regardless of T)
+impl Clone for LedgerHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// Cached resolved ledger config, keyed by the novelty config-write marker
+/// (`Novelty::config_write_t`). The marker advances iff a commit writes the
+/// config graph, so a matching key guarantees the cached config is current —
+/// and a mismatch (including the downward reset after a reindex) forces a
+/// re-resolve rather than a stale read. See `policy_view::resolve_ledger_config_cached`.
+#[derive(Default)]
+struct ConfigCacheEntry {
+    /// The `config_write_t` this entry was resolved at; `None` until first populated.
+    key: Option<i64>,
+    /// Resolved config at `key`. `None` (with `key = Some(_)`) memoizes the
+    /// "ledger declares no config" result so unconfigured ledgers skip the scan.
+    config: Option<Arc<LedgerConfig>>,
+}
+
+/// Log once per ledger load when the ledger holds shapes that no graph's
+/// config enforces (ledger info's `shacl-not-configured` diagnostic): shapes
+/// are enforced only where the config sets `f:shaclEnabled true`, so such a
+/// ledger admits every write without a word. Reads the ledger only when its
+/// index stats or novelty show a shape. Returns the config it read, keyed as the
+/// handle's config cache keys it, so the first request does not read it
+/// again. A failure to check is logged at debug and does not fail the load.
+#[cfg(feature = "shacl")]
+async fn warn_if_shapes_unenforced(
+    state: &LedgerState,
+) -> Option<(i64, Option<Arc<LedgerConfig>>)> {
+    let to_t = state.t();
+    let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+    if !crate::config_resolver::may_hold_shapes(&state.snapshot, overlay, to_t) {
+        return None;
+    }
+    let checked = async {
+        let config =
+            crate::config_resolver::resolve_ledger_config(&state.snapshot, overlay, to_t).await?;
+        let diagnostic = crate::config_resolver::unenforced_shapes(
+            &state.snapshot,
+            overlay,
+            to_t,
+            config.as_ref(),
+        )
+        .await?;
+        Ok::<_, ApiError>((config.map(Arc::new), diagnostic))
+    }
+    .await;
+    match checked {
+        Ok((config, diagnostic)) => {
+            if let Some(diagnostic) = diagnostic {
+                tracing::warn!(
+                    ledger_id = %state.ledger_id(),
+                    "{} (see ledger info configDiagnostics)",
+                    diagnostic.message
+                );
+            }
+            Some((state.novelty.config_write_t, config))
+        }
+        Err(error) => {
+            tracing::debug!(
+                ledger_id = %state.ledger_id(),
+                %error,
+                "could not check the ledger's shapes against its config at load"
+            );
+            None
+        }
+    }
+}
+
+/// Lock ordering invariant: always acquire `state` before `binary_store`.
+/// All paths that touch both locks (snapshot, apply_index_v2, reload)
+/// follow this order to prevent deadlock and ensure coherence.
+///
+/// `writer` is taken before `state`, and only by writers.
+///
+/// `config_cache` has its own lock and is never held while acquiring `state`;
+/// `reload`'s swap takes it briefly *while holding* `state`, so the one
+/// permitted order is `state` → `config_cache`, never the reverse.
+struct LedgerHandleInner {
+    /// Guards all access to the ledger state. A `RwLock` so concurrent reads
+    /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
+    /// snapshot) run in parallel instead of serializing; transactions take an
+    /// exclusive `write()` for the stage+commit duration.
+    ///
+    /// Wrapped in an `Arc` so a [`LedgerWriteGuard`] can hold an
+    /// `OwnedRwLockWriteGuard` and live independently of any handle reference —
+    /// callers don't have to keep a borrow of the handle alive to use the
+    /// guard.
+    state: Arc<RwLock<LedgerState>>,
+    /// Held by whoever writes the ledger. A transaction holds it with
+    /// `state`; an operation that builds a new head outside the transaction
+    /// path holds it alone until it installs that head, so queries go on
+    /// reading `state` meanwhile ([`LedgerHandle::exclude_writers`]).
+    writer: Arc<tokio::sync::Mutex<()>>,
+    /// Ledger ID (e.g., "mydb:main")
+    ledger_id: LedgerId,
+    /// Last access time (monotonic secs since process start)
+    last_access: AtomicU64,
+    /// Binary columnar index store (v2 only).
+    ///
+    /// Always coherent with `state.snapshot.range_provider` — writers hold
+    /// the `state` lock while updating this.
+    binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
+    /// Read-side tiered-compaction trigger (tier width). When a query snapshot is
+    /// taken, if any graph has a full size class (>= this many same-class
+    /// segments) novelty is tier-compacted first — bounded incremental merges
+    /// that cap read fan-out without a full rewrite. `0`/`1` disables. Policy:
+    /// query nodes and long-lived servers keep the default; a latency-sensitive
+    /// transactor can disable it. Lock-held staging compacts too
+    /// ([`LedgerWriteGuard::clone_state_for_staging`]): a transaction's reads
+    /// fan out across segments as a query's do.
+    tier_width: AtomicUsize,
+    /// Resolved-config cache, invalidated by the novelty config-write marker.
+    /// Independent of `state` (see the lock-ordering note above).
+    config_cache: RwLock<ConfigCacheEntry>,
+    /// The subjects the most recent commits touched, so a stage computed
+    /// against an earlier state can be re-based instead of redone (see
+    /// [`RecentCommits`]). Written and read only under the `state` write
+    /// lock; the mutex just satisfies the borrow checker.
+    recent_commits: parking_lot::Mutex<RecentCommits>,
+    /// `t` of the last commit this handle installed through its own commit
+    /// path, so the publish listener can tell its own commits from others'
+    /// without touching the state lock.
+    committed_t: std::sync::atomic::AtomicI64,
+    /// Bumped each time a reload swaps in a state it loaded from the
+    /// nameservice, which may be another line than the one it replaces (a
+    /// rebase), and when this process's own rebase installs its result. An
+    /// index install planned before either is not made after it; commits on
+    /// the line leave it alone.
+    line: AtomicU64,
+    write_paths: WritePathCounters,
+    /// Test hook: the next optimistic stage on this handle parks here after
+    /// staging and before taking the lock (see
+    /// [`LedgerHandle::gate_next_optimistic_stage_for_test`]).
+    stage_gate: parking_lot::Mutex<Option<StageGate>>,
+    /// Test hook: the next [`LedgerHandle::exclude_writers`] parks here once
+    /// it holds the writers (see
+    /// [`LedgerHandle::gate_next_writer_exclusion_for_test`]).
+    exclusion_gate: parking_lot::Mutex<Option<StageGate>>,
+}
+
+/// A parked optimistic stage or writer exclusion: tells the test it is
+/// parked, then waits to be released.
+pub(crate) struct StageGate {
+    parked: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl StageGate {
+    pub(crate) async fn park(self) {
+        let StageGate {
+            parked,
+            mut release,
+        } = self;
+        let _ = parked.send(());
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// One commit's footprint: where it sits in the chain and which subjects
+/// its flakes touched. `None` subjects means too many to keep (see
+/// [`MAX_FOOTPRINT_FLAKES`]): the commit is treated as touching everything.
+pub(crate) struct CommitFootprint {
+    pub t: i64,
+    pub parent: Option<ContentId>,
+    pub id: ContentId,
+    pub subjects: Option<Arc<FxHashSet<Sid>>>,
+}
+
+/// A commit with more flakes than this records no subject set. The ring
+/// would otherwise pin a bulk write's subjects for hundreds of commits, and
+/// a write that large is not what re-basing is for.
+pub(crate) const MAX_FOOTPRINT_FLAKES: usize = 100_000;
+
+/// Commits the ring remembers. Enough that a stage which lost the lock race
+/// a few times over is still re-basable; small enough to cost nothing.
+const RECENT_COMMITS: usize = 256;
+
+/// The footprints of the last commits, as one unbroken chain.
+///
+/// A stage computed against `(t0, head0)` can be committed over the current
+/// `(t1, head1)` when none of the commits in between touched anything it read
+/// or wrote. Answering that needs every one of those commits, so the ring
+/// keeps only a contiguous chain: a footprint that does not extend the last
+/// one (a reload, a recovery, a commit that went around this path) empties it,
+/// and a question the ring cannot answer completely is answered "unknown".
+#[derive(Default)]
+struct RecentCommits {
+    entries: VecDeque<CommitFootprint>,
+}
+
+impl RecentCommits {
+    fn push(&mut self, footprint: CommitFootprint) {
+        if let Some(back) = self.entries.back() {
+            if footprint.t != back.t + 1 || footprint.parent.as_ref() != Some(&back.id) {
+                self.entries.clear();
+            }
+        }
+        if self.entries.len() == RECENT_COMMITS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(footprint);
+    }
+
+    /// The subjects touched by every commit after `(t0, head0)` up to and
+    /// including `(t1, head1)`, if the ring holds that whole chain and every
+    /// commit in it kept its subjects.
+    fn subjects_between(
+        &self,
+        t0: i64,
+        head0: Option<&ContentId>,
+        t1: i64,
+        head1: Option<&ContentId>,
+    ) -> Option<Vec<Arc<FxHashSet<Sid>>>> {
+        if t1 <= t0 {
+            return None;
+        }
+        let front_t = self.entries.front()?.t;
+        let first = usize::try_from(t0 + 1 - front_t).ok()?;
+        let last = usize::try_from(t1 - front_t).ok()?;
+        if last >= self.entries.len() {
+            return None;
+        }
+        let chain = self.entries.range(first..=last);
+        let (Some(oldest), Some(newest)) = (self.entries.get(first), self.entries.get(last)) else {
+            return None;
+        };
+        if oldest.parent.as_ref() != head0 || Some(&newest.id) != head1 {
+            return None;
+        }
+        chain.map(|f| f.subjects.as_ref().map(Arc::clone)).collect()
+    }
+}
+
+/// How a cached-handle write reached its commit, counted per handle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WritePathStats {
+    /// Staged against a snapshot the lock then confirmed unchanged.
+    pub direct: u64,
+    /// Staged against a snapshot the ledger moved past, and re-based over
+    /// the commits in between because none of them touched its subjects.
+    pub rebased: u64,
+    /// Staged against a snapshot the ledger moved past, and staged again
+    /// under the lock.
+    pub restaged: u64,
+}
+
+#[derive(Default)]
+struct WritePathCounters {
+    direct: AtomicU64,
+    rebased: AtomicU64,
+    restaged: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WritePath {
+    Direct,
+    Rebased,
+    Restaged,
+}
+
+impl LedgerHandle {
+    /// Create a new handle wrapping ledger state
+    pub fn new(
+        ledger_id: LedgerId,
+        state: LedgerState,
+        binary_store: Option<Arc<BinaryIndexStore>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LedgerHandleInner {
+                state: Arc::new(RwLock::new(state)),
+                writer: Arc::new(tokio::sync::Mutex::new(())),
+                ledger_id,
+                last_access: AtomicU64::new(monotonic_secs()),
+                binary_store: RwLock::new(binary_store),
+                tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
+                config_cache: RwLock::new(ConfigCacheEntry::default()),
+                recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
+                committed_t: std::sync::atomic::AtomicI64::new(0),
+                line: AtomicU64::new(Line::fresh()),
+                write_paths: WritePathCounters::default(),
+                stage_gate: parking_lot::Mutex::new(None),
+                exclusion_gate: parking_lot::Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Park the next optimistic write on this handle between its stage and
+    /// its lock, so a test can commit something in between. The returned
+    /// receiver fires once that write is parked; sending `true` on the
+    /// returned sender releases it. One-shot: the gate is consumed by the
+    /// first write that reaches it.
+    #[doc(hidden)]
+    pub fn gate_next_optimistic_stage_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.inner.stage_gate.lock() = Some(StageGate {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        (parked_rx, release_tx)
+    }
+
+    pub(crate) fn take_stage_gate(&self) -> Option<StageGate> {
+        self.inner.stage_gate.lock().take()
+    }
+
+    /// Park the next [`Self::exclude_writers`] on this handle once it holds
+    /// the writers, so a test can read the ledger meanwhile. Same channels and
+    /// one-shot use as [`Self::gate_next_optimistic_stage_for_test`].
+    #[doc(hidden)]
+    pub fn gate_next_writer_exclusion_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.inner.exclusion_gate.lock() = Some(StageGate {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        (parked_rx, release_tx)
+    }
+
+    /// How writes through this handle reached their commits so far.
+    pub fn write_path_stats(&self) -> WritePathStats {
+        let c = &self.inner.write_paths;
+        WritePathStats {
+            direct: c.direct.load(Ordering::Relaxed),
+            rebased: c.rebased.load(Ordering::Relaxed),
+            restaged: c.restaged.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn note_write_path(&self, path: WritePath) {
+        let c = &self.inner.write_paths;
+        match path {
+            WritePath::Direct => &c.direct,
+            WritePath::Rebased => &c.rebased,
+            WritePath::Restaged => &c.restaged,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Remember a commit just installed under the write lock.
+    pub(crate) fn record_commit(&self, footprint: CommitFootprint) {
+        self.inner
+            .committed_t
+            .store(footprint.t, std::sync::atomic::Ordering::Release);
+        self.inner.recent_commits.lock().push(footprint);
+    }
+
+    /// `t` of the last commit installed through this handle's own commit
+    /// path (0 before any). Lock-free; may trail the state after commits
+    /// installed by other paths, which only makes a caller reconcile once
+    /// more than it needed to.
+    pub(crate) fn committed_t(&self) -> i64 {
+        self.inner
+            .committed_t
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The subjects touched by every commit after `(t0, head0)` up to the
+    /// current `(t1, head1)`, or `None` when this handle does not know all
+    /// of them. Call under the write lock, so the answer describes the state
+    /// the caller is about to commit over.
+    pub(crate) fn subjects_committed_between(
+        &self,
+        t0: i64,
+        head0: Option<&ContentId>,
+        t1: i64,
+        head1: Option<&ContentId>,
+    ) -> Option<Vec<Arc<FxHashSet<Sid>>>> {
+        self.inner
+            .recent_commits
+            .lock()
+            .subjects_between(t0, head0, t1, head1)
+    }
+
+    /// Fetch the cached resolved config if it was resolved at `key` (the
+    /// current `Novelty::config_write_t`). Returns `Some(cfg_opt)` on a hit
+    /// (`cfg_opt` is `None` when the ledger declares no config), or `None` on a
+    /// miss. Cheap: a single shared lock on the config cache, never the state.
+    pub(crate) async fn config_cache_get(&self, key: i64) -> Option<Option<Arc<LedgerConfig>>> {
+        let entry = self.inner.config_cache.read().await;
+        (entry.key == Some(key)).then(|| entry.config.clone())
+    }
+
+    /// Store the resolved config under its config-write marker. A later config
+    /// write advances the marker, so the next read misses and re-resolves — the
+    /// cache is a fail-safe fast path that can never serve stale config.
+    pub(crate) async fn config_cache_put(&self, key: i64, config: Option<Arc<LedgerConfig>>) {
+        let mut entry = self.inner.config_cache.write().await;
+        entry.key = Some(key);
+        entry.config = config;
+    }
+
+    /// Drop the resolved-config entry so the next read re-resolves.
+    ///
+    /// Needed by out-of-band state swaps (`LedgerManager::reload`): the marker
+    /// only protects against staleness it can *see* advance. A reader that
+    /// raced the unwind gap of a detached commit (see `DetachedCacheSlot`)
+    /// can have resolved config against the empty placeholder and cached it
+    /// under `config_write_t = 0` — and a reloaded state whose config graph
+    /// was last written at or below `index_t` legitimately carries marker `0`
+    /// too, so that entry would *hit*, silently serving "no config" for a
+    /// configured ledger until the next config write. Clearing at the swap
+    /// point closes it (all but a resolve still in flight across the swap,
+    /// whose put can land after this clear — reaching even that needs a panic
+    /// plus two racing windows).
+    pub(crate) async fn config_cache_clear(&self) {
+        let mut entry = self.inner.config_cache.write().await;
+        *entry = ConfigCacheEntry::default();
+    }
+
+    /// Set the novelty tier width that query snapshots and lock-held staging
+    /// compact to (`0`/`1` disables compaction). Policy hook: long-lived
+    /// servers / query nodes keep the default; a latency-sensitive transactor
+    /// can disable it.
+    pub fn set_tier_width(&self, tier_width: usize) {
+        self.inner.tier_width.store(tier_width, Ordering::Relaxed);
+    }
+
+    /// Read-side tiered-compaction trigger. If any graph has a full size class,
+    /// run bounded incremental merges (under the write lock) before serving so
+    /// this and subsequent reads avoid segment fan-out — no full rewrite, no
+    /// growing cliff. Idempotent and amortized over the request. Common case (no
+    /// full class) only pays a brief shared read-lock check.
+    async fn compact_if_needed(&self) {
+        let tier_width = self.inner.tier_width.load(Ordering::Relaxed);
+        if tier_width < 2 {
+            return;
+        }
+        // Cheap shared-lock check first; escalate to the write lock only when
+        // there is real work, so the steady state never serializes queries.
+        let needs = {
+            self.inner
+                .state
+                .read()
+                .await
+                .novelty
+                .needs_tier_compaction(tier_width)
+        };
+        if !needs {
+            return;
+        }
+        let mut state = self.inner.state.write().await;
+        // Re-checked inside: another query may have compacted between the locks.
+        compact_novelty(&mut state, tier_width, "snapshot");
+    }
+
+    /// Create an ephemeral handle (for when caching is disabled)
+    ///
+    /// This is functionally identical to `new()`, but the naming clarifies
+    /// that this handle is NOT cached and each call creates a fresh load.
+    pub fn ephemeral(ledger_id: LedgerId, state: LedgerState) -> Self {
+        Self::new(ledger_id, state, None)
+    }
+
+    /// Get read-only snapshot for queries (brief lock, clone, release)
+    ///
+    /// IMPORTANT: Queries must NOT execute while holding the internal lock.
+    /// The snapshot is a cheap clone; the lock is released immediately after.
+    pub async fn snapshot(&self) -> LedgerView {
+        self.touch();
+        self.compact_if_needed().await;
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
+        let mut snap = LedgerView::from_state(&state);
+        snap.binary_store = binary_store;
+        debug_assert!(
+            snap.snapshot.range_provider.is_some() == snap.binary_store.is_some(),
+            "range_provider and binary_store must be coherent"
+        );
+        snap
+        // Locks released here
+    }
+
+    /// The cached head's graph names, for resolving a request's dataset
+    /// references ahead of its query: no [`LedgerView`] is built, and the
+    /// read-side compaction check [`snapshot`](Self::snapshot) runs, which
+    /// visits every graph in novelty, is left to the query's own load.
+    pub async fn graph_names(&self) -> GraphNames {
+        self.touch();
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
+        GraphNames {
+            snapshot: Arc::clone(&state.snapshot),
+            binary_store,
+        }
+        // Locks released here
+    }
+
+    /// Acquire exclusive access for transaction (hold lock for stage+commit)
+    pub async fn lock_for_write(&self) -> LedgerWriteGuard {
+        self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
+        LedgerWriteGuard {
+            ledger: self.clone(),
+            guard: Arc::clone(&self.inner.state).write_owned().await,
+            _writer: writer,
+            acquired: Instant::now(),
+        }
+    }
+
+    /// Hold off this ledger's writers without blocking its readers:
+    /// transactions wait, queries go on against the current state. For an
+    /// operation that builds a new head outside the transaction path and
+    /// installs it at the end ([`WriterExclusion::lock_state`]).
+    pub async fn exclude_writers(&self) -> WriterExclusion {
+        self.touch();
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
+        let gate = self.inner.exclusion_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.park().await;
+        }
+        WriterExclusion {
+            ledger: self.clone(),
+            writer,
+        }
+    }
+
+    /// Keep the out-of-band cached binary store coherent with the current state.
+    ///
+    /// Call this while holding the state lock, **before** `guard.replace()`,
+    /// passing `&new_state`. This ensures the binary_store is updated before
+    /// the new state becomes visible to concurrent readers via `snapshot()`,
+    /// preventing a TOCTOU window where a reader could observe the new state
+    /// paired with the old binary_store.
+    pub async fn sync_binary_store_from_state(&self, state: &LedgerState) {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            std::sync::Arc::clone(&te.0)
+                .downcast::<BinaryIndexStore>()
+                .ok()
+        });
+        *self.inner.binary_store.write().await = binary_store;
+    }
+
+    /// Update last access time
+    fn touch(&self) {
+        self.inner
+            .last_access
+            .store(monotonic_secs(), Ordering::Relaxed);
+    }
+
+    /// Get last access time (monotonic secs since process start)
+    pub fn last_access_secs(&self) -> u64 {
+        self.inner.last_access.load(Ordering::Relaxed)
+    }
+
+    /// Get ledger ID
+    pub fn id(&self) -> &LedgerId {
+        &self.inner.ledger_id
+    }
+
+    /// Check if currently locked (for eviction - skip if in use)
+    pub fn is_locked(&self) -> bool {
+        self.inner.writer.try_lock().is_err() || self.inner.state.try_write().is_err()
+    }
+
+    /// Get current index_t (brief lock to read)
+    ///
+    /// This returns the indexed DB's t value, NOT including novelty.
+    /// For freshness checking against remote watermarks, use this method.
+    pub async fn index_t(&self) -> i64 {
+        let state = self.inner.state.read().await;
+        state.index_t()
+    }
+
+    /// Get current t value (max of db.t and novelty.t)
+    ///
+    /// This returns the ledger's current t including any unindexed novelty.
+    /// Use this for comparing against nameservice commit_t to detect staleness.
+    pub async fn t(&self) -> i64 {
+        let state = self.inner.state.read().await;
+        state.t()
+    }
+
+    /// Get state metrics for update planning
+    ///
+    /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
+    pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
+        let state = self.inner.state.read().await;
+        (
+            state.t(),
+            state.index_t(),
+            state
+                .ns_record
+                .as_ref()
+                .and_then(|r| r.index_head_id.clone()),
+        )
+    }
+
+    /// Check if cached state is fresh vs remote watermark
+    pub async fn check_freshness(&self, remote: &RemoteWatermark) -> FreshnessCheck {
+        let local_index_t = self.index_t().await;
+
+        if remote.index_t > local_index_t {
+            FreshnessCheck::Stale
+        } else {
+            FreshnessCheck::Current
+        }
+    }
+
+    /// Apply a v2 binary index root to this handle.
+    ///
+    /// All I/O (root read, BinaryIndexStore load) happens outside any lock.
+    /// The state lock is held while the snapshot is applied — novelty trim
+    /// and runtime-dict reseed scale with accumulated novelty, so this is
+    /// not a constant-time swap; see the `index_install_wait` /
+    /// `index_install_lock` spans — and both `state` and `binary_store` are
+    /// swapped under it, ensuring coherence between `db.range_provider` and
+    /// `binary_store` (lock ordering: state → binary_store).
+    ///
+    /// `cs` MUST be branch-aware for branched ledgers (built via
+    /// [`fluree_db_nameservice::branched_content_store_for_record`]) so the
+    /// index root and any inherited leaf/branch blobs that live under a
+    /// parent branch's namespace can be resolved.
+    pub async fn apply_index_v2(
+        &self,
+        index_id: &ContentId,
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &std::path::Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+        planned_on: Line,
+    ) -> Result<bool> {
+        use tracing::Instrument as _;
+        let span = tracing::debug_span!(
+            "index_install",
+            ledger_id = %self.id(),
+            index_t = tracing::field::Empty,
+        );
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache, planned_on)
+            .instrument(span)
+            .await
+    }
+
+    /// The line the cached state is on, for an index install planned now.
+    pub fn line(&self) -> Line {
+        Line(self.inner.line.load(Ordering::Acquire))
+    }
+
+    async fn apply_index_v2_inner(
+        &self,
+        index_id: &ContentId,
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &std::path::Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+        planned_on: Line,
+    ) -> Result<bool> {
+        use tracing::Instrument as _;
+        let bytes = cs
+            .get(index_id)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+        let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
+            .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+        let load_started = Instant::now();
+
+        // The store this publish replaces: an incremental root shares nearly
+        // all of its artifacts with it, and the load carries those over by
+        // content id instead of reopening them. A brief read of the store
+        // slot alone (no `state` lock held) cannot invert the lock order.
+        let prev_store = self.inner.binary_store.read().await.clone();
+        let mut store = BinaryIndexStore::load_from_root_v6_reusing(
+            Arc::clone(&cs),
+            &root,
+            cache_dir,
+            leaflet_cache,
+            prev_store.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+        drop(prev_store);
+
+        // Build metadata-only LedgerSnapshot from FIR6 root.
+        let meta = LedgerSnapshotMetadata {
+            ledger_id: LedgerId::parse(&root.ledger_id)
+                .map_err(|e| ApiError::internal(format!("index root ledger id: {e}")))?,
+            t: root.index_t,
+            base_t: root.base_t,
+            namespace_codes: root.namespace_codes.into_iter().collect(),
+            ns_split_mode: root.ns_split_mode,
+            stats: root.stats.map(Arc::new),
+            schema: root.schema,
+            subject_watermarks: root.subject_watermarks,
+            string_watermark: root.string_watermark,
+            graph_iris: root.graph_iris,
+            has_annotations: root.has_annotations,
+            annotation_index: root.annotation_index.clone(),
+            had_annotation_arena: root.had_annotation_arena,
+            has_list_meta: root.has_list_meta,
+            graph_drops: root.graph_drops.clone(),
+            index_root_id: Some(index_id.clone()),
+        };
+        tracing::Span::current().record("index_t", meta.t);
+        let db = LedgerSnapshot::new_meta(meta)
+            .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
+
+        // Exclusive lock: apply snapshot (trims novelty, rebuilds dict_novelty),
+        // then wire up range_provider with the correct dict_novelty.
+        // Lock ordering: state → binary_store (same as snapshot()).
+        //
+        // Wait and hold are bracketed by separate spans so each aggregates
+        // independently: a long `index_install_wait` is contention on the
+        // state lock (points at backpressure or install batching), while a
+        // long `index_install_lock` is the guarded work itself — the two
+        // novelty walks inside (apply_loaded_db, reseed_runtime_small_dicts)
+        // scale with accumulated novelty, so this is not a constant-time
+        // swap. No event fires inside the lock: under a default `fmt`
+        // subscriber, span lifecycle is in-memory bookkeeping rather than a
+        // formatted write to a shared writer.
+        let load_us = load_started.elapsed().as_micros() as u64;
+        let wait_started = Instant::now();
+        let state_guard = self
+            .inner
+            .state
+            .write()
+            .instrument(tracing::debug_span!("index_install_wait"))
+            .await;
+        let wait_us = wait_started.elapsed().as_micros() as u64;
+        let install_started = Instant::now();
+        let ledger_id = self.id().to_string();
+        if self.line() != planned_on {
+            tracing::debug!(
+                ledger = %ledger_id,
+                "a reload replaced the state the index was planned for; not installed"
+            );
+            return Ok(false);
+        }
+        let install = async move {
+            let mut state = state_guard;
+            let novelty_flakes_before = state.novelty.len();
+
+            // apply_loaded_db: validates, trims novelty, retires the
+            // dictionary entries the indexed commits introduced.
+            let phase = Instant::now();
+            state
+                .apply_loaded_db(db, Some(index_id))
+                .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
+            let apply_us = phase.elapsed().as_micros() as u64;
+            let phase = Instant::now();
+
+            // Sync namespace codes between store and snapshot (bimap validation).
+            crate::ns_helpers::sync_store_and_snapshot_ns(
+                &mut store,
+                Arc::make_mut(&mut state.snapshot),
+            )?;
+
+            let sync_ns_us = phase.elapsed().as_micros() as u64;
+            let phase = Instant::now();
+            let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+                store,
+                &state.snapshot.graph_registry,
+            ));
+            crate::runtime_dicts::reseed_runtime_small_dicts_from_previous(&mut state, &arc_store);
+            let reseed_us = phase.elapsed().as_micros() as u64;
+
+            // Build range_provider with the real dict_novelty (rebuilt by apply_loaded_db)
+            let ns_fallback = Some(state.snapshot.shared_namespaces());
+            let provider = BinaryRangeProvider::new(
+                Arc::clone(&arc_store),
+                Arc::clone(&state.dict_novelty),
+                Arc::clone(&state.runtime_small_dicts),
+                ns_fallback,
+            );
+            let snap = Arc::make_mut(&mut state.snapshot);
+            snap.range_provider = Some(Arc::new(provider));
+            // Plumb the CAS handle so arena-backed annotation reads can
+            // resolve `AnnotationIndexRoot.{forward,reverse}_branch_cid`.
+            // Without this, `LedgerSnapshot::has_arena_reader()` always
+            // returns false and the formatter / cascade falls back to
+            // the M2a scan path even on snapshots with on-disk arenas.
+            snap.content_store = Some(Arc::clone(&cs));
+
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
+
+            let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
+            state.binary_store = Some(TypeErasedStore(te_store));
+            *self.inner.binary_store.write().await = Some(arc_store);
+            tracing::debug!(
+                target: "fluree::write_path",
+                ledger = ledger_id,
+                index_t = state.index_t(),
+                novelty_flakes_before,
+                novelty_flakes_after = state.novelty.len(),
+                dict_entries = state.dict_novelty.subjects.len() + state.dict_novelty.strings.len(),
+                apply_us,
+                sync_ns_us,
+                reseed_us,
+                load_us,
+                wait_us,
+                install_us = install_started.elapsed().as_micros() as u64,
+                "index install"
+            );
+            Ok::<(), ApiError>(())
+        };
+        install
+            .instrument(tracing::debug_span!("index_install_lock"))
+            .await?;
+
+        Ok(true)
+    }
+}
+
+/// A ledger handle's line, as [`LedgerHandle::line`] reads it: an index
+/// install planned on one line is not made on another. Lines are unique
+/// across handles, so one taken from a handle since evicted matches none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Line(u64);
+
+impl Line {
+    /// The line of a ledger not cached when it was taken.
+    pub(crate) const UNCACHED: Line = Line(u64::MAX);
+
+    fn fresh() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+// ============================================================================
+// Freshness Types
+// ============================================================================
+
+/// Remote watermark for freshness comparison
+///
+/// Matches server's existing RemoteLedgerWatermark structure for compatibility.
+#[derive(Clone, Debug)]
+pub struct RemoteWatermark {
+    /// Remote commit_t value
+    pub commit_t: i64,
+    /// Remote index_t value (used for freshness comparison)
+    pub index_t: i64,
+    /// Remote index head CID (for potential future optimization)
+    pub index_head_id: Option<ContentId>,
+    /// When this watermark was last updated
+    pub updated_at: Instant,
+}
+
+/// Trait for sources that provide remote freshness info
+///
+/// Server's PeerState implements this; library doesn't depend on server types.
+pub trait FreshnessSource: Send + Sync {
+    /// Get remote watermark for a ledger ID
+    fn watermark(&self, ledger_id: &LedgerId) -> Option<RemoteWatermark>;
+}
+
+/// Result of checking if cached state is fresh
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshnessCheck {
+    /// Local index_t >= remote index_t
+    Current,
+    /// Remote index_t > local index_t, needs reload
+    Stale,
+}
+
+// ============================================================================
+// LoadState - Single-flight coordination
+// ============================================================================
+
+/// Loading state for single-flight coordination
+///
+/// Note: Loading sends `Result<LedgerHandle>` to waiters (they need the handle).
+///       Reloading sends `Result<()>` to waiters (handle already obtained).
+enum LoadState {
+    /// Initial load in progress - waiters receive handle on success.
+    ///
+    /// `generation` is a per-slot token allocated from
+    /// [`LedgerManager::load_generation`] when the leader inserts this entry.
+    /// A [`LoadingLeaderGuard`]'s detached cleanup removes the slot only if the
+    /// current `Loading` carries the same generation, so a stale guard can
+    /// never clobber a *new* leader's slot that was inserted after the original
+    /// orphan was cleared (e.g. by `disconnect`).
+    Loading {
+        generation: u64,
+        waiters: Vec<oneshot::Sender<std::result::Result<LedgerHandle, Arc<ApiError>>>>,
+    },
+    /// Loaded and cached
+    Ready(LedgerHandle),
+    /// Reload in progress - handle stays valid, waiters receive () on success.
+    ///
+    /// `generation` is a per-slot token (same source as `Loading`) so a
+    /// [`ReloadLeaderGuard`]'s cleanup only reclaims its own orphaned slot.
+    Reloading {
+        generation: u64,
+        handle: LedgerHandle,
+        waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
+    },
+    /// The ledger's binary store failed to load. Until `retry_at`, a request
+    /// gets this error without loading again, so a lasting failure costs one
+    /// load per [`LedgerManagerConfig::store_load_retry`], not one per
+    /// request. The next request after that loads again.
+    Failed {
+        error: Arc<ApiError>,
+        retry_at: Instant,
+    },
+}
+
+// ============================================================================
+// LoadingLeaderGuard - cancellation safety for single-flight loads
+// ============================================================================
+
+/// Cancellation-safety guard for a single-flight load leader in
+/// [`LedgerManager::get_or_load`].
+///
+/// The leader inserts [`LoadState::Loading`] before awaiting load I/O and only
+/// clears it on the publish path. If the leader future is dropped (cancelled)
+/// in between — an HTTP handler future dropped on client disconnect, an
+/// aborted task, an outer `tokio::time::timeout` — the `Loading` slot would be
+/// orphaned forever: [`LedgerManager::sweep_idle`] deliberately never evicts
+/// `Loading`, so every later caller for that ledger would park on `rx.await`
+/// indefinitely (a permanent per-ledger wedge).
+///
+/// On drop-before-publish this guard reclaims the orphaned slot. Removing the
+/// entry drops the queued waiter `oneshot` senders, so parked waiters receive
+/// `RecvError` (surfaced as `ApiError::internal("load cancelled")`) and the
+/// next caller re-elects a fresh leader. The leader calls [`Self::disarm`]
+/// once it has published (success or error), making normal completion a no-op.
+struct LoadingLeaderGuard {
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
+    alias: LedgerId,
+    /// Generation of the `Loading` slot this leader inserted. Cleanup removes
+    /// the slot only when it still carries this generation (ABA protection).
+    generation: u64,
+    armed: bool,
+}
+
+impl LoadingLeaderGuard {
+    /// Mark the load as published; the subsequent drop becomes a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LoadingLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is synchronous but the `entries` lock is async, so hand the
+        // cleanup to a detached task. A runtime context is present whenever a
+        // leader future is dropped on a worker thread (poll-time cancellation,
+        // task abort, or outer-future drop); if there is none, there is no
+        // runtime left to wedge.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = self.alias.clone();
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Loading` slot. A generation mismatch means
+            // the original orphan was already cleared (e.g. by `disconnect`) and
+            // a new leader inserted a fresh slot — never clobber that, nor a
+            // `Ready`/`Reloading` entry a later leader published.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Loading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
+}
+
+/// Cancellation-safety guard for a reload leader in [`LedgerManager::reload`].
+///
+/// `reload` transitions `Ready(h) → Reloading{h, waiters}` and only clears it
+/// on the publish path. A dropped reload-leader future would otherwise orphan
+/// the `Reloading` slot forever; unlike `Loading` this does NOT wedge query
+/// reads (`get_or_load` returns the still-valid handle for `Reloading`), but it
+/// permanently stalls future `reload`s and `current_t` for that ledger.
+///
+/// On drop-before-publish this guard evicts its own orphaned slot (generation
+/// match), dropping the waiter senders so parked reloaders get `RecvError`
+/// (surfaced as `ApiError::internal("reload cancelled")`). Eviction is safe —
+/// the next query cold-loads the ledger fresh — and avoids re-inserting after a
+/// concurrent `disconnect`/shutdown. The leader calls [`Self::disarm`] once it
+/// has published.
+struct ReloadLeaderGuard {
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
+    alias: LedgerId,
+    generation: u64,
+    armed: bool,
+}
+
+impl ReloadLeaderGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReloadLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = self.alias.clone();
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Reloading` slot (generation match), so a
+            // stale guard never clobbers a fresh slot inserted after the orphan
+            // was cleared.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
+}
+
+// ============================================================================
+// LedgerManagerConfig
+// ============================================================================
+
+/// Configuration for the ledger manager
+#[derive(Clone)]
+pub struct LedgerManagerConfig {
+    /// TTL before idle ledgers are evicted (default: 30 min)
+    pub idle_ttl: Duration,
+    /// Sweep interval for background cleanup (default: 1 min)
+    pub sweep_interval: Duration,
+    /// Directory for binary index cache files (leaflets, forward indexes, etc.)
+    ///
+    /// Layout: `{cache_dir}/{alias_hash}/{root_hash}/...`
+    /// Default: `$TMPDIR/fluree_binary_cache`
+    pub cache_dir: PathBuf,
+    /// Shared leaflet cache across all ledgers.
+    ///
+    /// By default this is injected by `Fluree` from its global cache budget.
+    pub leaflet_cache: Option<Arc<LeafletCache>>,
+    /// How long a ledger whose binary store failed to load answers with that
+    /// failure before a request loads it again (default: 5 s). Zero loads
+    /// again on the next request.
+    pub store_load_retry: Duration,
+}
+
+impl std::fmt::Debug for LedgerManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerManagerConfig")
+            .field("idle_ttl", &self.idle_ttl)
+            .field("sweep_interval", &self.sweep_interval)
+            .field("cache_dir", &self.cache_dir)
+            .field("has_leaflet_cache", &self.leaflet_cache.is_some())
+            .field("store_load_retry", &self.store_load_retry)
+            .finish()
+    }
+}
+
+impl Default for LedgerManagerConfig {
+    fn default() -> Self {
+        Self {
+            idle_ttl: Duration::from_secs(30 * 60),
+            sweep_interval: Duration::from_secs(60),
+            cache_dir: default_cache_dir(),
+            leaflet_cache: None,
+            store_load_retry: Duration::from_secs(5),
+        }
+    }
+}
+
+/// A temp-dir-backed cache path under `leaf`.
+///
+/// wasm32 has no filesystem and `std::env::temp_dir()` PANICS there ("no
+/// filesystem on this platform"), so every cache-path site must route
+/// through here rather than calling it directly — this is the one place
+/// that knows the wasm arm exists. The synthetic path is never touched at
+/// runtime: the disk cache opens with a zero write budget
+/// (`fs::create_dir_all` fails → writes disabled) and reads map
+/// `Unsupported` to a cache miss.
+pub(crate) fn temp_cache_dir(leaf: &str) -> PathBuf {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::temp_dir().join(leaf)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        PathBuf::from("/").join(leaf)
+    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    temp_cache_dir("fluree_binary_cache")
+}
+
+// ============================================================================
+// Binary Index Loading Helper
+// ============================================================================
+
+use fluree_db_query::BinaryRangeProvider;
+
+/// Residency mode (F8): prewarm the reverse-dict leaves that overlay
+/// translation of this snapshot's novelty will touch, in one concurrent
+/// fetch round after an index apply or a catch-up (a load warms these
+/// leaves before its own probes). Novelty replay stays the load model; its
+/// query-time miss sources (sync `find_subject_id_by_parts` /
+/// `find_string_id` per novelty entry) are prefetched here so a cold
+/// residency peer does not spend a retry round per reverse-tree leaf.
+/// Best-effort: failures fall back to the query-entry retry loop.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_translation(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    dict_novelty: &fluree_db_core::dict_novelty::DictNovelty,
+) {
+    if dict_novelty.subjects.is_empty() && dict_novelty.strings.is_empty() {
+        return;
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            dict_novelty.subjects.iter_entries(),
+            dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch"
+        );
+    }
+}
+
+/// Residency mode: fetch the reverse-dict leaves that
+/// `populate_dict_novelty_safe` probes for every novelty subject and string.
+/// Those probes are sync and a load runs in no retry frame, so a cold leaf
+/// fails the load. Covers the leaves [`prefetch_novelty_translation`] warms,
+/// since every DictNovelty entry comes from these flakes.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_dict_probes(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    novelty: &fluree_db_novelty::Novelty,
+) {
+    use fluree_db_core::FlakeValue;
+    let mut subjects: Vec<(u16, &str)> = Vec::new();
+    let mut strings: Vec<&str> = Vec::new();
+    for f in novelty.iter_flakes(fluree_db_core::IndexType::Post) {
+        subjects.push((f.s.namespace_code, &f.s.name));
+        match &f.o {
+            FlakeValue::Ref(sid) => subjects.push((sid.namespace_code, &sid.name)),
+            FlakeValue::String(s) | FlakeValue::Json(s) => strings.push(s),
+            _ => {}
+        }
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            subjects.into_iter(),
+            strings.into_iter(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch at load"
+        );
+    }
+}
+
+/// Load BinaryIndexStore from a v2 index root, attach range_provider
+/// to the LedgerState's LedgerSnapshot, and return the Arc'd store.
+///
+/// Returns `Ok(None)` if no index_head_id is present or the root is not v2.
+///
+/// `nameservice` is used to assemble a branch-aware content store when the
+/// ledger is a branch — without it, the index root and any inherited
+/// leaf/branch blobs that live under the source branch's namespace would
+/// 404 on a fresh branch that hasn't yet had its own index built.
+///
+/// `prev` is the store this load replaces, if any (a reload of a cached
+/// ledger); artifacts the new root shares with it are carried over.
+pub(crate) async fn load_and_attach_binary_store(
+    backend: &StorageBackend,
+    nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
+    state: &mut LedgerState,
+    cache_dir: &std::path::Path,
+    leaflet_cache: Option<Arc<LeafletCache>>,
+    prev: Option<&BinaryIndexStore>,
+) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
+    let record = match state.ns_record.as_ref() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let index_cid = match record.index_head_id.as_ref() {
+        Some(cid) => cid.clone(),
+        None => return Ok(None),
+    };
+
+    // Branch-aware store: walks branch ancestry on read miss so a fresh
+    // branch can read leaf/branch/history blobs written under the source
+    // branch's namespace. Also uses `record.ledger_id` (canonical) rather
+    // than `snapshot.ledger_id`, which may still carry a source id for
+    // imported/cloned roots.
+    let cs: Arc<dyn ContentStore> =
+        fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
+            .await?;
+    let root_started = Instant::now();
+    let bytes = cs
+        .get(&index_cid)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+    let root_read_us = root_started.elapsed().as_micros() as u64;
+    let decode_started = Instant::now();
+
+    // Decode FIR6 root metadata to populate snapshot watermarks.
+    // `LedgerSnapshot::from_root_bytes` only parses the header; watermarks are needed for
+    // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
+    let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
+        .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+    tracing::debug!(
+        target: "fluree::open",
+        ledger = %record.ledger_id,
+        bytes = bytes.len(),
+        root_read_us,
+        root_decode_us = decode_started.elapsed().as_micros() as u64,
+        "binary index root loaded"
+    );
+
+    let mut store = BinaryIndexStore::load_from_root_v6_reusing(
+        Arc::clone(&cs),
+        &root,
+        cache_dir,
+        leaflet_cache,
+        prev,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+
+    {
+        let snap = Arc::make_mut(&mut state.snapshot);
+        snap.subject_watermarks = root.subject_watermarks;
+        snap.string_watermark = root.string_watermark;
+        if root.stats.is_some() && snap.stats.is_none() {
+            snap.set_index_root_stats(root.stats.map(Arc::new), index_cid.clone());
+            tracing::debug!("loaded stats from FIR6 root");
+        }
+        if root.schema.is_some() && snap.schema.is_none() {
+            snap.schema = root.schema;
+            tracing::debug!("loaded schema from FIR6 root");
+        }
+    }
+    state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
+        state.snapshot.subject_watermarks.clone(),
+        state.snapshot.string_watermark,
+    ));
+
+    // Sync namespace codes between store and snapshot (bimap validation).
+    crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
+
+    // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
+    // entries not present in the persisted dictionaries (canonical IDs must win).
+    //
+    // This prevents minting a second internal ID for an already-indexed IRI/string.
+    if !state.novelty.is_empty() {
+        let novelty = state.novelty.as_ref();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        prefetch_novelty_dict_probes(&store, novelty).await;
+        let dn = Arc::make_mut(&mut state.dict_novelty);
+        fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+            dn,
+            Some(&store),
+            novelty.iter_flakes(fluree_db_core::IndexType::Post),
+        )
+        .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
+    }
+    // Populated from all of novelty, so it covers novelty.
+    let novelty_t = state.novelty.t;
+    Arc::make_mut(&mut state.dict_novelty).mark_covered_through(novelty_t);
+
+    let arc_store = Arc::new(fluree_db_transact::store_without_dropped_graphs(
+        store,
+        &state.snapshot.graph_registry,
+    ));
+    crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
+    let ns_fallback = Some(state.snapshot.shared_namespaces());
+    let provider = BinaryRangeProvider::new(
+        Arc::clone(&arc_store),
+        Arc::clone(&state.dict_novelty),
+        Arc::clone(&state.runtime_small_dicts),
+        ns_fallback,
+    );
+    // Always rebuild the provider here so it is coherent with the freshly
+    // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
+    let snap = Arc::make_mut(&mut state.snapshot);
+    snap.range_provider = Some(Arc::new(provider));
+    // Plumb the CAS handle so arena-backed annotation reads can resolve
+    // `AnnotationIndexRoot.{forward,reverse}_branch_cid`. Mirror of the
+    // identical line in `apply_index_v2` — fresh-load path needs the
+    // same wiring as the cache-update path or `has_arena_reader()`
+    // would always be false on snapshots loaded outside the
+    // LedgerManager handle path.
+    snap.content_store = Some(Arc::clone(&cs));
+
+    // Also attach the type-erased store to the state so transaction staging
+    // (which clones LedgerState under the write lock) can construct
+    // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
+    let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
+    state.binary_store = Some(TypeErasedStore(te_store));
+
+    Ok(Some(arc_store))
+}
+
+// ============================================================================
+// LedgerManager - Connection-level cache
+// ============================================================================
+
+/// Connection-level ledger cache manager
+///
+/// Provides single-flight loading (concurrent requests share one I/O operation)
+/// and idle eviction.
+/// Coverage envelope returned alongside the running ledger's
+/// attachment events.
+///
+/// Distinguishes "we walked every commit since genesis" (safe to
+/// publish as `Authoritative`) from "we only have the post-index
+/// tail" (must be merged with a base arena via `Augment`).
+#[derive(Debug, Clone, Copy)]
+pub enum RunningCoverage {
+    /// Snapshot.t == 0: no index has ever run, so the running
+    /// `AttachmentNovelty` was built by walking every commit since
+    /// genesis. Provider can return `Authoritative`.
+    Authoritative,
+    /// Snapshot.t > 0: an index has run. The running
+    /// `AttachmentNovelty` may be the full history (continuously-
+    /// running ledger) or only the post-index tail (after a
+    /// reload). We can't distinguish, so the provider must return
+    /// `Augment`.
+    Augment,
+}
+
+/// Result of `LedgerManager::try_running_attachment_events`.
+#[derive(Debug, Clone)]
+pub struct RunningAttachmentEvents {
+    pub coverage: RunningCoverage,
+    pub events: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>,
+}
+
+pub struct LedgerManager {
+    /// Cached ledger handles + loading state
+    ///
+    /// `Arc` so a [`LoadingLeaderGuard`] can reclaim an orphaned `Loading`
+    /// slot from a detached cleanup task if a load leader future is cancelled.
+    entries: Arc<RwLock<HashMap<LedgerId, LoadState>>>,
+    /// Storage backend for ledger loading
+    backend: StorageBackend,
+    /// Shared cache for index nodes
+    /// Nameservice for ledger lookup/loading
+    nameservice_mode: crate::NameServiceMode,
+    /// Configuration
+    config: LedgerManagerConfig,
+    /// Shutdown flag — prevents load/reload leaders from re-inserting after disconnect_all
+    shutdown: AtomicBool,
+    /// Monotonic generation source for `LoadState::Loading` slots. Lets a
+    /// [`LoadingLeaderGuard`]'s detached cleanup distinguish its own orphaned
+    /// slot from a fresh slot inserted by a later leader (ABA protection).
+    load_generation: AtomicU64,
+    /// Highest commit `t` reported per alias by head-advancing
+    /// components outside this manager's own load/commit pipeline
+    /// (see [`Self::note_head_advance`]). [`Self::get_or_load`]
+    /// treats a cached handle behind its alias's watermark as stale.
+    /// A `std::sync` lock: both sides are sub-microsecond map
+    /// operations with no `.await` inside the critical section.
+    head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
+}
+
+impl LedgerManager {
+    /// Get the shared leaflet cache (if configured).
+    pub fn leaflet_cache(&self) -> Option<&Arc<LeafletCache>> {
+        self.config.leaflet_cache.as_ref()
+    }
+
+    /// Create a new ledger manager
+    pub fn new(
+        backend: StorageBackend,
+        nameservice: crate::NameServiceMode,
+        config: LedgerManagerConfig,
+    ) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            backend,
+            nameservice_mode: nameservice,
+            config,
+            shutdown: AtomicBool::new(false),
+            load_generation: AtomicU64::new(0),
+            head_watermarks: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record that `ledger_id`'s authoritative commit head reached
+    /// `commit_t`. Monotonic — a lower `t` than already recorded is
+    /// a no-op.
+    ///
+    /// The single-node write path never needs this: it mutates the
+    /// cache atomically with the nameservice publish. Components
+    /// that advance heads outside that pipeline (a raft state
+    /// machine applying replicated commits) call it synchronously
+    /// at each advance, upholding the invariant that whoever moves
+    /// a head keeps this cache coherent. Cache hits behind the
+    /// watermark reload; the reload cost stays on the read path.
+    pub fn note_head_advance(&self, ledger_id: &LedgerId, commit_t: i64) {
+        let mut watermarks = self
+            .head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section");
+        let entry = watermarks.entry(ledger_id.clone()).or_insert(commit_t);
+        if *entry < commit_t {
+            *entry = commit_t;
+        }
+    }
+
+    /// The highest commit `t` reported for `ledger_id` via
+    /// [`Self::note_head_advance`], or `None` if no head-advancing
+    /// component has reported one (heads that only move through
+    /// this manager's own pipeline never do).
+    pub fn head_watermark(&self, ledger_id: &LedgerId) -> Option<i64> {
+        self.head_watermarks
+            .read()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .get(ledger_id)
+            .copied()
+    }
+
+    /// Get the manager configuration
+    pub fn config(&self) -> &LedgerManagerConfig {
+        &self.config
+    }
+
+    /// Compare the cached handle's `t` against the alias's head
+    /// watermark ([`Self::note_head_advance`]) and report whether
+    /// the cache is behind.
+    ///
+    /// A pure in-memory comparison — no nameservice involvement, so
+    /// it costs the same under every nameservice implementation. An
+    /// alias with no watermark is never stale: its heads only move
+    /// through this manager's own pipeline, which keeps the cache
+    /// coherent by construction.
+    async fn cached_handle_is_stale(&self, handle: &LedgerHandle) -> bool {
+        let cached_t = handle.t().await;
+        let watermark = self
+            .head_watermarks
+            .read()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .get(handle.id())
+            .copied();
+        matches!(watermark, Some(w) if w > cached_t)
+    }
+
+    /// Snapshot the running ledger's attachment-event delta in the
+    /// shape the indexer's arena builder expects, plus the coverage
+    /// envelope describing what the events span.
+    ///
+    /// Returns `None` when:
+    /// - the ledger isn't currently loaded into this manager (no
+    ///   running overlay to snapshot — the indexer treats this as
+    ///   "delta unknown" and defensively drops any base arena),
+    /// - the ledger is loading (we don't block the indexer's job
+    ///   dispatch on a load).
+    ///
+    /// Returns `Some(vec)` (possibly empty) when the snapshot was
+    /// observed cleanly — the empty case explicitly asserts "no
+    /// events since the base arena," which the indexer treats as
+    /// "delta is empty" and seals an authoritative (unchanged)
+    /// arena.
+    pub async fn try_running_attachment_events(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Option<RunningAttachmentEvents> {
+        let handle = self.ready_handle(ledger_id).await?;
+        let view = handle.snapshot().await;
+        // Coverage heuristic: when the snapshot's `t` is zero, no
+        // index has ever run on this ledger, so the running
+        // `AttachmentNovelty` was built by walking every commit
+        // since genesis — it carries the complete event history.
+        // Once `snapshot.t > 0`, we can't distinguish a continuously-
+        // running ledger (full history preserved across reindexes)
+        // from a reloaded one (only post-index tail in the overlay),
+        // so the safe call is `Augment`.
+        let coverage = if view.snapshot.t == 0 {
+            RunningCoverage::Authoritative
+        } else {
+            RunningCoverage::Augment
+        };
+        let events: Vec<_> = view.novelty.attachments.iter_event_pairs().collect();
+        Some(RunningAttachmentEvents { coverage, events })
+    }
+
+    /// Side-effect-free variant of `get_or_load` +
+    /// [`Self::try_running_attachment_events`] for a ledger that is NOT
+    /// resident in the cache: load a transient `LedgerState` straight from
+    /// the backend (never inserted into the cache — cache insertion from a
+    /// background context disturbs the running handle's novelty
+    /// bookkeeping; see
+    /// `it_select_star_novelty_retract::expansion_applies_novelty_retractions`)
+    /// and snapshot its attachment events. The load replays every
+    /// post-index commit into the transient novelty, so a never-indexed
+    /// ledger yields the complete event history (`Authoritative` at
+    /// `snapshot.t == 0`) — exactly what a first background index build
+    /// needs to seal an authoritative arena for a write-only ingest flow.
+    pub async fn transient_attachment_events(
+        &self,
+        ledger_id: &LedgerId,
+    ) -> Option<RunningAttachmentEvents> {
+        let canonical_alias = ledger_id.clone();
+        let state = LedgerState::load(&self.nameservice_mode, &canonical_alias, &self.backend)
+            .await
+            .ok()?;
+        // Same coverage heuristic as `try_running_attachment_events`: a
+        // fresh load at snapshot.t == 0 walked every commit since genesis.
+        let coverage = if state.snapshot.t == 0 {
+            RunningCoverage::Authoritative
+        } else {
+            RunningCoverage::Augment
+        };
+        let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
+        Some(RunningAttachmentEvents { coverage, events })
+    }
+
+    /// Return a read-only `LedgerView` for a currently-loaded ledger
+    /// without forcing a load. Returns `None` when the ledger isn't
+    /// in the cache.
+    ///
+    /// Used by `ApiAttachmentEventsProvider`'s bulk-import seal path:
+    /// when the running overlay reports no events but the snapshot's
+    /// sticky bit says annotations exist (the post-import state),
+    /// the provider needs the snapshot + range_provider to scan the
+    /// base index for `f:reifies*` flakes itself.
+    pub async fn get_loaded_view(&self, ledger_id: &LedgerId) -> Option<LedgerView> {
+        let handle = self.ready_handle(ledger_id).await?;
+        Some(handle.snapshot().await)
+    }
+
+    /// Clone out a `Ready` handle, releasing the `entries` guard before
+    /// returning.
+    ///
+    /// Every caller that goes on to touch the handle's `state` lock must
+    /// come through here. Holding `entries` across a `state` acquisition
+    /// is the one ordering this file forbids: a transaction holds
+    /// `state` for its whole commit, so a reader parked behind it while
+    /// still holding `entries` blocks the next `entries.write()` — a
+    /// cold load of any ledger — and, because the lock is write-fair,
+    /// every `entries.read()` after that. The manager wedges for the
+    /// duration of an unrelated write.
+    async fn ready_handle(&self, ledger_id: &LedgerId) -> Option<LedgerHandle> {
+        let canonical_alias = ledger_id.clone();
+        let entries = self.entries.read().await;
+        match entries.get(&canonical_alias) {
+            Some(LoadState::Ready(handle)) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// Return the already-cached handle for `ledger_id`, or `None` when it is
+    /// not loaded — never forces a load from the nameservice.
+    ///
+    /// Used by the owned-state commit path to write a freshly-committed state
+    /// back into the cache (read-your-writes) without resurrecting a ledger the
+    /// caller hasn't otherwise accessed.
+    pub async fn get_loaded_handle(&self, ledger_id: &LedgerId) -> Option<LedgerHandle> {
+        let canonical_alias = ledger_id.clone();
+        let entries = self.entries.read().await;
+        match entries.get(&canonical_alias)? {
+            LoadState::Ready(handle) | LoadState::Reloading { handle, .. } => Some(handle.clone()),
+            LoadState::Loading { .. } | LoadState::Failed { .. } => None,
+        }
+    }
+
+    /// Get cached handle or load from nameservice
+    ///
+    /// Uses single-flight pattern: concurrent requests for same ledger ID
+    /// will share one load operation, not stampede.
+    ///
+    /// The ledger_id is normalized to canonical form (e.g., "mydb" -> "mydb:main")
+    /// before caching to ensure consistent cache keys regardless of input form.
+    pub async fn get_or_load(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
+        // Normalize ledger_id to canonical form for consistent cache keys
+        // This ensures "mydb" and "mydb:main" use the same cache entry
+        let canonical_alias = ledger_id.clone();
+
+        // Fast path: already loaded
+        {
+            let entries = self.entries.read().await;
+            if let Some(LoadState::Ready(handle)) = entries.get(&canonical_alias) {
+                let handle = handle.clone();
+                drop(entries);
+                if !self.cached_handle_is_stale(&handle).await {
+                    return Ok(handle);
+                }
+                // Stale: fall through to the load path, which will
+                // re-fetch from nameservice + backend.
+                self.entries.write().await.remove(&canonical_alias);
+            } else if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias)
+            {
+                // Handle is valid even during reload
+                return Ok(handle.clone());
+            } else if let Some(LoadState::Failed { error, retry_at }) =
+                entries.get(&canonical_alias)
+            {
+                if Instant::now() < *retry_at {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
+            }
+        }
+
+        // Slow path: need to coordinate loading
+        let (rx, generation) = {
+            let mut entries = self.entries.write().await;
+
+            match entries.get_mut(&canonical_alias) {
+                Some(LoadState::Ready(handle)) => {
+                    // Another task loaded while we waited for write lock
+                    return Ok(handle.clone());
+                }
+                Some(LoadState::Reloading { handle, .. }) => {
+                    // Handle is valid even during reload
+                    return Ok(handle.clone());
+                }
+                Some(LoadState::Loading { waiters, .. }) => {
+                    // Someone else is loading - add ourselves as waiter
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    (Some(rx), 0)
+                }
+                Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                    return Err(ApiError::http(error.status_code(), error.to_string()));
+                }
+                // A failure whose window has passed loads again.
+                Some(LoadState::Failed { .. }) | None => {
+                    // We're first - mark as loading (with a fresh generation),
+                    // release lock, do I/O.
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                    entries.insert(
+                        canonical_alias.clone(),
+                        LoadState::Loading {
+                            generation,
+                            waiters: Vec::new(),
+                        },
+                    );
+                    (None, generation)
+                }
+            }
+        };
+        // Manager lock released here
+
+        if let Some(rx) = rx {
+            // Phase instrumentation (debug!): a waiter parked here with
+            // no matching leader publish is the orphaned-Loading signature.
+            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
+            // Wait for the loader to finish
+            // Note: Waiters receive an Http error (preserving status code) since
+            // ApiError isn't Clone. The leader (first caller) gets the full error type.
+            return rx
+                .await
+                .map_err(|_| ApiError::internal("load cancelled"))?
+                .map_err(|arc_err| {
+                    // The Arc contains an ApiError::Http - extract status and message
+                    match arc_err.as_ref() {
+                        ApiError::Http { status, message } => ApiError::http(*status, message),
+                        // Fallback for any other error type (shouldn't happen)
+                        other => ApiError::http(other.status_code(), other.to_string()),
+                    }
+                });
+        }
+
+        // We're the loader. Arm a guard over the `Loading` slot: if this
+        // leader future is cancelled before it publishes (HTTP handler dropped
+        // on client disconnect, task abort, outer timeout), the guard reclaims
+        // the slot so waiters unblock and a fresh caller re-elects a leader —
+        // otherwise the slot orphans forever and wedges the ledger.
+        let mut leader_guard = LoadingLeaderGuard {
+            entries: Arc::clone(&self.entries),
+            alias: canonical_alias.clone(),
+            generation,
+            armed: true,
+        };
+
+        // Phase instrumentation (debug!): leader load phases localize a hang to
+        // nameservice (DDB, no default timeout) vs storage (S3, 35s/attempt) vs
+        // the binary-store attach.
+        tracing::debug!(alias = %canonical_alias, "ledger.load.leader.begin");
+
+        // Do ALL load I/O — including the binary index store attach, which
+        // performs S3 reads — WITHOUT holding the manager lock. Holding the
+        // `entries` write lock across that I/O previously turned the entire
+        // ledger cache into a global mutex for the duration of any cold load.
+        // Note: we pass the original address to nameservice (it handles
+        // resolution), but cache under the canonical address.
+        let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+            .await
+            .map_err(ApiError::from); // Convert LedgerError to ApiError
+        tracing::debug!(
+            alias = %canonical_alias,
+            ok = load_result.is_ok(),
+            "ledger.load.state.done"
+        );
+
+        // Whether the load failed on the binary store, which is remembered for
+        // `store_load_retry` (a ledger-state failure, such as not found, is not).
+        let mut store_failed = false;
+        let publish = match load_result {
+            Ok(mut state) => {
+                // Attach the binary index store. A ledger with an index can be
+                // neither read nor checked without it, so a failure fails the
+                // load: a handle without its store is never cached, and a
+                // later request loads again.
+                match load_and_attach_binary_store(
+                    &self.backend,
+                    self.nameservice_mode.reader(),
+                    &mut state,
+                    &self.config.cache_dir,
+                    self.config.leaflet_cache.clone(),
+                    None,
+                )
+                .await
+                {
+                    Ok(binary_store) => Ok((state, binary_store)),
+                    Err(e) => {
+                        tracing::warn!(
+                            ledger_id = %ledger_id,
+                            error = %e,
+                            "Failed to load binary store; the load fails"
+                        );
+                        store_failed = true;
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let publish = match publish {
+            Ok((state, binary_store)) => {
+                tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
+                #[cfg(feature = "shacl")]
+                let loaded_config = warn_if_shapes_unenforced(&state).await;
+                let handle = LedgerHandle::new(canonical_alias.clone(), state, binary_store);
+                #[cfg(feature = "shacl")]
+                if let Some((key, config)) = loaded_config {
+                    handle.config_cache_put(key, config).await;
+                }
+                Ok(handle)
+            }
+            Err(e) => Err(e),
+        };
+
+        // Phase instrumentation (debug!): leader reached publish.
+        tracing::debug!(
+            alias = %canonical_alias,
+            ok = publish.is_ok(),
+            "ledger.load.leader.publish"
+        );
+
+        // Publish under a brief lock. There is no `.await` between acquiring
+        // the lock and disarming the guard, so the leader cannot be cancelled
+        // mid-publish: either the guard already fired (we never reached here)
+        // or the publish runs to completion in this poll.
+        let mut entries = self.entries.write().await;
+        let shutting_down = self.is_shutdown();
+        leader_guard.disarm();
+
+        // We only own the slot — and may remove/notify/cache it — if it is
+        // still OUR `Loading` (generation match). If `disconnect` cleared it and
+        // a newer leader inserted a fresh `Loading`, that slot belongs to the
+        // newer leader: publishing over it would clobber it and notify its
+        // waiters with our stale result. In that case we just return our own
+        // result to the direct caller without touching the cache. (The
+        // generation also guards the detached drop cleanup.)
+        let owns_slot = matches!(
+            entries.get(&canonical_alias),
+            Some(LoadState::Loading { generation: g, .. }) if *g == generation
+        );
+
+        match publish {
+            Ok(handle) => {
+                let mut absorb_missed_events = false;
+                if owns_slot {
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Ok(handle.clone()));
+                        }
+                    }
+                    // Don't re-insert into cache if shutdown has been initiated
+                    if !shutting_down {
+                        entries.insert(canonical_alias.clone(), LoadState::Ready(handle.clone()));
+                        absorb_missed_events = true;
+                    }
+                }
+                drop(entries);
+                // Commit events that fired while the entry was Loading were
+                // dropped by `notify`'s NotLoaded short-circuit (the listener
+                // can't update a cache that isn't there yet). The
+                // nameservice record we loaded against was sampled at
+                // load-start, so any commit that landed during the load is
+                // now invisible. Re-read the record once now that we're
+                // Ready and let the incremental path catch the cache up.
+                if absorb_missed_events {
+                    if let Err(error) = self
+                        .notify(NsNotify {
+                            ledger_id: canonical_alias,
+                            record: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            alias = %handle.id(),
+                            error = %error,
+                            "post-load reconciliation failed; cache may be stale until next event"
+                        );
+                    }
+                }
+                Ok(handle)
+            }
+            Err(e) => {
+                // Capture error with status code for waiters before consuming the error
+                // Note: Waiters receive an Http error (preserving status code);
+                // the leader (first caller) gets the original error type preserved.
+                if owns_slot {
+                    let error_for_waiters =
+                        Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                        }
+                    }
+                    // Remember a store failure, so requests in the window get
+                    // it without each loading again.
+                    let retry = self.config.store_load_retry;
+                    if store_failed && !retry.is_zero() && !shutting_down {
+                        entries.insert(
+                            canonical_alias.clone(),
+                            LoadState::Failed {
+                                error: error_for_waiters,
+                                retry_at: Instant::now() + retry,
+                            },
+                        );
+                    }
+                }
+
+                // Leader returns the original error (preserves full type/variant)
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove ledger from cache
+    ///
+    /// Note: If loading/reloading is in progress, waiters will receive
+    /// cancellation errors. This is acceptable - disconnect is a "force evict."
+    pub async fn disconnect(&self, ledger_id: &LedgerId) {
+        // Normalize ledger_id to match cache key format
+        let canonical_alias = ledger_id.clone();
+
+        let mut entries = self.entries.write().await;
+        // Removal will drop any pending oneshot senders, causing waiters to get RecvError
+        entries.remove(&canonical_alias);
+        // Drop the alias's head watermark with it — a ledger
+        // re-created under the same alias starts at low `t`, and a
+        // leftover watermark would mark every hit stale forever.
+        self.head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .remove(&canonical_alias);
+    }
+
+    /// Remove all ledgers from cache (for shutdown)
+    ///
+    /// Sets a shutdown flag that prevents in-flight load/reload leaders from
+    /// re-inserting entries after this call completes.
+    ///
+    /// Any in-flight Loading/Reloading waiters will receive cancellation
+    /// errors when their oneshot senders are dropped. This is the expected
+    /// behavior for a force-evict during shutdown.
+    pub async fn disconnect_all(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let mut entries = self.entries.write().await;
+        entries.clear();
+    }
+
+    /// Check if shutdown has been initiated
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Reload a ledger in place (for peer freshness)
+    ///
+    /// Truly coalesces concurrent reloads: only one actual reload I/O happens,
+    /// other callers wait for it. Does NOT invalidate the handle object.
+    ///
+    /// State machine:
+    /// - Ready(h) → Reloading{h, waiters=[]} (caller becomes leader)
+    /// - Reloading{h, waiters} → add waiter, await completion
+    /// - Loading(waiters) → wait for initial load, then return Ok(())
+    /// - None → Ok(()) (not loaded, nothing to reload)
+    ///
+    /// The reloaded state is installed only if it is not behind the cached
+    /// one, so a commit applied meanwhile is never clobbered.
+    pub async fn reload(&self, ledger_id: &LedgerId) -> Result<()> {
+        self.reload_installing(ledger_id, Install::UnlessBehind)
+            .await
+    }
+
+    async fn reload_installing(&self, ledger_id: &LedgerId, install: Install) -> Result<()> {
+        // Normalize ledger_id to match cache key format
+        let canonical_alias = ledger_id.clone();
+
+        enum ReloadAction {
+            BecomeLeader {
+                handle: LedgerHandle,
+                generation: u64,
+            },
+            WaitForReload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
+            WaitForInitialLoad(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
+            NotLoaded,
+        }
+
+        // Determine action under lock
+        let action = {
+            let mut entries = self.entries.write().await;
+
+            match entries.get_mut(&canonical_alias) {
+                Some(LoadState::Ready(h)) => {
+                    // Transition to Reloading, become leader. Tag the slot with
+                    // a fresh generation so a cancelled leader's guard reclaims
+                    // only its own slot.
+                    let handle = h.clone();
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                    let reloading = LoadState::Reloading {
+                        generation,
+                        handle: handle.clone(),
+                        waiters: Vec::new(),
+                    };
+                    entries.insert(canonical_alias.clone(), reloading);
+                    ReloadAction::BecomeLeader { handle, generation }
+                }
+                Some(LoadState::Reloading { waiters, .. }) => {
+                    // Join existing reload
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    ReloadAction::WaitForReload(rx)
+                }
+                Some(LoadState::Loading { waiters, .. }) => {
+                    // Initial load in progress - wait for it, then done
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    ReloadAction::WaitForInitialLoad(rx)
+                }
+                // Nothing is cached to reload; the next request loads.
+                Some(LoadState::Failed { .. }) | None => ReloadAction::NotLoaded,
+            }
+        };
+        // Manager lock released
+
+        match action {
+            ReloadAction::NotLoaded => Ok(()),
+
+            ReloadAction::WaitForInitialLoad(rx) => {
+                // Wait for initial load to complete, then we're fresh
+                // Note: Waiters receive Http error (preserving status code) since ApiError isn't Clone
+                rx.await
+                    .map_err(|_| ApiError::internal("load cancelled"))?
+                    .map_err(|arc_err| {
+                        // Extract Http error preserving status code
+                        match arc_err.as_ref() {
+                            ApiError::Http { status, message } => ApiError::http(*status, message),
+                            other => ApiError::http(other.status_code(), other.to_string()),
+                        }
+                    })?;
+                Ok(())
+            }
+
+            ReloadAction::WaitForReload(rx) => {
+                // Wait for reload leader to complete
+                // Note: Waiters receive Http error (preserving status code) since ApiError isn't Clone
+                rx.await
+                    .map_err(|_| ApiError::internal("reload cancelled"))?
+                    .map_err(|arc_err| {
+                        // Extract Http error preserving status code
+                        match arc_err.as_ref() {
+                            ApiError::Http { status, message } => ApiError::http(*status, message),
+                            other => ApiError::http(other.status_code(), other.to_string()),
+                        }
+                    })
+            }
+
+            ReloadAction::BecomeLeader { handle, generation } => {
+                // Guard the Reloading slot: a cancelled reload-leader future
+                // would otherwise orphan it (stalling future reloads/current_t).
+                let mut reload_guard = ReloadLeaderGuard {
+                    entries: Arc::clone(&self.entries),
+                    alias: canonical_alias.clone(),
+                    generation,
+                    armed: true,
+                };
+
+                // We're the reload leader. Build the replacement state + binary
+                // store WITHOUT holding the handle `state` lock, so concurrent
+                // queries (snapshot() -> state.lock()) are not blocked behind the
+                // reload's nameservice/S3/index I/O. The lock is taken only for
+                // the brief coherent swap below. The `entries` lock is likewise
+                // not held over any of this and is acquired after the swap, so
+                // the two locks never overlap (avoids the entries↔state ordering
+                // hazard with `current_t`).
+                let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+                    .await
+                    .map_err(ApiError::from);
+                let result = 'load: {
+                    match loaded {
+                        Ok(mut new_state) => {
+                            // Attempt to load binary index store (v2 only) — still off-lock.
+                            // Artifacts shared with the store being replaced are
+                            // carried over; the slot is read on its own (no
+                            // `state` lock held), which keeps the lock order.
+                            let prev_store = handle.inner.binary_store.read().await.clone();
+                            let new_binary_store = match load_and_attach_binary_store(
+                                &self.backend,
+                                self.nameservice_mode.reader(),
+                                &mut new_state,
+                                &self.config.cache_dir,
+                                self.config.leaflet_cache.clone(),
+                                prev_store.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(store) => store,
+                                Err(e) => {
+                                    // Keep serving the state and store the handle
+                                    // has rather than swap in one without a store.
+                                    tracing::warn!(
+                                        ledger_id = %ledger_id,
+                                        error = %e,
+                                        "Failed to load binary store during reload; keeping the previous state"
+                                    );
+                                    break 'load Err(e);
+                                }
+                            };
+
+                            // Brief coherent swap. Lock order: state -> binary_store;
+                            // acquire both before mutating so there is no `.await`
+                            // between the two assignments (no incoherent
+                            // state/binary_store window on cancellation, and readers
+                            // blocked on `state` never observe a half-applied swap).
+                            let mut write_guard = handle.lock_for_write().await;
+                            // Compare total `t()` (novelty included), not `index_t()`:
+                            // this is deliberately novelty-protective. If the reloaded
+                            // state carries a newer persisted index but an older total
+                            // `t` than the in-memory state, we skip the swap and keep
+                            // the fresher novelty — transiently forgoing the newer
+                            // index, which the next reload picks up. Never clobber a
+                            // newer in-memory commit to adopt a newer index.
+                            if install == Install::Always
+                                || new_state.t() >= write_guard.state().t()
+                            {
+                                let mut bs_guard = handle.inner.binary_store.write().await;
+                                write_guard.replace(new_state);
+                                handle.inner.line.store(Line::fresh(), Ordering::Release);
+                                *bs_guard = new_binary_store;
+                                // Out-of-band swap: any resolved-config entry may
+                                // have been cached against a state this swap just
+                                // replaced — including a detached-commit
+                                // placeholder whose marker (0) a reloaded state
+                                // can legitimately share. See `config_cache_clear`.
+                                // Taking the config lock while holding `state` is
+                                // safe: no path acquires `state` while holding the
+                                // config lock.
+                                handle.config_cache_clear().await;
+                            } else {
+                                // A concurrent commit advanced the in-memory state
+                                // past the reloaded storage HEAD (a txn took the
+                                // still-valid handle via get_or_load's Reloading
+                                // fast path while we loaded). Keep the fresher
+                                // in-memory state rather than clobber the commit.
+                                tracing::debug!(
+                                    ledger_id = %ledger_id,
+                                    "reload: in-memory state newer than reloaded storage; skipping swap"
+                                );
+                            }
+                            Ok(())
+                            // state (and binary_store) guards dropped here, before `entries`.
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+
+                // Publish under a brief `entries` lock — no `.await` between the
+                // lock and disarm, so the leader can't be cancelled mid-publish.
+                let mut entries = self.entries.write().await;
+                let shutting_down = self.is_shutdown();
+                reload_guard.disarm();
+
+                // Only publish if WE still own the slot (our `Reloading`
+                // generation). If `disconnect` cleared it and a newer reload
+                // inserted a fresh `Reloading`, that slot belongs to the newer
+                // leader; removing/notifying/restoring over it would deliver our
+                // stale success/error to its waiters and clobber it. In that
+                // case do nothing and return our own result to the caller.
+                let owns_slot = matches!(
+                    entries.get(&canonical_alias),
+                    Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+                );
+
+                match result {
+                    Ok(()) => {
+                        // Notify waiters and restore Ready state (unless shutting down)
+                        if owns_slot {
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Ok(()));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Capture error with status code for waiters before consuming the error
+                        // Note: Waiters receive Http error (preserving status code); leader gets original type
+                        if owns_slot {
+                            let error_for_waiters =
+                                Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                            // Notify waiters of failure, restore Ready (keep old data) unless shutting down
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
+                            }
+                        }
+                        // Leader returns the original error (preserves full type/variant)
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sweep idle entries (called by maintenance task)
+    ///
+    /// Only evicts Ready entries. Never evicts Loading/Reloading entries
+    /// (they're transient; eviction would cancel waiters unexpectedly).
+    pub async fn sweep_idle(&self) -> Vec<LedgerId> {
+        let now = monotonic_secs();
+        let ttl_secs = self.config.idle_ttl.as_secs();
+
+        let mut entries = self.entries.write().await;
+        let mut evicted = Vec::new();
+
+        entries.retain(|alias, load_state| {
+            if let LoadState::Ready(handle) = load_state {
+                let age = now.saturating_sub(handle.last_access_secs());
+                if age > ttl_secs && !handle.is_locked() {
+                    evicted.push(alias.clone());
+                    return false;
+                }
+            }
+            // A remembered store failure past its window holds nothing.
+            if let LoadState::Failed { retry_at, .. } = load_state {
+                return Instant::now() < *retry_at;
+            }
+            // Keep Loading/Reloading entries - they're transient
+            true
+        });
+
+        evicted
+    }
+
+    /// Get count of cached ledgers (for metrics)
+    pub async fn cached_count(&self) -> usize {
+        let entries = self.entries.read().await;
+        entries
+            .values()
+            .filter(|s| matches!(s, LoadState::Ready(_) | LoadState::Reloading { .. }))
+            .count()
+    }
+
+    /// Get list of cached ledger IDs (for introspection)
+    pub async fn cached_aliases(&self) -> Vec<LedgerId> {
+        let entries = self.entries.read().await;
+        entries
+            .iter()
+            .filter_map(|(alias, state)| {
+                if matches!(state, LoadState::Ready(_) | LoadState::Reloading { .. }) {
+                    Some(alias.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Spawn maintenance task for idle sweeping
+    ///
+    /// Returns JoinHandle for graceful shutdown. Call `.abort()` on shutdown.
+    pub fn spawn_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let mgr = Arc::clone(self);
+        let sweep_interval = self.config.sweep_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(sweep_interval);
+
+            loop {
+                interval.tick().await;
+                let evicted = mgr.sweep_idle().await;
+                if !evicted.is_empty() {
+                    tracing::debug!(
+                        count = evicted.len(),
+                        aliases = ?evicted,
+                        "Swept idle ledgers"
+                    );
+                }
+            }
+        })
+    }
+}
+
+// ============================================================================
+// Notify Types - Update Plan
+// ============================================================================
+
+/// Maximum number of commits to catch up incrementally before falling back to
+/// full reload. For gaps larger than this, the cost of N individual commit loads
+/// exceeds the cost of a single full reload.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_INCREMENTAL_COMMITS: i64 = 5;
+/// Browser peers: an SSE reconnect after a tab sleeps routinely wakes tens
+/// of commits behind, and a full re-open drops warm per-store state (the
+/// overlay-translation cache is store-id-keyed) that catch-up preserves.
+/// The parent-chain walk is one sequential fetch per commit, so the cap is
+/// where ~gap × RTT stops beating a re-open's concurrent artifact loads —
+/// past it, reload (which still fires the head-change signal) wins.
+#[cfg(target_arch = "wasm32")]
+const MAX_INCREMENTAL_COMMITS: i64 = 64;
+
+/// Decision from comparing cached state to nameservice record
+///
+/// Based on the legacy `plan-ns-update` behavior:
+/// - Compare local `t()` (max of index + novelty) against nameservice `commit_t`
+/// - Determine minimal action needed to bring cache up to date
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePlan {
+    /// Nothing to do - state is current
+    /// (ns.commit_t == local.t() AND index unchanged)
+    Noop,
+
+    /// Index advanced but commit_t unchanged
+    /// (ns.commit_t == local.t() BUT ns.index_t > local.index_t)
+    /// Action: reload index root, trim novelty to only commits > new index_t
+    IndexOnly {
+        /// New index head CID to load
+        index_head_id: ContentId,
+        /// New index_t value
+        index_t: i64,
+    },
+
+    /// Small commit gap — catch up incrementally
+    /// (ns.commit_t > local.t() AND gap <= MAX_INCREMENTAL_COMMITS)
+    /// Action: walk backward from commit_head to local_t, apply in oldest→newest order
+    CommitCatchUp {
+        /// CID of the remote commit head
+        commit_head_id: ContentId,
+        /// Remote commit_t
+        commit_t: i64,
+        /// Number of commits to catch up (1 = single commit fast path)
+        gap: i64,
+        /// If the index also advanced, apply after commits
+        index_update: Option<(ContentId, i64)>,
+    },
+
+    /// Stale - remote is too many commits ahead for incremental catch-up
+    /// (ns.commit_t - local.t() > MAX_INCREMENTAL_COMMITS)
+    /// Action: full reload from nameservice
+    Reload,
+}
+
+impl UpdatePlan {
+    /// Plan the update action based on local state vs nameservice record
+    ///
+    /// This mirrors the legacy `plan-ns-update` logic:
+    /// - If commit_t matches local t(), check if index advanced
+    /// - If commit_t is exactly local t() + 1, we can apply just that commit
+    /// - If commit_t is further ahead, we're stale and need full reload
+    ///
+    /// # Arguments
+    /// * `local_t` - Local ledger's current t (max of index + novelty)
+    /// * `local_index_t` - Local ledger's indexed t (db.t)
+    /// * `local_index_id` - Local ledger's current index CID (if any)
+    /// * `ns` - Fresh nameservice record
+    pub fn plan(
+        local_t: i64,
+        local_index_t: i64,
+        local_index_id: Option<&ContentId>,
+        ns: &NsRecord,
+    ) -> Self {
+        // An index the record names that the cached state has not installed.
+        // Valid whenever the record's index is newer than the local one: the
+        // index covers a prefix of commits, so it applies equally to a local
+        // state at, ahead of, or behind the record's commit head.
+        let index_advance = match (&ns.index_head_id, local_index_id) {
+            (Some(ns_idx), Some(local_idx))
+                if ns_idx != local_idx && ns.index_t > local_index_t =>
+            {
+                Some((ns_idx.clone(), ns.index_t))
+            }
+            (Some(ns_idx), None) if ns.index_t > local_index_t => {
+                Some((ns_idx.clone(), ns.index_t))
+            }
+            _ => None,
+        };
+
+        if ns.commit_t == local_t {
+            match index_advance {
+                Some((index_head_id, index_t)) => UpdatePlan::IndexOnly {
+                    index_head_id,
+                    index_t,
+                },
+                None => UpdatePlan::Noop,
+            }
+        } else if ns.commit_t > local_t && (ns.commit_t - local_t) <= MAX_INCREMENTAL_COMMITS {
+            // Small gap — catch up incrementally
+            let gap = ns.commit_t - local_t;
+            match &ns.commit_head_id {
+                Some(cid) => UpdatePlan::CommitCatchUp {
+                    commit_head_id: cid.clone(),
+                    commit_t: ns.commit_t,
+                    gap,
+                    index_update: index_advance,
+                },
+                None => UpdatePlan::Reload,
+            }
+        } else if ns.commit_t > local_t {
+            // Large gap — full reload
+            UpdatePlan::Reload
+        } else {
+            // ns.commit_t < local_t: the record is older than the cached
+            // state on commits. Routine on a busy writer — `notify` reads
+            // the record before it reads the local metrics, so a commit
+            // that lands in between (or, under the raft commit worker, a
+            // whole chunk staged behind the state lock) leaves the local
+            // state a commit newer than the record. Local is the fresher
+            // of the two on commits, so there is nothing to catch up. An
+            // index the record names is still installed: skipping it here
+            // left the novelty uncleared while every subsequent commit saw
+            // an oversized novelty and re-triggered a build, and the next
+            // publish raced the same way.
+            match index_advance {
+                Some((index_head_id, index_t)) => UpdatePlan::IndexOnly {
+                    index_head_id,
+                    index_t,
+                },
+                None => {
+                    tracing::debug!(
+                        local_t = local_t,
+                        ns_commit_t = ns.commit_t,
+                        "nameservice record older than local state; ignoring"
+                    );
+                    UpdatePlan::Noop
+                }
+            }
+        }
+    }
+
+    /// Check if this plan requires any action
+    pub fn is_noop(&self) -> bool {
+        matches!(self, UpdatePlan::Noop)
+    }
+
+    /// Check if this plan requires a full reload
+    pub fn requires_reload(&self) -> bool {
+        matches!(self, UpdatePlan::Reload)
+    }
+}
+
+/// Input for notify: ledger ID + optional fresh NsRecord
+pub struct NsNotify {
+    /// Ledger ID
+    pub ledger_id: LedgerId,
+    /// Fresh nameservice record (if already fetched)
+    pub record: Option<NsRecord>,
+}
+
+/// The head a cached ledger holds, as [`LedgerManager::follow`] compares
+/// records with it.
+struct CachedHead {
+    t: i64,
+    head: Option<ContentId>,
+    index_t: i64,
+    index: Option<ContentId>,
+}
+
+impl CachedHead {
+    async fn of(handle: &LedgerHandle) -> Self {
+        let state = handle.inner.state.read().await;
+        Self {
+            t: state.t(),
+            head: state.head_commit_id.clone(),
+            index_t: state.index_t(),
+            index: state.head_index_id.clone().or_else(|| {
+                state
+                    .ns_record
+                    .as_ref()
+                    .and_then(|r| r.index_head_id.clone())
+            }),
+        }
+    }
+
+    /// Whether `record` moves the cached head forward, or names the cached
+    /// head and index both.
+    fn advanced_or_held_by(&self, record: &NsRecord) -> bool {
+        record.commit_t > self.t
+            || (record.commit_t == self.t
+                && record.commit_head_id == self.head
+                && record.index_head_id == self.index)
+    }
+
+    /// Whether the nameservice's `current` record has replaced the cached
+    /// line: a head at or below the cached `t` other than the cached head,
+    /// or a lower or absent index under the cached head. The nameservice
+    /// only moves a branch back on a reset.
+    fn replaced_by(&self, current: &NsRecord) -> bool {
+        if current.commit_head_id == self.head {
+            self.index_lowered_by(current)
+        } else {
+            current.commit_t <= self.t
+        }
+    }
+
+    fn index_lowered_by(&self, record: &NsRecord) -> bool {
+        self.index.is_some() && (record.index_head_id.is_none() || record.index_t < self.index_t)
+    }
+}
+
+/// Which reloaded state [`LedgerManager::reload_installing`] installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// One not behind the cached state on commits.
+    UnlessBehind,
+    /// Any: the nameservice's head replaces the cached line, as a rebase
+    /// that moves a branch's head back requires.
+    Always,
+}
+
+/// Result of notify operation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyResult {
+    /// Ledger not in cache, no action taken
+    NotLoaded,
+    /// Already up to date, no action taken (Noop plan)
+    Current,
+    /// Index was updated incrementally (trimmed novelty, loaded new index root)
+    IndexUpdated,
+    /// Applied commits incrementally to novelty
+    CommitsApplied {
+        /// Number of commits applied
+        count: i64,
+    },
+    /// Was stale, reloaded in-place via reload()
+    Reloaded,
+}
+
+/// Options for `Fluree::refresh()`.
+///
+/// Controls minimum-`t` enforcement: if `min_t` is set and the ledger's `t`
+/// is still below that value after pulling the latest state from the
+/// nameservice, the call returns [`ApiError::AwaitTNotReached`] so the
+/// caller can decide whether to retry, back off, or time out.
+#[derive(Debug, Clone, Default)]
+pub struct RefreshOpts {
+    /// If set, refresh will return an error when the ledger's `t` is still
+    /// below this value after the nameservice pull + apply cycle.
+    pub min_t: Option<i64>,
+}
+
+/// Result of a successful `Fluree::refresh()` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshResult {
+    /// The ledger's `t` value after the refresh completed.
+    pub t: i64,
+    /// What action was taken (no-op, incremental, reload, etc.).
+    pub action: NotifyResult,
+}
+
+impl LedgerManager {
+    /// Handle nameservice update notification
+    ///
+    /// Uses update planning to determine minimal action:
+    /// - Noop: nothing to do
+    /// - IndexOnly: load new index root, trim novelty (incremental)
+    /// - CommitCatchUp: load 1-5 commits, merge into novelty (incremental)
+    /// - Reload: full reload from storage (large gaps)
+    pub async fn notify(&self, input: NsNotify) -> Result<NotifyResult> {
+        self.notify_planned(input, None).await
+    }
+
+    /// [`Self::notify`] for a record its caller read after taking
+    /// `planned_on` from [`Self::line_of`]: an index install is not made if a
+    /// reload replaced the cached state since. Without one, the line is taken
+    /// here, before this call reads the record.
+    pub(crate) async fn notify_planned(
+        &self,
+        input: NsNotify,
+        planned_on: Option<Line>,
+    ) -> Result<NotifyResult> {
+        // Check if ledger is cached
+        let handle = {
+            let entries = self.entries.read().await;
+            match entries.get(&input.ledger_id) {
+                Some(LoadState::Ready(h)) => h.clone(),
+                Some(LoadState::Reloading { handle, .. }) => handle.clone(),
+                _ => return Ok(NotifyResult::NotLoaded),
+            }
+        };
+        let planned_on = planned_on.unwrap_or_else(|| handle.line());
+
+        // Get fresh record from nameservice if not provided
+        let ns_record = match input.record {
+            Some(r) => r,
+            None => match self
+                .nameservice_mode
+                .reader()
+                .lookup(&input.ledger_id)
+                .await?
+            {
+                Some(r) => r,
+                None => return Ok(NotifyResult::Current), // Ledger doesn't exist
+            },
+        };
+
+        // Get local state metrics for planning
+        let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
+
+        // Plan the update action
+        let plan = UpdatePlan::plan(local_t, local_index_t, local_index_id.as_ref(), &ns_record);
+
+        tracing::debug!(
+            alias = %input.ledger_id,
+            local_t = local_t,
+            local_index_t = local_index_t,
+            ns_commit_t = ns_record.commit_t,
+            ns_index_t = ns_record.index_t,
+            ?plan,
+            "notify: computed update plan"
+        );
+
+        // Build a branch-aware content store once for any plan variant that
+        // walks the commit chain or loads index blobs. For non-branched
+        // ledgers this returns a flat namespace store with no extra cost
+        // beyond the `ns_record` lookup we already did above.
+        let cs_for_record = || async {
+            fluree_db_nameservice::branched_content_store_for_record(
+                &self.backend,
+                self.nameservice_mode.reader(),
+                &ns_record,
+            )
+            .await
+            .map_err(ApiError::from)
+        };
+
+        match plan {
+            UpdatePlan::Noop => Ok(NotifyResult::Current),
+
+            UpdatePlan::IndexOnly {
+                index_head_id,
+                index_t,
+            } => {
+                tracing::debug!(
+                    alias = %input.ledger_id,
+                    %index_head_id, index_t,
+                    "notify: applying index update (incremental)"
+                );
+                let cs = cs_for_record().await?;
+                // Boxed: an index install loads the index, and inline it
+                // nests that load in every caller that reaches `notify`,
+                // `get_or_load` among them, past the future layout limit.
+                let installed = Box::pin(handle.apply_index_v2(
+                    &index_head_id,
+                    cs,
+                    &self.config.cache_dir,
+                    self.config.leaflet_cache.clone(),
+                    planned_on,
+                ))
+                .await?;
+                Ok(if installed {
+                    NotifyResult::IndexUpdated
+                } else {
+                    NotifyResult::Current
+                })
+            }
+
+            UpdatePlan::CommitCatchUp {
+                commit_head_id,
+                commit_t,
+                gap,
+                index_update,
+            } => {
+                tracing::debug!(
+                    alias = %input.ledger_id,
+                    %commit_head_id, commit_t, gap,
+                    has_index_update = index_update.is_some(),
+                    "notify: catching up commits (incremental)"
+                );
+
+                let ledger_id_canonical = handle.id().to_string();
+                let cs: Arc<dyn ContentStore> = cs_for_record().await?;
+
+                // Load commits outside any lock.
+                // trace_first_parent_commits_by_id walks HEAD → oldest, stopping at local_t.
+                // Collect then reverse to apply oldest → newest.
+                let mut commits = Vec::with_capacity(gap as usize);
+                {
+                    let stream = trace_first_parent_commits_by_id(
+                        Arc::clone(&cs),
+                        commit_head_id.clone(),
+                        local_t,
+                    );
+                    futures::pin_mut!(stream);
+                    while let Some(result) = futures::StreamExt::next(&mut stream).await {
+                        let commit = result.map_err(|e| {
+                            ApiError::internal(format!("load commit during catch-up: {e}"))
+                        })?;
+                        commits.push(commit);
+                    }
+                }
+
+                // Verify we got the expected number of commits.
+                // If the chain is broken or shorter than expected, fall back to reload.
+                let loaded = commits.len() as i64;
+                if loaded != gap {
+                    tracing::warn!(
+                        alias = %input.ledger_id,
+                        expected = gap,
+                        loaded,
+                        "incremental catch-up: commit count mismatch, falling back to reload"
+                    );
+                    self.reload(&input.ledger_id).await?;
+                    return Ok(NotifyResult::Reloaded);
+                }
+
+                commits.reverse(); // oldest → newest
+
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                let translation_prefetch: Option<(
+                    Arc<fluree_db_binary_index::BinaryIndexStore>,
+                    Arc<fluree_db_core::dict_novelty::DictNovelty>,
+                )>;
+
+                // Apply commits under write lock (brief — all sync).
+                // Re-check state.t() under lock to guard against concurrent updates.
+                {
+                    let mut write_guard = handle.lock_for_write().await;
+                    let current_t = write_guard.state().t();
+                    if current_t != local_t {
+                        // State advanced while we were loading commits — re-plan
+                        // by falling through to a reload (safe, not optimal).
+                        tracing::debug!(
+                            alias = %input.ledger_id,
+                            local_t, current_t,
+                            "incremental catch-up: state advanced concurrently, falling back to reload"
+                        );
+                        drop(write_guard);
+                        self.reload(&input.ledger_id).await?;
+                        return Ok(NotifyResult::Reloaded);
+                    }
+                    // The walk stops at the cached `t`, not the cached head: after
+                    // a rebase the new line's commits sit on another commit at
+                    // that `t`, and applying them would mix the two lines.
+                    if let Some(cached_head) = write_guard.state().head_commit_id.as_ref() {
+                        let oldest_parent = commits.first().and_then(|c| c.parent_ids().next());
+                        if oldest_parent != Some(cached_head) {
+                            tracing::debug!(
+                                alias = %input.ledger_id,
+                                local_t,
+                                "incremental catch-up: commits are not on the cached line, falling back to reload"
+                            );
+                            drop(write_guard);
+                            self.reload(&input.ledger_id).await?;
+                            return Ok(NotifyResult::Reloaded);
+                        }
+                    }
+                    // Detach the range provider before the commit loop. A
+                    // BinaryRangeProvider owns Arc clones of dict_novelty /
+                    // runtime_small_dicts; while attached, each `apply_single_commit`'s
+                    // `Arc::make_mut` on those dicts sees strong_count >= 2 and
+                    // deep-clones the (growing) dictionaries every commit — the
+                    // O(accumulated-novelty) cost that returns right after the first
+                    // reindex. Capture its store first so we can rebuild the provider
+                    // with the updated dicts afterward.
+                    let provider_store = write_guard
+                        .state()
+                        .snapshot
+                        .range_provider
+                        .as_ref()
+                        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+                        .map(|brp| Arc::clone(brp.store()));
+                    if provider_store.is_some() {
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider = None;
+                    }
+
+                    // Apply commits, capturing the first error instead of `?`-ing
+                    // straight out: the provider MUST be reattached even on a
+                    // mid-loop failure, or the live cached state is stranded with
+                    // `range_provider == None` and silently loses overlay
+                    // translation for this ledger until a reload.
+                    let mut apply_err = None;
+                    for commit in commits {
+                        if let Err(e) = write_guard
+                            .state_mut()
+                            .apply_single_commit(commit, &ledger_id_canonical)
+                        {
+                            apply_err = Some(ApiError::internal(format!("apply commit: {e}")));
+                            break;
+                        }
+                    }
+
+                    // Rebuild + reattach the provider pointing at the updated
+                    // DictNovelty / runtime dicts so overlay translation resolves
+                    // novelty-only strings/subjects introduced by these commits.
+                    // (`apply_single_commit` mutates the dicts in place now that the
+                    // provider no longer pins them.) Runs unconditionally — even
+                    // after an apply error — so the provider is never left detached.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    {
+                        translation_prefetch = provider_store.as_ref().map(|store| {
+                            (
+                                Arc::clone(store),
+                                Arc::clone(&write_guard.state().dict_novelty),
+                            )
+                        });
+                    }
+
+                    if let Some(store) = provider_store {
+                        let dn = Arc::clone(&write_guard.state().dict_novelty);
+                        let runtime_small_dicts =
+                            Arc::clone(&write_guard.state().runtime_small_dicts);
+                        let ns_fallback = Some(write_guard.state().snapshot.shared_namespaces());
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
+                            Some(Arc::new(BinaryRangeProvider::new(
+                                store,
+                                dn,
+                                runtime_small_dicts,
+                                ns_fallback,
+                            )));
+                    }
+
+                    // A commit that dropped a graph leaves the store still
+                    // holding it.
+                    if fluree_db_transact::hide_dropped_graphs(write_guard.state_mut()) {
+                        handle
+                            .sync_binary_store_from_state(write_guard.state())
+                            .await;
+                    }
+
+                    if let Some(e) = apply_err {
+                        return Err(e);
+                    }
+                }
+
+                // Apply index update if present (after commits so novelty has latest flakes).
+                // Reuse the same branch-aware store built above for the commit walk.
+                if let Some((index_head_id, _index_t)) = index_update {
+                    // Boxed, as in the index-only plan above.
+                    Box::pin(handle.apply_index_v2(
+                        &index_head_id,
+                        Arc::clone(&cs),
+                        &self.config.cache_dir,
+                        self.config.leaflet_cache.clone(),
+                        planned_on,
+                    ))
+                    .await?;
+                }
+
+                // Caught-up commits introduced new novelty entries whose
+                // overlay translation reverse-looks-up the persisted dict
+                // trees at query time: prewarm those leaves now (the same F8
+                // treatment the load and index-apply paths get), so a
+                // head-change → re-query is a pure hit instead of a retry
+                // round. Runs outside the write guard; when an index update
+                // swapped the store above, its apply-path prefetch already
+                // covered the new store and this is a resident no-op.
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                if let Some((store, dict_novelty)) = translation_prefetch {
+                    prefetch_novelty_translation(&store, &dict_novelty).await;
+                }
+
+                Ok(NotifyResult::CommitsApplied { count: gap })
+            }
+
+            UpdatePlan::Reload => {
+                self.reload(&input.ledger_id).await?;
+                Ok(NotifyResult::Reloaded)
+            }
+        }
+    }
+
+    /// Apply a record from the writer's own event stream, as a query peer
+    /// does. The stream is authoritative, but it can trail the cached state:
+    /// a load reads the nameservice, which may already be ahead of it.
+    ///
+    /// A record that moves the cached head forward, or names the cached head
+    /// and index, is applied as [`Self::notify`] applies it. Any other record
+    /// is judged by the nameservice's current record: a head below or beside
+    /// the cached one, or another index under it. Such a record is one the
+    /// cache has passed, an index the nameservice may no longer hold (one a
+    /// rebase reset, or a reset read half-written), or a reset itself, such
+    /// as a rebase that moves a branch's head back or lowers its index. A
+    /// reset reloads the ledger, which goes on serving the cached state until
+    /// the reload lands; otherwise the current record is applied.
+    ///
+    /// A record for a ledger that is still loading is followed once the load
+    /// lands, since the load may have read the nameservice before it.
+    pub async fn follow(&self, record: NsRecord) -> Result<NotifyResult> {
+        let ledger_id = record.ledger_id.clone();
+        let cached = match self.entries.read().await.get(&ledger_id) {
+            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                Some(handle.clone())
+            }
+            Some(LoadState::Loading { .. }) => None,
+            Some(LoadState::Failed { .. }) | None => return Ok(NotifyResult::NotLoaded),
+        };
+        let handle = match cached {
+            Some(handle) => handle,
+            // Joins the load in flight.
+            None => self.get_or_load(&ledger_id).await?,
+        };
+        self.follow_cached(&handle, record).await
+    }
+
+    async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
+        let ledger_id = record.ledger_id.clone();
+        let planned_on = handle.line();
+        if CachedHead::of(handle).await.advanced_or_held_by(&record) {
+            return self.notify_with(record, planned_on).await;
+        }
+        let Some(current) = self.current_record(&ledger_id).await? else {
+            return Ok(NotifyResult::Current);
+        };
+        if !CachedHead::of(handle).await.replaced_by(&current) {
+            // A record the cache has passed.
+            return self.notify_with(current, planned_on).await;
+        }
+        tracing::info!(
+            alias = %ledger_id,
+            commit_t = current.commit_t,
+            index_t = current.index_t,
+            "the nameservice replaced the cached line; reloading"
+        );
+        self.reload_installing(&ledger_id, Install::Always).await?;
+        // A reload already in flight installs only a state not behind the
+        // cached one, so it may have installed nothing.
+        if let Some(current) = self.current_record(&ledger_id).await? {
+            if CachedHead::of(handle).await.replaced_by(&current) {
+                self.reload_installing(&ledger_id, Install::Always).await?;
+            }
+        }
+        Ok(NotifyResult::Reloaded)
+    }
+
+    async fn notify_with(&self, record: NsRecord, planned_on: Line) -> Result<NotifyResult> {
+        self.notify_planned(
+            NsNotify {
+                ledger_id: record.ledger_id.clone(),
+                record: Some(record),
+            },
+            Some(planned_on),
+        )
+        .await
+    }
+
+    async fn current_record(&self, ledger_id: &LedgerId) -> Result<Option<NsRecord>> {
+        Ok(self.nameservice_mode.reader().lookup(ledger_id).await?)
+    }
+
+    /// The line of the cached ledger, for a record its caller is about to
+    /// read and pass to [`Self::notify_planned`]. A ledger not cached now has
+    /// a line no handle has.
+    pub(crate) async fn line_of(&self, ledger_id: &LedgerId) -> Line {
+        self.get_loaded_handle(ledger_id)
+            .await
+            .map_or(Line::UNCACHED, |handle| handle.line())
+    }
+
+    /// Returns the cached ledger's current `t`, or `None` if not cached.
+    pub async fn current_t(&self, ledger_id: &LedgerId) -> Option<i64> {
+        // Clone the handle out and drop the `entries` read guard BEFORE locking
+        // the handle `state` (via state_metrics): never hold `entries` across a
+        // `state` lock, so there is no entries↔state acquisition-order pair to
+        // deadlock with writers. Mirrors `notify`.
+        let handle = {
+            let entries = self.entries.read().await;
+            match entries.get(ledger_id) {
+                Some(LoadState::Ready(handle)) => handle.clone(),
+                Some(LoadState::Reloading { handle, .. }) => handle.clone(),
+                _ => return None,
+            }
+        };
+        let (t, _, _) = handle.state_metrics().await;
+        Some(t)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> LedgerId {
+        LedgerId::parse(s).unwrap()
+    }
+
+    #[test]
+    fn test_monotonic_secs() {
+        let t1 = monotonic_secs();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let t2 = monotonic_secs();
+        // Should be monotonically non-decreasing
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let config = LedgerManagerConfig::default();
+        assert_eq!(config.idle_ttl, Duration::from_secs(30 * 60));
+        assert_eq!(config.sweep_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_freshness_check() {
+        let remote = RemoteWatermark {
+            commit_t: 10,
+            index_t: 8,
+            index_head_id: None,
+            updated_at: Instant::now(),
+        };
+
+        // These are compile-time checks that the types work correctly
+        assert_eq!(FreshnessCheck::Current, FreshnessCheck::Current);
+        assert_eq!(FreshnessCheck::Stale, FreshnessCheck::Stale);
+        assert_ne!(FreshnessCheck::Current, FreshnessCheck::Stale);
+
+        // RemoteWatermark is Clone
+        let _cloned = remote.clone();
+    }
+
+    #[test]
+    fn test_update_plan_variants() {
+        assert_eq!(UpdatePlan::Noop, UpdatePlan::Noop);
+        assert_eq!(UpdatePlan::Reload, UpdatePlan::Reload);
+        assert_ne!(UpdatePlan::Noop, UpdatePlan::Reload);
+    }
+
+    #[test]
+    fn test_notify_result_variants() {
+        assert_eq!(NotifyResult::NotLoaded, NotifyResult::NotLoaded);
+        assert_eq!(NotifyResult::Current, NotifyResult::Current);
+        assert_eq!(NotifyResult::Reloaded, NotifyResult::Reloaded);
+    }
+
+    /// The read-side tiered-compaction trigger: a long-lived handle accumulates
+    /// one segment per incremental commit; taking a query `snapshot()` runs
+    /// tiered compaction, keeping segment count ~logarithmic (not linear in
+    /// commits) without losing any flake.
+    #[tokio::test]
+    async fn snapshot_triggers_tier_compaction() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        fn mk(s: u16, t: i64) -> Flake {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                Sid::new(1, "p"),
+                FlakeValue::Long(i64::from(s)),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        }
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/compact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new(id("test/compact:main"), state, None);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
+        let rg = std::collections::HashMap::new();
+
+        let commits = 50u16;
+        for i in 0..commits {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(vec![mk(i + 1, i64::from(i) + 1)], i64::from(i) + 1, &rg)
+                    .expect("apply_commit");
+            }
+            // Query path: snapshot() runs compact_if_needed (tiered) before serving.
+            let _view = handle.snapshot().await;
+            let k = handle
+                .lock_for_write()
+                .await
+                .state()
+                .novelty
+                .max_segment_count();
+            assert!(
+                k <= tier_width * 4,
+                "tiered snapshot must keep K ~logarithmic; got {k} after commit {i}"
+            );
+        }
+
+        let g = handle.lock_for_write().await;
+        assert_eq!(
+            g.state().novelty.len(),
+            commits as usize,
+            "tiered compaction must not lose flakes"
+        );
+        assert!(
+            g.state().novelty.max_segment_count() < commits as usize,
+            "tiering must keep K below commit count"
+        );
+    }
+
+    /// Tier width 0 disables the read-side trigger (e.g. a latency-sensitive
+    /// transactor opting out): segments accumulate unbounded across snapshots.
+    #[tokio::test]
+    async fn snapshot_tier_compaction_disabled_when_width_zero() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/nocompact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new(id("test/nocompact:main"), state, None);
+        handle.set_tier_width(0);
+        let rg = std::collections::HashMap::new();
+
+        for i in 0..12u16 {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(
+                        vec![Flake::new(
+                            Sid::new(i + 1, format!("s{i}")),
+                            Sid::new(1, "p"),
+                            FlakeValue::Long(i64::from(i)),
+                            Sid::new(2, "long"),
+                            i64::from(i) + 1,
+                            true,
+                            None,
+                        )],
+                        i64::from(i) + 1,
+                        &rg,
+                    )
+                    .expect("apply_commit");
+            }
+            let _ = handle.snapshot().await;
+        }
+        let k = handle
+            .lock_for_write()
+            .await
+            .state()
+            .novelty
+            .max_segment_count();
+        assert_eq!(k, 12, "tier width 0 must disable read-triggered compaction");
+    }
+
+    /// A writer that never takes a snapshot: staging on the locked state
+    /// compacts as a snapshot does, and stages on the compacted novelty.
+    #[tokio::test]
+    async fn staging_on_the_locked_state_compacts_novelty() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/stage-compact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new(id("test/stage-compact:main"), state, None);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
+        let rg = std::collections::HashMap::new();
+
+        let commits = 50u16;
+        for i in 0..commits {
+            let mut g = handle.lock_for_write().await;
+            let staged = g.clone_state_for_staging();
+            assert!(
+                staged.novelty.max_segment_count() <= tier_width * 4,
+                "staging must see compacted novelty; got {} segments before commit {i}",
+                staged.novelty.max_segment_count()
+            );
+            Arc::make_mut(&mut g.state_mut().novelty)
+                .apply_commit(
+                    vec![Flake::new(
+                        Sid::new(i + 1, format!("s{i}")),
+                        Sid::new(1, "p"),
+                        FlakeValue::Long(i64::from(i)),
+                        Sid::new(2, "long"),
+                        i64::from(i) + 1,
+                        true,
+                        None,
+                    )],
+                    i64::from(i) + 1,
+                    &rg,
+                )
+                .expect("apply_commit");
+        }
+        let g = handle.lock_for_write().await;
+        assert_eq!(g.state().novelty.len(), commits as usize, "no flake lost");
+    }
+
+    // ========================================================================
+    // UpdatePlan::plan() tests - compatibility scenarios
+    // ========================================================================
+
+    fn make_cid(label: &str) -> ContentId {
+        use fluree_db_core::ContentKind;
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    fn make_index_cid(label: &str) -> ContentId {
+        use fluree_db_core::ContentKind;
+        ContentId::new(ContentKind::IndexRoot, label.as_bytes())
+    }
+
+    fn make_ns_record(
+        commit_t: i64,
+        index_t: i64,
+        commit_id: Option<ContentId>,
+        index_id: Option<ContentId>,
+    ) -> NsRecord {
+        NsRecord {
+            ledger_id: id("test:main"),
+            name: "test:main".to_string(),
+            branch: "main".to_string(),
+            commit_head_id: commit_id,
+            config_id: None,
+            commit_t,
+            index_head_id: index_id,
+            index_t,
+            default_context: None,
+            retracted: false,
+            source_branch: None,
+            branches: 0,
+        }
+    }
+
+    #[test]
+    fn test_update_plan_noop_when_commit_t_matches() {
+        // Local t == ns.commit_t, index unchanged -> Noop
+        let idx_cid = make_index_cid("index:8");
+        let ns = make_ns_record(10, 8, Some(make_cid("commit:10")), Some(idx_cid.clone()));
+        let plan = UpdatePlan::plan(10, 8, Some(&idx_cid), &ns);
+        assert_eq!(plan, UpdatePlan::Noop);
+    }
+
+    #[test]
+    fn test_update_plan_noop_when_commit_t_matches_no_index() {
+        // Local t == ns.commit_t, no index on either side -> Noop
+        let ns = make_ns_record(5, 0, Some(make_cid("commit:5")), None);
+        let plan = UpdatePlan::plan(5, 0, None, &ns);
+        assert_eq!(plan, UpdatePlan::Noop);
+    }
+
+    #[test]
+    fn test_update_plan_noop_with_novelty_present() {
+        // Key regression test: local has novelty (commit_t > index_t is normal)
+        // ns.commit_t == local.t() should be Noop, not trigger reload
+        let idx_cid = make_index_cid("index:5");
+        let ns = make_ns_record(10, 5, Some(make_cid("commit:10")), Some(idx_cid.clone()));
+        // Local: index_t=5, but t()=10 due to novelty
+        let plan = UpdatePlan::plan(10, 5, Some(&idx_cid), &ns);
+        assert_eq!(plan, UpdatePlan::Noop);
+    }
+
+    #[test]
+    fn test_update_plan_index_only_when_index_advanced() {
+        // Local t == ns.commit_t, but ns.index_t > local.index_t -> IndexOnly
+        let ns = make_ns_record(
+            10,
+            10,
+            Some(make_cid("commit:10")),
+            Some(make_index_cid("index:10")),
+        );
+        let local_idx = make_index_cid("index:5");
+        // Local: t()=10, index_t=5
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
+    }
+
+    #[test]
+    fn test_update_plan_index_only_when_index_appears() {
+        // Local t == ns.commit_t, index appears where there was none -> IndexOnly
+        let ns = make_ns_record(
+            10,
+            10,
+            Some(make_cid("commit:10")),
+            Some(make_index_cid("index:10")),
+        );
+        // Local: t()=10, no index
+        let plan = UpdatePlan::plan(10, 0, None, &ns);
+        assert!(matches!(plan, UpdatePlan::IndexOnly { index_t: 10, .. }));
+    }
+
+    #[test]
+    fn test_update_plan_commit_catch_up_when_one_ahead() {
+        // ns.commit_t == local.t() + 1 -> CommitCatchUp with gap=1
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(11, 5, Some(make_cid("commit:11")), Some(local_idx.clone()));
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert!(matches!(
+            plan,
+            UpdatePlan::CommitCatchUp {
+                commit_t: 11,
+                gap: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_record_behind_on_commits_still_installs_its_newer_index() {
+        // A commit landed between the record lookup and the local metrics
+        // read: local t is one past the record, and the record names an
+        // index the cached state has not installed.
+        let local_idx = make_index_cid("index:2");
+        let ns_idx = make_index_cid("index:61");
+        let ns = make_ns_record(66, 61, Some(make_cid("commit:66")), Some(ns_idx.clone()));
+        let plan = UpdatePlan::plan(67, 2, Some(&local_idx), &ns);
+        assert_eq!(
+            plan,
+            UpdatePlan::IndexOnly {
+                index_head_id: ns_idx,
+                index_t: 61
+            }
+        );
+
+        // Same lag with no index advance stays a no-op.
+        let ns = make_ns_record(66, 2, Some(make_cid("commit:66")), Some(local_idx.clone()));
+        assert_eq!(
+            UpdatePlan::plan(67, 2, Some(&local_idx), &ns),
+            UpdatePlan::Noop
+        );
+    }
+
+    #[test]
+    fn test_update_plan_reload_when_stale() {
+        // ns.commit_t far ahead of local -> Reload (gap > MAX_INCREMENTAL_COMMITS)
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(
+            20,
+            15,
+            Some(make_cid("commit:20")),
+            Some(make_index_cid("index:15")),
+        );
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert_eq!(plan, UpdatePlan::Reload);
+    }
+
+    #[test]
+    fn test_update_plan_catch_up_when_small_gap() {
+        // ns.commit_t a few ahead -> CommitCatchUp (gap <= MAX_INCREMENTAL_COMMITS)
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(13, 5, Some(make_cid("commit:13")), Some(local_idx.clone()));
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert!(matches!(
+            plan,
+            UpdatePlan::CommitCatchUp {
+                commit_t: 13,
+                gap: 3,
+                index_update: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_update_plan_catch_up_with_index_update() {
+        // Commit + index both advanced
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(
+            11,
+            10,
+            Some(make_cid("commit:11")),
+            Some(make_index_cid("index:10")),
+        );
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        match plan {
+            UpdatePlan::CommitCatchUp {
+                gap: 1,
+                index_update: Some((_, idx_t)),
+                ..
+            } => {
+                assert_eq!(idx_t, 10);
+            }
+            other => panic!("expected CommitCatchUp with index_update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_plan_noop_when_local_ahead() {
+        // The record is older than the cached state: a reconciliation that
+        // fetched it, then waited on the state lock across the raft worker's
+        // next install. Stale record, nothing to do — never a reload.
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(5, 5, Some(make_cid("commit:5")), Some(local_idx.clone()));
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert_eq!(plan, UpdatePlan::Noop);
+    }
+
+    #[test]
+    fn test_update_plan_reload_when_commit_next_missing_cid() {
+        // ns.commit_t == local.t() + 1 but no commit_head_id -> Reload (safety)
+        let local_idx = make_index_cid("index:5");
+        let ns = make_ns_record(11, 5, None, Some(local_idx.clone()));
+        let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
+        assert_eq!(plan, UpdatePlan::Reload);
+    }
+
+    #[test]
+    fn test_update_plan_helpers() {
+        assert!(UpdatePlan::Noop.is_noop());
+        assert!(!UpdatePlan::Reload.is_noop());
+
+        assert!(UpdatePlan::Reload.requires_reload());
+        assert!(!UpdatePlan::Noop.requires_reload());
+    }
+
+    // ========================================================================
+    // Error propagation tests - verify status codes are preserved for waiters
+    // ========================================================================
+
+    #[test]
+    fn test_error_status_code_preservation() {
+        // Verify that ApiError::http preserves status codes correctly
+        // This is the mechanism used for waiter error propagation
+
+        // NotFound should map to 404
+        let not_found = ApiError::NotFound("ledger foo".to_string());
+        assert_eq!(not_found.status_code(), 404);
+
+        // When converted for waiters via http(), status should be preserved
+        let http_not_found = ApiError::http(not_found.status_code(), not_found.to_string());
+        assert_eq!(http_not_found.status_code(), 404);
+
+        // LedgerExists should map to 409
+        let exists = ApiError::LedgerExists("ledger foo".to_string());
+        assert_eq!(exists.status_code(), 409);
+
+        let http_exists = ApiError::http(exists.status_code(), exists.to_string());
+        assert_eq!(http_exists.status_code(), 409);
+
+        // Internal should map to 500
+        let internal = ApiError::internal("something failed");
+        assert_eq!(internal.status_code(), 500);
+
+        let http_internal = ApiError::http(internal.status_code(), internal.to_string());
+        assert_eq!(http_internal.status_code(), 500);
+    }
+
+    #[tokio::test]
+    async fn cached_handle_is_stale_follows_head_watermark() {
+        use fluree_db_core::{LedgerSnapshot, MemoryStorage};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        use fluree_db_novelty::Novelty;
+
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(5);
+        let state = LedgerState::new(snapshot, novelty);
+        let handle = LedgerHandle::new(id("test:main"), state, None);
+
+        let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
+
+        // No watermark: never stale. Heads that only move through
+        // this manager's own pipeline keep the cache coherent by
+        // construction, so nothing reports advances and hits serve
+        // as-is — the single-node behavior.
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
+
+        // A watermark at the cached `t` is still fresh.
+        mgr.note_head_advance(&id("test:main"), 5);
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
+
+        // A head-advancer reporting past the cached `t` marks it stale.
+        mgr.note_head_advance(&id("test:main"), 12);
+        assert!(mgr.cached_handle_is_stale(&handle).await);
+
+        // Monotonic: a late, lower report can't roll the watermark back.
+        mgr.note_head_advance(&id("test:main"), 3);
+        assert!(mgr.cached_handle_is_stale(&handle).await);
+
+        // Disconnect clears the watermark with the entry, so a
+        // ledger re-created under the same alias isn't permanently
+        // flagged stale by a leftover high watermark.
+        mgr.disconnect(&id("test:main")).await;
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_all_clears_entries() {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+
+        let storage = MemoryStorage::new();
+        let backend = StorageBackend::Managed(Arc::new(storage));
+        let ns = MemoryNameService::new();
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(ns));
+        let config = LedgerManagerConfig::default();
+        let mgr = LedgerManager::new(backend, ns_mode, config);
+
+        // Directly insert Loading entries (simulates in-flight loads)
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("ledger_a:main"),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+            entries.insert(
+                id("ledger_b:main"),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+
+        // Verify entries exist
+        {
+            let entries = mgr.entries.read().await;
+            assert_eq!(entries.len(), 2);
+        }
+
+        // disconnect_all should clear everything
+        mgr.disconnect_all().await;
+
+        {
+            let entries = mgr.entries.read().await;
+            assert_eq!(entries.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flag_prevents_reinsertion() {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+
+        let storage = MemoryStorage::new();
+        let backend = StorageBackend::Managed(Arc::new(storage));
+        let ns = MemoryNameService::new();
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(ns));
+        let config = LedgerManagerConfig::default();
+        let mgr = LedgerManager::new(backend, ns_mode, config);
+
+        // Simulate: disconnect_all sets shutdown flag and clears entries
+        mgr.disconnect_all().await;
+        assert!(mgr.is_shutdown());
+
+        // Simulate a load leader completing after shutdown by directly inserting
+        // (this mimics what get_or_load's publish path would do without the guard)
+        {
+            let mut entries = mgr.entries.write().await;
+            // The shutdown guard in get_or_load checks is_shutdown() before inserting.
+            // Verify the flag is set so the guard would skip insertion.
+            if !mgr.shutdown.load(Ordering::Acquire) {
+                entries.insert(
+                    id("should_not_appear:main"),
+                    LoadState::Loading {
+                        generation: 0,
+                        waiters: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        // Entries should still be empty because shutdown flag was set
+        {
+            let entries = mgr.entries.read().await;
+            assert_eq!(entries.len(), 0);
+        }
+    }
+
+    // ========================================================================
+    // Lock order: never hold `entries` across a handle `state` lock
+    // ========================================================================
+
+    fn ready_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(1));
+        LedgerHandle::new(id(alias), state, None)
+    }
+
+    /// The shape of the wedge a writer can cause: a transaction holds
+    /// ledger A's `state` write lock for its whole commit, and a
+    /// background reader snapshots A while still holding the global
+    /// `entries` guard. That reader now parks on A's state lock *with
+    /// `entries` held*, and because tokio's `RwLock` is write-fair, the
+    /// next `entries.write()` — a cold load of any other ledger — queues,
+    /// and every `entries.read()` after it queues too. `ledger_cached`
+    /// on a ledger that has nothing to do with A blocks until A's
+    /// transaction finishes.
+    ///
+    /// Drives the two offenders and asserts the manager stays usable.
+    #[tokio::test]
+    async fn snapshot_readers_release_entries_before_taking_state() {
+        let mgr = Arc::new(make_test_manager());
+        let handle = ready_handle(&id("busy:main"));
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(id("busy:main"), LoadState::Ready(handle.clone()));
+        }
+
+        // A transaction in flight on `busy:main`.
+        let in_flight = handle.lock_for_write().await;
+
+        // Two background readers that snapshot the busy ledger. Each
+        // must park on `state`, not on `entries`.
+        let reader_a = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.try_running_attachment_events(&id("busy:main")).await })
+        };
+        let reader_b = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_loaded_view(&id("busy:main")).await })
+        };
+        tokio::task::yield_now().await;
+
+        // While those readers are parked, the manager must still admit
+        // a writer to `entries` (what a cold load of an unrelated ledger
+        // needs) and readers behind it.
+        let unrelated = tokio::time::timeout(Duration::from_millis(500), async {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("other:main"),
+                LoadState::Ready(ready_handle(&id("other:main"))),
+            );
+            drop(entries);
+            mgr.current_t(&id("other:main")).await
+        })
+        .await;
+        assert!(
+            unrelated
+                .expect("entries must not be wedged by a reader parked on a state lock")
+                .is_some(),
+            "the unrelated ledger must be reachable",
+        );
+
+        // Release the transaction; the parked readers complete normally.
+        drop(in_flight);
+        let a = tokio::time::timeout(Duration::from_secs(2), reader_a)
+            .await
+            .expect("reader A completes once the writer is done")
+            .expect("reader A does not panic");
+        assert!(a.is_some());
+        let b = tokio::time::timeout(Duration::from_secs(2), reader_b)
+            .await
+            .expect("reader B completes once the writer is done")
+            .expect("reader B does not panic");
+        assert!(b.is_some());
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - LoadingLeaderGuard
+    // ========================================================================
+
+    fn make_test_manager() -> LedgerManager {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
+        LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default())
+    }
+
+    /// Regression: a leader future cancelled mid-load must NOT orphan its
+    /// `Loading` slot. Before the guard, the slot persisted forever (sweep_idle
+    /// never evicts Loading) and every later caller wedged on `rx.await`.
+    #[tokio::test]
+    async fn test_cancelled_leader_does_not_orphan_loading_slot() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // Simulate a leader that inserted Loading then was dropped before publish.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 0,
+                armed: true,
+            };
+            // dropped here WITHOUT disarm() == cancelled leader
+        }
+        // Cleanup is detached; give it a few scheduler turns to run.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get(&id("x:main")).is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get(&id("x:main")).is_none(),
+            "orphaned Loading slot must be reclaimed when the leader future is dropped"
+        );
+    }
+
+    /// A waiter parked on the orphaned slot must unblock (RecvError) when the
+    /// cancelled leader's guard reclaims the slot — not hang to the 900s limit.
+    #[tokio::test]
+    async fn test_waiter_unblocks_when_leader_cancelled() {
+        let mgr = make_test_manager();
+        let (tx, rx) = oneshot::channel::<std::result::Result<LedgerHandle, Arc<ApiError>>>();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: vec![tx],
+                },
+            );
+        }
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 0,
+                armed: true,
+            };
+        }
+        // Removing the slot drops the sender -> the waiter observes RecvError
+        // instead of hanging forever.
+        let res = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("waiter must not hang after the leader is cancelled");
+        assert!(
+            res.is_err(),
+            "waiter should receive RecvError once the orphaned slot is reclaimed"
+        );
+    }
+
+    /// A leader that publishes (disarms) must leave its slot intact — the
+    /// guard's drop is a no-op on the success path.
+    #[tokio::test]
+    async fn test_disarmed_guard_leaves_slot_intact() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let mut guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 0,
+                armed: true,
+            };
+            guard.disarm();
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mgr.entries.read().await.get(&id("x:main")).is_some(),
+            "a disarmed guard must not touch the slot"
+        );
+    }
+
+    /// ABA protection: a stale guard whose original slot was already cleared
+    /// (e.g. by `disconnect`) and replaced by a NEW leader's `Loading` slot
+    /// (different generation) must NOT remove the new leader's slot.
+    #[tokio::test]
+    async fn test_stale_guard_does_not_clobber_new_leader_slot() {
+        let mgr = make_test_manager();
+        // A new leader has inserted a fresh slot with generation 7.
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Loading {
+                    generation: 7,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // A stale guard from a previous, already-cleared load (generation 3)
+        // is dropped now.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 3,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The new leader's slot (gen 7) must survive the stale guard's cleanup.
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get(&id("x:main")),
+                Some(LoadState::Loading { generation: 7, .. })
+            ),
+            "stale guard (gen 3) must not remove the new leader's slot (gen 7)"
+        );
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - ReloadLeaderGuard
+    // ========================================================================
+
+    /// Build a minimal cached handle for guard tests (genesis snapshot, empty
+    /// novelty, no binary store).
+    fn make_test_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(0));
+        LedgerHandle::new(id(alias), state, None)
+    }
+
+    /// Regression: a reload-leader future cancelled mid-load must not orphan its
+    /// `Reloading` slot (which would stall future reloads/current_t).
+    #[tokio::test]
+    async fn test_cancelled_reload_leader_reclaims_reloading_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Reloading {
+                    generation: 5,
+                    handle: handle.clone(),
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 5,
+                armed: true,
+            };
+            // dropped WITHOUT disarm() == cancelled reload leader
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get(&id("x:main")).is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get(&id("x:main")).is_none(),
+            "orphaned Reloading slot must be reclaimed when the reload leader is dropped"
+        );
+    }
+
+    /// ABA: a stale reload guard must not clobber a fresh slot (different
+    /// generation, or a `Loading`/`Ready` a later caller installed).
+    #[tokio::test]
+    async fn test_stale_reload_guard_does_not_clobber_new_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                id("x:main"),
+                LoadState::Reloading {
+                    generation: 9,
+                    handle,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: id("x:main"),
+                generation: 4,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get(&id("x:main")),
+                Some(LoadState::Reloading { generation: 9, .. })
+            ),
+            "stale reload guard (gen 4) must not remove the newer slot (gen 9)"
+        );
+    }
+
+    #[test]
+    fn test_waiter_error_arc_extraction() {
+        // Simulate the waiter error extraction pattern
+        let original = ApiError::NotFound("ledger bar".to_string());
+        let arc_error = Arc::new(ApiError::http(original.status_code(), original.to_string()));
+
+        // Extract like a waiter would
+        let extracted = match arc_error.as_ref() {
+            ApiError::Http { status, message } => ApiError::http(*status, message),
+            other => ApiError::http(other.status_code(), other.to_string()),
+        };
+
+        // Status code should be preserved (404, not 500)
+        assert_eq!(extracted.status_code(), 404);
+        assert!(extracted.to_string().contains("ledger bar"));
+    }
+
+    /// The resolved-config cache is a fail-safe fast path: a value is served
+    /// only on an exact config-write-marker match. A newer marker (config
+    /// changed) misses and forces a re-resolve — it never serves stale config.
+    /// A memoized "no config" result is a hit (unconfigured ledgers skip the
+    /// scan), and a `put` at a new marker supersedes the prior entry.
+    #[tokio::test]
+    async fn config_cache_marker_gated_and_fail_safe() {
+        let handle = make_test_handle("cfg:main");
+
+        // Empty cache: every marker misses.
+        assert!(
+            handle.config_cache_get(0).await.is_none(),
+            "empty cache misses"
+        );
+
+        // Store a resolved config at marker 7.
+        let cfg = Arc::new(LedgerConfig::default());
+        handle.config_cache_put(7, Some(Arc::clone(&cfg))).await;
+        assert!(
+            matches!(handle.config_cache_get(7).await, Some(Some(_))),
+            "exact marker hits and returns the stored config"
+        );
+
+        // A config write advances the marker → the old entry no longer matches,
+        // so the read misses and the caller re-resolves (never a stale read).
+        assert!(
+            handle.config_cache_get(8).await.is_none(),
+            "advanced marker invalidates the cached config"
+        );
+
+        // "No config at this marker" is a genuine hit, not a miss.
+        handle.config_cache_put(9, None).await;
+        assert!(
+            matches!(handle.config_cache_get(9).await, Some(None)),
+            "memoized no-config result is a hit"
+        );
+        // The overwrite dropped the marker-7 entry.
+        assert!(
+            handle.config_cache_get(7).await.is_none(),
+            "put supersedes the prior marker entry"
+        );
+    }
+}

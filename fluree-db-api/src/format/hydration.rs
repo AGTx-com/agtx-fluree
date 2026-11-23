@@ -1,0 +1,3000 @@
+//! Hydration formatter — materializes a Sid into a nested JSON-LD object by
+//! recursively fetching its properties.
+//!
+//! Each hydration column carries its own root, level, and depth budget. The
+//! formatter dispatches per column: a variable root reads the row's binding
+//! and expands that subject; an IRI-constant root expands the named subject
+//! directly; non-hydration (`Var`) columns are formatted by the regular
+//! flat-binding formatters.
+//!
+//! # Supported Syntax
+//!
+//! ```json
+//! // Variable-bound hydration
+//! {"select": {"?person": ["*", {"ex:friend": ["*"]}]},
+//!  "where": {"@id": "?person", "type": "ex:User"}}
+//!
+//! // With depth parameter for auto-expansion
+//! {"select": {"?s": ["*"]}, "depth": 3, "where": ...}
+//!
+//! // IRI constant root (no WHERE needed)
+//! {"select": {"ex:alice": ["*"]}}
+//!
+//! // Multiple hydration columns: each row is [expanded_a, expanded_b].
+//! {"select": [{"?person": ["*"]}, {"?org": ["*"]}],
+//!  "where": {"@id": "?person", "ex:worksFor": "?org"}}
+//!
+//! // Hydration columns mixed with flat variables.
+//! {"select": ["?age", {"?person": ["*"]}],
+//!  "where": {"@id": "?person", "ex:age": "?age"}}
+//! ```
+//!
+//! # Output cardinality
+//!
+//! Solution rows generally map 1:1 to output rows, except when no column
+//! depends on any solution binding (every column is an IRI-constant
+//! hydration). In that case the output is independent of the row, so the
+//! formatter emits a single row regardless of how many solutions the WHERE
+//! produced. An empty solution set still produces no rows.
+//!
+//! A variable root that's unbound for a given solution renders as `null` in
+//! that cell rather than dropping the entire row.
+
+use super::config::{FormatterConfig, OutputFormat};
+use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
+use super::iri::IriCompactor;
+use super::{FormatError, Result};
+use crate::QueryResult;
+use fluree_db_core::comparator::IndexType;
+use fluree_db_core::query_bounds::RangeOptions;
+use fluree_db_core::range::{RangeMatch, RangeTest};
+use fluree_db_core::value::FlakeValue;
+use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
+use fluree_db_policy::PolicyContext;
+use fluree_db_query::binding::Binding;
+use fluree_db_query::ir::{
+    Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
+};
+use fluree_db_query::QueryPolicyEnforcer;
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD, RDF};
+use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
+use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::FutureExt;
+use serde_json::{json, Value as JsonValue};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+/// Cache key: `(Sid, local_spec_hash, depth_remaining, root_canonical_iri)`.
+///
+/// The `local_spec_hash` is computed from the current `NestedSelectSpec`,
+/// NOT any top-level spec. This serves two purposes:
+/// - Different nested hydrations of the same Sid produce different entries.
+/// - Multiple top-level hydration columns share entries when they land on
+///   the same Sid with structurally identical levels, and stay separated
+///   when their levels differ.
+///
+/// The leading `usize` is the active view index (`HydrationFormatter::active_idx`):
+/// a `Sid` is view-local, so the same bytes can name different subjects across
+/// ledgers, and the index uniquely identifies the view within a single
+/// hydration's shared cache. It replaces the active ledger `Arc<str>` to avoid
+/// hashing and `Arc`-cloning a string on every `format_subject` call. The
+/// trailing `Option<Arc<str>>` is the root subject's canonical IRI (present
+/// only for multi-ledger `IriMatch` roots). Both participate so a cross-ledger
+/// query can never serve one ledger's rendering for another ledger's subject
+/// (issue #1259).
+type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
+
+/// Per-response hydration caches, threaded through the recursive formatter.
+///
+/// - `results`: memoizes a subject's finished JSON so a subject reached many
+///   times in one response (shared ancestors/units, multiply-referenced
+///   entities) is hydrated once.
+/// - `reencoded_levels`: memoizes a level re-encoded into a target ledger's dict
+///   (issue #1295), keyed by `(target view index, level address)` — re-encoded
+///   once per `(level, target)`, then shared via `Arc` instead of re-cloning the
+///   sub-tree per crossing. The address key is stable for the response (originals
+///   live in the `HydrationSpec`), only ever compared, never dereferenced.
+#[derive(Default)]
+struct HydrationCaches {
+    results: HashMap<CacheKey, JsonValue>,
+    reencoded_levels: HashMap<(usize, usize), Arc<NestedSelectSpec>>,
+    /// Post-policy wildcard subject flakes, shared across rows, levels, and
+    /// nested ref expansion; bulk-populated by [`prefetch_wildcard_roots`].
+    /// Keyed by primary-view Sid — single-ledger only (dataset mode routes
+    /// per-ledger views whose Sids share an encoding space).
+    subject_flakes: HashMap<Sid, Arc<Vec<Flake>>>,
+}
+
+/// Depth bookkeeping for one hydration call.
+///
+/// Each hydration column carries its own budget; threading the pair as a
+/// single value (instead of two parallel `usize` parameters) keeps the
+/// recursive signatures small and puts the descent / expansion-gate logic
+/// on the type itself.
+#[derive(Copy, Clone)]
+struct DepthBudget {
+    /// Current recursion depth (0 at a column's root).
+    current: usize,
+    /// Auto-expansion budget for this column.
+    max: usize,
+}
+
+impl DepthBudget {
+    /// Budget at a column's root: depth 0, with the column's `max`.
+    fn root(max: usize) -> Self {
+        Self { current: 0, max }
+    }
+
+    /// Budget for one level of recursive descent.
+    fn descend(self) -> Self {
+        Self {
+            current: self.current + 1,
+            max: self.max,
+        }
+    }
+
+    /// Levels of auto-expansion still permitted (for cache keying).
+    fn remaining(self) -> usize {
+        self.max.saturating_sub(self.current)
+    }
+
+    /// Whether auto-expansion (no explicit sub-spec) is still permitted at
+    /// this level — i.e. there's at least one descent left in the budget.
+    fn can_expand(self) -> bool {
+        self.current < self.max
+    }
+}
+
+/// Context for formatting a specific predicate's values.
+struct PredicateContext<'a> {
+    /// The predicate SID being formatted.
+    pred: &'a Sid,
+    /// The flakes to format.
+    flakes: &'a [&'a Flake],
+    /// Explicit nested selection spec for this predicate (if any).
+    explicit_sub_spec: Option<&'a NestedSelectSpec>,
+}
+
+/// Build the forward-predicate allow-list for one hydration level.
+///
+/// Returned to the range provider via [`RangeOptions::predicate_filter`] so
+/// the SPOT-per-subject scan can skip dict touches on unselected predicates.
+///
+/// - `Wildcard`: returns `None` — the projection wants every predicate, so
+///   no filter is applied and the legacy decode-everything path runs.
+/// - `Explicit` with no `ForwardItem::Property` entries (e.g., `@id`-only or
+///   reverse-only): still returns `Some(empty)`. The range provider will
+///   short-circuit every base row, which is correct — no forward predicate
+///   was selected.
+///
+/// `ForwardItem::Id` is skipped because `@id` is derived from the subject
+/// Sid in the caller, not from a flake. Reverse predicates are not included
+/// either — they go through `fetch_reverse_properties`, which already does
+/// a single-predicate POST scan and isn't affected by this filter.
+fn predicate_filter_for_level(level: &NestedSelectSpec) -> Option<Arc<[Sid]>> {
+    match level {
+        NestedSelectSpec::Wildcard { .. } => None,
+        NestedSelectSpec::Explicit { forward, .. } => {
+            let preds: Vec<Sid> = forward
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardItem::Property { predicate, .. } => Some(predicate.clone()),
+                    ForwardItem::Id => None,
+                })
+                .collect();
+            Some(Arc::from(preds))
+        }
+    }
+}
+
+/// Re-encode a hydration level's IMMEDIATE predicate `Sid`s from the lowering
+/// (primary) dict into `target`'s dict (issue #1295). The spec is lowered once
+/// against the primary dict, so its `Sid`s miss any target ledger whose codes
+/// diverge, dropping predicates in non-reserved namespaces.
+///
+/// **Shallow**: `sub_spec`s and reverse/refinement values stay in lowering-dict
+/// form and are re-encoded at their own crossing, so the decode source is ALWAYS
+/// the lowering view — never `self`, which may be non-primary in a depth-N chain.
+/// A predicate `target` can't encode is dropped (it can hold no such flake),
+/// mirroring the subject-side `encode_iri_strict` in `expand_ref`.
+///
+/// Mirror of the WHERE-scan's per-graph re-encode (`fluree_db_query::binary_scan`'s
+/// `reencode_sid`); that one preserves an unencodable `Sid`, this one drops it —
+/// keep the vocabulary in sync.
+fn reencode_level_for_view(
+    level: &NestedSelectSpec,
+    lowering: &IriCompactor,
+    target: &LedgerSnapshot,
+) -> NestedSelectSpec {
+    let reencode = |sid: &Sid| -> Option<Sid> {
+        let iri = lowering.decode_sid(sid).ok()?;
+        target.encode_iri_strict(&iri)
+    };
+    let reencode_map = |m: &std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>| {
+        m.iter()
+            .filter_map(|(k, v)| Some((reencode(k)?, v.clone())))
+            .collect()
+    };
+    match level {
+        NestedSelectSpec::Explicit { forward, reverse } => NestedSelectSpec::Explicit {
+            forward: forward
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardItem::Id => Some(ForwardItem::Id),
+                    ForwardItem::Property {
+                        predicate,
+                        sub_spec,
+                        modifiers,
+                    } => Some(ForwardItem::Property {
+                        predicate: reencode(predicate)?,
+                        sub_spec: sub_spec.clone(),
+                        modifiers: reencode_modifiers(modifiers.as_deref(), &reencode),
+                    }),
+                })
+                .collect(),
+            reverse: reencode_map(reverse),
+        },
+        NestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => NestedSelectSpec::Wildcard {
+            refinements: refinements
+                .iter()
+                .filter_map(|(k, v)| Some((reencode(k)?, v.clone())))
+                .collect(),
+            reverse: reencode_map(reverse),
+        },
+    }
+}
+
+/// Order then page a property's materialized values.
+///
+/// Ordering first is what makes paging meaningful: `offset`/`limit` over an
+/// unordered set would cut an arbitrary window.
+///
+/// A sort key reads from each value: `predicate: None` compares the values
+/// themselves, and a predicate compares the named entry of each expanded object.
+/// Values missing the key sort last in ascending order, so the ones that *have*
+/// it are the ones a `limit` keeps.
+fn apply_nested_modifiers(
+    values: &mut Vec<JsonValue>,
+    modifiers: &NestedModifiers,
+    compactor: &IriCompactor,
+) -> Result<()> {
+    if modifiers.is_noop() || values.is_empty() {
+        return Ok(());
+    }
+
+    if !modifiers.order.is_empty() {
+        // Resolve each sort predicate to the key it appears under exactly once,
+        // rather than per comparison.
+        let mut keys: Vec<(Option<String>, bool)> = Vec::with_capacity(modifiers.order.len());
+        for key in &modifiers.order {
+            let name = match &key.predicate {
+                Some(sid) => Some(compactor.compact_sid(sid)?),
+                None => None,
+            };
+            keys.push((name, key.descending));
+        }
+        values.sort_by(|a, b| {
+            for (name, descending) in &keys {
+                let (lhs, rhs) = match name {
+                    Some(key) => (a.get(key.as_str()), b.get(key.as_str())),
+                    None => (Some(a), Some(b)),
+                };
+                let ordering = compare_sort_values(lhs, rhs);
+                if ordering != std::cmp::Ordering::Equal {
+                    return if *descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(offset) = modifiers.offset {
+        if offset >= values.len() {
+            values.clear();
+        } else {
+            values.drain(..offset);
+        }
+    }
+    if let Some(limit) = modifiers.limit {
+        values.truncate(limit);
+    }
+    Ok(())
+}
+
+/// Order two JSON values for a nested sort.
+///
+/// Numbers compare numerically, strings lexically, booleans false-before-true.
+/// An expanded node compares by its `@id`, which is the only total order a node
+/// has without naming a property. Anything else (arrays of objects, mixed types)
+/// compares equal, leaving the surrounding sort stable rather than imposing an
+/// order nobody asked for. A missing value sorts after a present one.
+fn compare_sort_values(lhs: Option<&JsonValue>, rhs: Option<&JsonValue>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Some(a), Some(b)) => (a, b),
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => return Ordering::Equal,
+    };
+    // A multi-valued entry is compared by its first value: the one a reader sees
+    // first, and the only choice that does not need a tie-break policy.
+    fn first(v: &JsonValue) -> &JsonValue {
+        match v {
+            JsonValue::Array(items) => items.first().unwrap_or(v),
+            other => other,
+        }
+    }
+    // A node's identity stands in for "the value itself".
+    fn sortable(v: &JsonValue) -> &JsonValue {
+        match v {
+            JsonValue::Object(map) => map.get("@id").unwrap_or(v),
+            other => other,
+        }
+    }
+    // Integers compare exactly. `as_f64` alone misorders `xsd:long` past 2⁵³,
+    // where distinct values share a float — 2⁵³ and 2⁵³+1 would tie, and the
+    // sort would then order them by whichever the input happened to hold first.
+    fn numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+        if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+            return a.cmp(&b);
+        }
+        if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+            return a.cmp(&b);
+        }
+        // Anything left is a float, or a negative against a `u64` past
+        // `i64::MAX`. Both are safe through `f64`: precision loss can collapse
+        // neighbours, never flip a sign.
+        a.as_f64()
+            .partial_cmp(&b.as_f64())
+            .unwrap_or(Ordering::Equal)
+    }
+
+    match (sortable(first(lhs)), sortable(first(rhs))) {
+        (JsonValue::Number(a), JsonValue::Number(b)) => numbers(a, b),
+        (JsonValue::String(a), JsonValue::String(b)) => a.cmp(b),
+        (JsonValue::Bool(a), JsonValue::Bool(b)) => a.cmp(b),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Re-encode a modifier block's sort predicates into the target ledger's Sid
+/// space, alongside the level it belongs to.
+///
+/// A sort predicate the target ledger has never seen cannot order anything, so
+/// the key is dropped rather than failing the query — the same choice the
+/// surrounding `filter_map` makes for an unknown selection predicate.
+fn reencode_modifiers(
+    modifiers: Option<&NestedModifiers>,
+    reencode: &impl Fn(&Sid) -> Option<Sid>,
+) -> Option<Box<NestedModifiers>> {
+    let modifiers = modifiers?;
+    Some(Box::new(NestedModifiers {
+        order: modifiers
+            .order
+            .iter()
+            .filter_map(|key| {
+                let predicate = match &key.predicate {
+                    Some(sid) => Some(reencode(sid)?),
+                    None => None,
+                };
+                Some(NestedOrderKey {
+                    predicate,
+                    descending: key.descending,
+                })
+            })
+            .collect(),
+        offset: modifiers.offset,
+        limit: modifiers.limit,
+    }))
+}
+
+/// Hash a `NestedSelectSpec` to a u64 cache key. We can't derive `Hash`
+/// because the nested HashMaps don't implement it; iterate keys in sorted
+/// order for determinism.
+fn compute_level_hash(level: &NestedSelectSpec) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_level(level, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_level<H: std::hash::Hasher>(level: &NestedSelectSpec, hasher: &mut H) {
+    use std::hash::Hash;
+    match level {
+        NestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => {
+            0u8.hash(hasher);
+            let mut keys: Vec<_> = refinements.keys().collect();
+            keys.sort();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                hash_level(refinements.get(key).unwrap(), hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+        NestedSelectSpec::Explicit { forward, reverse } => {
+            1u8.hash(hasher);
+            forward.len().hash(hasher);
+            for item in forward {
+                hash_forward_item(item, hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+    }
+}
+
+fn hash_forward_item<H: std::hash::Hasher>(item: &ForwardItem, hasher: &mut H) {
+    use std::hash::Hash;
+    match item {
+        ForwardItem::Id => 0u8.hash(hasher),
+        ForwardItem::Property {
+            predicate,
+            sub_spec,
+            modifiers,
+        } => {
+            1u8.hash(hasher);
+            predicate.hash(hasher);
+            // Modifiers are part of the key: two selections that differ only in
+            // `limit` produce different output and must not share a cache entry.
+            match modifiers {
+                None => 0u8.hash(hasher),
+                Some(m) => {
+                    1u8.hash(hasher);
+                    m.offset.hash(hasher);
+                    m.limit.hash(hasher);
+                    m.order.len().hash(hasher);
+                    for key in &m.order {
+                        key.predicate.hash(hasher);
+                        key.descending.hash(hasher);
+                    }
+                }
+            }
+            match sub_spec {
+                None => 0u8.hash(hasher),
+                Some(boxed) => {
+                    1u8.hash(hasher);
+                    hash_level(boxed, hasher);
+                }
+            }
+        }
+    }
+}
+
+fn hash_reverse<H: std::hash::Hasher>(
+    reverse: &HashMap<Sid, Option<Box<NestedSelectSpec>>>,
+    hasher: &mut H,
+) {
+    use std::hash::Hash;
+    let mut keys: Vec<_> = reverse.keys().collect();
+    keys.sort();
+    keys.len().hash(hasher);
+    for key in keys {
+        key.hash(hasher);
+        match reverse.get(key).unwrap() {
+            None => 0u8.hash(hasher),
+            Some(inner) => {
+                1u8.hash(hasher);
+                hash_level(inner, hasher);
+            }
+        }
+    }
+}
+
+/// Resolve a hydration root variable's binding into a `Sid` plus its canonical
+/// IRI (when known) for a single row.
+///
+/// The optional `Arc<str>` is the canonical IRI carried by a multi-ledger
+/// `Binding::IriMatch`. It MUST be preferred over decoding the returned SID
+/// against the formatter's single-snapshot namespace dict: the SID is encoded
+/// in its *originating* ledger, which may differ from the ledger backing the
+/// formatter, so decoding it here would silently produce the wrong IRI
+/// (issue #1259). Single-ledger bindings (`Binding::Sid`) carry no canonical
+/// IRI and are decoded normally.
+///
+/// Returns `Ok(None)` when the binding is unbound, poisoned, missing, or not
+/// subject-shaped (literals, IRIs that didn't match a known subject, etc.).
+/// Such columns render as `null` rather than skipping the row entirely.
+fn resolve_root_sid_from_binding(
+    result: &QueryResult,
+    binding: Option<&Binding>,
+) -> Result<Option<RootRef>> {
+    match binding {
+        Some(b) if b.is_encoded() => {
+            let materialized = super::materialize::materialize_binding(result, b)?;
+            Ok(match materialized {
+                Binding::Sid { sid, .. } => Some(RootRef::local(sid)),
+                Binding::IriMatch {
+                    primary_sid,
+                    iri,
+                    ledger_alias,
+                } => Some(RootRef::cross_ledger(primary_sid, iri, ledger_alias)),
+                _ => None,
+            })
+        }
+        Some(Binding::Sid { sid, .. }) => Ok(Some(RootRef::local(sid.clone()))),
+        Some(Binding::IriMatch {
+            primary_sid,
+            iri,
+            ledger_alias,
+        }) => Ok(Some(RootRef::cross_ledger(
+            primary_sid.clone(),
+            iri.clone(),
+            ledger_alias.clone(),
+        ))),
+        Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+        Some(
+            Binding::Lit { .. }
+            | Binding::Grouped(_)
+            | Binding::Path { .. }
+            | Binding::Rel(_)
+            | Binding::List(_)
+            | Binding::Map(_)
+            | Binding::Iri(_)
+            | Binding::EncodedLit { .. }
+            | Binding::EncodedSid { .. }
+            | Binding::EncodedPid { .. },
+        ) => Ok(None),
+    }
+}
+
+/// A resolved hydration-root reference.
+///
+/// `sid` is the subject's SID in its originating ledger. For multi-ledger
+/// (`IriMatch`) roots, `iri` is the canonical IRI (used for the `@id` and to
+/// re-resolve the subject in its home ledger) and `ledger_alias` names that
+/// home ledger so the formatter can route expansion to the correct view
+/// (issue #1259). Single-ledger (`Sid`) roots carry neither.
+struct RootRef {
+    sid: Sid,
+    iri: Option<Arc<str>>,
+    ledger_alias: Option<Arc<str>>,
+}
+
+impl RootRef {
+    fn local(sid: Sid) -> Self {
+        Self {
+            sid,
+            iri: None,
+            ledger_alias: None,
+        }
+    }
+
+    fn cross_ledger(sid: Sid, iri: Arc<str>, ledger_alias: Arc<str>) -> Self {
+        Self {
+            sid,
+            iri: Some(iri),
+            ledger_alias: Some(ledger_alias),
+        }
+    }
+}
+
+/// Merge two JSON-LD objects describing the **same subject** seen through
+/// different default-graph ledgers (RDF merge of the union). Predicates present
+/// in only one are kept; predicates in both have their values unioned and
+/// de-duplicated (so identical triples, including `@id` / `@type`, collapse).
+fn merge_subject_objects(a: JsonValue, b: JsonValue) -> JsonValue {
+    let (JsonValue::Object(mut am), JsonValue::Object(bm)) = (a, b) else {
+        // Both are always objects in practice; if not, prefer the first.
+        return JsonValue::Null;
+    };
+    for (k, bv) in bm {
+        match am.remove(&k) {
+            None => {
+                am.insert(k, bv);
+            }
+            Some(av) => {
+                am.insert(k, merge_values(av, bv));
+            }
+        }
+    }
+    JsonValue::Object(am)
+}
+
+/// Union two property values into a de-duplicated value: a single survivor is
+/// returned bare, multiple as an array. Arrays on either side are flattened.
+fn merge_values(a: JsonValue, b: JsonValue) -> JsonValue {
+    let mut items: Vec<JsonValue> = Vec::new();
+    collect_values(a, &mut items);
+    collect_values(b, &mut items);
+    let mut out: Vec<JsonValue> = Vec::with_capacity(items.len());
+    for it in items {
+        if !out.contains(&it) {
+            out.push(it);
+        }
+    }
+    if out.len() == 1 {
+        out.into_iter().next().unwrap()
+    } else {
+        JsonValue::Array(out)
+    }
+}
+
+fn collect_values(v: JsonValue, out: &mut Vec<JsonValue>) {
+    match v {
+        JsonValue::Array(arr) => out.extend(arr),
+        other => out.push(other),
+    }
+}
+
+/// Format one hydration column for one solution row.
+///
+/// Resolves the column's root (variable or IRI constant) into a `Sid` and
+/// expands it via [`HydrationFormatter::format_subject`] using the column's
+/// own level and depth budget. A variable root that's unbound for this row
+/// renders as `null` rather than skipping the row entirely.
+async fn format_hydration_column(
+    set: &FormatterSet<'_>,
+    spec: &HydrationSpec,
+    result: &QueryResult,
+    batch: &fluree_db_query::Batch,
+    row_idx: usize,
+    cache: &mut HydrationCaches,
+) -> Result<JsonValue> {
+    // Resolve the root. For an `IriMatch` root, `iri` is the ledger-correct
+    // canonical IRI (used for the `@id`) and `ledger_alias` names its home
+    // ledger so we route expansion to that view rather than decoding/scanning
+    // a foreign SID against the primary view (issue #1259).
+    let root = match &spec.root {
+        Root::Sid(sid) => RootRef::local(sid.clone()),
+        Root::Var(var_id) => {
+            let Some(resolved) =
+                resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            else {
+                return Ok(JsonValue::Null);
+            };
+            resolved
+        }
+    };
+
+    let formatter = set.pick(root.ledger_alias.as_ref());
+    let mut visited = HashSet::new();
+
+    // Multi-ledger: resolve the root across the default-graph union (same
+    // machinery as nested `expand_ref`), so a subject described in several
+    // default ledgers merges (RDF merge) and a root with no home-ledger
+    // provenance — e.g. one bound as the object of a primary-ledger triple —
+    // is still found in its home ledger rather than coming back `@id`-only.
+    // The level is re-encoded per contributing view inside the resolver (#1295).
+    // Single-ledger: format directly in the one view (byte-identical).
+    if formatter.dataset.is_some() {
+        // Canonical IRI: an `IriMatch` root carries it; a bare-`Sid` root's SID
+        // is primary-dict-encoded, so decode it against the picked (primary)
+        // view to recover it.
+        let iri: Arc<str> = match &root.iri {
+            Some(iri) => Arc::clone(iri),
+            None => Arc::from(formatter.compactor.decode_sid(&root.sid)?.as_str()),
+        };
+        formatter
+            .resolve_iri_across_union(
+                iri,
+                &spec.level,
+                DepthBudget::root(spec.depth),
+                &mut visited,
+                cache,
+            )
+            .await
+    } else {
+        formatter
+            .format_subject(
+                &root.sid,
+                root.iri,
+                &spec.level,
+                DepthBudget::root(spec.depth),
+                &mut visited,
+                cache,
+            )
+            .await
+    }
+}
+
+/// Async hydration formatter entry point.
+///
+/// This is the full hydration implementation with async database access
+/// for property fetching, depth expansion, and reverse property expansion.
+///
+/// # Policy Support
+///
+/// When `policy` is `Some`, flakes are filtered according to view policies.
+/// When `policy` is `None`, no filtering is applied (zero overhead).
+pub async fn format_async(
+    result: &QueryResult,
+    db: GraphDbRef<'_>,
+    compactor: &IriCompactor,
+    config: &FormatterConfig,
+    policy: Option<&PolicyContext>,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
+    // Attach the tracker to the GraphDbRef so db.range calls inside the
+    // formatter charge per-leaflet + per-dict-touch fuel through the
+    // BinaryGraphView/BinaryCursor wiring (not just the per-flake baseline).
+    let db = match tracker {
+        Some(t) => db.with_tracker(t),
+        None => db,
+    };
+
+    // Single-view (single-ledger) hydration: one formatter, no cross-ledger
+    // routing. `FormatterSet::pick` always falls back to this primary.
+    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
+    let set = FormatterSet {
+        formatters: vec![formatter],
+        by_ledger: HashMap::new(),
+        primary: 0,
+    };
+    run_hydration_rows(&set, result).await
+}
+
+/// Dataset-aware hydration entry point (multi-ledger).
+///
+/// Unlike [`format_async`], each ledger in the dataset gets its own
+/// `(GraphDbRef, IriCompactor, policy)` view, and a hydration column's root is
+/// routed to its **home** ledger (via the `IriMatch` provenance carried on the
+/// root binding) so the subject's properties and `@id` decode against the
+/// ledger that actually stores them — not the primary view's namespace dict
+/// (issue #1259).
+///
+/// Per-ledger policy is preserved: a foreign subject is read under *its own*
+/// view's policy enforcer, never the primary's.
+///
+/// Explicit-projection predicate `Sid`s are re-encoded into the ledger that
+/// stores each subject — both for nested refs (`expand_ref`) and for a root
+/// routed to a non-primary ledger (issue #1295) — so a cross-ledger projection
+/// returns the same predicates a single-ledger one would, regardless of how the
+/// ledgers allocated namespace codes.
+///
+/// Known gap: a root with no home-ledger provenance — bound as the *object* of a
+/// primary-ledger triple — routes to the primary view and can come back
+/// `@id`-only (a separate root-routing follow-up).
+pub async fn format_async_dataset(
+    result: &QueryResult,
+    dataset: &crate::view::DataSetDb,
+    context: &crate::ParsedContext,
+    config: &FormatterConfig,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
+
+    let ctx = DatasetCtx::build(dataset, context, config, tracker);
+    let formatters: Vec<HydrationFormatter> =
+        (0..ctx.views.len()).map(|i| ctx.formatter_for(i)).collect();
+    let set = FormatterSet {
+        formatters,
+        by_ledger: ctx.by_ledger.clone(),
+        primary: ctx.primary,
+    };
+    run_hydration_rows(&set, result).await
+}
+
+/// One ledger's hydration view: its db, namespace-aware compactor, and policy.
+/// Owned by [`DatasetCtx`]; formatters borrow from it. (Ledger identity is
+/// tracked by view index via [`DatasetCtx::by_ledger`], not stored per view.)
+struct LedgerView<'a> {
+    db: GraphDbRef<'a>,
+    compactor: IriCompactor,
+    policy: Option<PolicyContext>,
+}
+
+/// Owns every dataset ledger's [`LedgerView`] and the routing metadata that
+/// cross-ledger hydration needs: which views back the default-graph union and
+/// which ledger maps to which view. Formatters borrow from this; it must
+/// outlive them.
+struct DatasetCtx<'a> {
+    views: Vec<LedgerView<'a>>,
+    /// `GraphDb::ledger_id` → index into `views` (matches `IriMatch.ledger_alias`).
+    by_ledger: HashMap<Arc<str>, usize>,
+    /// Indices of the default-graph views — the union scope for default-graph refs.
+    default_indices: Vec<usize>,
+    /// Primary view index (flat columns + unrouted-root fallback).
+    primary: usize,
+    typed: bool,
+    normalize_arrays: bool,
+    tracker: Option<&'a Tracker>,
+}
+
+impl<'a> DatasetCtx<'a> {
+    fn build(
+        dataset: &'a crate::view::DataSetDb,
+        context: &crate::ParsedContext,
+        config: &FormatterConfig,
+        tracker: Option<&'a Tracker>,
+    ) -> Self {
+        // Default graphs first (their indices form the union scope), then named.
+        let graph_views: Vec<&crate::view::GraphDb> = dataset
+            .default
+            .iter()
+            .chain(dataset.named.values())
+            .collect();
+        let default_count = dataset.default.len();
+
+        let mut views: Vec<LedgerView<'a>> = Vec::with_capacity(graph_views.len());
+        let mut by_ledger: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut default_indices: Vec<usize> = Vec::with_capacity(default_count);
+        for (i, g) in graph_views.iter().enumerate() {
+            let mut view_db = g.as_graph_db_ref();
+            if let Some(t) = tracker {
+                view_db = view_db.with_tracker(t);
+            }
+            views.push(LedgerView {
+                db: view_db,
+                compactor: IriCompactor::new(g.snapshot.shared_namespaces(), context),
+                policy: g.policy().cloned(),
+            });
+            // First occurrence wins (a ledger may appear as both default and named).
+            by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
+            if i < default_count {
+                default_indices.push(i);
+            }
+        }
+
+        let primary = dataset
+            .primary()
+            .and_then(|p| by_ledger.get(&p.ledger_id).copied())
+            .unwrap_or(0);
+
+        DatasetCtx {
+            views,
+            by_ledger,
+            default_indices,
+            primary,
+            typed: config.format == OutputFormat::TypedJson,
+            normalize_arrays: config.normalize_arrays,
+            tracker,
+        }
+    }
+
+    /// Build a formatter bound to one view, wired back to this context so it can
+    /// resolve cross-ledger refs.
+    fn formatter_for(&'a self, idx: usize) -> HydrationFormatter<'a> {
+        let view = &self.views[idx];
+        // Mirror `HydrationFormatter::new`: cache one arena reader and the
+        // overlay's `Novelty` downcast per view so annotation lookups share
+        // branch/leaf caches and skip repeated dynamic dispatch.
+        let arena_reader = match (
+            view.db.snapshot.annotation_index.as_ref(),
+            view.db.snapshot.content_store.as_ref(),
+        ) {
+            (Some(root), Some(store)) => Some(
+                fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    root,
+                    store.as_ref(),
+                ),
+            ),
+            _ => None,
+        };
+        let novelty = view
+            .db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(view.db.snapshot, arena_reader.is_some());
+        HydrationFormatter {
+            db: view.db,
+            compactor: &view.compactor,
+            typed: self.typed,
+            normalize_arrays: self.normalize_arrays,
+            policy: view.policy.as_ref(),
+            tracker: self.tracker,
+            arena_reader,
+            arena_dropped_graphs,
+            novelty,
+            dataset: Some(self),
+            active_idx: idx,
+            holds_cells: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// A collection of per-ledger hydration formatters with root-routing.
+///
+/// In single-ledger mode this holds exactly one formatter and every lookup
+/// falls back to it. In dataset mode it holds one formatter per ledger view,
+/// and [`FormatterSet::pick`] routes a hydration root to its home ledger.
+struct FormatterSet<'a> {
+    formatters: Vec<HydrationFormatter<'a>>,
+    /// `GraphDb::ledger_id` → index into `formatters`.
+    by_ledger: HashMap<Arc<str>, usize>,
+    /// Index of the primary formatter (flat columns + unrouted-root fallback).
+    primary: usize,
+}
+
+impl<'a> FormatterSet<'a> {
+    fn primary(&self) -> &HydrationFormatter<'a> {
+        &self.formatters[self.primary]
+    }
+
+    /// Select the formatter for a root's home ledger, falling back to the
+    /// primary when there is no provenance (single-ledger `Sid` roots,
+    /// constant-IRI roots) or the ledger isn't in the dataset.
+    fn pick(&self, ledger_alias: Option<&Arc<str>>) -> &HydrationFormatter<'a> {
+        ledger_alias
+            .and_then(|a| self.by_ledger.get(a))
+            .map(|&i| &self.formatters[i])
+            .unwrap_or_else(|| self.primary())
+    }
+}
+
+/// Concurrent wildcard-root fetches in flight during [`prefetch_wildcard_roots`].
+const PREFETCH_CONCURRENCY: usize = 16;
+
+/// Bulk-fetch the top-level subjects of wildcard hydration columns before
+/// the row walk. The engine has already produced the subject list, so these
+/// are independent point reads — issue them with bounded concurrency in
+/// subject order (leaflet locality) instead of one awaited SPOT scan per
+/// row. Runs through [`HydrationFormatter::fetch_subject_properties`], so
+/// policy filtering and fuel charging are identical to the on-demand path.
+///
+/// Single-ledger only: dataset hydration routes each root to its
+/// home-ledger view, and per-ledger Sids share an encoding space, so a
+/// Sid-keyed cache would be ambiguous there. Explicit (non-wildcard)
+/// projections keep their narrowed per-predicate reads. Nested ref
+/// expansion still fetches on demand but reads through the same cache.
+async fn prefetch_wildcard_roots(
+    set: &FormatterSet<'_>,
+    result: &QueryResult,
+    columns: &[Column],
+    cache: &mut HydrationCaches,
+) -> Result<()> {
+    let primary = set.primary();
+    if primary.dataset.is_some() || set.formatters.len() > 1 {
+        return Ok(());
+    }
+
+    let mut wanted: Vec<Sid> = Vec::new();
+    for column in columns {
+        let Column::Hydration(spec) = column else {
+            continue;
+        };
+        if predicate_filter_for_level(&spec.level).is_some() {
+            continue;
+        }
+        match &spec.root {
+            Root::Sid(sid) => wanted.push(sid.clone()),
+            Root::Var(var_id) => {
+                for batch in &result.batches {
+                    for row_idx in 0..batch.len() {
+                        let Some(root) =
+                            resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+                        else {
+                            continue;
+                        };
+                        if root.ledger_alias.is_none() {
+                            wanted.push(root.sid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    wanted.sort_unstable_by(|a, b| {
+        (a.namespace_code, a.name.as_ref()).cmp(&(b.namespace_code, b.name.as_ref()))
+    });
+    wanted.dedup();
+    wanted.retain(|sid| !cache.subject_flakes.contains_key(sid));
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let fetched: Vec<(Sid, Vec<Flake>)> = stream::iter(wanted.into_iter().map(|sid| async move {
+        let flakes = primary.fetch_subject_properties(&sid, None).await?;
+        Ok::<_, FormatError>((sid, flakes))
+    }))
+    .buffer_unordered(PREFETCH_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+    for (sid, flakes) in fetched {
+        cache.subject_flakes.insert(sid, Arc::new(flakes));
+    }
+    Ok(())
+}
+
+/// Shared row loop for single-view and dataset hydration.
+///
+/// Flat (`Column::Var`) columns are formatted with the primary view's
+/// compactor — they carry `IriMatch.iri` for cross-ledger references, so the
+/// dict is irrelevant. Hydration columns route to their home-ledger formatter.
+async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Result<JsonValue> {
+    let columns = result.output.columns().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called on non-Select output".into())
+    })?;
+
+    let primary = set.primary();
+    let primary_compactor = primary.compactor;
+    let typed = primary.typed;
+
+    // Shared per-response cache, reused across all rows and hydration columns.
+    // See `HydrationCaches` for the key shape and what each map memoizes.
+    let mut cache = HydrationCaches::default();
+    prefetch_wildcard_roots(set, result, columns, &mut cache).await?;
+    let mut rows: Vec<JsonValue> = Vec::new();
+
+    // If the underlying query produced no solutions, expansion produces no
+    // rows — even when a column root is a constant Sid.
+    if result.row_count() == 0 {
+        return Ok(JsonValue::Array(rows));
+    }
+
+    // Single-column projections (e.g. `select: {"?x": ["*"]}`) emit a bare
+    // object per row; multi-column projections emit array rows.
+    let single_column = columns.len() == 1;
+
+    // A projection is "row-independent" when no column reads any solution
+    // binding — every column is a `Root::Sid` hydration. Such a projection
+    // produces the same output for every solution row, so we emit a single
+    // row regardless of how many solutions the WHERE clause yielded (the
+    // WHERE still gates *whether* a row is emitted via row_count == 0
+    // above).
+    let row_dependent = columns.iter().any(|c| match c {
+        Column::Var(_) => true,
+        Column::Hydration(spec) => matches!(spec.root, Root::Var(_)),
+    });
+
+    'rows: for batch in &result.batches {
+        for row_idx in 0..batch.len() {
+            let mut row_values: Vec<JsonValue> = Vec::with_capacity(columns.len());
+
+            for column in columns {
+                let value = match column {
+                    Column::Var(v) => match batch.get(row_idx, *v) {
+                        Some(binding) if typed => super::typed::format_binding_with_result(
+                            result,
+                            binding,
+                            primary_compactor,
+                        )?,
+                        Some(binding) => super::jsonld::format_binding_with_result(
+                            result,
+                            binding,
+                            primary_compactor,
+                        )?,
+                        None => JsonValue::Null,
+                    },
+                    Column::Hydration(spec) => {
+                        format_hydration_column(set, spec, result, batch, row_idx, &mut cache)
+                            .await?
+                    }
+                };
+                row_values.push(value);
+            }
+
+            if single_column {
+                let v = row_values.into_iter().next().unwrap();
+                // Skip rows where the single hydration column produced
+                // `Null` — covers (a) anonymous annotation hides
+                // (`format_subject` returns `Null` when the row's
+                // subject is a known live annotation in the
+                // BLANK_NODE namespace), and (b) unbound hydration
+                // roots. In either case there's no body to emit and
+                // a `null` row is more confusing than informative.
+                // Multi-column projections still emit the row with
+                // a `null` slot — there may be sibling columns with
+                // useful bindings.
+                if !v.is_null() {
+                    rows.push(v);
+                }
+            } else {
+                rows.push(JsonValue::Array(row_values));
+            }
+
+            if !row_dependent {
+                break 'rows;
+            }
+        }
+    }
+
+    Ok(JsonValue::Array(rows))
+}
+
+/// Hydration formatter with async DB access.
+///
+/// The formatter is spec-agnostic: per-call the caller passes the
+/// `NestedSelectSpec` level and `max_depth` budget. This lets a single
+/// formatter serve multiple hydration columns in the same query.
+struct HydrationFormatter<'a> {
+    db: GraphDbRef<'a>,
+    compactor: &'a IriCompactor,
+    /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
+    typed: bool,
+    /// Whether to always wrap property values in arrays (even single-valued).
+    normalize_arrays: bool,
+    /// Optional policy context for access control filtering.
+    /// When None, no policy filtering is applied (zero overhead).
+    policy: Option<&'a PolicyContext>,
+    /// Optional execution tracker for fuel/policy tracking.
+    tracker: Option<&'a Tracker>,
+    /// Single arena reader reused across every annotation lookup in
+    /// this response. Constructed once on `new()` when the snapshot
+    /// satisfies `has_arena_reader()`. Holds the loaded forward /
+    /// reverse branches plus a per-CID leaf cache, so successive
+    /// edge lookups amortize the CAS reads. `None` falls back to the
+    /// scan path in `inject_annotations`.
+    arena_reader: Option<
+        fluree_db_binary_index::annotation_arena::AnnotationArenaReader<
+            'a,
+            dyn fluree_db_core::storage::ContentStore,
+        >,
+    >,
+    /// The graphs a drop took after the index, as edges name them: the
+    /// arena predates those drops, so an edge of theirs is read from novelty
+    /// alone. Empty without an arena reader or a drop since the index.
+    arena_dropped_graphs: Vec<Option<Sid>>,
+    /// Cached downcast of `db.overlay` to the concrete
+    /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
+    /// and reused across every annotation-hydration call site —
+    /// previously each call did its own
+    /// `as_any().downcast_ref::<Novelty>()` (three times per
+    /// ref-valued property: in the gate, in
+    /// `arena_lookup_annotations`, and twice in
+    /// `is_live_annotation_subject`). `None` means the overlay
+    /// isn't the concrete `Novelty` type (test fakes / future
+    /// overlays); callers fall back to the scan path the same way
+    /// they did before.
+    novelty: Option<&'a fluree_db_novelty::Novelty>,
+    /// Dataset context for cross-ledger reference resolution.
+    ///
+    /// `None` in single-ledger mode (refs stay within `db`). `Some` in dataset
+    /// mode: when expansion follows a ref into another ledger, the ref's SID is
+    /// decoded to its canonical IRI here, then re-encoded and expanded in the
+    /// target ledger's view (issue #1259).
+    dataset: Option<&'a DatasetCtx<'a>>,
+    /// This formatter's index into [`DatasetCtx::views`] (0 in single-ledger mode).
+    ///
+    /// Also the leading component of [`CacheKey`]: a `Sid` is view-local, so the
+    /// same bytes can name different subjects across ledgers. The index uniquely
+    /// identifies the view within a hydration's shared cache, so one ledger's
+    /// rendering is never served for another's (issue #1259).
+    active_idx: usize,
+    /// Whether `db` holds an `rdf:first` triple, so a blank-node value may
+    /// head a list stored as its triples; read when the crawl first meets a
+    /// blank-node value ([`Self::holds_cells`]).
+    holds_cells: std::sync::OnceLock<bool>,
+}
+
+/// [`HydrationFormatter::arena_dropped_graphs`] for `snapshot`, when an
+/// arena reader is in use.
+fn arena_dropped_graphs(snapshot: &LedgerSnapshot, has_arena: bool) -> Vec<Option<Sid>> {
+    if has_arena {
+        snapshot.edge_graphs_dropped_since_index()
+    } else {
+        Vec::new()
+    }
+}
+
+impl<'a> HydrationFormatter<'a> {
+    fn new(
+        db: GraphDbRef<'a>,
+        compactor: &'a IriCompactor,
+        config: &FormatterConfig,
+        policy: Option<&'a PolicyContext>,
+        tracker: Option<&'a Tracker>,
+    ) -> Self {
+        // Cache one arena reader for the whole response so successive
+        // edge lookups share branch + leaf caches. Constructed only
+        // when both `annotation_index` and `content_store` are set on
+        // the snapshot — otherwise the scan path runs.
+        let arena_reader = match (
+            db.snapshot.annotation_index.as_ref(),
+            db.snapshot.content_store.as_ref(),
+        ) {
+            (Some(root), Some(store)) => Some(
+                fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    root,
+                    store.as_ref(),
+                ),
+            ),
+            _ => None,
+        };
+        // Cache the overlay's `Novelty` downcast once. The overlay
+        // pointer is fixed for the lifetime of the formatter (one
+        // hydration response), so doing the dynamic dispatch up
+        // front avoids three `as_any().downcast_ref::<Novelty>()`
+        // calls per ref-valued property at format time.
+        let novelty = db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(db.snapshot, arena_reader.is_some());
+        Self {
+            db,
+            compactor,
+            typed: config.format == OutputFormat::TypedJson,
+            normalize_arrays: config.normalize_arrays,
+            policy,
+            tracker,
+            arena_reader,
+            arena_dropped_graphs,
+            novelty,
+            dataset: None,
+            active_idx: 0,
+            holds_cells: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Format a subject to a JSON-LD object
+    ///
+    /// # Arguments
+    /// - `sid`: Subject to expand
+    /// - `level`: Selection specification (what properties to include)
+    /// - `depth`: Current depth and per-column max — see [`DepthBudget`].
+    /// - `visited`: Cycle detection set (per-path)
+    /// - `cache`: Result cache (shared across all subjects)
+    ///
+    /// Note: Returns BoxFuture to support recursive async calls
+    fn format_subject<'b>(
+        &'b self,
+        sid: &'b Sid,
+        root_iri: Option<Arc<str>>,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> BoxFuture<'b, Result<JsonValue>> {
+        async move {
+            let cache_key = (
+                self.active_idx,
+                sid.clone(),
+                compute_level_hash(level),
+                depth.remaining(),
+                root_iri.clone(),
+            );
+
+            // Check cache first (same Sid + spec + depth = same result)
+            if let Some(cached) = cache.results.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+
+            // The `@id` of THIS subject: prefer the canonical IRI from a
+            // multi-ledger `IriMatch` root over decoding the SID against this
+            // formatter's single-snapshot dict, which would mis-decode a SID
+            // that originated in a different ledger (issue #1259). The compaction
+            // is a pure context operation, independent of the namespace dict.
+            // `root_iri` is only ever set for the root subject; nested refs
+            // (recursive calls below) pass `None` and decode their SID against
+            // the ledger whose flakes produced them.
+            //
+            // `@id` is a node-identifier position, so compaction must go through
+            // the `compact_id_*` path (`@base` + explicit prefixes only); using
+            // the `@vocab`-applying path would non-conformantly shorten the IRI
+            // to a bare term when it falls under `@vocab` (issue #1280).
+            let id_json = |compactor: &IriCompactor| -> Result<JsonValue> {
+                Ok(json!(match root_iri.as_deref() {
+                    Some(iri) => compactor.compact_id_iri(iri),
+                    None => compactor.compact_id_sid(sid)?,
+                }))
+            };
+
+            // Cycle detection - if already in current path, return just @id
+            if !visited.insert(sid.clone()) {
+                return Ok(json!({ "@id": id_json(self.compactor)? }));
+            }
+
+            // Build object with sorted keys for determinism (BTreeMap)
+            let mut obj: BTreeMap<String, JsonValue> = BTreeMap::new();
+
+            // @id inclusion:
+            // - Always include for nested hydrations (identity of an expanded ref)
+            // - Otherwise include when wildcard or explicit @id selection
+            if depth.current > 0 || level.includes_id() {
+                obj.insert("@id".to_string(), id_json(self.compactor)?);
+            }
+
+            // Hide anonymous (blank-node) annotation subjects from
+            // top-level subject expansion. Per the design contract,
+            // generated annotation SIDs are LPG-style internal
+            // occurrence ids — the user surface for reading
+            // annotations is `@annotation` / `@reifies`, which goes
+            // through the dedicated `inject_annotations` path that
+            // strips the bnode `@id`. A wildcard subject expansion
+            // landing on an annotation SID via the body's user
+            // properties (e.g. `?s ex:role "Engineer"` happens to
+            // bind `?s` to a blank-node annotation) would otherwise
+            // leak the bnode identifier as a top-level subject.
+            //
+            // The check runs **before** `fetch_subject_properties`
+            // so it sees the unfiltered annotation membership — a
+            // policy that allows `ex:role` but denies `f:reifies*`
+            // would strip the discriminator from the rendered flake
+            // set, and we'd lose the signal. Going through the
+            // overlay (and arena, when present) sidesteps the
+            // policy filter entirely; annotation membership is a
+            // structural property of the snapshot, not user data.
+            //
+            // Only fires at the top of the expansion (`depth.current
+            // == 0`) — recursive ref expansion keeps the existing
+            // behavior so explicit-IRI annotation subjects nested
+            // under a ref-valued property still render.
+            if depth.current == 0
+                && sid.namespace_code == BLANK_NODE
+                && self.is_live_annotation_subject(sid).await?
+            {
+                visited.remove(sid);
+                return Ok(JsonValue::Null);
+            }
+
+            // Fetch forward properties. For Explicit projections we hand the
+            // range provider a predicate allow-list so it can skip object
+            // decode / dict touches / subject re-resolve on discarded rows;
+            // Wildcard projections want every predicate, so the filter stays
+            // None and the legacy SPOT-everything path runs unchanged.
+            //
+            // Single-predicate fast path: SPOT(s,p,*) narrows the cursor's
+            // leaflet key-range to the (s, p) prefix directly, skipping the
+            // predicate-filter machinery and the in-batch scan over the
+            // subject's other predicate rows. K ≥ 2 stays on the
+            // SPOT(s,*,*) + predicate_filter path because two cursor
+            // descents would each pay their own INDEX_TOUCH (0.010 fuel)
+            // and beat the single-scan baseline.
+            //
+            // Zero-predicate fast path (K = 0): an Explicit level with no
+            // forward `Property` items — e.g. `["@id"]` or reverse-only —
+            // skips the forward fetch entirely. Opening the cursor would
+            // still pay one INDEX_TOUCH (0.010 fuel) per leaflet batch
+            // even though the row loop drops every row. `@id` and reverse
+            // properties are emitted by the dedicated paths further down.
+            let predicate_filter = predicate_filter_for_level(level);
+            let flakes: Arc<Vec<Flake>> = match predicate_filter.as_deref() {
+                Some([]) => Arc::new(Vec::new()),
+                Some([only]) => Arc::new(self.fetch_subject_predicate_pair(sid, only).await?),
+                // Wildcard: read through the shared flake cache (bulk-filled
+                // by the prefetch pass for top-level roots; nested refs and
+                // repeat subjects fill it on demand). Dataset mode bypasses
+                // the cache — per-ledger Sids share an encoding space.
+                // Wildcard ONLY: a narrowed K ≥ 2 projection must keep its
+                // predicate_filter (the filter drops rows before decode and
+                // dict-touch fuel; caching the unfiltered set would silently
+                // pay for every predicate).
+                None if self.dataset.is_none() => match cache.subject_flakes.get(sid) {
+                    Some(hit) => Arc::clone(hit),
+                    None => {
+                        let fetched = Arc::new(self.fetch_subject_properties(sid, None).await?);
+                        cache
+                            .subject_flakes
+                            .insert(sid.clone(), Arc::clone(&fetched));
+                        fetched
+                    }
+                },
+                _ => Arc::new(self.fetch_subject_properties(sid, predicate_filter).await?),
+            };
+
+            // Group flakes by predicate, in predicate order. The order the
+            // predicates are formatted in decides which path reaches a shared
+            // node first, and so what its cached rendering holds (the cycle
+            // cut at `visited` depends on the path): a std map, seeded at
+            // random per instance, rendered the same subject differently from
+            // run to run.
+            let mut by_pred: BTreeMap<Sid, Vec<&Flake>> = BTreeMap::new();
+            for flake in flakes.iter() {
+                by_pred.entry(flake.p.clone()).or_default().push(flake);
+            }
+
+            // Format each predicate
+            for (pred, mut pred_flakes) in by_pred {
+                // System-fact filter (M1b): the seven `f:reifies*`
+                // predicates encode an annotation's reified edge. They
+                // are system-controlled — never user-data — and must
+                // not leak through wildcard subject hydration. Direct
+                // user mention in queries is already blocked by the
+                // parser firewall in `fluree-db-query::parse`; this
+                // filter closes the wildcard-projection path.
+                //
+                // Explicitly-listed levels can still reach these via
+                // a `Pattern::Triple` lookup at the planner layer
+                // (which is what the `Pattern::EdgeAnnotation` /
+                // `AnnotationTarget` IR expansion does), but those
+                // patterns don't go through hydration.
+                if fluree_db_core::is_reserved_reifies_predicate(&pred) {
+                    continue;
+                }
+
+                // Returns `None` when the level is Explicit and the predicate
+                // isn't listed; otherwise the sub-spec (itself `None` for
+                // "select but don't recurse") and this predicate's per-value
+                // modifiers. One lookup, because an Explicit level answers both
+                // by scanning the same list.
+                let Some((explicit_sub_spec, level_modifiers)) =
+                    level.select_predicate_with_modifiers(&pred)
+                else {
+                    continue;
+                };
+
+                // If these flakes represent an ordered list (`@list`), preserve transaction order
+                // by sorting by the list index stored in FlakeMeta.i.
+                //
+                // NOTE: Even when the caller did not explicitly define @container @list in context,
+                // list assertions carry list indices. Sorting by meta index is the correct behavior
+                // for ordered lists.
+                if pred_flakes
+                    .iter()
+                    .any(|f| f.m.as_ref().and_then(|m| m.i).is_some())
+                {
+                    pred_flakes.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or(i32::MAX));
+                }
+
+                // A list stored as an `rdf:first`/`rdf:rest` chain, not
+                // compactly, reads as its members, as a compact list does.
+                let chains = self.stored_list_members(&pred_flakes).await?;
+                let pred_flakes: Vec<&Flake> = if chains.is_empty() {
+                    pred_flakes
+                } else {
+                    pred_flakes
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(k, f)| match chains.iter().find(|(at, _)| *at == k) {
+                            Some((_, members)) => members.iter().collect(),
+                            None => vec![f],
+                        })
+                        .collect()
+                };
+
+                let pred_ctx = PredicateContext {
+                    pred: &pred,
+                    flakes: &pred_flakes,
+                    explicit_sub_spec,
+                };
+                let mut values = self
+                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
+                    .await?;
+
+                // Per-value ordering and paging, if this level asked for any.
+                // Applied here, after materialization, because the values are
+                // what they act on — a nested `limit` bounds how many of *this
+                // subject's* values are shown, which the WHERE clause (which
+                // bounds solutions, not values) cannot express.
+                if let Some(modifiers) = level_modifiers {
+                    apply_nested_modifiers(&mut values, modifiers, self.compactor)?;
+                }
+
+                if !values.is_empty() {
+                    let key = self.format_predicate_key(&pred)?;
+                    if values.len() == 1
+                        && !self.normalize_arrays
+                        && !self.force_array_for_key(&key)
+                    {
+                        obj.insert(key, values.into_iter().next().unwrap());
+                    } else {
+                        obj.insert(key, JsonValue::Array(values));
+                    }
+                }
+            }
+
+            // Format reverse properties, in predicate order (as `by_pred`).
+            let mut reverse: Vec<_> = level.reverse().iter().collect();
+            reverse.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (rev_pred, rev_nested_opt) in reverse {
+                let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
+                if !rev_flakes.is_empty() {
+                    let values = self
+                        .format_reverse_values(
+                            &rev_flakes,
+                            rev_nested_opt.as_deref(),
+                            level,
+                            depth,
+                            visited,
+                            cache,
+                        )
+                        .await?;
+                    if !values.is_empty() {
+                        let key = self.compactor.compact_reverse_sid(rev_pred)?;
+                        if values.len() == 1
+                            && !self.normalize_arrays
+                            && !self.force_array_for_key(&key)
+                        {
+                            obj.insert(key, values.into_iter().next().unwrap());
+                        } else {
+                            obj.insert(key, JsonValue::Array(values));
+                        }
+                    }
+                }
+            }
+
+            // Remove from visited (allow revisiting via different paths)
+            visited.remove(sid);
+
+            // Convert BTreeMap to JsonValue::Object
+            let result = JsonValue::Object(obj.into_iter().collect());
+
+            // Cache the result
+            cache.results.insert(cache_key, result.clone());
+
+            Ok(result)
+        }
+        .boxed()
+    }
+
+    /// Expand a referenced subject, routing across ledgers when needed.
+    ///
+    /// In single-ledger mode this is just `format_subject` against the current
+    /// view. In dataset mode the ref's SID is decoded (via the current view) to
+    /// its canonical IRI, then re-encoded and expanded in the target ledger(s):
+    /// a ref inside a default-graph view resolves across the **whole
+    /// default-graph union** (merging each contributing ledger's view of the
+    /// subject under that ledger's own policy); a ref inside a named graph stays
+    /// in that graph. This is what makes a ref that points into another ledger
+    /// hydrate its properties instead of rendering as a bare `{"@id": ...}`
+    /// (issue #1259).
+    fn expand_ref<'b>(
+        &'b self,
+        ref_sid: &'b Sid,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> BoxFuture<'b, Result<JsonValue>> {
+        async move {
+            if self.dataset.is_none() {
+                // Single-ledger: stay in the current view.
+                return self
+                    .format_subject(ref_sid, None, level, depth, visited, cache)
+                    .await;
+            }
+
+            // Decode against the CURRENT view (where the flake lives) to recover
+            // the canonical IRI, then resolve it across the scope.
+            let iri: Arc<str> = Arc::from(self.compactor.decode_sid(ref_sid)?.as_str());
+            self.resolve_iri_across_union(iri, level, depth, visited, cache)
+                .await
+        }
+        .boxed()
+    }
+
+    /// Hydrate a canonical IRI across the current scope, RDF-merging each
+    /// contributing ledger's view of the subject.
+    ///
+    /// A subject reached from a default-graph view resolves across the **whole
+    /// default-graph union** (so a subject described in several default ledgers
+    /// merges — same predicate included); a subject in a named graph stays in
+    /// that graph. Each contributing view re-encodes the projection level into
+    /// its own dict (#1295) and reads under its own policy. Returns a bare
+    /// `{"@id": …}` when no view can resolve the subject.
+    ///
+    /// Shared by nested-ref expansion (`expand_ref`) and root hydration
+    /// (`format_hydration_column`) so both honor the same default-graph merge.
+    /// Requires a dataset context; single-ledger callers format directly.
+    async fn resolve_iri_across_union(
+        &self,
+        iri: Arc<str>,
+        level: &NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &mut HashSet<Sid>,
+        cache: &mut HydrationCaches,
+    ) -> Result<JsonValue> {
+        let ctx = self
+            .dataset
+            .expect("resolve_iri_across_union requires a dataset context");
+
+        // Scope: default-graph subjects resolve across the default-graph union;
+        // a named-graph subject stays within its graph.
+        let targets: Vec<usize> = if ctx.default_indices.contains(&self.active_idx) {
+            ctx.default_indices.clone()
+        } else {
+            vec![self.active_idx]
+        };
+
+        let mut merged: Option<JsonValue> = None;
+        for tidx in targets {
+            let tview = &ctx.views[tidx];
+            // Only a view whose namespace dict can encode the IRI can hold the
+            // subject — skip the rest (no scan, no error).
+            let Some(tsid) = tview.db.snapshot.encode_iri_strict(&iri) else {
+                continue;
+            };
+            let tfmt = ctx.formatter_for(tidx);
+            // Re-encode the level into this target ledger's dict (#1295). The
+            // primary view (`tidx == primary`) needs none — keep the original
+            // (no allocation, byte-identical). Decode source is the
+            // primary/lowering view, never `self` (may be non-primary here).
+            let reencoded_arc;
+            let level_for_target = if tidx == ctx.primary {
+                level
+            } else {
+                // Memoized per (target view, level address); see
+                // `HydrationCaches::reencoded_levels`.
+                let key = (tidx, level as *const NestedSelectSpec as usize);
+                reencoded_arc = cache
+                    .reencoded_levels
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(reencode_level_for_view(
+                            level,
+                            &ctx.views[ctx.primary].compactor,
+                            tview.db.snapshot,
+                        ))
+                    })
+                    .clone();
+                &*reencoded_arc
+            };
+            let obj = tfmt
+                .format_subject(
+                    &tsid,
+                    Some(Arc::clone(&iri)),
+                    level_for_target,
+                    depth,
+                    visited,
+                    cache,
+                )
+                .await?;
+            merged = Some(match merged {
+                None => obj,
+                Some(acc) => merge_subject_objects(acc, obj),
+            });
+        }
+
+        // No view could resolve the subject → bare canonical @id.
+        match merged {
+            Some(v) => Ok(v),
+            None => Ok(json!({ "@id": self.compactor.compact_id_iri(&iri) })),
+        }
+    }
+
+    /// Hydrate a referenced subject, dispatching cross-ledger only when needed.
+    ///
+    /// `expand_ref` is the cross-ledger path: it returns its own boxed future
+    /// and then awaits `format_subject`'s boxed future, so a single-ledger ref
+    /// crawl would allocate two boxed futures per ref. Single-ledger refs stay
+    /// in the current view, so route them straight to `format_subject` (one
+    /// boxed future). This helper is a plain `async fn`, so it folds into the
+    /// caller's state machine and adds no allocation of its own.
+    async fn expand_or_format_ref<'b>(
+        &'b self,
+        ref_sid: &'b Sid,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<JsonValue> {
+        if self.dataset.is_some() {
+            self.expand_ref(ref_sid, level, depth, visited, cache).await
+        } else {
+            self.format_subject(ref_sid, None, level, depth, visited, cache)
+                .await
+        }
+    }
+
+    /// Whether this compact key should always be represented as an array.
+    ///
+    /// JSON-LD `@container` semantics:
+    /// - `@set`: always array (even for 1 value)
+    /// - `@list`: always array (ordered list)
+    fn force_array_for_key(&self, compact_key: &str) -> bool {
+        let Some(entry) = self.compactor.context().get(compact_key) else {
+            return false;
+        };
+        let Some(containers) = &entry.container else {
+            return false;
+        };
+        containers.iter().any(|c| {
+            matches!(
+                c,
+                fluree_graph_json_ld::Container::Set | fluree_graph_json_ld::Container::List
+            )
+        })
+    }
+
+    /// Format predicate key with @type special-casing
+    fn format_predicate_key(&self, pred: &Sid) -> Result<String> {
+        let expanded = self.compactor.decode_sid(pred)?;
+        if expanded == RDF_TYPE_IRI {
+            Ok("@type".to_string())
+        } else {
+            self.compactor.compact_sid(pred)
+        }
+    }
+
+    /// Format values for a predicate
+    async fn format_predicate_values<'b>(
+        &'b self,
+        pred_ctx: PredicateContext<'b>,
+        parent_level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<Vec<JsonValue>> {
+        let expanded = self.compactor.decode_sid(pred_ctx.pred)?;
+        let is_rdf_type = expanded == RDF_TYPE_IRI;
+
+        let mut values = Vec::new();
+        for flake in pred_ctx.flakes {
+            match &flake.o {
+                FlakeValue::Ref(ref_sid) => {
+                    if is_rdf_type {
+                        // @type special case: compact IRI string, not {"@id": ...}
+                        values.push(json!(self.compactor.compact_sid(ref_sid)?));
+                    } else {
+                        // Hydration decision:
+                        // 1. If explicit sub-selection exists → expand with that spec
+                        // 2. Else if budget permits → auto-expand with FULL parent level
+                        // 3. Else → just return {"@id": ...}
+                        let sub_level = pred_ctx
+                            .explicit_sub_spec
+                            .or_else(|| depth.can_expand().then_some(parent_level));
+                        let mut value = match sub_level {
+                            Some(level) => {
+                                self.expand_or_format_ref(
+                                    ref_sid,
+                                    level,
+                                    depth.descend(),
+                                    visited,
+                                    cache,
+                                )
+                                .await?
+                            }
+                            None => json!({ "@id": self.compactor.compact_id_sid(ref_sid)? }),
+                        };
+
+                        // Inject `@annotation` blocks (M1b round-trip):
+                        // when the edge `(flake.s, flake.p, flake.o)`
+                        // carries any currently-asserted annotations,
+                        // surface their bodies under the value's
+                        // `@annotation` key.
+                        self.inject_annotations(flake, &mut value, depth, visited, cache)
+                            .await?;
+
+                        values.push(value);
+                    }
+                }
+                _ => {
+                    // Literal value. Probe annotations first so the
+                    // virtual literal renderer can force `@value`
+                    // inclusion when an annotation must attach — a
+                    // virtual projection like `{"ex:p": ["@type"]}`
+                    // would otherwise return `{"@type": "..."}` with
+                    // no `@value`, which would be structurally
+                    // indistinguishable from an `@json` payload at
+                    // promotion time. Probing first lets the renderer
+                    // produce a fully-shaped value-object that
+                    // promotion can accept without rewrapping.
+                    let bodies = self
+                        .lookup_annotation_bodies(flake, depth, visited, cache)
+                        .await?;
+                    let has_annotations = !bodies.is_empty();
+
+                    let rendered = if let Some(nested) = pred_ctx.explicit_sub_spec {
+                        self.format_literal_virtual(flake, nested, has_annotations)?
+                    } else if self.typed {
+                        self.format_typed_literal_value(flake)?
+                    } else {
+                        self.format_literal_value(flake)?
+                    };
+
+                    if !has_annotations {
+                        values.push(rendered);
+                    } else {
+                        let mut promoted =
+                            self.promote_literal_to_value_object_for_annotation(flake, rendered)?;
+                        if let Some(obj) = promoted.as_object_mut() {
+                            let ann_json = if bodies.len() == 1 {
+                                bodies.into_iter().next().unwrap()
+                            } else {
+                                JsonValue::Array(bodies)
+                            };
+                            obj.insert("@annotation".to_string(), ann_json);
+                        }
+                        values.push(promoted);
+                    }
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// If the edge `(flake.s, flake.p, flake.o)` has any currently-
+    /// asserted annotations, format each one and inject the result
+    /// as the `@annotation` key on `value`.
+    ///
+    /// `value` must already be a JSON object (the rendered Ref form).
+    /// When `value` is a primitive (shouldn't happen in the Ref arm
+    /// today, but guarded for safety), the injection is a no-op.
+    ///
+    /// Anonymous annotation subjects (blank-node SIDs minted by the
+    /// M1a transactor lowering) render their body without `@id`,
+    /// since the synthetic blank-node IRI isn't meaningful to the
+    /// user. Explicit-IRI annotations keep their `@id`.
+    ///
+    /// Multiple parallel annotations on the same edge produce an
+    /// array under `@annotation`; a single annotation produces a
+    /// bare object.
+    ///
+    /// **M2 read path:** uses scan-based lookups through
+    /// `self.db.range`, which goes through the merged base+novelty
+    /// view. This catches annotations whether they're in the
+    /// novelty overlay (fresh inserts) or in indexed base storage
+    /// (post-reindex), closing the M1b "novelty-only" limitation.
+    /// Time-travel correctness: `db.range` respects `self.db.t`, so
+    /// a historical view sees only `f:reifies*` flakes asserted at
+    /// `t <= self.db.t`.
+    async fn inject_annotations<'b>(
+        &'b self,
+        flake: &'b Flake,
+        value: &mut JsonValue,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<()> {
+        let bodies = self
+            .lookup_annotation_bodies(flake, depth, visited, cache)
+            .await?;
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        // The injection target must be a JSON object — caller (Ref
+        // arm or post-promotion literal arm) guarantees that.
+        let Some(obj) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let ann_json = if bodies.len() == 1 {
+            bodies.into_iter().next().unwrap()
+        } else {
+            JsonValue::Array(bodies)
+        };
+        obj.insert("@annotation".to_string(), ann_json);
+        Ok(())
+    }
+
+    /// Look up the rendered annotation bodies attached to `flake`'s
+    /// base edge. Returns an empty vec when the ledger has no
+    /// annotations or when the edge has none.
+    ///
+    /// Used as the probe step by both the Ref arm (via
+    /// `inject_annotations`) and the literal arm (which needs to
+    /// decide whether to promote a scalar render to a value-object
+    /// shape before injecting).
+    async fn lookup_annotation_bodies<'b>(
+        &'b self,
+        flake: &'b Flake,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<Vec<JsonValue>> {
+        // Zero-cost gate for non-annotation ledgers — mirrors the
+        // cascade fast-path in `fluree_db_transact::stage` so a
+        // hydration query like `select: {"?s": ["*"]}` doesn't pay
+        // a POST scan per ref value when the ledger has never seen
+        // an `f:reifies*` flake. Two signals:
+        //
+        // - `snapshot.has_annotations`: sticky bit on `IndexRoot`,
+        //   set at indexer time when any of the seven reserved
+        //   `f:reifies*` predicate SIDs first appears in the
+        //   predicate dictionary. Zero historical exposure on
+        //   ledgers that never used annotations.
+        // - `novelty.attachments.has_annotations()`: in-memory
+        //   overlay sticky bit, flipped on the first observed
+        //   `f:reifies*` bundle.
+        //
+        // Both must be false to skip safely. We only consult the
+        // overlay when it downcasts cleanly to the concrete
+        // `Novelty` type — for unknown overlay implementations
+        // (test fakes, future variants), keep the scan fallback so
+        // we don't silently miss attachments.
+        if !self.db.snapshot.has_annotations {
+            let novelty_clean = self.novelty.map(|n| !n.attachments.has_annotations());
+            if matches!(novelty_clean, Some(true)) {
+                return Ok(Vec::new());
+            }
+        }
+
+        let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
+
+        // Span name preserved across the refactor (was emitted by the
+        // pre-refactor `inject_annotations`). External tooling
+        // (`.claude/skills/trace-*`, `docs/operations/telemetry.md`)
+        // tracks this span — see CLAUDE.md "When adding or renaming
+        // spans".
+        use tracing::Instrument;
+        let span = tracing::debug_span!(
+            "inject_annotations",
+            edge_in_named_graph = edge_key.g.is_some(),
+            path = tracing::field::Empty,
+            annotation_count = tracing::field::Empty,
+        );
+        async {
+            // Arena-backed fast path.
+            if self.arena_reader.is_some() {
+                if let Some(mut ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
+                    tracing::Span::current().record("path", "arena");
+                    tracing::Span::current().record("annotation_count", ann_sids.len());
+                    if ann_sids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    // Sort by Sid for stable, path-independent output
+                    // order. `merge_live_annotations` already returns
+                    // BTreeMap-sorted today, but pinning the sort here
+                    // keeps arena/scan parity if that helper ever
+                    // changes its collection order.
+                    ann_sids.sort();
+                    return self
+                        .render_annotation_bodies(&ann_sids, depth, visited, cache)
+                        .await;
+                }
+            }
+            tracing::Span::current().record("path", "scan");
+
+            // Scan fallback: POST(f:reifiesSubject, edge.s) → candidate
+            // annotations whose subject points at our base subject. Each
+            // candidate's bundle is decoded and compared against the
+            // base flake's EdgeKey (full structural equality including
+            // `lang` and `dt`) before its body is formatted.
+            let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+            let candidate_flakes = self
+                .db
+                .range(
+                    IndexType::Post,
+                    RangeTest::Eq,
+                    RangeMatch::predicate_object(
+                        f_reifies_subject,
+                        FlakeValue::Ref(edge_key.s.clone()),
+                    ),
+                )
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!(
+                        "annotation lookup (f:reifiesSubject scan) failed: {e}"
+                    ))
+                })?;
+
+            if candidate_flakes.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // First pass: dedupe candidates and filter to those whose
+            // decoded bundle structurally matches `edge_key`. POST
+            // iteration is sorted by `s`, but we sort the matched set
+            // explicitly so the output order is path-independent and
+            // matches the arena fast path (see #3 in the edge-
+            // annotations review).
+            let mut matched_anns: Vec<Sid> = Vec::new();
+            let mut seen: HashSet<Sid> = HashSet::new();
+            for cand in &candidate_flakes {
+                let ann_sid = &cand.s;
+                if !seen.insert(ann_sid.clone()) {
+                    continue;
+                }
+
+                // Structural bundle decode bypasses view policy by
+                // design — same justification as
+                // `is_live_annotation_subject`. The `f:reifies*`
+                // flakes are system-controlled discriminators, not
+                // user data; running them through the policy filter
+                // here would let a policy that incidentally hides
+                // FLUREE_DB-namespace predicates collapse the
+                // bundle decode and drop the annotation entirely,
+                // even when the annotation body would have been
+                // policy-visible. Reaching the body still goes
+                // through `format_subject` below, which applies
+                // policy normally — so user-data visibility is
+                // unchanged.
+                let bundle: Vec<Flake> = self
+                    .db
+                    .range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject(ann_sid.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        FormatError::InvalidBinding(format!(
+                            "annotation bundle scan (SPOT s=ann) failed: {e}"
+                        ))
+                    })?
+                    .into_iter()
+                    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+                    .collect();
+                if bundle.is_empty() {
+                    continue;
+                }
+
+                let cand_edge = match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                if cand_edge != edge_key {
+                    continue;
+                }
+
+                matched_anns.push(ann_sid.clone());
+            }
+            matched_anns.sort();
+
+            tracing::Span::current().record("annotation_count", matched_anns.len());
+            self.render_annotation_bodies(&matched_anns, depth, visited, cache)
+                .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Render the annotation bodies for a list of resolved annotation
+    /// SIDs (arena-fast-path output). Shared with the scan fallback's
+    /// body-rendering loop above through the same wildcard select
+    /// spec.
+    async fn render_annotation_bodies<'b>(
+        &'b self,
+        ann_sids: &[Sid],
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<Vec<JsonValue>> {
+        let ann_level = NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        };
+        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
+        for ann_sid in ann_sids {
+            let mut body = self
+                .format_subject(ann_sid, None, &ann_level, depth.descend(), visited, cache)
+                .await?;
+            if ann_sid.namespace_code == BLANK_NODE {
+                if let Some(map) = body.as_object_mut() {
+                    map.remove("@id");
+                }
+            }
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
+    /// Promote a rendered literal into JSON-LD value-object form so
+    /// it can carry `@annotation` as a sibling key.
+    ///
+    /// Rules:
+    /// - If `current` is already a JSON object that contains `@value`,
+    ///   it's already a value-object — return as is. (Includes the
+    ///   typed-literal renderer's `{"@value": ..., "@type": ...}`
+    ///   output and the language-tagged form.)
+    /// - Otherwise wrap: `{"@value": <current>}` plus `@language` (when
+    ///   the flake carries `flake.m.lang`) or `@type` (when the
+    ///   datatype is not inferable from the JSON scalar type).
+    ///
+    /// Critically, `@json` literals rendered as plain JSON objects
+    /// (no `@value` key) take the wrap branch — we never inject
+    /// `@annotation` into the payload of an `@json` literal.
+    fn promote_literal_to_value_object_for_annotation(
+        &self,
+        flake: &Flake,
+        current: JsonValue,
+    ) -> Result<JsonValue> {
+        if let JsonValue::Object(obj) = &current {
+            if obj.contains_key("@value") {
+                return Ok(current);
+            }
+        }
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert("@value".to_string(), current);
+        if let Some(ref meta) = flake.m {
+            if let Some(ref lang) = meta.lang {
+                wrapper.insert("@language".to_string(), json!(lang));
+                return Ok(JsonValue::Object(wrapper));
+            }
+        }
+        let dt_full = self.compactor.decode_sid(&flake.dt)?;
+        let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+        if !may_print_bare(&dt_full, &flake.o) {
+            wrapper.insert("@type".to_string(), json!(dt_compact));
+        }
+        Ok(JsonValue::Object(wrapper))
+    }
+
+    /// Returns `true` iff `sid` is a currently-asserted annotation
+    /// subject. Consults the arena reader (when present) and the
+    /// novelty overlay's `AttachmentNovelty` reverse map. Bypasses
+    /// view policy by design — annotation membership is a structural
+    /// snapshot property, and the wildcard-hide rule must hold even
+    /// when policy denies the discriminating `f:reifies*` flakes.
+    ///
+    /// Returns `false` for non-blank-node SIDs without a lookup
+    /// (every caller already gates on `BLANK_NODE`, but the check
+    /// is cheap and keeps the helper safe to use elsewhere).
+    async fn is_live_annotation_subject(&self, sid: &Sid) -> Result<bool> {
+        if sid.namespace_code != BLANK_NODE {
+            return Ok(false);
+        }
+        // Overlay-side: AttachmentNovelty's reverse map answers
+        // "does this ann SID have any live target?" without policy.
+        let novelty_events: Vec<(fluree_db_core::edge::EdgeKey, i64, bool)> = self
+            .novelty
+            .map(|n| n.attachments.collect_reverse_events(sid))
+            .unwrap_or_default();
+        if let Some(reader) = self.arena_reader.as_ref() {
+            let live = reader
+                .current_targets_merged(sid, &novelty_events, self.db.t)
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!("annotation membership lookup failed: {e}"))
+                })?;
+            return Ok(!live.is_empty());
+        }
+        // No arena: try the overlay's current_targets_for first
+        // (the merge helper's edge-cancellation logic over the live
+        // events).
+        let novelty_says_live = self
+            .novelty
+            .is_some_and(|n| n.attachments.current_targets_for(sid).next().is_some());
+        if novelty_says_live {
+            return Ok(true);
+        }
+
+        // Fall back to an indexed-base SPOT probe. Without this, a
+        // ledger whose annotation flakes have rolled into the base
+        // index but never had an arena sealed (M2a scan-fallback
+        // ledgers, or any snapshot opened without a content_store)
+        // would leak the anonymous annotation SID as a top-level
+        // wildcard row — the discriminator (`f:reifiesSubject` on
+        // the SID) is in base storage but neither the arena reader
+        // nor the overlay has it. SPOT(s = sid) is the same shape
+        // `fetch_subject_properties` uses and survives the
+        // blank-node-subject quirk in practice (verified by the
+        // scan-fallback hydration path at `lookup_annotation_bodies`).
+        let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+        let flakes = self
+            .db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject(sid.clone()),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!("annotation membership SPOT probe failed: {e}"))
+            })?;
+        Ok(flakes.iter().any(|f| f.p == f_reifies_subject))
+    }
+
+    /// Arena-backed annotation lookup. Returns `Some(sids)` when the
+    /// arena reader resolved the query, `None` when a precondition
+    /// failed (no cached reader, or the overlay is not the expected
+    /// concrete novelty type) — caller falls back to the M2a scan
+    /// path.
+    ///
+    /// Reuses the formatter's cached `arena_reader` so successive
+    /// edge lookups in the same response amortize branch + leaf
+    /// loads.
+    async fn arena_lookup_annotations(
+        &self,
+        edge_key: &fluree_db_core::edge::EdgeKey,
+    ) -> Result<Option<Vec<Sid>>> {
+        use tracing::Instrument;
+        let span = tracing::debug_span!(
+            "annotation_arena_lookup",
+            live_count = tracing::field::Empty,
+        );
+        async {
+            let Some(reader) = self.arena_reader.as_ref() else {
+                return Ok(None);
+            };
+            // The overlay must be the concrete `Novelty` type so we
+            // can reach `AttachmentNovelty`. If it isn't (test fakes,
+            // future overlay variants), bail to the scan path —
+            // proceeding with an empty novelty event slice would let
+            // the arena report stale indexed attachments while the
+            // overlay still holds unobserved retracts. Downcast was
+            // cached at formatter construction; no per-call dispatch.
+            let Some(novelty) = self.novelty else {
+                return Ok(None);
+            };
+            if self.arena_dropped_graphs.contains(&edge_key.g) {
+                // The arena predates the drop of this edge's graph, which
+                // took all it holds of the edge.
+                let live: Vec<Sid> = novelty
+                    .attachments
+                    .current_annotations_for_at(edge_key, self.db.t)
+                    .collect();
+                tracing::Span::current().record("live_count", live.len());
+                return Ok(Some(live));
+            }
+            let novelty_events = novelty.attachments.collect_forward_events(edge_key);
+            let live = reader
+                .current_annotations_merged(edge_key, &novelty_events, self.db.t)
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
+                })?;
+            tracing::Span::current().record("live_count", live.len());
+            Ok(Some(live))
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Format reverse property values
+    async fn format_reverse_values<'b>(
+        &'b self,
+        flakes: &[Flake],
+        nested_spec: Option<&'b NestedSelectSpec>,
+        parent_level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> Result<Vec<JsonValue>> {
+        let mut values = Vec::new();
+        for flake in flakes {
+            // For reverse lookup, subject is the entity that points to our object
+            let subject_sid = &flake.s;
+
+            let sub_level = nested_spec.or_else(|| depth.can_expand().then_some(parent_level));
+            match sub_level {
+                Some(level) => values.push(
+                    self.expand_or_format_ref(subject_sid, level, depth.descend(), visited, cache)
+                        .await?,
+                ),
+                None => {
+                    // No expansion - just @id
+                    values.push(json!({ "@id": self.compactor.compact_id_sid(subject_sid)? }));
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// Format a literal flake value
+    fn format_literal_value(&self, flake: &Flake) -> Result<JsonValue> {
+        let dt_full = self.compactor.decode_sid(&flake.dt)?;
+        let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+
+        // Special handling for @json datatype: deserialize the JSON string.
+        // Accept both Json and String variants (see jsonld.rs for rationale).
+        // Text that is not JSON is written as the typed literal it is.
+        if dt_full == rdf::JSON || dt_compact == "@json" {
+            return match &flake.o {
+                FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
+                    Ok(json_document(json_str).unwrap_or_else(|| ill_typed_json_literal(json_str)))
+                }
+                _ => Err(FormatError::InvalidBinding(
+                    "@json datatype must have FlakeValue::Json".to_string(),
+                )),
+            };
+        }
+
+        // Check for language tag
+        if let Some(ref meta) = flake.m {
+            if let Some(ref lang) = meta.lang {
+                return match &flake.o {
+                    FlakeValue::String(s) => Ok(json!({
+                        "@value": s,
+                        "@language": lang
+                    })),
+                    FlakeValue::Null => Ok(JsonValue::Null),
+                    _ => Err(FormatError::InvalidBinding(
+                        "Language-tagged literals must be strings".to_string(),
+                    )),
+                };
+            }
+        }
+
+        // Inferable datatypes can omit @type
+        if may_print_bare(&dt_full, &flake.o) {
+            return match &flake.o {
+                FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
+                FlakeValue::Long(n) => Ok(json!(n)),
+                FlakeValue::Double(d) => {
+                    if d.is_nan() {
+                        Ok(JsonValue::String("NaN".to_string()))
+                    } else if d.is_infinite() {
+                        if d.is_sign_positive() {
+                            Ok(JsonValue::String("INF".to_string()))
+                        } else {
+                            Ok(JsonValue::String("-INF".to_string()))
+                        }
+                    } else {
+                        Ok(json!(d))
+                    }
+                }
+                FlakeValue::Boolean(b) => Ok(json!(b)),
+                FlakeValue::Vector(v) => Ok(JsonValue::Array(v.iter().map(|f| json!(f)).collect())),
+                FlakeValue::Json(_) => Err(FormatError::InvalidBinding(
+                    "@json should have been handled above".to_string(),
+                )),
+                FlakeValue::Null => Ok(JsonValue::Null),
+                FlakeValue::Ref(sid) => {
+                    // This shouldn't happen for literals, but handle gracefully
+                    Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }))
+                }
+                // Extended numeric types - serialize as string
+                FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
+                FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
+                // Temporal types - serialize as original string
+                FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
+                FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
+                FlakeValue::Time(t) => Ok(JsonValue::String(t.to_string())),
+                // Additional temporal types - serialize as original string
+                FlakeValue::GYear(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::GYearMonth(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::GMonth(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::GDay(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::GMonthDay(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::YearMonthDuration(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
+                FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+            };
+        }
+
+        // Non-inferable datatypes include @type
+        let value_json = match &flake.o {
+            FlakeValue::String(s) => JsonValue::String(s.clone()),
+            FlakeValue::Long(n) => json!(n),
+            FlakeValue::Double(d) => {
+                if d.is_nan() {
+                    JsonValue::String("NaN".to_string())
+                } else if d.is_infinite() {
+                    if d.is_sign_positive() {
+                        JsonValue::String("INF".to_string())
+                    } else {
+                        JsonValue::String("-INF".to_string())
+                    }
+                } else {
+                    json!(d)
+                }
+            }
+            FlakeValue::Boolean(b) => json!(b),
+            FlakeValue::Vector(v) => JsonValue::Array(v.iter().map(|f| json!(f)).collect()),
+            FlakeValue::Json(json_str) => JsonValue::String(json_str.clone()), // Fallback for non-@json context
+            FlakeValue::Null => return Ok(JsonValue::Null),
+            FlakeValue::Ref(sid) => {
+                return Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }));
+            }
+            // Extended numeric types - serialize as string with @type
+            FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
+            FlakeValue::Decimal(d) => JsonValue::String(d.to_plain_string()),
+            // Temporal types - serialize as original string with @type
+            FlakeValue::DateTime(dt) => JsonValue::String(dt.to_string()),
+            FlakeValue::Date(d) => JsonValue::String(d.to_string()),
+            FlakeValue::Time(t) => JsonValue::String(t.to_string()),
+            // Additional temporal types - serialize as original string with @type
+            FlakeValue::GYear(v) => JsonValue::String(v.to_string()),
+            FlakeValue::GYearMonth(v) => JsonValue::String(v.to_string()),
+            FlakeValue::GMonth(v) => JsonValue::String(v.to_string()),
+            FlakeValue::GDay(v) => JsonValue::String(v.to_string()),
+            FlakeValue::GMonthDay(v) => JsonValue::String(v.to_string()),
+            FlakeValue::YearMonthDuration(v) => JsonValue::String(v.to_string()),
+            FlakeValue::DayTimeDuration(v) => JsonValue::String(v.to_string()),
+            FlakeValue::Duration(v) => JsonValue::String(v.to_string()),
+            FlakeValue::GeoPoint(v) => JsonValue::String(v.to_string()),
+        };
+
+        Ok(json!({
+            "@value": value_json,
+            "@type": dt_compact
+        }))
+    }
+
+    /// Format a literal flake value with explicit type annotations (TypedJson mode).
+    ///
+    /// Always emits `{"@value": ..., "@type": "..."}` for every literal, including
+    /// types that would normally be inferred (xsd:string, xsd:long, etc.).
+    /// Language-tagged strings use `{"@value": ..., "@language": "..."}` (no @type).
+    /// `@json` values use `{"@value": <parsed>, "@type": "@json"}`.
+    fn format_typed_literal_value(&self, flake: &Flake) -> Result<JsonValue> {
+        let dt_full = self.compactor.decode_sid(&flake.dt)?;
+        let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+
+        // @json datatype: deserialize and wrap with @type; text that is not
+        // JSON as the typed literal it is.
+        if dt_full == rdf::JSON || dt_compact == "@json" {
+            return match &flake.o {
+                FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
+                    Ok(match json_document(json_str) {
+                        Some(json_val) => json!({
+                            "@value": json_val,
+                            "@type": "@json"
+                        }),
+                        None => ill_typed_json_literal(json_str),
+                    })
+                }
+                _ => Err(FormatError::InvalidBinding(
+                    "@json datatype must have FlakeValue::Json".to_string(),
+                )),
+            };
+        }
+
+        // Language-tagged string: use @language instead of @type
+        if let Some(ref meta) = flake.m {
+            if let Some(ref lang) = meta.lang {
+                return match &flake.o {
+                    FlakeValue::String(s) => Ok(json!({
+                        "@value": s,
+                        "@language": lang
+                    })),
+                    FlakeValue::Null => Ok(JsonValue::Null),
+                    _ => Err(FormatError::InvalidBinding(
+                        "Language-tagged literals must be strings".to_string(),
+                    )),
+                };
+            }
+        }
+
+        // All other types: always include @type
+        let value_json = match &flake.o {
+            FlakeValue::String(s) => json!(s),
+            FlakeValue::Long(n) => json!(n),
+            FlakeValue::Double(d) => {
+                if d.is_nan() {
+                    json!("NaN")
+                } else if d.is_infinite() {
+                    if d.is_sign_positive() {
+                        json!("INF")
+                    } else {
+                        json!("-INF")
+                    }
+                } else {
+                    json!(d)
+                }
+            }
+            FlakeValue::Boolean(b) => json!(b),
+            FlakeValue::Vector(v) => json!(v),
+            // JSON values should usually be handled by the `@json` branch above,
+            // but we can still encounter `FlakeValue::Json` here (e.g., custom
+            // datatypes or typed-json formatting paths). Never panic in a server
+            // formatter: fall back to parsing the JSON payload, or emit the raw
+            // string if it isn't valid JSON.
+            FlakeValue::Json(s) => {
+                serde_json::from_str::<JsonValue>(s).unwrap_or_else(|_| json!(s))
+            }
+            FlakeValue::Null => return Ok(JsonValue::Null),
+            FlakeValue::Ref(sid) => {
+                return Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }))
+            }
+            FlakeValue::BigInt(n) => json!(n.to_string()),
+            FlakeValue::Decimal(d) => json!(d.to_plain_string()),
+            FlakeValue::DateTime(dt) => json!(dt.to_string()),
+            FlakeValue::Date(d) => json!(d.to_string()),
+            FlakeValue::Time(t) => json!(t.to_string()),
+            FlakeValue::GYear(v) => json!(v.to_string()),
+            FlakeValue::GYearMonth(v) => json!(v.to_string()),
+            FlakeValue::GMonth(v) => json!(v.to_string()),
+            FlakeValue::GDay(v) => json!(v.to_string()),
+            FlakeValue::GMonthDay(v) => json!(v.to_string()),
+            FlakeValue::YearMonthDuration(v) => json!(v.to_string()),
+            FlakeValue::DayTimeDuration(v) => json!(v.to_string()),
+            FlakeValue::Duration(v) => json!(v.to_string()),
+            FlakeValue::GeoPoint(v) => json!(v.to_string()),
+        };
+
+        Ok(json!({
+            "@value": value_json,
+            "@type": dt_compact
+        }))
+    }
+
+    /// Format a literal as a virtual node when explicitly selected.
+    ///
+    /// Supports `@value`, `@type`, and `@language` selection semantics.
+    fn format_literal_virtual(
+        &self,
+        flake: &Flake,
+        spec: &NestedSelectSpec,
+        force_value: bool,
+    ) -> Result<JsonValue> {
+        let mut want_value = force_value;
+        let mut want_type = false;
+        let mut want_language = false;
+
+        match spec {
+            NestedSelectSpec::Wildcard { .. } => {
+                want_value = true;
+                want_type = true;
+                want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
+            }
+            NestedSelectSpec::Explicit { forward, .. } => {
+                for item in forward {
+                    if let ForwardItem::Property { predicate, .. } = item {
+                        if predicate.namespace_code == JSON_LD {
+                            match predicate.name.as_ref() {
+                                "value" => want_value = true,
+                                "type" => want_type = true,
+                                "language" => want_language = true,
+                                _ => {}
+                            }
+                        } else if self.compactor.decode_sid(predicate).ok().as_deref()
+                            == Some(RDF_TYPE_IRI)
+                        {
+                            // `@type` lowers to the rdf:type predicate; on a
+                            // literal value that means "emit the datatype".
+                            want_type = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut obj = serde_json::Map::new();
+
+        if want_value {
+            obj.insert(
+                "@value".to_string(),
+                self.format_literal_plain_value(flake)?,
+            );
+        }
+
+        if want_type {
+            let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+            obj.insert("@type".to_string(), json!(dt_compact));
+        }
+
+        if want_language {
+            if let Some(lang) = flake.m.as_ref().and_then(|m| m.lang.as_ref()) {
+                obj.insert("@language".to_string(), json!(lang));
+            }
+        }
+
+        Ok(JsonValue::Object(obj))
+    }
+
+    fn format_literal_plain_value(&self, flake: &Flake) -> Result<JsonValue> {
+        let dt_full = self.compactor.decode_sid(&flake.dt)?;
+        let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+
+        // The document, or text that is not JSON as that text; `@type`
+        // beside it names the datatype.
+        if dt_full == rdf::JSON || dt_compact == "@json" {
+            return match &flake.o {
+                FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
+                    Ok(json_document(json_str)
+                        .unwrap_or_else(|| JsonValue::String(json_str.clone())))
+                }
+                _ => Err(FormatError::InvalidBinding(
+                    "@json datatype must have FlakeValue::Json".to_string(),
+                )),
+            };
+        }
+
+        match &flake.o {
+            FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
+            FlakeValue::Long(n) => Ok(json!(n)),
+            FlakeValue::Double(d) => {
+                if d.is_nan() {
+                    Ok(JsonValue::String("NaN".to_string()))
+                } else if d.is_infinite() {
+                    if d.is_sign_positive() {
+                        Ok(JsonValue::String("INF".to_string()))
+                    } else {
+                        Ok(JsonValue::String("-INF".to_string()))
+                    }
+                } else {
+                    Ok(json!(d))
+                }
+            }
+            FlakeValue::Boolean(b) => Ok(json!(b)),
+            FlakeValue::Vector(v) => Ok(JsonValue::Array(v.iter().map(|f| json!(f)).collect())),
+            FlakeValue::Json(_) => Err(FormatError::InvalidBinding(
+                "@json should have been handled above".to_string(),
+            )),
+            FlakeValue::Null => Ok(JsonValue::Null),
+            FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? })),
+            FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
+            FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
+            FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
+            FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
+            FlakeValue::Time(t) => Ok(JsonValue::String(t.to_string())),
+            // Additional temporal types - serialize as original string
+            FlakeValue::GYear(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::GYearMonth(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::GMonth(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::GDay(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::GMonthDay(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::YearMonthDuration(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::DayTimeDuration(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::Duration(v) => Ok(JsonValue::String(v.to_string())),
+            FlakeValue::GeoPoint(v) => Ok(JsonValue::String(v.to_string())),
+        }
+    }
+
+    /// Fetch a subject's forward flakes via the SPOT index, optionally
+    /// narrowed to a projection-predicate allow-list.
+    ///
+    /// `predicate_filter` mirrors [`RangeOptions::predicate_filter`]: when
+    /// `Some`, the range provider drops non-listed predicates **before**
+    /// resolving the subject Sid, decoding the object, or charging
+    /// dict-touch fuel. When `None`, behavior matches the legacy
+    /// SPOT-everything path (used for `*`-wildcard projections where every
+    /// predicate is wanted).
+    ///
+    /// When policy is set, the returned flakes are post-filtered by view
+    /// policy. Per-flake / per-leaflet / per-dict-touch fuel charges happen
+    /// inside `db.range_with_opts` via the `GraphDbRef` tracker.
+    async fn fetch_subject_properties(
+        &self,
+        sid: &Sid,
+        predicate_filter: Option<Arc<[Sid]>>,
+    ) -> Result<Vec<Flake>> {
+        let opts = RangeOptions::default();
+        let opts = match predicate_filter {
+            Some(allow) => opts.with_predicate_filter(allow),
+            None => opts,
+        };
+        let flakes = self
+            .db
+            .range_with_opts(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject(sid.clone()),
+                opts,
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!("Failed to fetch subject properties: {e}"))
+            })?;
+
+        // Policy filtering: only when policy is Some and not root.
+        if let Some(policy_ctx) = self.policy {
+            if !policy_ctx.wrapper().is_root() {
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
+            }
+        }
+
+        Ok(flakes)
+    }
+
+    /// The members of each of `flakes` that names a list stored as an
+    /// `rdf:first`/`rdf:rest` chain, with the flake's position. A list any of
+    /// whose members the view policy hides is left as its head.
+    async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
+        let mut out = Vec::new();
+        for (k, flake) in flakes.iter().enumerate() {
+            let FlakeValue::Ref(head) = &flake.o else {
+                continue;
+            };
+            if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
+                continue;
+            }
+            let members = fluree_db_core::rdf_list::chain_members(self.db, head)
+                .await
+                .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+            let Some(members) = members else {
+                continue;
+            };
+            let members = match self.policy {
+                Some(policy_ctx) if !policy_ctx.wrapper().is_root() => {
+                    let count = members.len();
+                    let visible = self.filter_flakes_by_policy(members, policy_ctx).await?;
+                    if visible.len() != count {
+                        continue;
+                    }
+                    visible
+                }
+                _ => members,
+            };
+            out.push((k, members));
+        }
+        Ok(out)
+    }
+
+    /// Whether `db` holds any `rdf:first` triple, read once per response:
+    /// without one, no blank node heads a list stored as its triples.
+    async fn holds_cells(&self) -> Result<bool> {
+        if let Some(&held) = self.holds_cells.get() {
+            return Ok(held);
+        }
+        let first = self
+            .db
+            .range_with_opts(
+                IndexType::Psot,
+                RangeTest::Eq,
+                RangeMatch {
+                    p: Some(Sid::new(RDF, fluree_vocab::predicates::RDF_FIRST)),
+                    ..Default::default()
+                },
+                RangeOptions::default().with_flake_limit(1),
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+        let held = !first.is_empty();
+        let _ = self.holds_cells.set(held);
+        Ok(held)
+    }
+
+    /// Fetch one `(subject, predicate)` pair via the SPOT index.
+    ///
+    /// Caller invariant: the projection's level is Explicit with exactly
+    /// one forward `Property` item. This narrows the cursor's leaflet
+    /// key-range to the `(s, p)` prefix — same number of cursor descents
+    /// and same `INDEX_TOUCH` fuel as the SPOT(s,*,*) + `predicate_filter`
+    /// path, but skips the per-row `binary_search` against the filter and
+    /// the in-batch scan over the subject's other predicate rows. Worth it
+    /// on fat subjects; a CPU/clarity wash on small ones.
+    async fn fetch_subject_predicate_pair(&self, sid: &Sid, pred: &Sid) -> Result<Vec<Flake>> {
+        let flakes = self
+            .db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(sid.clone(), pred.clone()),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!(
+                    "Failed to fetch (subject, predicate) pair: {e}"
+                ))
+            })?;
+
+        if let Some(policy_ctx) = self.policy {
+            if !policy_ctx.wrapper().is_root() {
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
+            }
+        }
+
+        Ok(flakes)
+    }
+
+    /// Fetch subjects that have this object via predicate (reverse lookup using POST index)
+    ///
+    /// When policy is set, filters flakes according to view policies.
+    /// When policy is None, returns all flakes (zero overhead).
+    async fn fetch_reverse_properties(&self, object_sid: &Sid, pred: &Sid) -> Result<Vec<Flake>> {
+        let flakes = self
+            .db
+            .range(
+                IndexType::Post,
+                RangeTest::Eq,
+                RangeMatch::predicate_object(pred.clone(), FlakeValue::Ref(object_sid.clone())),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!("Failed to fetch reverse properties: {e}"))
+            })?;
+
+        // Policy filtering: only when policy is Some and not root
+        // Zero overhead when policy is None (common case).
+        // Per-flake / per-leaflet / per-dict-touch fuel charges happen inside
+        // db.range via the GraphDbRef tracker — no extra charge needed here.
+        if let Some(policy_ctx) = self.policy {
+            if !policy_ctx.wrapper().is_root() {
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
+            }
+        }
+
+        Ok(flakes)
+    }
+
+    /// Filter flakes according to view policies.
+    ///
+    /// Schema flakes are always allowed. Other flakes are checked against the
+    /// policy context's view set via the **async** evaluator, so `f:query`
+    /// policies run (the sync evaluator silently skips them). Class membership
+    /// is resolved at this view's `t` via the GraphDbRef.
+    async fn filter_flakes_by_policy(
+        &self,
+        flakes: Vec<Flake>,
+        policy_ctx: &PolicyContext,
+    ) -> Result<Vec<Flake>> {
+        // Share the existing class cache (Arc-backed) so populated lookups carry
+        // across fetches and the original policy context sees them too.
+        let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
+
+        let disabled = Tracker::disabled();
+        let tracker = self.tracker.unwrap_or(&disabled);
+        enforcer
+            .filter_flakes_for_graph(
+                self.db.snapshot,
+                self.db.g_id,
+                self.db.overlay,
+                self.db.t,
+                tracker,
+                flakes,
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Past 2⁵³ floats step by two, so consecutive `xsd:long` values share one
+    /// `f64`. Comparing through `as_f64` made them tie, and a stable sort then
+    /// left them in whatever order the hydration happened to produce — which is
+    /// why this is pinned here rather than end to end, where the arrival order
+    /// masks it.
+    #[test]
+    fn large_integers_compare_exactly_not_through_f64() {
+        const BASE: i64 = 1 << 53;
+        let n = |v: i64| JsonValue::Number(v.into());
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            assert_eq!((BASE + 1) as f64, BASE as f64, "premise: they share a f64");
+        }
+
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE)), Some(&n(BASE + 1))),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE + 1)), Some(&n(BASE))),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE)), Some(&n(BASE))),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// A negative against a `u64` past `i64::MAX` matches neither integer
+    /// branch and falls through to `f64`, which is safe here: rounding can
+    /// collapse neighbouring values, never flip a sign.
+    #[test]
+    fn mixed_width_integers_compare_by_value() {
+        let big = JsonValue::Number(serde_json::Number::from(u64::MAX));
+        let small = JsonValue::Number(serde_json::Number::from(-1i64));
+        assert_eq!(
+            compare_sort_values(Some(&small), Some(&big)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&big), Some(&small)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Floats still work, and an int/float mix falls through to the float path
+    /// rather than comparing as equal.
+    #[test]
+    fn floats_still_compare() {
+        let a = JsonValue::Number(serde_json::Number::from_f64(1.5).unwrap());
+        let b = JsonValue::Number(serde_json::Number::from_f64(2.5).unwrap());
+        let one = JsonValue::Number(1i64.into());
+        assert_eq!(
+            compare_sort_values(Some(&a), Some(&b)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&one), Some(&a)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_cache_key_different_depths() {
+        let sid = Sid::new(100, "alice");
+        let spec_hash = 12345u64;
+        let view_a = 0usize;
+
+        let key1: CacheKey = (view_a, sid.clone(), spec_hash, 0, None);
+        let key2: CacheKey = (view_a, sid.clone(), spec_hash, 1, None);
+        let key3: CacheKey = (view_a, sid.clone(), spec_hash, 0, None);
+        // Same SID + spec + depth but a different canonical IRI (cross-ledger
+        // collision) must NOT share a cache entry.
+        let key4: CacheKey = (
+            view_a,
+            sid.clone(),
+            spec_hash,
+            0,
+            Some(Arc::from("http://other.example/x")),
+        );
+        // Same SID + spec + depth in a DIFFERENT view (ledger) must NOT share an entry.
+        let key5: CacheKey = (1usize, sid, spec_hash, 0, None);
+
+        // Different depths should produce different keys
+        assert_ne!(key1, key2);
+        // Same Sid + spec + depth should be equal
+        assert_eq!(key1, key3);
+        // Different canonical IRI → different key
+        assert_ne!(key1, key4);
+        // Different active view → different key
+        assert_ne!(key1, key5);
+    }
+
+    fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {
+        NestedSelectSpec::Explicit {
+            forward,
+            reverse: HashMap::new(),
+        }
+    }
+
+    fn wildcard() -> NestedSelectSpec {
+        NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn level_hash_distinguishes_explicit_from_wildcard() {
+        let hash_empty = compute_level_hash(&explicit(vec![]));
+        let hash_wildcard = compute_level_hash(&wildcard());
+        assert_ne!(hash_empty, hash_wildcard);
+        // Same level produces same hash.
+        assert_eq!(compute_level_hash(&wildcard()), hash_wildcard);
+    }
+
+    #[test]
+    fn level_hash_distinguishes_properties() {
+        let pred1 = Sid::new(1, "name");
+        let pred2 = Sid::new(2, "age");
+
+        let hash1 = compute_level_hash(&explicit(vec![ForwardItem::Property {
+            predicate: pred1.clone(),
+            sub_spec: None,
+            modifiers: None,
+        }]));
+        let hash2 = compute_level_hash(&explicit(vec![ForwardItem::Property {
+            predicate: pred2.clone(),
+            sub_spec: None,
+            modifiers: None,
+        }]));
+        assert_ne!(hash1, hash2);
+
+        // Sub-spec presence changes the hash.
+        let hash3 = compute_level_hash(&explicit(vec![ForwardItem::Property {
+            predicate: pred1.clone(),
+            sub_spec: Some(Box::new(wildcard())),
+            modifiers: None,
+        }]));
+        assert_ne!(hash1, hash3);
+
+        // So do the per-value modifiers: two levels selecting the same
+        // predicate with different `limit`s produce different output, so they
+        // must not collide in the hydration result cache.
+        let limited = |limit: usize| {
+            compute_level_hash(&explicit(vec![ForwardItem::Property {
+                predicate: pred1.clone(),
+                sub_spec: None,
+                modifiers: Some(Box::new(NestedModifiers {
+                    order: Vec::new(),
+                    offset: None,
+                    limit: Some(limit),
+                })),
+            }]))
+        };
+        assert_ne!(hash1, limited(1));
+        assert_ne!(limited(1), limited(2));
+
+        // And the sort keys.
+        let ordered = |descending: bool| {
+            compute_level_hash(&explicit(vec![ForwardItem::Property {
+                predicate: pred1.clone(),
+                sub_spec: None,
+                modifiers: Some(Box::new(NestedModifiers {
+                    order: vec![NestedOrderKey {
+                        predicate: Some(pred2.clone()),
+                        descending,
+                    }],
+                    offset: None,
+                    limit: None,
+                })),
+            }]))
+        };
+        assert_ne!(ordered(false), ordered(true));
+    }
+
+    #[test]
+    fn level_hash_distinguishes_reverse() {
+        let rev_pred = Sid::new(10, "friendOf");
+
+        let hash_no_reverse = compute_level_hash(&wildcard());
+
+        let mut reverse1 = HashMap::new();
+        reverse1.insert(rev_pred.clone(), None);
+        let hash_with_reverse = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse1,
+        });
+        assert_ne!(hash_no_reverse, hash_with_reverse);
+
+        let mut reverse2 = HashMap::new();
+        reverse2.insert(rev_pred, Some(Box::new(wildcard())));
+        let hash_nested = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse2,
+        });
+        assert_ne!(hash_with_reverse, hash_nested);
+    }
+}

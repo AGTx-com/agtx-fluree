@@ -1,0 +1,805 @@
+//! On-demand binding materialization service.
+//!
+//! The `Materializer` provides lazy decoding of encoded bindings with caching.
+//! Each query gets its own `Materializer` instance to avoid cross-query cache pollution.
+//!
+//! # Design Principles
+//!
+//! 1. **Return views/keys, not Bindings**: The materializer returns separate key/value
+//!    objects (`JoinKey`, `ComparableValue`, etc.) rather than rewriting `Binding` values.
+//!    This prevents accidental mutation of hash keys in GROUP BY/DISTINCT/hash joins.
+//!
+//! 2. **Safe boundaries**: Only `to_term()` produces full `Binding` values, and it should
+//!    only be called at terminal boundaries (formatting/projection) after all hashing/grouping
+//!    is complete.
+//!
+//! 3. **Caching**: Decoded values are cached for the query duration to avoid repeated
+//!    dictionary lookups.
+//!
+//! # Single-Ledger vs Multi-Ledger (Dataset) Mode
+//!
+//! - **Single-ledger**: Join keys use raw `s_id` comparison (no decoding needed).
+//! - **Multi-ledger**: Join keys use canonical IRI strings for correct cross-ledger semantics.
+
+use crate::binding::Binding;
+use crate::error::{QueryError, Result};
+use chrono::{Datelike, Timelike};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_core::DatatypeConstraint;
+use fluree_db_core::{FlakeValue, Sid};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+/// Join key for hash joins, DISTINCT, and GROUP BY operations.
+///
+/// This type is designed to be cheap to hash and compare without requiring
+/// dictionary lookups in single-ledger mode.
+#[derive(Debug, Clone)]
+pub enum JoinKey<'a> {
+    /// Single-ledger: raw subject/ref ID (no decoding needed for comparison)
+    Sid(u64),
+    /// Single-ledger: raw predicate ID
+    Pid(u32),
+    /// Multi-ledger: canonical IRI string for cross-ledger comparison (borrowed)
+    Iri(Cow<'a, str>),
+    /// Multi-ledger: canonical IRI string (owned via Arc, no allocation on clone)
+    /// This is used for cached IRI resolutions to avoid allocating a new String.
+    IriOwned(Arc<str>),
+    /// Literal value key (excluding transaction metadata)
+    Lit {
+        o_kind: u8,
+        o_key: u64,
+        dt_id: u16,
+        lang_id: u16,
+    },
+    /// Already-materialized Sid (namespace_code + name)
+    MaterializedSid(u16, Cow<'a, str>),
+    /// Already-materialized literal (for decoded Lit bindings)
+    ///
+    /// IMPORTANT: Must include datatype and language to match SPARQL term identity.
+    MaterializedLit(MaterializedLitKey),
+    /// Unbound/Poisoned - represents absence
+    Absent,
+}
+
+/// Hashable wrapper for FlakeValue (excluding Ref which should use Sid)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlakeValueKey(pub FlakeValue);
+
+impl Eq for FlakeValueKey {}
+
+impl Hash for FlakeValueKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash by discriminant + value
+        std::mem::discriminant(&self.0).hash(state);
+        match &self.0 {
+            FlakeValue::String(s) => s.hash(state),
+            FlakeValue::Long(n) => n.hash(state),
+            // The bits `FlakeValue`'s equality compares: every NaN equal,
+            // -0.0 equal to 0.0.
+            FlakeValue::Double(d) => {
+                fluree_db_core::value_id::canonical_f64_bits(*d).hash(state);
+            }
+            FlakeValue::Boolean(b) => b.hash(state),
+            FlakeValue::Ref(sid) => {
+                sid.namespace_code.hash(state);
+                sid.name.hash(state);
+            }
+            FlakeValue::BigInt(n) => n.to_string().hash(state),
+            FlakeValue::Decimal(d) => d.to_string().hash(state),
+            FlakeValue::DateTime(dt) => dt.hash(state),
+            FlakeValue::Date(d) => d.hash(state),
+            FlakeValue::Time(t) => t.hash(state),
+            FlakeValue::Json(s) => s.hash(state),
+            FlakeValue::Vector(v) => {
+                fluree_db_core::value::vector_value_hash(v).hash(state);
+            }
+            FlakeValue::Null => {}
+            FlakeValue::GYear(v) => v.hash(state),
+            FlakeValue::GYearMonth(v) => v.hash(state),
+            FlakeValue::GMonth(v) => v.hash(state),
+            FlakeValue::GDay(v) => v.hash(state),
+            FlakeValue::GMonthDay(v) => v.hash(state),
+            FlakeValue::YearMonthDuration(v) => v.hash(state),
+            FlakeValue::DayTimeDuration(v) => v.hash(state),
+            FlakeValue::Duration(v) => v.hash(state),
+            FlakeValue::GeoPoint(v) => v.hash(state),
+        }
+    }
+}
+
+/// Hashable key for a fully materialized literal binding.
+///
+/// This must include datatype and language to match `Binding::Lit` equality/hash semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MaterializedLitKey {
+    pub val: FlakeValueKey,
+    pub dtc: DatatypeConstraint,
+}
+
+impl PartialEq for JoinKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (JoinKey::Sid(a), JoinKey::Sid(b)) => a == b,
+            (JoinKey::Pid(a), JoinKey::Pid(b)) => a == b,
+            // Iri and IriOwned are equivalent if they have the same string content
+            (JoinKey::Iri(a), JoinKey::Iri(b)) => a == b,
+            (JoinKey::IriOwned(a), JoinKey::IriOwned(b)) => a == b,
+            (JoinKey::Iri(a), JoinKey::IriOwned(b)) => a.as_ref() == b.as_ref(),
+            (JoinKey::IriOwned(a), JoinKey::Iri(b)) => a.as_ref() == b.as_ref(),
+            (
+                JoinKey::Lit {
+                    o_kind: k1,
+                    o_key: ok1,
+                    dt_id: d1,
+                    lang_id: l1,
+                },
+                JoinKey::Lit {
+                    o_kind: k2,
+                    o_key: ok2,
+                    dt_id: d2,
+                    lang_id: l2,
+                },
+            ) => k1 == k2 && ok1 == ok2 && d1 == d2 && l1 == l2,
+            (JoinKey::MaterializedSid(ns1, n1), JoinKey::MaterializedSid(ns2, n2)) => {
+                ns1 == ns2 && n1 == n2
+            }
+            (JoinKey::MaterializedLit(a), JoinKey::MaterializedLit(b)) => a == b,
+            (JoinKey::Absent, JoinKey::Absent) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for JoinKey<'_> {}
+
+impl Hash for JoinKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Use explicit discriminant values to ensure Iri and IriOwned hash the same
+        // (since they are considered equal when they have the same string content)
+        let discriminant: u8 = match self {
+            JoinKey::Sid(_) => 0,
+            JoinKey::Pid(_) => 1,
+            JoinKey::Iri(_) | JoinKey::IriOwned(_) => 2, // Same discriminant for equivalence
+            JoinKey::Lit { .. } => 3,
+            JoinKey::MaterializedSid(_, _) => 4,
+            JoinKey::MaterializedLit(_) => 5,
+            JoinKey::Absent => 6,
+        };
+        discriminant.hash(state);
+        match self {
+            JoinKey::Sid(id) => id.hash(state),
+            JoinKey::Pid(id) => id.hash(state),
+            JoinKey::Iri(s) => s.hash(state),
+            JoinKey::IriOwned(s) => s.hash(state),
+            JoinKey::Lit {
+                o_kind,
+                o_key,
+                dt_id,
+                lang_id,
+            } => {
+                o_kind.hash(state);
+                o_key.hash(state);
+                dt_id.hash(state);
+                lang_id.hash(state);
+            }
+            JoinKey::MaterializedSid(ns, name) => {
+                ns.hash(state);
+                name.hash(state);
+            }
+            JoinKey::MaterializedLit(v) => v.hash(state),
+            JoinKey::Absent => {}
+        }
+    }
+}
+
+/// Comparable value for FILTER expressions and ORDER BY.
+///
+/// This type supports the SPARQL comparison semantics including
+/// cross-type numeric comparisons and proper ordering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComparableValue {
+    Iri(Arc<str>),
+    String(Arc<str>),
+    Long(i64),
+    Double(f64),
+    Bool(bool),
+    DateTime(i64),
+    Date(i32),
+    Time(i64),
+    BigInt(Arc<str>), // String representation for comparison
+    Decimal(Arc<str>),
+    /// Sid for single-ledger IRI comparisons
+    Sid(Sid),
+}
+
+impl ComparableValue {
+    /// Extract numeric value for arithmetic/comparison operations
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            ComparableValue::Long(n) => Some(*n as f64),
+            ComparableValue::Double(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Extract integer value
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            ComparableValue::Long(n) => Some(*n),
+            ComparableValue::Double(d) if d.fract() == 0.0 => Some(*d as i64),
+            _ => None,
+        }
+    }
+}
+
+/// Join key mode for the materializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinKeyMode {
+    /// Single-ledger: use raw IDs for comparison (no decoding)
+    #[default]
+    SingleLedger,
+    /// Multi-ledger (dataset): use canonical IRI strings
+    MultiLedger,
+}
+
+/// Per-query materializer with caching.
+///
+/// Create one instance per query execution and pass it to operators that need
+/// to materialize bindings for comparison/hashing/output.
+pub struct Materializer {
+    /// Graph-scoped view (store + graph ID) for decoding.
+    ///
+    /// When constructed with a novelty-aware `BinaryGraphView` (via
+    /// `ExecutionContext::one_graph_view()`), all decode methods automatically
+    /// handle watermark routing for novelty-only subject/string IDs.
+    graph_view: BinaryGraphView,
+    /// Cache: s_id -> Sid (for terminal output)
+    sid_cache: HashMap<u64, Sid>,
+    /// Cache: s_id -> canonical IRI (for multi-ledger join keys)
+    iri_cache: HashMap<u64, Arc<str>>,
+    /// Cache: p_id -> Sid
+    pid_cache: HashMap<u32, Sid>,
+    /// Join key mode
+    mode: JoinKeyMode,
+    /// Ledger ID (for IriMatch construction in multi-ledger mode)
+    ledger_id: Option<Arc<str>>,
+}
+
+impl Materializer {
+    /// Create a new materializer for a query.
+    ///
+    /// # Arguments
+    /// * `graph_view` - Graph-scoped view (store + graph ID) for decoding
+    /// * `mode` - Single-ledger or multi-ledger join key mode
+    pub fn new(graph_view: BinaryGraphView, mode: JoinKeyMode) -> Self {
+        Self {
+            graph_view,
+            sid_cache: HashMap::new(),
+            iri_cache: HashMap::new(),
+            pid_cache: HashMap::new(),
+            mode,
+            ledger_id: None,
+        }
+    }
+
+    /// Set ledger ID for IriMatch construction in multi-ledger mode.
+    pub fn with_ledger_id(mut self, ledger_id: impl Into<Arc<str>>) -> Self {
+        self.ledger_id = Some(ledger_id.into());
+        self
+    }
+
+    /// Get the join key mode.
+    pub fn mode(&self) -> JoinKeyMode {
+        self.mode
+    }
+
+    /// Get the underlying binary index store.
+    pub fn store(&self) -> &BinaryIndexStore {
+        self.graph_view.store()
+    }
+
+    // -------------------------------------------------------------------------
+    // Join Key API (for hash operations: DISTINCT, GROUP BY, hash joins)
+    // -------------------------------------------------------------------------
+
+    /// Get a join key for a binding.
+    ///
+    /// This returns a `JoinKey` that can be hashed and compared for equality
+    /// without modifying the original `Binding`. Use this for DISTINCT, GROUP BY,
+    /// and hash join operations.
+    ///
+    /// In single-ledger mode, encoded IDs are used directly (no decoding).
+    /// In multi-ledger mode, IRIs are resolved to canonical strings; an ID that
+    /// cannot be decoded is an error rather than a key that silently differs.
+    pub fn join_key<'a>(&'a mut self, binding: &'a Binding) -> Result<JoinKey<'a>> {
+        Ok(match binding {
+            Binding::Unbound | Binding::Poisoned => JoinKey::Absent,
+
+            Binding::Sid { sid, .. } => match self.mode {
+                // In single-ledger mode, (namespace_code, name) is a valid key
+                JoinKeyMode::SingleLedger => {
+                    JoinKey::MaterializedSid(sid.namespace_code, Cow::Borrowed(&sid.name))
+                }
+                // Namespace codes may differ across ledgers, so compare full IRIs.
+                JoinKeyMode::MultiLedger => JoinKey::IriOwned(Arc::from(self.sid_iri(sid)?)),
+            },
+
+            Binding::IriMatch { iri, .. } => JoinKey::Iri(Cow::Borrowed(iri.as_ref())),
+
+            Binding::Iri(iri) => JoinKey::Iri(Cow::Borrowed(iri.as_ref())),
+
+            Binding::EncodedSid { s_id, .. } => match self.mode {
+                JoinKeyMode::SingleLedger => JoinKey::Sid(*s_id),
+                JoinKeyMode::MultiLedger => JoinKey::IriOwned(self.resolve_iri(*s_id)?),
+            },
+
+            Binding::EncodedPid { p_id } => match self.mode {
+                JoinKeyMode::SingleLedger => JoinKey::Pid(*p_id),
+                JoinKeyMode::MultiLedger => {
+                    JoinKey::IriOwned(Arc::from(self.predicate_iri(*p_id)?))
+                }
+            },
+
+            Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
+                val: FlakeValueKey(val.clone()),
+                dtc: dtc.clone(),
+            }),
+
+            // An arena handle (NUM_BIG, VECTOR_ID) is not a term identity: it is
+            // scoped per (graph, predicate), and the vector arena does not
+            // deduplicate. Key it by its decoded value, read through the graph
+            // the literal carries.
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                arena_g_id,
+                ..
+            } if crate::binding::is_arena_kind(*o_kind) => {
+                match crate::group_aggregate::materialize_encoded(
+                    binding,
+                    Some(self.graph_view.terms()),
+                )? {
+                    Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
+                        val: FlakeValueKey(val),
+                        dtc,
+                    }),
+                    _ => {
+                        return Err(decode_error(
+                            "decode arena literal",
+                            format!("o_kind={o_kind} o_key={o_key} p_id={p_id} g_id={arena_g_id}"),
+                            format!("dt_id={dt_id} lang_id={lang_id}"),
+                        ))
+                    }
+                }
+            }
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                dt_id,
+                lang_id,
+                ..
+            } => JoinKey::Lit {
+                o_kind: *o_kind,
+                o_key: *o_key,
+                dt_id: *dt_id,
+                lang_id: *lang_id,
+            },
+
+            Binding::Grouped(_) => {
+                // Grouped bindings shouldn't appear in join key contexts
+                debug_assert!(false, "Grouped binding in join_key");
+                JoinKey::Absent
+            }
+
+            // Paths/lists are not hashed/joined/grouped (v1).
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                JoinKey::Absent
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Comparable Value API (for FILTER and ORDER BY)
+    // -------------------------------------------------------------------------
+
+    /// Get a comparable value for a binding.
+    ///
+    /// This returns a `ComparableValue` for use in FILTER expressions and
+    /// ORDER BY comparisons. Returns `None` for unbound/poisoned bindings and
+    /// an error for an encoded value that cannot be decoded.
+    pub fn comparable(&mut self, binding: &Binding) -> Result<Option<ComparableValue>> {
+        Ok(match binding {
+            Binding::Unbound | Binding::Poisoned => None,
+
+            Binding::Sid { sid, .. } => Some(ComparableValue::Sid(sid.clone())),
+
+            Binding::IriMatch { iri, .. } => Some(ComparableValue::Iri(Arc::clone(iri))),
+
+            Binding::Iri(iri) => Some(ComparableValue::Iri(Arc::clone(iri))),
+
+            Binding::EncodedSid { s_id, .. } => {
+                Some(ComparableValue::Iri(self.resolve_iri(*s_id)?))
+            }
+
+            Binding::EncodedPid { p_id } => {
+                Some(ComparableValue::Iri(Arc::from(self.predicate_iri(*p_id)?)))
+            }
+
+            Binding::Lit { val, .. } => flake_value_to_comparable(val),
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                arena_g_id,
+                ..
+            } => flake_value_to_comparable(&self.decode_lit(
+                *o_kind,
+                *o_key,
+                *p_id,
+                *dt_id,
+                *lang_id,
+                *arena_g_id,
+            )?),
+
+            Binding::Grouped(_) => None,
+
+            // A path/list is not a scalar comparable value.
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // String API (for STR/REGEX/CONTAINS functions)
+    // -------------------------------------------------------------------------
+
+    /// Get a string representation of a binding.
+    ///
+    /// This is used for SPARQL functions like STR(), REGEX(), CONTAINS().
+    /// Returns `None` for unbound/poisoned bindings and an error for an
+    /// encoded value that cannot be decoded.
+    pub fn as_string(&mut self, binding: &Binding) -> Result<Option<Arc<str>>> {
+        Ok(match binding {
+            Binding::Unbound | Binding::Poisoned => None,
+
+            // `namespace_code:name` is an internal representation, not an IRI.
+            Binding::Sid { sid, .. } => Some(Arc::from(self.sid_iri(sid)?)),
+
+            Binding::IriMatch { iri, .. } => Some(Arc::clone(iri)),
+
+            Binding::Iri(iri) => Some(Arc::clone(iri)),
+
+            Binding::EncodedSid { s_id, .. } => Some(self.resolve_iri(*s_id)?),
+
+            Binding::EncodedPid { p_id } => Some(Arc::from(self.predicate_iri(*p_id)?)),
+
+            Binding::Lit { val, .. } => Some(Arc::from(val.to_string())),
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                arena_g_id,
+                ..
+            } => Some(Arc::from(
+                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
+                    .to_string(),
+            )),
+
+            Binding::Grouped(_) => None,
+
+            // No canonical string form for a path/list value.
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Terminal Materialization (ONLY at formatting/projection boundaries)
+    // -------------------------------------------------------------------------
+
+    /// Materialize a binding to its full decoded form.
+    ///
+    /// **IMPORTANT**: This should ONLY be called at terminal boundaries
+    /// (formatting, projection) AFTER all hashing/grouping/joining is complete.
+    /// Calling this during intermediate processing can corrupt hash-based
+    /// operator results if the materialized binding is inserted into a hash
+    /// structure that contained the original encoded binding.
+    ///
+    /// An encoded value that cannot be decoded is an error: callers use the
+    /// result to build flakes and rows, where a placeholder would be written
+    /// or joined as if it were real.
+    pub fn to_term(&mut self, binding: &Binding) -> Result<Binding> {
+        Ok(match binding {
+            // Already materialized
+            Binding::Unbound
+            | Binding::Poisoned
+            | Binding::Sid { .. }
+            | Binding::IriMatch { .. }
+            | Binding::Iri(_)
+            | Binding::Lit { .. }
+            | Binding::Grouped(_)
+            | Binding::Path { .. }
+            | Binding::Rel(_)
+            | Binding::List(_)
+            | Binding::Map(_) => binding.clone(),
+
+            Binding::EncodedSid { s_id, .. } => Binding::sid(self.resolve_sid(*s_id)?),
+
+            Binding::EncodedPid { p_id } => Binding::sid(self.resolve_pid(*p_id)?),
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                i_val,
+                t,
+                arena_g_id,
+            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)? {
+                FlakeValue::Ref(sid) => Binding::sid(sid),
+                val => {
+                    let dt_sid = self
+                        .graph_view
+                        .store()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
+                        .ok_or_else(|| {
+                            QueryError::dictionary_lookup(format!(
+                                "materialize literal: unknown dt_id {dt_id}"
+                            ))
+                        })?;
+                    let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
+                    let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
+                        Some(lang) => DatatypeConstraint::LangTag(lang),
+                        None => DatatypeConstraint::Explicit(dt_sid),
+                    };
+                    Binding::Lit {
+                        val,
+                        dtc,
+                        t: Some(*t),
+                        op: None,
+                        p_id: Some(*p_id),
+                    }
+                }
+            },
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers with caching
+    // -------------------------------------------------------------------------
+
+    /// Resolve s_id to canonical IRI string (cached).
+    ///
+    /// Novelty-aware: `BinaryGraphView` handles watermark routing internally.
+    fn resolve_iri(&mut self, s_id: u64) -> Result<Arc<str>> {
+        if let Some(cached) = self.iri_cache.get(&s_id) {
+            return Ok(Arc::clone(cached));
+        }
+        let iri: Arc<str> = self
+            .graph_view
+            .resolve_subject_iri(s_id)
+            .map_err(|e| decode_error("resolve subject IRI", format!("s_id={s_id}"), e))?
+            .into();
+        self.iri_cache.insert(s_id, Arc::clone(&iri));
+        Ok(iri)
+    }
+
+    /// Resolve s_id to Sid (cached).
+    ///
+    /// Novelty-aware: uses `resolve_subject_sid` which returns `Sid` directly
+    /// for novel subjects (no IRI string allocation or trie lookup).
+    fn resolve_sid(&mut self, s_id: u64) -> Result<Sid> {
+        if let Some(cached) = self.sid_cache.get(&s_id) {
+            return Ok(cached.clone());
+        }
+        let sid = self
+            .graph_view
+            .resolve_subject_sid(s_id)
+            .map_err(|e| decode_error("resolve subject", format!("s_id={s_id}"), e))?;
+        self.sid_cache.insert(s_id, sid.clone());
+        Ok(sid)
+    }
+
+    /// Resolve p_id to Sid (cached).
+    fn resolve_pid(&mut self, p_id: u32) -> Result<Sid> {
+        if let Some(cached) = self.pid_cache.get(&p_id) {
+            return Ok(cached.clone());
+        }
+        let sid = self
+            .graph_view
+            .store()
+            .encode_iri(self.predicate_iri(p_id)?);
+        self.pid_cache.insert(p_id, sid.clone());
+        Ok(sid)
+    }
+
+    fn predicate_iri(&self, p_id: u32) -> Result<&str> {
+        self.graph_view
+            .store()
+            .resolve_predicate_iri(p_id)
+            .ok_or_else(|| {
+                QueryError::dictionary_lookup(format!("resolve predicate IRI: unknown p_id {p_id}"))
+            })
+    }
+
+    fn sid_iri(&self, sid: &Sid) -> Result<String> {
+        self.graph_view.store().sid_to_iri(sid).ok_or_else(|| {
+            QueryError::dictionary_lookup(format!(
+                "decode Sid: unknown namespace code {} for {:?}",
+                sid.namespace_code, sid.name
+            ))
+        })
+    }
+
+    fn decode_lit(
+        &self,
+        o_kind: u8,
+        o_key: u64,
+        p_id: u32,
+        dt_id: u16,
+        lang_id: u16,
+        arena_g_id: fluree_db_core::GraphId,
+    ) -> Result<FlakeValue> {
+        self.graph_view
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
+            .map_err(|e| {
+                decode_error(
+                    "decode literal",
+                    format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
+                    e,
+                )
+            })
+    }
+}
+
+/// Convert a FlakeValue to a ComparableValue.
+fn decode_error(kind: &str, details: String, err: impl std::fmt::Display) -> QueryError {
+    QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
+}
+
+fn flake_value_to_comparable(val: &FlakeValue) -> Option<ComparableValue> {
+    match val {
+        FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+        FlakeValue::Long(n) => Some(ComparableValue::Long(*n)),
+        FlakeValue::Double(d) => Some(ComparableValue::Double(*d)),
+        FlakeValue::Boolean(b) => Some(ComparableValue::Bool(*b)),
+        FlakeValue::DateTime(dt) => Some(ComparableValue::DateTime(dt.epoch_millis())),
+        FlakeValue::Date(d) => Some(ComparableValue::Date(d.date().num_days_from_ce())),
+        FlakeValue::Time(t) => Some(ComparableValue::Time(
+            t.time().num_seconds_from_midnight() as i64
+        )),
+        FlakeValue::BigInt(n) => Some(ComparableValue::BigInt(Arc::from(n.to_string()))),
+        FlakeValue::Decimal(d) => Some(ComparableValue::Decimal(Arc::from(d.to_string()))),
+        FlakeValue::Ref(sid) => Some(ComparableValue::Sid(sid.clone())),
+        FlakeValue::Json(s) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+        FlakeValue::Vector(_) => None, // Vectors aren't directly comparable
+        FlakeValue::Null => None,
+        // Temporal types - convert to comparable representation
+        FlakeValue::GYear(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::GYearMonth(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::GMonth(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::GDay(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::GMonthDay(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::YearMonthDuration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::DayTimeDuration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::Duration(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+        FlakeValue::GeoPoint(v) => Some(ComparableValue::String(Arc::from(v.to_string()))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_join_key_equality() {
+        // Same s_id should be equal
+        assert_eq!(JoinKey::Sid(123), JoinKey::Sid(123));
+        assert_ne!(JoinKey::Sid(123), JoinKey::Sid(456));
+
+        // Same IRI should be equal
+        assert_eq!(
+            JoinKey::Iri(Cow::Borrowed("http://example.org/foo")),
+            JoinKey::Iri(Cow::Borrowed("http://example.org/foo"))
+        );
+
+        // Different types should not be equal
+        assert_ne!(JoinKey::Sid(123), JoinKey::Pid(123));
+        assert_ne!(JoinKey::Sid(123), JoinKey::Absent);
+    }
+
+    #[test]
+    fn test_join_key_hashing() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(JoinKey::Sid(123));
+        set.insert(JoinKey::Sid(456));
+        set.insert(JoinKey::Sid(123)); // Duplicate
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_comparable_value_numeric() {
+        let long_val = ComparableValue::Long(42);
+        assert_eq!(long_val.as_f64(), Some(42.0));
+        assert_eq!(long_val.as_i64(), Some(42));
+
+        let double_val = ComparableValue::Double(3.5);
+        assert_eq!(double_val.as_f64(), Some(3.5));
+        assert_eq!(double_val.as_i64(), None); // Has fractional part
+    }
+
+    /// Double bit patterns whose identity differs from their bits: NaNs with
+    /// every sign and a spread of payloads (quiet and signalling), both zeros,
+    /// both infinities, and a few ordinary values to compare them against.
+    fn special_double_bits() -> Vec<u64> {
+        let mut bits = vec![
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFF0_0000_0000_0001,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+        ];
+        for shift in 0..51 {
+            bits.push(0x7FF0_0000_0000_0000 | (1u64 << shift));
+            bits.push(0xFFF0_0000_0000_0000 | (1u64 << shift));
+        }
+        bits
+    }
+
+    /// A hash join keys rows by `FlakeValueKey`, whose equality is
+    /// `FlakeValue`'s: every NaN equals every NaN, and -0.0 equals 0.0. Equal
+    /// keys must hash equally, or a join drops rows that match.
+    #[test]
+    fn equal_double_keys_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        let hash = |k: &FlakeValueKey| {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            h.finish()
+        };
+        let keys: Vec<FlakeValueKey> = special_double_bits()
+            .into_iter()
+            .map(|b| FlakeValueKey(FlakeValue::Double(f64::from_bits(b))))
+            .collect();
+        let mut equal_pairs = 0;
+        for a in &keys {
+            for b in &keys {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        // Every NaN with every NaN, each zero with both zeros, the rest only
+        // with themselves.
+        let nans = keys
+            .iter()
+            .filter(|k| matches!(k.0, FlakeValue::Double(d) if d.is_nan()))
+            .count();
+        assert_eq!(equal_pairs, nans * nans + 4 + (keys.len() - nans - 2));
+    }
+}

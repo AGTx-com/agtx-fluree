@@ -1,0 +1,1735 @@
+# JSON-LD Query
+
+JSON-LD Query is Fluree's native query language, providing a JSON-based interface for querying graph data. It combines the expressiveness of SPARQL with the convenience of JSON, making it easy to integrate with modern applications.
+
+## Overview
+
+JSON-LD Query uses JSON-LD syntax to express queries, leveraging `@context` for IRI expansion and compaction. Queries are structured as JSON objects with familiar clauses like `select`, `where`, `from`, etc.
+
+### Basic Query Structure
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "select": ["?name", "?age"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name", "ex:age": "?age" }
+  ]
+}
+```
+
+## Query Clauses
+
+### @context
+
+The `@context` defines namespace mappings for IRI expansion/compaction:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/",
+    "foaf": "http://xmlns.com/foaf/0.1/"
+  }
+}
+```
+
+When querying via the **CLI**, omitting `@context` causes the ledger's [default context](../concepts/iri-and-context.md#default-context) to be injected automatically. The HTTP API defaults this behavior off; pass `?default-context=true` to opt in for a request. To opt out explicitly, pass an empty object: `"@context": {}`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context).
+
+> **Note:** When using `fluree-db-api` directly (embedded), `@context` is not injected automatically. Queries must supply their own context or use full IRIs. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in.
+
+### select
+
+Specifies what to return in results. The shape of `select` determines the shape of each output row.
+
+**Bare variable** — one column, each row is the bound value (not wrapped in an array):
+
+```json
+{
+  "select": "?name"
+}
+```
+
+**Variable list** — each row is `[v1, v2, ...]`:
+
+```json
+{
+  "select": ["?name", "?age"]
+}
+```
+
+**Wildcard** — every variable bound in the WHERE clause:
+
+```json
+{
+  "select": "*"
+}
+```
+
+**Subject expansion** — return a nested JSON-LD object instead of a flat row. The key is either a variable (the WHERE clause binds it to subjects) or an IRI constant (the named subject is expanded directly, no WHERE needed):
+
+```json
+{
+  "select": { "?person": ["*", { "schema:knows": ["@id", "schema:name"] }] },
+  "where": { "@id": "?person", "@type": "schema:Person" }
+}
+```
+
+```json
+{
+  "select": { "ex:alice": ["*"] }
+}
+```
+
+The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
+
+**Ordering and paging inside an expansion.** A nested selection's value may be an object instead of an array, adding `orderBy`, `limit` and `offset` around its `select`:
+
+```json
+{
+  "select": {
+    "?person": [
+      "@id",
+      "schema:name",
+      {
+        "schema:knows": {
+          "select": ["@id", "schema:name", "schema:age"],
+          "orderBy": [["desc", "schema:age"]],
+          "limit": 3
+        }
+      }
+    ]
+  },
+  "where": { "@id": "?person", "@type": "schema:Person" }
+}
+```
+
+These bound how many values **each subject** shows, which is a different question from how many rows the query returns — the top-level `limit` bounds people, this one bounds each person's friends. There is no way to express it in the `where` clause.
+
+| Key | Meaning |
+|-----|---------|
+| `select` | The selection spec, exactly as in the array form. Optional: omit it for a literal-valued property, which has nothing to expand. |
+| `orderBy` | Sort keys, most significant first. A property name, or `["desc", name]`. `"@value"` (equivalently `"@id"`) sorts by the value itself — the literal for a literal-valued property, the subject IRI for an expanded node. |
+| `limit` / `offset` | Applied **after** ordering, so they cut a stable window. |
+
+A key with several values sorts by its first. Values missing the sort key sort last in ascending order, so the ones that have it are the ones a `limit` keeps. Values that cannot be compared (objects without the key, mixed types) keep their relative order.
+
+```json
+{ "select": { "?person": [{ "ex:tag": { "orderBy": ["@value"], "limit": 5 } }] } }
+```
+
+Reverse selections (`@reverse`) do not accept these yet.
+
+**Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
+
+```json
+{
+  "select": [
+    "?age",
+    { "?person": ["@id", "schema:name"] },
+    { "?org": ["@id", "schema:name"] }
+  ],
+  "where": {
+    "@id": "?person",
+    "ex:age": "?age",
+    "ex:worksFor": "?org"
+  }
+}
+```
+
+Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-constant expansion (no variable dependency anywhere in `select`), the output is independent of the WHERE solution count: the formatter emits one row regardless of how many solutions the WHERE produced.
+
+**S-expression columns** — a select item that is a string starting with `(` is an S-expression, in two flavors:
+
+*Aggregates*. Auto-aliased (`?count`, `?sum`, etc.) or with an explicit alias via `(as ...)`:
+
+```json
+{
+  "select": ["?category", "(count ?product)"],
+  "groupBy": ["?category"]
+}
+```
+
+```json
+{
+  "select": ["?category", "(as (count ?product) ?total)"],
+  "groupBy": ["?category"]
+}
+```
+
+*Scalar expressions* (COALESCE, IF, arithmetic, string/hash/date functions, …). Always require an explicit alias via `(as <expr> ?alias)`. Mirrors SPARQL `SELECT (expr AS ?alias)`:
+
+```json
+{
+  "select": ["?p", "(as (coalesce ?titleFr ?titleEn \"untitled\") ?title)"]
+}
+```
+
+```json
+{
+  "select": [
+    "?name",
+    "(as (coalesce ?email \"no-email\") ?contact)",
+    "(as (count ?favNums) ?count)"
+  ],
+  "groupBy": ["?name", "?contact"]
+}
+```
+
+In a query that does not group, a scalar select expression desugars to a `bind` in the WHERE pattern list. In a query that groups (a `groupBy`, or an aggregate anywhere in `select` or `having`), where it runs depends on what it reads — the same rule SPARQL uses:
+
+- An expression over `groupBy` keys, aggregate outputs and earlier such aliases — or a constant — runs **once per group**, after aggregation (before `having` when `having` reads its alias, after it otherwise): its alias is a single value per group. `(as (+ ?count 1) ?adjusted)` and `(as (strlen ?category) ?len)` under `"groupBy": ["?category"]` both give one value per row.
+- An expression over a variable that is neither a `groupBy` key nor an aggregate runs **before grouping**, once per solution, so its alias is a per-group list like any other ungrouped variable (see [groupBy](#groupby)).
+- An alias that is itself a `groupBy` key, or that an aggregate reads, is computed before grouping — so an alias is a valid `groupBy` key.
+
+A per-group expression cannot reuse the name of a variable the `where` clause binds.
+
+The same expression language is shared with `bind` and `filter`. The one exception is `in` / `not-in`, which require the bracketed-list form and are not accepted in select expressions — rewrite as `(or (= ?x 1) (= ?x 2) …)` instead.
+
+### ask
+
+Tests whether a set of patterns has any solution, returning `true` or `false`. No variables are projected. Equivalent to SPARQL `ASK`. The value of `ask` is the where clause itself — an array or object of the same patterns accepted by `where`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "ask": [
+    { "@id": "?person", "ex:name": "Alice" }
+  ]
+}
+```
+
+Single-pattern shorthand (object instead of array):
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "ask": { "@id": "?person", "ex:name": "Alice" }
+}
+```
+
+Returns `true` if at least one solution exists, `false` otherwise. Internally, `LIMIT 1` is applied for efficiency.
+
+`values`, `offset` and `limit` apply as they do to `select`: `ask` is `true` when a solution remains after them (`"offset": 1` needs a second solution, `"limit": 0` is always `false`). As for `select`, `offset` and `limit` must be non-negative integers; anything else is a 400.
+
+`groupBy` and `having` group the solutions first: `ask` is then `true` when at least one group passes `having`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "ask": { "@id": "?product", "ex:category": "?category" },
+  "groupBy": ["?category"],
+  "having": "(> (count ?product) 10)"
+}
+```
+
+### from
+
+Specifies which ledger(s) to query:
+
+**Single Ledger:**
+
+```json
+{
+  "from": "mydb:main"
+}
+```
+
+**Multiple Ledgers:**
+
+```json
+{
+  "from": ["mydb:main", "otherdb:main"]
+}
+```
+
+**Time Travel:**
+
+```json
+{
+  "from": "mydb:main@t:100"
+}
+```
+
+```json
+{
+  "from": "mydb:main@time:2024-01-15T10:30:00Z"
+}
+```
+
+```json
+{
+  "from": "mydb:main@commit:bafybeig..."
+}
+```
+
+**Union default graph:** a ledger's default graph holds only the triples written outside any named graph, unless the ledger reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph). `opts.unionDefaultGraph` decides for one query, whatever the ledger's setting (the SPARQL counterpart is `# PRAGMA union-default-graph`):
+
+```json
+{
+  "from": "mydb:main",
+  "opts": { "unionDefaultGraph": true },
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" }
+}
+```
+
+### where
+
+The `where` clause contains query patterns:
+
+**Basic Pattern:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+**Multiple Patterns:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    { "@id": "?person", "ex:age": "?age" }
+  ]
+}
+```
+
+**Type Pattern:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "@type": "ex:User", "ex:name": "?name" }
+  ]
+}
+```
+
+## Pattern Types
+
+### Object Patterns
+
+Match triples where subject, predicate, and object are specified:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:name": "Alice"
+}
+```
+
+### Variable Patterns
+
+Use variables (starting with `?`) to match unknown values:
+
+```json
+{
+  "@id": "?person",
+  "ex:name": "?name"
+}
+```
+
+A variable can also stand in predicate position to enumerate all properties of
+a subject:
+
+```json
+{
+  "@id": "?person",
+  "?p": "?o"
+}
+```
+
+Variable-predicate scans return every stored triple, including data written
+with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
+`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
+predicates — the internal storage encoding of edge annotations. They are
+system-written (user transactions cannot assert them), redundant with the
+edge and annotation content already in the results, and therefore hidden from
+variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` (in
+SPARQL, `# PRAGMA include-system-facts: true`) to surface them for debugging or
+inspection. Commit metadata (`f:t`, `f:address`,
+…) lives in the ledger's txn-meta graph, not the default graph, so it never
+appears in default-graph scans either way.
+
+### Type Patterns
+
+Match entities by type:
+
+```json
+{
+  "@id": "?person",
+  "@type": "ex:User",
+  "ex:name": "?name"
+}
+```
+
+### Property Join Patterns
+
+Match multiple properties of the same subject:
+
+```json
+{
+  "@id": "?person",
+  "ex:name": "?name",
+  "ex:age": "?age",
+  "ex:email": "?email"
+}
+```
+
+## Advanced Patterns
+
+### Optional Patterns
+
+Match optional data that may not exist:
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    ["optional", { "@id": "?person", "ex:email": "?email" }]
+  ]
+}
+```
+
+#### Sibling vs. grouped OPTIONAL — semantics
+
+The two forms below are **not** equivalent. Each `["optional", ...]` array is a
+single OPTIONAL block in SPARQL terms — every item inside is part of the same
+conjunctive group, and a row is null-extended only when the group as a whole
+fails to match. To express two independent left joins, write two sibling
+arrays.
+
+**Sibling OPTIONALs — two independent left joins:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    ["optional", { "@id": "?person", "ex:email": "?email" }],
+    ["optional", { "@id": "?person", "ex:phone": "?phone" }]
+  ]
+}
+```
+
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email }
+OPTIONAL { ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are independent — a person with only an email keeps
+`?email` bound and gets `null` for `?phone`, and vice versa.
+
+**Grouped OPTIONAL — one conjunctive left join:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    ["optional",
+     { "@id": "?person", "ex:email": "?email" },
+     { "@id": "?person", "ex:phone": "?phone" }
+    ]
+  ]
+}
+```
+
+Equivalent SPARQL:
+
+```sparql
+?person ex:name ?name .
+OPTIONAL { ?person ex:email ?email . ?person ex:phone ?phone }
+```
+
+`?email` and `?phone` are bound together — a person who has an email but no
+phone is null-extended on **both** variables, because the inner conjunctive
+group did not match as a whole.
+
+#### Filters and binds inside OPTIONAL
+
+`filter` and `bind` constrain or compute from existing bindings, so they need
+something to anchor to inside the OPTIONAL block. Any binding-producing
+pattern qualifies as an anchor — a node-map, `values`, an earlier `bind`, a
+nested `optional`, or a sub-`query`. A `filter` or `bind` as the very first
+item in an OPTIONAL array is rejected.
+
+```json
+["optional",
+  { "@id": "?person", "ex:age": "?age" },
+  ["filter", "(> ?age 18)"]
+]
+```
+
+```json
+["optional",
+  ["values", ["?x", [1, 2, 3]]],
+  ["filter", "(> ?x 0)"]
+]
+```
+
+### Union Patterns
+
+Match data from multiple alternative patterns:
+
+```json
+{
+  "where": [
+    ["union",
+     { "@id": "?person", "ex:name": "?name" },
+     { "@id": "?person", "ex:alias": "?name" }
+    ]
+  ]
+}
+```
+
+### Negation Patterns
+
+Restrict results to subjects that *do not* match a given pattern. Two forms
+are available; **prefer `not-exists` for the common "subjects without
+property `p`" case.**
+
+#### `not-exists` (canonical)
+
+`["not-exists", { ... }]` keeps rows for which the inner pattern has **no**
+solution under the current bindings:
+
+```json
+{
+  "where": [
+    { "@id": "?file", "@type": "ex:File" },
+    ["not-exists", { "@id": "?file", "ex:parent": "?p" }]
+  ],
+  "select": "?file"
+}
+```
+
+When the inner pattern is correlated to the outer **only via vars the inner
+itself produces** (here `?file`, produced by both the outer triple and the
+inner triple), and the inner does not reference any outer-only variable
+(e.g. via a `["filter", ...]` mentioning an outer var the inner doesn't
+produce), the planner builds the inner solution set **once** and probes it
+per outer row — the performant path on large outer streams. If either
+condition fails, the inner is rebuilt and re-run per outer row (still
+correct, but linear in the outer cardinality).
+
+`["exists", { ... }]` is the affirmative dual and uses the same dispatch.
+
+#### `OPTIONAL` + `(not (bound ?v))`
+
+The SPARQL-muscle-memory form `OPTIONAL { ... } FILTER (!bound(?v))` is
+spelled in JSON-LD as an `optional` followed by a filter using the supported
+`bound` function:
+
+```json
+{
+  "where": [
+    { "@id": "?file", "@type": "ex:File" },
+    ["optional", { "@id": "?file", "ex:parent": "?p" }],
+    ["filter", "(not (bound ?p))"]
+  ],
+  "select": "?file"
+}
+```
+
+The data filter form is equivalent: `["filter", ["not", ["bound", "?p"]]]`.
+
+When the `optional` block binds `?v`, the filter immediately tests
+`!bound(?v)`, and `?v` is not used after the filter, the planner rewrites
+this shape to a NOT EXISTS and dispatches it through the same strategy
+chooser as `not-exists`. The two forms therefore have the same plan and the
+same performance.
+
+#### `minus`
+
+`["minus", { ... }]` removes solutions whose shared variables match the
+inner pattern. Use when you want set-difference semantics rather than
+negation-as-failure (see SPARQL 1.1 §8.3 for the difference).
+
+#### Filter expression — supported "is-unbound" idioms
+
+The s-expression parser recognizes `not`, `and`, `or` as AST operators and
+`bound` as a function. The following are **not** parser tokens:
+
+| Attempt | Result |
+|---|---|
+| `(not (bound ?p))` | ✅ supported |
+| `["not", ["bound", "?p"]]` | ✅ supported (data filter form) |
+| `(!bound ?p)`, `(! (bound ?p))` | ❌ parse error — use `(not (bound ?p))` |
+| `(nil? ?p)` | ❌ parse error — use `(not (bound ?p))` |
+
+The "Unknown function" parse error includes a hint pointing at
+`(not (bound ?v))` or `["not-exists", ...]` for these common attempts.
+
+#### SPARQL → JSON-LD translation
+
+| SPARQL | JSON-LD |
+|---|---|
+| `FILTER NOT EXISTS { ?s :p ?v }` | `["not-exists", {"@id":"?s","ex:p":"?v"}]` |
+| `FILTER EXISTS { ?s :p ?v }` | `["exists", {"@id":"?s","ex:p":"?v"}]` |
+| `OPTIONAL { ?s :p ?v } FILTER(!bound(?v))` | `["optional", {"@id":"?s","ex:p":"?v"}]` then `["filter", "(not (bound ?v))"]` |
+| `?a :p ?b MINUS { ?a :q ?c }` | `{"@id":"?a","ex:p":"?b"}` then `["minus", {"@id":"?a","ex:q":"?c"}]` |
+
+### Graph Patterns
+
+Scope patterns to a named graph:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "mydb:main",
+  "fromNamed": {
+    "products": {
+      "@id": "mydb:main",
+      "@graph": "http://example.org/graphs/products"
+    }
+  },
+  "select": ["?product", "?name"],
+  "where": [
+    ["graph", "products", { "@id": "?product", "ex:name": "?name" }]
+  ]
+}
+```
+
+Notes:
+- `fromNamed` is an object whose keys are dataset-local aliases. Each value is an object with `@id` (ledger reference) and optional `@graph` (graph selector IRI).
+- The second element of `["graph", ...]` can be a dataset-local alias (recommended), a graph IRI, or a variable. A compact IRI whose prefix the query's `@context` defines is expanded, as SPARQL expands `GRAPH ex:products`: with `"ex": "http://example.org/ns/"`, `"ex:products"` names `http://example.org/ns/products`. A name that is not an IRI is an alias and is kept as written, and so is any name the query's own `fromNamed` spells exactly that way, or the dataset the query runs against registers (a Rust `DataSetDb`, or a graph source `from` names).
+- A node-level `@graph` scopes one node (and the nodes nested in it) the same way: `{"@id": "?product", "@graph": "products", "ex:name": "?name"}`. Its name can be a dataset-local alias, a graph IRI, or a compact IRI your `@context` expands, resolved as in a transaction's `insert` and `delete`. (The keywords `"config"` and `"txn-meta"` name a ledger's graphs only in an update's `where`, which knows its ledger. In a query, `"default"` names the query's default graph, which a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph) widens to every graph; `"urn:default"` names the default graph alone.)
+- The legacy `"from-named": [...]` array format is still accepted for backward compatibility.
+- For dataset and named-graph configuration details, see `docs/query/datasets.md`.
+
+### Filter Patterns
+
+Apply conditions to filter results:
+
+**Single Filter:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:age": "?age" },
+    ["filter", "(> ?age 18)"]
+  ]
+}
+```
+
+**Multiple Filters:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:age": "?age", "ex:name": "?name" },
+    ["filter", "(> ?age 18)", "(strStarts ?name \"A\")"]
+  ]
+}
+```
+
+**Comparing against IRIs:**
+
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
+are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
+identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+string `"ex:knows"`. In every other position it is the string it has always
+been:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?s", "?o"],
+  "where": [
+    { "@id": "?s", "?p": "?o" },
+    ["filter", "(= ?p ex:knows)"]
+  ]
+}
+```
+
+A bare absolute URL is an IRI operand too: `(= ?u http://example.org/page)`
+compares against the IRI, and `(= ?u "http://example.org/page")` against the
+string. **This changed after 4.2.0.** Every unquoted atom used to lower to a
+string, so `(= ?p ex:knows)` could never match a predicate — the bug this
+fixes. A query that compared a *string-valued* property against an unquoted
+URL matched before and does not now; quote the operand to restore it. The
+prefixed-name form cannot break a working query, since the string `"ex:knows"`
+never matched an IRI either way.
+
+A prefixed name whose prefix the query's `@context` does not define stays a
+plain string and never equals an IRI; quote a value (`"ex:knows"`) when you
+mean the literal text. Inside [datalog rules](datalog-rules.md) an undefined
+prefix is an error rather than a silent string.
+
+The distinction lives in the quoting, so it exists only in the s-expression
+string form. In the **array form** every element is a JSON string, with no
+syntax to mark one as unquoted, so `["=", "?p", "ex:knows"]` compares against
+the *string* `"ex:knows"`. Write the s-expression form, or wrap the IRI in
+`iri`, when you mean the IRI:
+
+```json
+["filter", "(= ?p ex:knows)"]
+["filter", ["=", "?p", ["iri", "ex:knows"]]]
+["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]
+```
+
+A constant `iri` argument is expanded the way an `@id` is: through the
+`@context`, under the same compact-IRI check. `["iri", "ex:knows"]` with `ex`
+defined is the full IRI, and a prefix the `@context` does not define
+(`["iri", "bad:thing"]`) is an "Unresolved compact IRI" error, unless
+`opts.strictCompactIri` is `false`, which takes it verbatim. A `str-dt`
+datatype written as a string is expanded the same way, in either form. An
+argument computed at run time, such as a variable, is used as it is.
+
+**Complex Filters:**
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:age": "?age", "ex:last": "?last" },
+    ["filter", "(and (> ?age 45) (strEnds ?last \"ith\"))"]
+  ]
+}
+```
+
+Filter expressions use S-expression (prefix) syntax. SPARQL-style function
+calls — `contains(lcase(?name), "x")` — are rejected with a parse error rather
+than accepted; so is a filter that is a bare string or number constant, since
+it would match every row. To compare against a string literal that itself looks
+like a function call, quote it: `"(= ?v \"contains(x)\")"`. `bind` and `unwind`
+share the same expression language, so a call-shaped literal there needs the
+same quoting: `["bind", "?co", "\"Acme(Inc)\""]`.
+
+### Bind Patterns
+
+Compute values and bind to variables:
+
+```json
+{
+  "where": [
+    { "@id": "?person", "ex:age": "?age" },
+    ["bind", "?nextAge", "(+ ?age 1)"]
+  ]
+}
+```
+
+Bind to a fresh variable. A `bind` onto a variable an earlier pattern already
+bound does not replace its value: it keeps only the rows where the expression
+equals that value. `["bind", "?age", "(+ ?age 1)"]` after the pattern above
+returns no rows. To compare, prefer `["filter", "(= ?age ...)"]`, which says
+so. (SPARQL rejects a `BIND` onto an in-scope variable.)
+
+### Values Patterns
+
+Provide initial bindings:
+
+```json
+{
+  "where": [
+    ["values", ["?name", ["Alice", "Bob", "Carol"]]],
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+`values` takes exactly one argument, the `[vars, rows]` pair. Bind several
+variables together by making `vars` a list and each row a list of the same
+length; IRI cells are written `{"@id": "..."}`:
+
+```json
+{
+  "where": [
+    ["values", [["?person", "?name"], [
+      [{"@id": "ex:alice"}, "Alice"],
+      [{"@id": "ex:bob"}, "Bob"]
+    ]]]
+  ]
+}
+```
+
+### Unwind Patterns
+
+`unwind` expands a **list-valued expression** into one row per element, binding
+each element to a variable. It is the inverse of an aggregate like `collect`:
+where aggregation folds many rows into one list, `unwind` fans one list back out
+into many rows.
+
+```json
+["unwind", "?n", "(range 1 5)"]
+```
+
+The list source is any expression that evaluates to a list:
+
+- **`(range start end)`** / **`(range start end step)`** — an inclusive integer
+  sequence (`(range 1 5)` → `1,2,3,4,5`). `start > end` yields an empty list.
+- **`(list a b c …)`** — a list literal built from its arguments.
+- **a bound list variable** — e.g. a list produced earlier by `bind`, or the
+  result of an aggregate such as `collect`.
+
+Per Cypher/GQL semantics, an **empty list, an unbound value, or a non-list
+value produces zero rows** for that input (it does not error and does not emit a
+null row).
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?n"],
+  "where": [["unwind", "?n", "(range 1 3)"]]
+}
+// → ?n = 1, then 2, then 3
+```
+
+#### When to use `unwind` (and when not to)
+
+`unwind` earns its place in exactly one situation: **generating rows that do not
+exist in the stored data**, from a *computed* list.
+
+- **Do not** use it for a constant set of values — `values` is clearer and
+  cheaper (`["values", "?s", ["a", "b"]]`).
+- **Do not** use it to read a multi-valued predicate — in RDF that is already
+  multiple triples, so a plain pattern `{ "@id": "?s", "ex:tag": "?tag" }`
+  yields one row per value natively.
+- **Do** use it when the driving rows must come from a `range` (a numeric axis,
+  a calendar, buckets, a pagination window) or from a list you computed — none
+  of which `values` (constants only) or triple patterns (stored data only) can
+  produce.
+
+#### Canonical use case: a dense / gap-filled series
+
+A `groupBy` only ever produces keys that occur in the data. To report a value
+for **every** point on an axis — including the empty ones — generate the axis
+with `range` and `unwind`, then LEFT JOIN the data with `optional`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?year", "(as (count ?o) ?orders)"],
+  "where": [
+    ["unwind", "?year", "(range 2019 2023)"],
+    ["optional", { "@id": "?o", "@type": "ex:Order", "ex:orderYear": "?year" }]
+  ],
+  "groupBy": ["?year"],
+  "orderBy": ["?year"]
+}
+```
+
+Every year `2019`–`2023` appears in the result, with `0` for years that have no
+orders — because the driving rows came from the generated range and the
+`optional` contributes a count only where matching data exists. The same shape
+fills gaps for any axis the data does not itself contain. Where the bounds are
+themselves derived from the data (e.g. a sub-select computing the min/max year),
+this produces a dynamically-sized dense axis that `values` cannot express.
+
+#### Ordering and correlation
+
+`unwind` is placed after whatever produces the variables its list expression
+reads, so a list computed by an earlier `bind` is expanded correctly:
+
+```json
+{
+  "where": [
+    ["bind", "?nums", "(range 1 3)"],
+    ["unwind", "?n", "?nums"]
+  ]
+}
+```
+
+### Property Paths
+
+Property paths enable transitive traversal of predicates, following chains of relationships across multiple hops. Define a path alias in `@context` using `@path`, then use the alias as a key in WHERE node-maps.
+
+**Defining a Path Alias:**
+
+Add a term definition with `@path` to your `@context`. The value of `@path` can be a string (SPARQL property path syntax) or an array (S-expression form).
+
+**String Form (SPARQL syntax):**
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "knowsPlus": { "@path": "ex:knows+" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "knowsPlus": "?who" }
+  ]
+}
+```
+
+This returns all entities reachable from `ex:alice` by following one or more `ex:knows` edges transitively.
+
+**Array Form (S-expression):**
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "knowsPlus": { "@path": ["+", "ex:knows"] }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "knowsPlus": "?who" }
+  ]
+}
+```
+
+The array form uses the operator as the first element followed by its operands.
+
+**Supported Operators:**
+
+| Operator | String syntax | Array syntax | Description |
+|----------|--------------|--------------|-------------|
+| One or more | `ex:p+` | `["+", "ex:p"]` | Transitive closure (1+ hops) |
+| Zero or more | `ex:p*` | `["*", "ex:p"]` | Reflexive transitive closure (0+ hops) |
+| Zero or one | `ex:p?` | `["?", "ex:p"]` | The node itself plus a single `ex:p` hop |
+| Inverse | `^ex:p` | `["^", "ex:p"]` | Traverse predicate in reverse direction |
+| Alternative | <code>ex:a&#124;ex:b</code> | <code>["&#124;", "ex:a", "ex:b"]</code> | Match any of several predicates |
+| Sequence | `ex:a/ex:b` | `["/", "ex:a", "ex:b"]` | Follow a chain of predicates (property chain) |
+| Alternation-transitive | <code>(ex:a&#124;ex:b)+</code> | <code>["+", ["&#124;", "ex:a", "ex:b"]]</code> | Transitive closure following an edge of **any** listed predicate per hop |
+| Composite-transitive | `(ex:a/ex:b)+` | `["+", ["/", "ex:a", "ex:b"]]` | Transitive closure where each hop follows the whole sub-path (steps may be inverse, e.g. `(^ex:a/ex:b)+`) |
+
+Zero-or-more (`*`) includes the starting node itself in the results (zero hops).
+Zero-or-one (`?`) is the start node plus exactly one hop. Nested modifiers
+collapse algebraically (`((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, `(ex:p?)?`
+≡ `ex:p?`).
+
+Sequence (`/`) compiles into a chain of triple patterns joined by internal
+intermediate variables. Each step must be a simple predicate or an inverse simple
+predicate (`^ex:p`). For example, `"ex:friend/ex:name"` matches paths where
+subject has a `ex:friend` whose `ex:name` is the result.
+
+Composite steps may be simple predicates, alternations of simple predicates, or
+either of those inverted (`(^ex:a/ex:b)+`, where a step runs backward).
+
+**Not Yet Supported:**
+
+A **nested transitive** step inside a composite repeated unit is rejected — e.g.
+`(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself quantified.
+
+**Subject and Object Variables:**
+
+Path aliases work with variables on either side:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "knowsPlus": { "@path": "ex:knows+" }
+  },
+  "select": ["?x", "?y"],
+  "where": [
+    { "@id": "?x", "knowsPlus": "?y" }
+  ]
+}
+```
+
+This returns all pairs `(?x, ?y)` where `?y` is transitively reachable from `?x` via `ex:knows`.
+
+**Fixed Subject or Object:**
+
+You can also fix one end to an IRI:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "knowsPlus": { "@path": "ex:knows+" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "?who", "knowsPlus": { "@id": "ex:bob" } }
+  ]
+}
+```
+
+This finds all entities that can reach `ex:bob` through one or more `ex:knows` hops.
+
+**Inverse Example:**
+
+Find entities that know `ex:bob` (traverse `ex:knows` in reverse):
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "knownBy": { "@path": "^ex:knows" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:bob", "knownBy": "?who" }
+  ]
+}
+```
+
+**Alternative Example:**
+
+Match entities connected by either `ex:knows` or `ex:likes`:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "connected": { "@path": "ex:knows|ex:likes" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "connected": "?who" }
+  ]
+}
+```
+
+**Alternation-Transitive Example:**
+
+Apply a transitive modifier (`+` or `*`) to an alternative of predicates to follow an edge of *any* listed predicate at each hop. For example, `(ex:knows|ex:likes)+` reaches every node connected through a chain of `ex:knows` and/or `ex:likes` edges, in any combination:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "reaches": { "@path": "(ex:knows|ex:likes)+" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "reaches": "?who" }
+  ]
+}
+```
+
+Array form:
+
+```json
+{ "@path": ["+", ["|", "ex:knows", "ex:likes"]] }
+```
+
+This differs from running `ex:knows+` and `ex:likes+` separately: a single closure mixes both predicates within one path (e.g. `alice -knows-> bob -likes-> carol`). The branches under the transitive modifier must be **simple forward predicate IRIs** — inverse (`^ex:p`), sequence, or nested-transitive branches are not supported in this position. Like other arbitrary-length paths, the closure is duplicate-free and cycle-safe.
+
+Inverse can also be applied to complex paths (sequences and alternatives):
+
+- `^(ex:friend/ex:name)` — inverse of a sequence: reverses the step order and inverts each step, producing `(^ex:name)/(^ex:friend)`
+- `^(ex:name|ex:nick)` — inverse of an alternative: distributes the inverse into each branch, producing `(^ex:name)|(^ex:nick)`
+- Double inverse cancels: `^(^ex:p)` simplifies to `ex:p`
+
+Array form examples:
+
+```json
+{ "@path": ["^", ["/", "ex:friend", "ex:name"]] }
+{ "@path": ["^", ["|", "ex:name", "ex:nick"]] }
+```
+
+Inverse is supported inside alternative branches (e.g. `ex:knows|^ex:knows` matches both directions of the `ex:knows` predicate).
+
+Alternative branches can also be sequence chains. For example, `ex:friend/ex:name|ex:colleague/ex:name` returns the name of a friend OR the name of a colleague:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "contactName": { "@path": "ex:friend/ex:name|ex:colleague/ex:name" }
+  },
+  "select": ["?name"],
+  "where": [
+    { "@id": "ex:alice", "contactName": "?name" }
+  ]
+}
+```
+
+Branches can freely mix simple predicates, inverse predicates, and sequence chains (e.g. `ex:name|ex:friend/ex:name|^ex:colleague`).
+
+Alternative uses UNION semantics (bag, not set): when multiple branches match the same `(subject, object)` pair, duplicate solutions are produced. Use `selectDistinct` if set semantics are needed.
+
+**Sequence (Property Chain) Example:**
+
+Follow a chain of predicates. The string form uses `/` to separate steps:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "friendName": { "@path": "ex:friend/ex:name" }
+  },
+  "select": ["?person", "?name"],
+  "where": [
+    { "@id": "?person", "friendName": "?name" }
+  ]
+}
+```
+
+The array form uses `"/"` as the operator:
+
+```json
+{ "@path": ["/", "ex:friend", "ex:name"] }
+```
+
+Sequence steps can include inverse predicates. For example, `"^ex:parent/ex:name"` traverses the `ex:parent` link backwards, then follows `ex:name`:
+
+```json
+{ "@path": "^ex:parent/ex:name" }
+```
+
+Longer chains are supported: `"ex:friend/ex:address/ex:city"` follows three hops.
+
+Sequence steps can also be alternatives. For example, `"ex:friend/(ex:name|ex:nick)"` distributes the alternative into a union of chains (`ex:friend/ex:name` and `ex:friend/ex:nick`):
+
+```json
+{ "@path": "ex:friend/(ex:name|ex:nick)" }
+```
+
+Array form:
+
+```json
+{ "@path": ["/", "ex:friend", ["|", "ex:name", "ex:nick"]] }
+```
+
+Multiple alternative steps are supported: `"(ex:a|ex:b)/(ex:c|ex:d)"` expands to 4 chains. A safety limit of 64 expanded chains is enforced to prevent combinatorial explosion.
+
+Each step must be a simple predicate (`ex:p`), inverse simple predicate (`^ex:p`), or an alternative of simple predicates (`(ex:a|ex:b)`). Transitive (`+`/`*`) and nested sequence modifiers are not allowed inside sequence steps.
+
+**Rules:**
+
+- `@path` and `@reverse` are mutually exclusive on the same term definition (produces an error).
+- `@path` and `@id` may coexist on the same term definition; when the alias key appears in a WHERE node-map, the `@path` definition is used.
+- Cycle detection is built in: transitive traversal terminates when it encounters a node already visited.
+- Variable names starting with `?__` are reserved for internal use (e.g., intermediate join variables generated by sequence paths). These variables will not appear in wildcard (`select: "*"`) output.
+
+### Shortest Path
+
+`shortestPath` / `allShortestPaths` find the shortest path(s) between two nodes over a single predicate and **bind the path to a variable** (unlike a property path, which matches transitively but binds only the endpoint). It is a `where`-clause object form:
+
+```json
+["shortestPath", {
+  "from": "?a", "to": "?b",
+  "via": "ex:knows",
+  "direction": "out",
+  "minHops": 1, "maxHops": 6,
+  "bind": "?p"
+}]
+```
+
+| Key | Meaning |
+|-----|---------|
+| `from` / `to` | Endpoints — a variable (`?x`) or a constant IRI. Usually bound by prior patterns. |
+| `via` | The predicate IRI to traverse. A single predicate; unknown IRI → no rows. |
+| `bind` | Variable bound to the resulting **path value**. |
+| `direction` | `out` (default), `in`, or `both` (undirected). |
+| `minHops` / `maxHops` | Optional hop bounds. Omit `maxHops` for unbounded (subject to safety caps). |
+
+- `["shortestPath", …]` binds **one** shortest path (or no row if none exists); `["allShortestPaths", …]` binds **every** path of the minimal length (one row each).
+- The path value is consumed by the path functions below; it is not itself a list of bindings.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?hops"],
+  "where": [
+    ["shortestPath", { "from": "ex:alice", "to": "ex:dan", "via": "ex:knows", "bind": "?p" }],
+    ["bind", "?hops", "(size (path-pairs ?p))"]
+  ]
+}
+```
+
+#### Path value functions
+
+Consume a path value bound by `shortestPath` / `allShortestPaths`:
+
+- `(nodes ?p)` — the list of nodes along the path (in order). A list value, so it can feed [`unwind`](#unwind-patterns) or the [list functions](#list-value-functions).
+- `(path-pairs ?p)` — the consecutive node pairs `[[a,b],[b,c],…]`; its `size` is the hop count.
+
+### Edge Annotations
+
+Edge annotations attach metadata to a specific `(subject, predicate, object)` edge. Two query forms are supported:
+
+- **Inline form** with `@annotation` — match an edge and pull metadata about it.
+- **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
+
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+
+**Inline form (`@annotation`):**
+
+The `@annotation` block sits inside the object node-map and binds the annotation subject. Each annotation occurrence on the matched edge produces one row.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?person", "?org", "?role"],
+  "where": {
+    "@id": "?person",
+    "ex:worksFor": {
+      "@id": "?org",
+      "@annotation": { "ex:role": "?role" }
+    }
+  }
+}
+```
+
+When two parallel annotations reify the same edge, the inline form returns two rows (property-graph fidelity). A bare triple pattern (`?person ex:worksFor ?org` with no `@annotation` block) returns one row regardless of how many annotations exist — annotations only multiply cardinality through the `@annotation` / `@reifies` keywords.
+
+The annotation subject can be bound to a variable or filtered by an explicit IRI:
+
+```json
+"@annotation": { "@id": "?ann", "ex:role": "?role" }
+```
+
+```json
+"@annotation": { "@id": "ex:emp/alice-acme" }
+```
+
+**Annotation-rooted form (`@reifies`):**
+
+Filter by annotation metadata first, then surface the reified edge.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?person", "?org"],
+  "where": {
+    "ex:role": "Engineer",
+    "@reifies": {
+      "@id": "?person",
+      "ex:worksFor": { "@id": "?org" }
+    }
+  }
+}
+```
+
+The base edge identified by `@reifies` is also matched as an ordinary triple, so the visibility check is automatic — if the edge is currently retracted or hidden by policy, the row drops.
+
+**Subject expansion output:**
+
+Wildcard hydration (`select: {"?s": ["*"]}`) on an annotated subject's base edge surfaces each annotation under an `@annotation` key on the expanded value. Anonymous (blank-node) annotation subjects render their body without `@id`; explicit-IRI annotations keep theirs. Multiple parallel annotations render as an array under `@annotation`.
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:worksFor": {
+    "@id": "ex:acme",
+    "@annotation": { "ex:role": "Engineer" }
+  }
+}
+```
+
+**Reserved predicates:**
+
+Annotations are backed by reserved system predicates you can't query directly — use `@annotation` / `@reifies` instead. Naming them in a query is rejected at parse time, and they're hidden from variable-predicate scans (`?p`) and wildcard hydration so they never surface as ordinary RDF. See the [vocabulary reference](../reference/vocabulary.md#edge-annotation-predicates-reserved) for the list.
+
+## Filter Functions
+
+### Comparison Functions
+
+Comparison operators accept two or more arguments. With multiple arguments, they chain pairwise: `(< ?a ?b ?c)` means `?a < ?b AND ?b < ?c`.
+
+- `(= ?x ?y ...)` - Equality
+- `(!= ?x ?y ...)` - Inequality
+- `(> ?x ?y ...)` - Greater than
+- `(>= ?x ?y ...)` - Greater than or equal
+- `(< ?x ?y ...)` - Less than
+- `(<= ?x ?y ...)` - Less than or equal
+
+When comparing incomparable types (e.g., a number and a string):
+
+- `=` yields `false` — values of different types are not equal
+- `!=` yields `true` — values of different types are not equal
+- `<`, `<=`, `>`, `>=` raise an error — ordering between incompatible types is undefined
+
+A string constant is an `xsd:string` term. `(= ?o "a")` is `false` for `"a"@en`, and for a literal of another datatype (`"a"^^ex:T`) both `=` and `!=` raise an error, which drops the row. To compare the text whatever its tag or datatype, use `(= (str ?o) "a")`. An `@fulltext` or `@json` value is its own datatype the same way, while the string functions (`contains`, `regex`, `strStarts`, `subStr`, …) read it as text. (This differs from a bare string as a constant object in `where`, which matches the text under any tag; see [Datatypes](../concepts/datatypes.md).)
+
+### Logical Functions
+
+- `(and ...)` - Logical AND
+- `(or ...)` - Logical OR
+- `(not ...)` - Logical NOT
+
+### String Functions
+
+- `(strStarts ?str ?prefix)` - String starts with
+- `(strEnds ?str ?suffix)` - String ends with
+- `(contains ?str ?substr)` - String contains
+- `(regex ?str ?pattern)` - Regular expression match
+
+### Numeric Functions
+
+Arithmetic operators accept two or more arguments. With multiple arguments, they fold left: `(+ ?x ?y ?z)` evaluates as `(?x + ?y) + ?z`. A single argument returns the value unchanged.
+
+- `(+ ?x ?y ...)` - Addition
+- `(- ?x ?y ...)` - Subtraction
+- `(* ?x ?y ...)` - Multiplication
+- `(/ ?x ?y ...)` - Division
+- `(- ?x)` - Unary negation (single argument)
+- `(abs ?x)` - Absolute value
+
+`(- ?a ?b)` also subtracts two temporal values of the same kind — two
+`xsd:dateTime`s, two `xsd:date`s or two `xsd:time`s — yielding the elapsed time
+as an `xsd:dayTimeDuration`:
+
+```json
+["bind", "?elapsed", "(- ?end ?start)"]
+```
+
+The result is signed, and subtraction is the only operator defined over two
+temporal operands (shifting by a duration is the other form). This is an extension beyond the SPARQL
+standard; see [Date/Time Arithmetic](sparql.md#datetime-arithmetic) for the full
+semantics and portability caveat, which apply identically here — both query
+surfaces lower to the same expression IR.
+
+### List Value Functions
+
+Operate on list values — those produced by `range`, `list`, or [`collect`](#aggregation-functions). Usable anywhere expressions are (`bind`, `filter`, `select`), and the list-producing ones drive [`unwind`](#unwind-patterns).
+
+Producers:
+
+- `(range ?start ?end)` / `(range ?start ?end ?step)` - Inclusive integer sequence; `?start > ?end` yields an empty list
+- `(list ?a ?b ...)` - List literal from the given arguments
+
+Accessors / transforms:
+
+- `(size ?list)` - Element count (also the length of a string)
+- `(head ?list)` - First element (null if empty)
+- `(last ?list)` - Last element (null if empty)
+- `(nth ?list ?i)` - Element at 0-based index `?i`; negative indexes count from the end; out-of-range/non-integer/non-list → null
+- `(tail ?list)` - The list without its first element
+- `(reverse ?list)` - The list reversed (also reverses a string)
+
+`head`, `last`, and `nth` return a single element; `tail` and `reverse` return a list (compose them, e.g. `(head (reverse ?xs))`).
+
+### Vector Similarity Functions
+
+Used with `bind` to compute similarity scores between `@vector` values:
+
+- `(dotProduct ?vec1 ?vec2)` - Dot product (inner product)
+- `(cosineSimilarity ?vec1 ?vec2)` - Cosine similarity (-1 to 1)
+- `(euclideanDistance ?vec1 ?vec2)` - Euclidean (L2) distance
+
+Function names are case-insensitive. See [Vector Search](../indexing-and-search/vector-search.md) for usage examples.
+
+### Type Functions
+
+- `(bound ?var)` - Variable is bound. To test for **absence**, see
+  [Negation Patterns](#negation-patterns) — `(not (bound ?v))` after
+  `optional` is supported, or use `["not-exists", ...]` directly.
+- `(isIRI ?x)` - Is an IRI
+- `(isBlank ?x)` - Is a blank node
+- `(isLiteral ?x)` - Is a literal
+
+## Query Modifiers
+
+### orderBy
+
+Sort results:
+
+```json
+{
+  "orderBy": ["?name"]
+}
+```
+
+**Descending Order:**
+
+```json
+{
+  "orderBy": [["desc", "?age"]]
+}
+```
+
+**Multiple Sort Keys:**
+
+```json
+{
+  "orderBy": ["?last", ["desc", "?age"]]
+}
+```
+
+Sort keys are variables. To sort on an expression or an aggregate, select it under an alias and sort on the alias:
+
+```json
+{
+  "select": ["?category", "(as (count ?product) ?n)"],
+  "groupBy": ["?category"],
+  "orderBy": [["desc", "?n"]]
+}
+```
+
+### limit
+
+Limit number of results:
+
+```json
+{
+  "limit": 10
+}
+```
+
+### offset
+
+Skip results:
+
+```json
+{
+  "offset": 20,
+  "limit": 10
+}
+```
+
+### groupBy
+
+Group results:
+
+```json
+{
+  "select": ["?category", "(count ?product)"],
+  "groupBy": ["?category"],
+  "where": [
+    { "@id": "?product", "ex:category": "?category" }
+  ]
+}
+```
+
+A selected variable that is neither a `groupBy` key nor an aggregate comes back as a **per-group list** of its values (SPARQL rejects this shape; the JSON-LD surface keeps it). Two limits apply: a subquery cannot return a per-group list (it is an error — aggregate the variable, e.g. with `collect`), and SPARQL JSON and SPARQL XML results and the [streaming endpoint](../api/streaming-query.md) refuse one, since they have no list type (CSV and TSV join the values with `;`). On the streaming endpoint this includes `select "*"` under `groupBy` when the `where` binds a variable that is not a key.
+
+### having
+
+Filter grouped results:
+
+```json
+{
+  "select": ["?category", "(count ?product)"],
+  "groupBy": ["?category"],
+  "having": "(> (count ?product) 10)",
+  "where": [
+    { "@id": "?product", "ex:category": "?category" }
+  ]
+}
+```
+
+`having` and `orderBy` in a grouped query follow SPARQL 1.1: a variable they read that is neither a `groupBy` key nor an aggregate means `(sample ?v)` — an arbitrary value from the group. `having` can read a select expression's alias as well as an aggregate's: the expression runs once per group, before `having` (the SPARQL rule, a Fluree extension there). On a query that does not group, `having` filters the solutions, like a `filter`.
+
+## Aggregation Functions
+
+- `(count ?var)` / `(count *)` — count non-null values; `*` counts solution rows
+- `(count-distinct ?var)` — count distinct non-null values
+- `(sum ?var)` — sum numeric values
+- `(avg ?var)` — average numeric values
+- `(min ?var)` / `(max ?var)` — extremum
+- `(median ?var)` — median
+- `(variance ?var)` / `(stddev ?var)` — population variance / standard deviation
+- `(sample ?var)` — implementation-defined sample value
+- `(groupconcat ?var)` / `(groupconcat ?var ", ")` — concatenate string values, optional separator (defaults to a single space)
+- `(collect ?var)` — gather every non-null value in the group into a **list value** (a JSON array), keeping row-level duplicates
+- `(collect-distinct ?var)` — like `collect`, but deduplicates within the group
+
+Each aggregate auto-aliases to `?<fn-name>` (`?count`, `?sum`, …). Use `(as (<fn> ?var) ?alias)` to choose an explicit alias.
+
+`collect` is the inverse of [`unwind`](#unwind-patterns): it folds many rows into one list, and `unwind` fans a list back out into rows. A `collect` result is a first-class list value, so it can be re-expanded — e.g. a sub-select that `collect`s values, with an outer `unwind` over the result.
+
+> Note: in RDF a repeated *identical* value is a single triple, so `collect` and `collect-distinct` differ only when the same value reaches the aggregate on multiple solution rows (typically via a join).
+
+## Time Travel Queries
+
+Query historical data using time specifiers in `from`:
+
+**Transaction Number:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:100",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+**ISO Timestamp:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@time:2024-01-15T10:30:00Z",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+**Commit ContentId:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@commit:bafybeig...",
+  "select": ["?name"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+**Multiple Ledgers at Different Times:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": ["ledger1:main@t:100", "ledger2:main@t:200"],
+  "select": ["?data"],
+  "where": [
+    { "@id": "?entity", "ex:data": "?data" }
+  ]
+}
+```
+
+## History Queries
+
+History queries let you see all changes (assertions and retractions) within a time range. Specify the range using `from` and `to` keys with time-specced endpoints:
+
+### Time Range Syntax
+
+```json
+{
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest"
+}
+```
+
+### Binding Transaction Metadata
+
+Use `@t` and `@op` annotations on value objects to capture metadata:
+
+- **@t** - Binds the transaction time (integer) when the fact was asserted/retracted.
+- **@op** - Binds the operation type as a boolean: `true` for assertions, `false` for retractions. (Mirrors `Flake.op` on disk; constants `"assert"` / `"retract"` are *not* accepted — use `true` / `false`.)
+
+Both annotations work uniformly for literal-valued and IRI-valued objects.
+
+**Entity History:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?name", "?age", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
+    { "@id": "ex:alice", "ex:age": "?age" }
+  ],
+  "orderBy": "?t"
+}
+```
+
+**Property-Specific History:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:100",
+  "select": ["?age", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:age": { "@value": "?age", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+**Time Range with ISO:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@time:2024-01-01T00:00:00Z",
+  "to": "ledger:main@time:2024-12-31T23:59:59Z",
+  "select": ["?name", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
+  ]
+}
+```
+
+**Filter by Operation:**
+
+You can either use a constant `@op` shorthand (preferred) or filter on the bound variable:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?name", "?t"],
+  "where": [
+    { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
+  ]
+}
+```
+
+The shorthand `"@op": false` lowers to `FILTER(op(?name) = false)`. Equivalent long form using a bound variable: `"@op": "?op"` plus `["filter", "(= ?op false)"]`.
+
+**All Properties History:**
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "from": "ledger:main@t:1",
+  "to": "ledger:main@t:latest",
+  "select": ["?property", "?value", "?t", "?op"],
+  "where": [
+    { "@id": "ex:alice", "?property": { "@value": "?value", "@t": "?t", "@op": "?op" } }
+  ],
+  "orderBy": "?t"
+}
+```
+
+## Graph Source Queries
+
+Query graph sources using the same syntax:
+
+**BM25 Search:**
+
+```json
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "from": "products:main@t:1000",
+  "select": ["?product", "?score"],
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 10,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?score" }
+    }
+  ],
+  "orderBy": [["desc", "?score"]],
+  "limit": 10
+}
+```
+
+**Vector Similarity:**
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "f": "https://ns.flur.ee/db#"
+  },
+  "from": "documents:main",
+  "select": ["?document", "?similarity"],
+  "values": [
+    ["?queryVec"],
+    [{"@value": [0.1, 0.2, 0.3], "@type": "https://ns.flur.ee/db#embeddingVector"}]
+  ],
+  "where": [
+    {
+      "f:graphSource": "documents-vector:main",
+      "f:queryVector": "?queryVec",
+      "f:searchLimit": 5,
+      "f:searchResult": { "f:resultId": "?document", "f:resultScore": "?similarity" }
+    }
+  ],
+  "orderBy": [["desc", "?similarity"]],
+  "limit": 5
+}
+```
+
+Note: `f:*` keys used for graph source queries should be defined in your `@context` for clarity.
+
+## Complete Examples
+
+### Simple Select Query
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "select": ["?name", "?age"],
+  "where": [
+    {
+      "@id": "?person",
+      "@type": "ex:User",
+      "ex:name": "?name",
+      "ex:age": "?age"
+    },
+    ["filter", "(> ?age 18)"]
+  ],
+  "orderBy": ["?name"],
+  "limit": 10
+}
+```
+
+### Complex Query with Joins
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "select": ["?person", "?friend", "?friendName"],
+  "where": [
+    { "@id": "?person", "ex:name": "?name" },
+    { "@id": "?person", "ex:friend": "?friend" },
+    { "@id": "?friend", "ex:name": "?friendName" },
+    ["filter", "(= ?name \"Alice\")"]
+  ]
+}
+```
+
+### Aggregation Query
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/"
+  },
+  "select": [
+    "?category",
+    "(as (count ?product) ?count)",
+    "(as (avg ?price) ?avgPrice)"
+  ],
+  "groupBy": ["?category"],
+  "having": "(> (count ?product) 5)",
+  "where": [
+    { "@id": "?product", "ex:category": "?category", "ex:price": "?price" }
+  ],
+  "orderBy": [["desc", "?count"]]
+}
+```
+
+## Parse Options
+
+JSON-LD queries accept parse-time options under a top-level `opts` object. These control how the query is parsed (not what it returns).
+
+### `strictCompactIri`
+
+By default, JSON-LD queries reject unresolved compact-looking IRIs (`prefix:suffix` where the prefix is not in `@context`) at parse time. To opt out:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "opts": {"strictCompactIri": false},
+  "select": ["?id", "?name"],
+  "where": {"@id": "?id", "ex:name": "?name"}
+}
+```
+
+The default is `true`. Disable only when you are intentionally working with bare `prefix:suffix` strings as opaque identifiers. See [IRIs and @context — Strict Compact-IRI Guard](../concepts/iri-and-context.md#strict-compact-iri-guard) for the full policy.
+
+## Best Practices
+
+1. **Always Provide @context**: Makes queries readable and maintainable
+2. **Use Specific Patterns**: More specific patterns are more efficient
+3. **Limit Result Sets**: Use `limit` for large result sets
+4. **Flexible Filter Placement**: Filters, including `exists` and `not-exists`, can be placed anywhere in `where` clauses - the query engine applies each one to the whole clause, as soon as every variable it reads has its final value. A variable that an `optional` or a `null` in `values` leaves unbound on some rows waits for any later pattern that fills it in
+5. **Use Time Specifiers**: Use `@t:` when transaction numbers are known (fastest)
+6. **Graph Source Selection**: Choose appropriate graph sources for query patterns
+
+## Related Documentation
+
+- [SPARQL](sparql.md): SPARQL query language
+- [Time Travel](../concepts/time-travel.md): Historical queries
+- [Graph Sources](../concepts/graph-sources.md): Graph source queries
+- [Output Formats](output-formats.md): Query result formats
+- [IRIs and @context](../concepts/iri-and-context.md): IRI resolution and the strict compact-IRI guard

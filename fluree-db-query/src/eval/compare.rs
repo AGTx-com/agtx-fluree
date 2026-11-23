@@ -1,0 +1,1100 @@
+//! Value comparison logic
+//!
+//! This module contains functions for comparing ComparableValues,
+//! including numeric, temporal, and string comparisons.
+//!
+//! Comparison operations are variadic (chained pairwise):
+//! - 1 arg → vacuously true
+//! - 2+ args → every consecutive pair must satisfy the relation:
+//!   `(< a b c)` means `a < b AND b < c`
+//!
+//! Type mismatches (incomparable types):
+//! - `=` yields `false` (different types are not equal)
+//! - `!=` yields `true` (different types are not equal)
+//! - `<`, `<=`, `>`, `>=` yield a `ComparisonError::TypeMismatch` error
+
+use crate::binding::Binding;
+use crate::binding::RowAccess;
+use crate::context::{ConstSidKey, ConstSidMemo, ExecutionContext};
+use crate::error::{QueryError, Result};
+use crate::fast_path_common::subject_ref_to_s_id;
+use crate::ir::{CompareOp, Expression, Function, Ref};
+use fluree_db_core::FlakeValue;
+use std::cmp::Ordering;
+
+use super::helpers::check_min_arity;
+use super::value::{ComparableValue, ComparisonError};
+
+/// Outcome of the IRI-binding fast equality probe.
+///
+/// `Eq(bool)` is a definitive equality verdict (`!=` flips it). The two
+/// unbound variants preserve the caller-specific semantics of an unbound
+/// operand: `=`/`!=` treat either side's unbound as `false` for both
+/// operators, while `IN` treats an unbound TEST value as an overall `false`
+/// but an unbound ELEMENT as merely "no match, keep looking".
+pub(super) enum FastEqOutcome {
+    Eq(bool),
+    TestUnbound,
+    OtherUnbound,
+}
+
+pub(crate) fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
+    op: CompareOp,
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<bool>> {
+    if !matches!(op, CompareOp::Eq | CompareOp::Ne) || args.len() != 2 {
+        return Ok(None);
+    }
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+
+    // Try both orientations: (?var EncodedSid) op (const IRI/Sid) OR swapped.
+    for (var_side, other_side) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+        if let Some(outcome) =
+            fast_eq_iri_binding_directional(var_side, other_side, row, ctx, store)?
+        {
+            let out = match outcome {
+                FastEqOutcome::Eq(eq) => match op {
+                    CompareOp::Eq => eq,
+                    CompareOp::Ne => !eq,
+                    _ => unreachable!(),
+                },
+                // An unbound operand compares as `false` for both `=` and `!=`
+                // (mirrors the generic path's `eval_to_comparable → None`).
+                FastEqOutcome::TestUnbound | FastEqOutcome::OtherUnbound => false,
+            };
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+
+/// Per-element entry for `IN`: probe `test IN (.. elem ..)` through the same
+/// encoded/Sid/IRI representations the `=` fast path uses, without
+/// materializing the test value. Directional only — `test` must be the
+/// variable side — so the caller can tell WHICH side was unbound.
+///
+/// Without this, `?x IN (<iri>)` on an index-encoded binding fell through to
+/// `rdf_term_equal`, whose Resource arm compares representations, not
+/// resources — an `EncodedSid`/`Sid` row value vs a constant `Iri` silently
+/// evaluated to "not equal" and the filter dropped every row.
+pub(super) fn fast_in_membership_for_iri_bindings<R: RowAccess>(
+    test: &Expression,
+    elem: &Expression,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<FastEqOutcome>> {
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+    fast_eq_iri_binding_directional(test, elem, row, ctx, store)
+}
+
+/// Whether the IRI-binding fast path can decide anything about `test`.
+///
+/// `fast_eq_iri_binding_directional` only reaches a verdict when the test
+/// side is a variable bound to a resource-flavored binding; every other
+/// binding falls out of its trailing `_ => Ok(None)` arm — but only
+/// *after* it has evaluated the element operand. Checking the flavor once,
+/// before any element is touched, lets `IN` over a literal-bound variable
+/// skip the probe loop entirely instead of evaluating every element twice
+/// (once here, once on the generic path) and collecting them all into a
+/// per-row `Vec`.
+///
+/// An unbound test variable answers `false` here and is handled by the
+/// generic path's own unbound check, which reports `TestUnbound` — the
+/// same answer the probe gives.
+pub(super) fn iri_fast_path_can_decide<R: RowAccess>(
+    test: &Expression,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> bool {
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    if ctx.binary_store.is_none() {
+        return false;
+    }
+    let Expression::Var(v) = test else {
+        return false;
+    };
+    row.get(*v).is_some_and(binding_is_resource_flavored)
+}
+
+/// The binding flavors `fast_eq_iri_binding_directional` has a match arm
+/// for. Every other flavor reaches its trailing `_ => Ok(None)`.
+///
+/// Kept beside that match on purpose: the two must list the same variants,
+/// or a new resource-flavored `Binding` either loses the fast path (listed
+/// there, missing here) or pays the double evaluation this check exists to
+/// avoid (listed here, missing there).
+fn binding_is_resource_flavored(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::EncodedSid { .. }
+            | Binding::Sid { .. }
+            | Binding::Iri(_)
+            | Binding::IriMatch { .. }
+            | Binding::EncodedPid { .. }
+    )
+}
+
+/// The memo key for a constant `?var = …` operand, read off the expression
+/// without evaluating it: an `IRI("…")` operand (how SPARQL and JSON-LD lower
+/// an IRI constant) by its string, a SID constant by its SID. `None` for any
+/// other operand.
+///
+/// The key is the constant, not the operand's address. A correlated UNION or
+/// MINUS builds a branch's operator tree, with its own copy of the FILTER's
+/// expression, for each input row and drops it before building the next, so an
+/// address-based key could hand a later branch an earlier branch's constant
+/// once its copy landed at the same address (#2385). A constant key also hits
+/// across those rebuilt trees, where an address never could.
+fn const_operand_key(expr: &Expression) -> Option<ConstSidKey<'_>> {
+    match expr {
+        Expression::Call {
+            func: Function::Iri,
+            args,
+        } => match args.as_slice() {
+            [Expression::Const(FlakeValue::String(iri))] => Some(ConstSidKey::IriLiteral(iri)),
+            _ => None,
+        },
+        Expression::Const(FlakeValue::Ref(sid)) => {
+            Some(ConstSidKey::Sid(sid.namespace_code, &sid.name))
+        }
+        _ => None,
+    }
+}
+
+/// The memo key for an evaluated subject operand: a full IRI by its string, a
+/// SID by its SID. `None` for any other value.
+fn comparable_subject_key(value: &ComparableValue) -> Option<ConstSidKey<'_>> {
+    match value {
+        ComparableValue::Iri(iri) => Some(ConstSidKey::Iri(iri)),
+        ComparableValue::Sid(sid) => Some(ConstSidKey::Sid(sid.namespace_code, &sid.name)),
+        _ => None,
+    }
+}
+
+/// The indexed `s_id` of an evaluated subject operand: `None` when it isn't an
+/// IRI or SID, or isn't an indexed subject. Both memo sites resolve through
+/// this, so they can't map a value to a subject differently.
+fn comparable_subject_s_id(
+    ctx: &ExecutionContext<'_>,
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    value: &ComparableValue,
+) -> Result<Option<u64>> {
+    let subject = match value {
+        ComparableValue::Sid(sid) => Ref::Sid(sid.clone()),
+        ComparableValue::Iri(iri) => Ref::Iri(iri.clone()),
+        _ => return Ok(None),
+    };
+    subject_ref_to_s_id(ctx.active_snapshot, store, &subject)
+}
+
+/// One directional probe of the IRI-binding fast equality: `var_expr` must be
+/// a variable whose binding is resource-flavored (`EncodedSid`, `Sid`, `Iri`/
+/// `IriMatch`, or `EncodedPid`); `other_expr` is the comparand. Returns
+/// `Ok(None)` when this pair must fall back to the generic comparable path.
+fn fast_eq_iri_binding_directional<R: RowAccess>(
+    var_expr: &Expression,
+    other_expr: &Expression,
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+    store: &fluree_db_binary_index::BinaryIndexStore,
+) -> Result<Option<FastEqOutcome>> {
+    let sid_to_iri = |sid: &fluree_db_core::Sid| {
+        store
+            .sid_to_iri(sid)
+            .or_else(|| ctx.active_snapshot.decode_sid(sid))
+    };
+    let comparable_to_subject_iri = |value: ComparableValue| -> Option<String> {
+        match value {
+            ComparableValue::Sid(sid) => sid_to_iri(&sid),
+            ComparableValue::Iri(iri) => Some(iri.to_string()),
+            _ => None,
+        }
+    };
+
+    let Expression::Var(v) = var_expr else {
+        return Ok(None);
+    };
+    let Some(binding) = row.get(*v) else {
+        return Ok(Some(FastEqOutcome::TestUnbound));
+    };
+
+    // Single-ledger fast path: when the bound side is a subject encoded by
+    // the binary index, its internal `s_id` is directly comparable to the
+    // other side's `s_id` within a single ledger — so compare ids and skip
+    // resolving to IRI strings. Cross-ledger `s_id`s are NOT comparable, so
+    // gated on `!is_multi_ledger`; everything else falls through unchanged.
+    if !ctx.is_multi_ledger() {
+        if let Binding::EncodedSid { s_id, .. } = binding {
+            // var = var: both sides EncodedSid → compare raw s_ids directly.
+            if let Expression::Var(ov) = other_expr {
+                if let Some(Binding::EncodedSid { s_id: rhs_s_id, .. }) = row.get(*ov) {
+                    return Ok(Some(FastEqOutcome::Eq(s_id == rhs_s_id)));
+                }
+            }
+
+            // var = const: a constant operand resolves to the same s_id on
+            // every row, so resolve it once per query and memoize it by the
+            // constant read off the expression ([`const_operand_key`]) —
+            // skipping the per-row eval_to_comparable and IRI re-encode
+            // (`canonical_split` / namespace lookup). Any other operand takes
+            // the value-keyed memo below, after evaluating it.
+            if let Some(key) = const_operand_key(other_expr) {
+                let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                    match other_expr.eval_to_comparable(row, Some(ctx))? {
+                        Some(value) => comparable_subject_s_id(ctx, store, &value),
+                        None => Ok(None),
+                    }
+                })?;
+                if let Some(rhs_s_id) = rhs {
+                    return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
+                }
+                // `None`: the constant isn't an indexed subject; fall through
+                // to the paths below.
+            }
+        }
+    }
+
+    let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
+        return Ok(Some(FastEqOutcome::OtherUnbound));
+    };
+
+    match binding {
+        Binding::EncodedSid { s_id, .. } => {
+            // Single-ledger fast path for `?var = <const IRI>` / `?var = Sid`
+            // (e.g. BSBM's `FILTER (<product> != ?p)`): reduce the constant
+            // side to its internal `s_id` and compare u64s, skipping the
+            // costly `resolve_subject_iri` string materialization of the
+            // bound side. Cross-ledger `s_id`s aren't comparable, so gate on
+            // `!is_multi_ledger`. A `None` reduction (subject not indexed, or
+            // an IRI-normalization mismatch) falls through to the IRI-string
+            // path below, which stays conservative.
+            if !ctx.is_multi_ledger() {
+                if let Some(key) = comparable_subject_key(&other) {
+                    // The constant operand resolves to the same `s_id` on
+                    // every row, so memoize it per query instead of doing a
+                    // dictionary reverse-lookup (`find_subject_id_by_parts`)
+                    // per row — the dominant cost of this filter at scale.
+                    let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                        comparable_subject_s_id(ctx, store, &other)
+                    })?;
+                    if let Some(rhs_s_id) = rhs {
+                        return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
+                    }
+                }
+            }
+
+            let Some(lhs_iri) = ctx
+                .resolve_subject_iri(*s_id)
+                .transpose()
+                .map_err(|e| QueryError::Internal(format!("resolve_subject_iri: {e}")))?
+            else {
+                return Ok(None);
+            };
+            let Some(rhs_iri) = comparable_to_subject_iri(other) else {
+                return Ok(None);
+            };
+
+            Ok(Some(FastEqOutcome::Eq(lhs_iri == rhs_iri)))
+        }
+        Binding::Sid { sid, .. } => {
+            let eq = match other {
+                ComparableValue::Sid(rhs) => {
+                    if sid == &rhs {
+                        true
+                    } else {
+                        let (Some(lhs_iri), Some(rhs_iri)) = (sid_to_iri(sid), sid_to_iri(&rhs))
+                        else {
+                            return Ok(None);
+                        };
+                        lhs_iri == rhs_iri
+                    }
+                }
+                ComparableValue::Iri(iri) => {
+                    let Some(lhs_iri) = sid_to_iri(sid) else {
+                        return Ok(None);
+                    };
+                    lhs_iri == iri.as_ref()
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(eq)))
+        }
+        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
+            let eq = match other {
+                ComparableValue::Sid(rhs) => {
+                    let Some(rhs_iri) = sid_to_iri(&rhs) else {
+                        return Ok(None);
+                    };
+                    iri.as_ref() == rhs_iri
+                }
+                ComparableValue::Iri(rhs) => iri.as_ref() == rhs.as_ref(),
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(eq)))
+        }
+        Binding::EncodedPid { p_id } => {
+            let rhs_p_id_opt = match other {
+                ComparableValue::Sid(sid) => store.sid_to_p_id(&sid),
+                ComparableValue::Iri(iri) => store.find_predicate_id(iri.as_ref()),
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(
+                rhs_p_id_opt.is_some_and(|rhs| rhs == *p_id),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+impl CompareOp {
+    /// Whether the given ordering satisfies this comparison operator.
+    fn satisfies(self, ord: Ordering) -> bool {
+        match self {
+            CompareOp::Eq => ord == Ordering::Equal,
+            CompareOp::Ne => ord != Ordering::Equal,
+            CompareOp::Lt => ord == Ordering::Less,
+            CompareOp::Le => ord != Ordering::Greater,
+            CompareOp::Gt => ord == Ordering::Greater,
+            CompareOp::Ge => ord != Ordering::Less,
+        }
+    }
+
+    /// Evaluate this comparison over variadic arguments (chained pairwise).
+    ///
+    /// - 1 arg → vacuously true
+    /// - 2+ args → checks every consecutive pair, short-circuiting on failure
+    pub fn eval<R: RowAccess>(
+        &self,
+        args: &[Expression],
+        row: &R,
+        ctx: Option<&ExecutionContext<'_>>,
+    ) -> Result<Option<ComparableValue>> {
+        check_min_arity(args, 1, self.symbol())?;
+
+        if let Some(b) = fast_eq_ne_for_iri_bindings(*self, args, row, ctx)? {
+            return Ok(Some(ComparableValue::Bool(b)));
+        }
+
+        // 1 arg → vacuously true
+        if args.len() == 1 {
+            // Still evaluate the arg (may have side effects / unbound check)
+            return match args[0].eval_to_comparable(row, ctx)? {
+                Some(_) => Ok(Some(ComparableValue::Bool(true))),
+                None => Ok(Some(ComparableValue::Bool(false))),
+            };
+        }
+
+        let mut prev = match args[0].eval_to_comparable(row, ctx)? {
+            Some(v) => v,
+            None => return Ok(Some(ComparableValue::Bool(false))),
+        };
+
+        for arg in &args[1..] {
+            let curr = match arg.eval_to_comparable(row, ctx)? {
+                Some(v) => v,
+                None => return Ok(Some(ComparableValue::Bool(false))),
+            };
+
+            let satisfied = match self {
+                // `=`/`!=` follow RDFterm-equal / the SPARQL operator mapping:
+                // value equality with numeric promotion, plain = xsd:string, and
+                // case-insensitive language tags; incomparable operands (an
+                // unrecognized/ill-typed datatype that might still denote the same
+                // value) are a type error that excludes the row for BOTH `=` and
+                // `!=` (open-eq-04..12, eq-2/4, eq-graph, eq-dateTime).
+                CompareOp::Eq | CompareOp::Ne => match rdf_term_equal_in(&prev, &curr, ctx) {
+                    EqOutcome::Eq => matches!(self, CompareOp::Eq),
+                    EqOutcome::Ne => matches!(self, CompareOp::Ne),
+                    EqOutcome::TypeError => {
+                        return Err(ComparisonError::TypeMismatch {
+                            operator: self.symbol(),
+                            left_type: prev.type_name(),
+                            right_type: curr.type_name(),
+                        }
+                        .into())
+                    }
+                },
+                _ => match cmp_values(&prev, &curr) {
+                    ValueOrder::Ordered(ord) => self.satisfies(ord),
+                    ValueOrder::Unordered => false,
+                    ValueOrder::Incomparable => {
+                        return Err(ComparisonError::TypeMismatch {
+                            operator: self.symbol(),
+                            left_type: prev.type_name(),
+                            right_type: curr.type_name(),
+                        }
+                        .into())
+                    }
+                },
+            };
+            if !satisfied {
+                return Ok(Some(ComparableValue::Bool(false)));
+            }
+
+            prev = curr;
+        }
+
+        Ok(Some(ComparableValue::Bool(true)))
+    }
+}
+
+/// How two values relate under the SPARQL comparison operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueOrder {
+    /// Comparable, with this ordering.
+    Ordered(Ordering),
+    /// Two numbers, at least one of them NaN. XPath's numeric comparisons
+    /// return false whenever an operand is NaN (F&O 3.1 §4.3), so `=`, `<`,
+    /// `>`, `<=` and `>=` are all false and `!=` is true (SPARQL 1.1 §17.3).
+    /// A false comparison, not a type error.
+    Unordered,
+    /// Not comparable: a type error.
+    Incomparable,
+}
+
+/// Compare two values for the ordering operators (`<`, `<=`, `>`, `>=`).
+/// Delegates to FlakeValue's comparison methods for numeric and temporal types.
+fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> ValueOrder {
+    cmp_values_inner(left, right, true)
+}
+
+/// Whether `v`, when its value is a string (`fv`), is a plain string term: a
+/// simple literal or `xsd:string`, the one kind of string a temporal orders
+/// against. A language-tagged, custom-typed, `@fulltext` or JSON literal, and
+/// an IRI, are not. True for every non-string value.
+fn plain_if_string(v: &ComparableValue, fv: &FlakeValue) -> bool {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    if !matches!(fv, FlakeValue::String(_)) {
+        return true;
+    }
+    match v {
+        ComparableValue::String(_) => true,
+        ComparableValue::TypedLiteral { dtc: None, .. } => true,
+        ComparableValue::TypedLiteral {
+            dtc: Some(U::Explicit(iri)),
+            ..
+        } => iri.as_ref() == fluree_vocab::xsd::STRING,
+        _ => false,
+    }
+}
+
+/// Ordering of two comparable values. `temporal_string_coerce` enables reading
+/// a plain string as a temporal to order it against a typed temporal (used for
+/// `<`/`>`); it is disabled for `=`/`!=`, where a plain string is never
+/// value-equal to a temporal (eq-dateTime).
+fn cmp_values_inner(
+    left: &ComparableValue,
+    right: &ComparableValue,
+    temporal_string_coerce: bool,
+) -> ValueOrder {
+    // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float, whose
+    // value is stored string-backed) into their primitive numeric variant so the
+    // numeric comparison below applies — mirroring arithmetic's operand coercion.
+    // Only clone when a typed literal is actually present (the uncommon case).
+    let (lc, rc);
+    let (left, right) = if matches!(left, ComparableValue::TypedLiteral { .. })
+        || matches!(right, ComparableValue::TypedLiteral { .. })
+    {
+        lc = left.clone().coerce_numeric_operand();
+        rc = right.clone().coerce_numeric_operand();
+        (&lc, &rc)
+    } else {
+        (left, right)
+    };
+
+    let left_fv: FlakeValue = left.into();
+    let right_fv: FlakeValue = right.into();
+
+    // Numeric comparison first (handles all numeric cross-type comparisons).
+    if left_fv.is_numeric() && right_fv.is_numeric() {
+        let is_nan = |v: &FlakeValue| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        return match left_fv.numeric_cmp(&right_fv) {
+            Some(ordering) => ValueOrder::Ordered(ordering),
+            None if is_nan(&left_fv) || is_nan(&right_fv) => ValueOrder::Unordered,
+            None => ValueOrder::Incomparable,
+        };
+    }
+
+    // Try temporal comparison (same-type temporal only)
+    if let Some(ordering) = left_fv.temporal_cmp(&right_fv) {
+        return ValueOrder::Ordered(ordering);
+    }
+
+    // Cross-type coercion: when one side is a temporal type and the other is a
+    // plain string, read the string as a value of that temporal type
+    // (ordering only). A tagged or otherwise-typed literal is a term of its
+    // own type and is not read as a temporal.
+    if temporal_string_coerce
+        && plain_if_string(left, &left_fv)
+        && plain_if_string(right, &right_fv)
+    {
+        if let Some(ordering) = fluree_db_core::temporal::cmp_with_lexical(&left_fv, &right_fv) {
+            return ValueOrder::Ordered(ordering);
+        }
+    }
+
+    // Fall back to same-type comparisons for non-numeric, non-temporal types
+    let ordering = match (left, right) {
+        (ComparableValue::String(a), ComparableValue::String(b)) => a.cmp(b),
+        (ComparableValue::Bool(a), ComparableValue::Bool(b)) => a.cmp(b),
+        (ComparableValue::Sid(a), ComparableValue::Sid(b)) => a.cmp(b),
+        (ComparableValue::Iri(a), ComparableValue::Iri(b)) => a.cmp(b),
+        // Type mismatch
+        _ => return ValueOrder::Incomparable,
+    };
+    ValueOrder::Ordered(ordering)
+}
+
+/// Outcome of RDFterm-equal (`=` / `!=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EqOutcome {
+    /// Equal (value equality, or the same term).
+    Eq,
+    /// Known to be different.
+    Ne,
+    /// A type error — an unrecognized / ill-typed datatype that might still
+    /// denote the same value; excludes the row for BOTH `=` and `!=`.
+    TypeError,
+}
+
+/// Equality kind of a value, for the RDFterm-equal fallback used when two
+/// operands are not value-comparable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EqKind {
+    Numeric,
+    Str,
+    Bool,
+    Temporal,
+    Resource,
+    Lang,
+    Foreign,
+    Other,
+}
+
+impl EqKind {
+    /// A recognized value type (numeric / string / boolean / temporal): two
+    /// distinct recognized types are known-unequal rather than a type error.
+    fn recognized(self) -> bool {
+        matches!(
+            self,
+            EqKind::Numeric | EqKind::Str | EqKind::Bool | EqKind::Temporal
+        )
+    }
+}
+
+fn eq_kind(v: &ComparableValue) -> EqKind {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    match v {
+        ComparableValue::Long(_)
+        | ComparableValue::Double(_)
+        | ComparableValue::Float(_)
+        | ComparableValue::BigInt(_)
+        | ComparableValue::Decimal(_) => EqKind::Numeric,
+        ComparableValue::String(_) => EqKind::Str,
+        ComparableValue::Bool(_) => EqKind::Bool,
+        ComparableValue::DateTime(_) | ComparableValue::Date(_) | ComparableValue::Time(_) => {
+            EqKind::Temporal
+        }
+        ComparableValue::Sid(_) | ComparableValue::Iri(_) => EqKind::Resource,
+        ComparableValue::TypedLiteral { dtc, .. } => match dtc {
+            Some(U::LangTag(_)) => EqKind::Lang,
+            Some(U::Explicit(_)) => EqKind::Foreign,
+            None => EqKind::Str,
+        },
+        ComparableValue::Vector(_) | ComparableValue::GeoPoint(_) => EqKind::Other,
+    }
+}
+
+/// `(lexical form, language tag)` of a language-tagged literal.
+fn lang_parts(v: &ComparableValue) -> Option<(&str, &str)> {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    match v {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc: Some(U::LangTag(tag)),
+        } => Some((s.as_str(), tag.as_ref())),
+        _ => None,
+    }
+}
+
+/// Whether a `Sid` and an `Iri` comparable name the same resource, when the
+/// pair is that shape and the context can decode the SID. `None` for every
+/// other pair (or an undecodable SID).
+///
+/// The `Sid` side is encoded in the active snapshot's space — a raw scan
+/// output, or an `IRI(..)` constant — while the `Iri` side is a stamped
+/// `IriMatch` (a cross-ledger SERVICE body, a multi-graph dataset), a
+/// constructed IRI, or a foreign-ledger term. `rdf_term_equal` alone calls
+/// them different resources, so `?p != <iri>` silently keeps every row.
+pub(crate) fn resource_iri_eq(
+    a: &ComparableValue,
+    b: &ComparableValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<bool> {
+    match (a, b) {
+        (ComparableValue::Sid(sid), ComparableValue::Iri(iri))
+        | (ComparableValue::Iri(iri), ComparableValue::Sid(sid)) => {
+            ctx?.decode_sid(sid).map(|decoded| decoded == iri.as_ref())
+        }
+        _ => None,
+    }
+}
+
+/// [`rdf_term_equal`] with the [`resource_iri_eq`] bridge in front of it.
+pub(crate) fn rdf_term_equal_in(
+    a: &ComparableValue,
+    b: &ComparableValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> EqOutcome {
+    match resource_iri_eq(a, b, ctx) {
+        Some(true) => EqOutcome::Eq,
+        Some(false) => EqOutcome::Ne,
+        None => rdf_term_equal(a, b),
+    }
+}
+
+/// SPARQL RDFterm-equal (`=`, and negated, `!=`): §17.4.1.7 and the §17.3
+/// operator mapping. Returns a three-valued outcome so an incomparable pair is
+/// a type error (excluding the row) rather than silently `false`/`true`.
+pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
+    // Value-comparable fast path: numeric promotion, string, boolean, temporal.
+    // No plain-string↔temporal coercion (equality, not ordering).
+    match cmp_values_inner(a, b, false) {
+        ValueOrder::Ordered(Ordering::Equal) => return EqOutcome::Eq,
+        ValueOrder::Ordered(_) => return EqOutcome::Ne,
+        // XPath op:numeric-equal (F&O 3.1 §4.3.1): NaN equals nothing, itself
+        // included, so `NaN = NaN` is false and `NaN != NaN` is true. Also
+        // for a NaN carried by a string-backed literal (`xsd:float`, `STRDT`),
+        // which `cmp_values_inner` coerces to a number first.
+        ValueOrder::Unordered => return EqOutcome::Ne,
+        ValueOrder::Incomparable => {}
+    }
+    // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
+    if a == b || super::value::same_json_term(a, b) {
+        return EqOutcome::Eq;
+    }
+    match (eq_kind(a), eq_kind(b)) {
+        // Both language-tagged: equal iff same lexical form and same tag (tags
+        // compared case-insensitively). Same-term already handled above.
+        (EqKind::Lang, EqKind::Lang) => match (lang_parts(a), lang_parts(b)) {
+            (Some((la, ta)), Some((lb, tb))) if la == lb && ta.eq_ignore_ascii_case(tb) => {
+                EqOutcome::Eq
+            }
+            _ => EqOutcome::Ne,
+        },
+        // A resource is never equal to a literal or a different resource (the
+        // same resource is caught by the value path / same-term above).
+        (EqKind::Resource, _) | (_, EqKind::Resource) => EqOutcome::Ne,
+        // A language-tagged literal vs a non-language literal → known different.
+        (EqKind::Lang, _) | (_, EqKind::Lang) => EqOutcome::Ne,
+        // Two recognized but differently-typed value literals (e.g. string vs
+        // number) → known different.
+        (ka, kb) if ka.recognized() && kb.recognized() => EqOutcome::Ne,
+        // Otherwise at least one operand has an unrecognized / ill-typed datatype
+        // that might still denote the same value → type error.
+        _ => EqOutcome::TypeError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The flavor gate must admit exactly the bindings
+    /// `fast_eq_iri_binding_directional` can decide. A literal test value
+    /// has to answer `false`: on the `IN` path a `true` here costs every
+    /// element an extra evaluation and the row a `Vec` allocation on the
+    /// way to the generic path that would have handled it anyway.
+    #[test]
+    fn resource_flavored_bindings_are_exactly_the_fast_path_arms() {
+        use crate::binding::Binding;
+        use fluree_db_core::datatype_constraint::DatatypeConstraint;
+        use fluree_db_core::Sid;
+
+        assert!(binding_is_resource_flavored(&Binding::Sid {
+            sid: Sid::new(1, Arc::from("alice")),
+            t: None,
+            op: None,
+        }));
+        assert!(binding_is_resource_flavored(&Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        }));
+        assert!(binding_is_resource_flavored(&Binding::Iri(Arc::from(
+            "http://example.org/a"
+        ))));
+        assert!(binding_is_resource_flavored(&Binding::EncodedPid {
+            p_id: 3
+        }));
+
+        // Literals and the unbound flavors take the generic path.
+        let lit = |val| Binding::Lit {
+            val,
+            dtc: DatatypeConstraint::Explicit(fluree_db_core::xsd_string_datatype_sid()),
+            t: None,
+            op: None,
+            p_id: None,
+        };
+        assert!(!binding_is_resource_flavored(&lit(FlakeValue::String(
+            "alice".to_string()
+        ))));
+        assert!(!binding_is_resource_flavored(&lit(FlakeValue::Long(1))));
+        assert!(!binding_is_resource_flavored(&Binding::Unbound));
+        assert!(!binding_is_resource_flavored(&Binding::Poisoned));
+    }
+
+    #[test]
+    fn test_cmp_longs() {
+        let a = ComparableValue::Long(10);
+        let b = ComparableValue::Long(20);
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&b, &a), ValueOrder::Ordered(Ordering::Greater));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_cmp_strings() {
+        let a = ComparableValue::String(Arc::from("alpha"));
+        let b = ComparableValue::String(Arc::from("beta"));
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_type_mismatch() {
+        let long = ComparableValue::Long(10);
+        let string = ComparableValue::String(Arc::from("10"));
+        assert_eq!(cmp_values(&long, &string), ValueOrder::Incomparable);
+    }
+
+    // XPath op:numeric-equal: NaN is never equal, including to itself; `!=`
+    // is therefore true.
+    #[test]
+    fn test_rdf_term_equal_nan_is_never_equal() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        let f_nan = ComparableValue::Float(f32::NAN);
+        let one = ComparableValue::Double(1.0);
+        assert_eq!(rdf_term_equal(&d_nan, &d_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&f_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &one), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&one, &d_nan), EqOutcome::Ne);
+        assert_eq!(
+            rdf_term_equal(&d_nan, &ComparableValue::Long(1)),
+            EqOutcome::Ne
+        );
+    }
+
+    // A NaN among two numbers is unordered (every `<`, `>`, `<=`, `>=` is
+    // false, not a type error, F&O 3.1 §4.3.2), and +/-INF order around every
+    // other number. NaN vs a non-numeric operand keeps its outcome:
+    // a recognized pair is Ne via the kind table, and an
+    // unrecognized-datatype literal stays a TypeError.
+    #[test]
+    fn test_nan_is_unordered_among_numbers() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        let one = ComparableValue::Long(1);
+        let inf = ComparableValue::Double(f64::INFINITY);
+        let ninf = ComparableValue::Double(f64::NEG_INFINITY);
+        assert_eq!(cmp_values(&d_nan, &d_nan), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&d_nan, &one), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&inf, &d_nan), ValueOrder::Unordered);
+        assert_eq!(
+            cmp_values(&inf, &one),
+            ValueOrder::Ordered(Ordering::Greater)
+        );
+        assert_eq!(cmp_values(&ninf, &one), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&inf, &inf), ValueOrder::Ordered(Ordering::Equal));
+        assert_eq!(cmp_values(&ninf, &inf), ValueOrder::Ordered(Ordering::Less));
+        // A NaN carried by a string-backed float literal is a NaN too.
+        let float_nan = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("NaN".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from(fluree_vocab::xsd::FLOAT),
+            )),
+        };
+        assert_eq!(cmp_values(&float_nan, &one), ValueOrder::Unordered);
+        assert_eq!(rdf_term_equal(&float_nan, &float_nan), EqOutcome::Ne);
+        let s = ComparableValue::String(Arc::from("NaN"));
+        assert_eq!(rdf_term_equal(&d_nan, &s), EqOutcome::Ne);
+        let foreign = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from("http://example.org/dt"),
+            )),
+        };
+        assert_eq!(rdf_term_equal(&d_nan, &foreign), EqOutcome::TypeError);
+    }
+
+    // =========================================================================
+    // Variadic eval tests
+    // =========================================================================
+
+    use crate::binding::BindingRow;
+    use fluree_db_core::value::FlakeValue;
+
+    fn long(v: i64) -> Expression {
+        Expression::Const(FlakeValue::Long(v))
+    }
+
+    fn string(s: &str) -> Expression {
+        Expression::Const(FlakeValue::String(s.to_string()))
+    }
+
+    fn empty_row() -> BindingRow<'static> {
+        BindingRow::new(&[], &[])
+    }
+
+    #[test]
+    fn test_chained_lt_holds() {
+        let row = empty_row();
+        // 1 < 2 < 3 → true
+        let args = vec![long(1), long(2), long(3)];
+        let result = CompareOp::Lt.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_chained_lt_breaks() {
+        let row = empty_row();
+        // 1 < 3 < 2 → false (3 < 2 fails)
+        let args = vec![long(1), long(3), long(2)];
+        let result = CompareOp::Lt.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(false)));
+    }
+
+    #[test]
+    fn test_chained_eq_all_same() {
+        let row = empty_row();
+        // 5 = 5 = 5 → true
+        let args = vec![long(5), long(5), long(5)];
+        let result = CompareOp::Eq.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_chained_eq_not_all_same() {
+        let row = empty_row();
+        // 5 = 5 = 6 → false
+        let args = vec![long(5), long(5), long(6)];
+        let result = CompareOp::Eq.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(false)));
+    }
+
+    #[test]
+    fn test_single_arg_vacuously_true() {
+        let row = empty_row();
+        let args = vec![long(42)];
+        let result = CompareOp::Lt.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_zero_args_error() {
+        let row = empty_row();
+        let args: Vec<Expression> = vec![];
+        assert!(CompareOp::Lt.eval(&args, &row, None).is_err());
+    }
+
+    #[test]
+    fn test_chained_ge_holds() {
+        let row = empty_row();
+        // 5 >= 3 >= 3 → true
+        let args = vec![long(5), long(3), long(3)];
+        let result = CompareOp::Ge.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_chained_ne() {
+        let row = empty_row();
+        // 1 != 2 != 3 → true (all consecutive pairs differ)
+        let args = vec![long(1), long(2), long(3)];
+        let result = CompareOp::Ne.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_ne_type_mismatch_is_true() {
+        let row = empty_row();
+        // 1 != "hello" → true (incomparable types are not equal)
+        let args = vec![long(1), string("hello")];
+        let result = CompareOp::Ne.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_eq_type_mismatch_is_false() {
+        let row = empty_row();
+        // 1 = "hello" → false (incomparable types are not equal)
+        let args = vec![long(1), string("hello")];
+        let result = CompareOp::Eq.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Bool(false)));
+    }
+
+    #[test]
+    fn test_lt_type_mismatch_is_err() {
+        let row = empty_row();
+        // 1 < "hello" → error (incomparable types cannot be ordered)
+        let args = vec![long(1), string("hello")];
+        assert!(CompareOp::Lt.eval(&args, &row, None).is_err());
+    }
+
+    #[test]
+    fn test_le_type_mismatch_is_err() {
+        let row = empty_row();
+        let args = vec![long(1), string("hello")];
+        assert!(CompareOp::Le.eval(&args, &row, None).is_err());
+    }
+
+    #[test]
+    fn test_gt_type_mismatch_is_err() {
+        let row = empty_row();
+        let args = vec![long(1), string("hello")];
+        assert!(CompareOp::Gt.eval(&args, &row, None).is_err());
+    }
+
+    #[test]
+    fn test_ge_type_mismatch_is_err() {
+        let row = empty_row();
+        let args = vec![long(1), string("hello")];
+        assert!(CompareOp::Ge.eval(&args, &row, None).is_err());
+    }
+
+    fn iri_operand(iri: &str) -> Expression {
+        Expression::Call {
+            func: Function::Iri,
+            args: vec![Expression::Const(FlakeValue::String(iri.to_string()))],
+        }
+    }
+
+    /// The memo key is the constant an operand names, wherever the operand
+    /// lives: a FILTER copy built where an earlier, different one was freed
+    /// gets its own key (#2385). The slot is overwritten in place, so the
+    /// address is the same by construction.
+    #[test]
+    fn const_operand_key_is_the_constant_not_its_address() {
+        let mut slot = Box::new(iri_operand("http://example.org/Widget"));
+        let addr = std::ptr::from_ref::<Expression>(&slot) as usize;
+        assert!(matches!(
+            const_operand_key(&slot),
+            Some(ConstSidKey::IriLiteral("http://example.org/Widget"))
+        ));
+
+        *slot = iri_operand("http://example.org/box1");
+        assert_eq!(std::ptr::from_ref::<Expression>(&slot) as usize, addr);
+        assert!(matches!(
+            const_operand_key(&slot),
+            Some(ConstSidKey::IriLiteral("http://example.org/box1"))
+        ));
+    }
+
+    /// Each kind of constant has its own entries: an `IRI("…")` string is
+    /// kept apart from the same IRI as evaluated, and a SID's name is per
+    /// namespace.
+    #[test]
+    fn const_sid_memo_keeps_each_constant_apart() {
+        let mut memo = crate::context::ConstSidMemo::default();
+        memo.insert(ConstSidKey::IriLiteral("http://example.org/a"), Some(1));
+        memo.insert(ConstSidKey::Sid(5, "a"), Some(2));
+        memo.insert(ConstSidKey::Iri("http://example.org/c"), None);
+
+        let get = |key| memo.get(key);
+        assert_eq!(
+            get(ConstSidKey::IriLiteral("http://example.org/a")),
+            Some(Some(1))
+        );
+        assert_eq!(get(ConstSidKey::IriLiteral("http://example.org/b")), None);
+        assert_eq!(get(ConstSidKey::Iri("http://example.org/a")), None);
+        assert_eq!(get(ConstSidKey::Iri("http://example.org/c")), Some(None));
+        assert_eq!(get(ConstSidKey::Sid(5, "a")), Some(Some(2)));
+        assert_eq!(get(ConstSidKey::Sid(6, "a")), None);
+    }
+
+    /// A miss resolves once and memoizes the result (a non-subject's `None`
+    /// included), a hit never calls the resolver, and a failed resolve
+    /// memoizes nothing.
+    #[test]
+    fn const_sid_memo_get_or_resolve_resolves_each_key_once() {
+        let cache = std::sync::Mutex::new(crate::context::ConstSidMemo::default());
+        let calls = std::cell::Cell::new(0);
+        let resolve = |s_id: Option<u64>| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(s_id)
+            }
+        };
+        let a = ConstSidKey::Iri("http://example.org/a");
+        let b = ConstSidKey::Sid(5, "b");
+
+        for _ in 0..3 {
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, a, resolve(Some(7))).unwrap(),
+                Some(7)
+            );
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, b, resolve(None)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(calls.get(), 2, "one resolve per key");
+
+        let c = ConstSidKey::IriLiteral("http://example.org/c");
+        let failed = ConstSidMemo::get_or_resolve(&cache, c, || {
+            Err(QueryError::Internal("dictionary read failed".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            cache.lock().unwrap().get(c),
+            None,
+            "an error isn't memoized"
+        );
+        assert_eq!(
+            ConstSidMemo::get_or_resolve(&cache, c, resolve(Some(9))).unwrap(),
+            Some(9)
+        );
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// Only an `IRI("…")` string or a SID constant is keyed before
+    /// evaluation; anything else is evaluated first and keyed by its value.
+    #[test]
+    fn const_operand_key_reads_iri_strings_and_sids_only() {
+        let sid = fluree_db_core::Sid::new(17, "box1");
+        assert!(matches!(
+            const_operand_key(&Expression::Const(FlakeValue::Ref(sid))),
+            Some(ConstSidKey::Sid(17, "box1"))
+        ));
+        let built = Expression::Call {
+            func: Function::Iri,
+            args: vec![Expression::Call {
+                func: Function::Concat,
+                args: vec![string("http://example.org/"), string("box1")],
+            }],
+        };
+        for operand in [
+            Expression::Var(crate::var_registry::VarId(0)),
+            string("http://example.org/box1"),
+            built,
+        ] {
+            assert!(const_operand_key(&operand).is_none(), "{operand:?}");
+        }
+    }
+}

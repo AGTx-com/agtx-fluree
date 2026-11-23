@@ -1,0 +1,438 @@
+//! JSON and struct output for class stats from SPOT merge results.
+//!
+//! Resolves class sid64 → (ns_code, suffix) via targeted binary search into
+//! flat dict files (avoids loading the full `BinaryIndexStore`).
+
+use std::collections::HashMap;
+
+use fluree_db_core::value_id::ValueTypeTag;
+use fluree_db_core::GraphId;
+use rustc_hash::FxHashMap;
+
+/// Uncapped per-class ref-target counts, keyed by
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> delta`. Produced by
+/// [`crate::stats::IdStatsHook::finalize_with_aggregate_properties`].
+pub type ClassRefTargets = HashMap<(GraphId, u64), HashMap<u32, HashMap<u64, i64>>>;
+
+/// FxHashMap-keyed variant used internally to match `SpotClassStats.class_prop_refs`.
+type ClassRefTargetsFx = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>;
+
+/// `(g_id, class) → p_id → inner_key → count` — the shape shared by
+/// `SpotClassStats`'s datatype/lang maps (`K = u16`) and ref-target map
+/// (`K = u64`). Used by [`merge_class_prop_map`].
+type ClassPropCountMap<K> = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<K, u64>>>;
+
+/// Sentinel datatype value used in [`SpotClassStats`] for object-reference
+/// properties (`ObjKind::REF_ID`). Displayed as `@id` in stats output.
+pub const DT_REF_ID: u16 = u16::MAX;
+
+/// Class→property→datatype statistics collected during the SPOT merge.
+///
+/// Exploits SPOT ordering (subject-grouped) to compute class statistics
+/// with O(properties-per-subject) memory per subject group. Only the global
+/// accumulators grow with distinct classes/properties.
+///
+/// # Datatype keys
+///
+/// The inner `u16` key holds a [`ValueTypeTag`] value (`as_u8() as u16`) for
+/// literal values, or [`DT_REF_ID`] (`u16::MAX`) for object references (`@id`).
+/// Stored in the `ValueTypeTag` domain because the SPOT-merge collector only
+/// has access to the per-flake `o_type` byte, not the datatype dictionary.
+#[derive(Debug, Default)]
+pub struct SpotClassStats {
+    /// (g_id, class_sid64) → instance count (number of subjects with this rdf:type)
+    pub class_counts: FxHashMap<(GraphId, u64), u64>,
+    /// (g_id, class_sid64) → p_id → dt → flake count
+    pub class_prop_dts: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u16, u64>>>,
+    /// (g_id, class_sid64) → p_id → lang_id → flake count
+    pub class_prop_langs: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u16, u64>>>,
+    /// (g_id, class_sid64) → p_id → target_class sid64 → count
+    pub class_prop_refs: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>,
+}
+
+impl SpotClassStats {
+    /// Merge another `SpotClassStats` into `self` by key-wise union, summing
+    /// counts on any colliding key.
+    ///
+    /// Used by the import pipeline to fold each named-graph build's class stats
+    /// into the default-graph accumulator. All maps are keyed by
+    /// `(g_id, class_sid)` and the per-graph builds use disjoint `g_id`s, so in
+    /// practice there are no top-level collisions — but summing keeps the merge
+    /// correct regardless of key overlap. Ref-target classes that a build could
+    /// not resolve (e.g. a ref into another graph) are simply absent from
+    /// `other.class_prop_refs`; they remain counted as `@id` flakes in
+    /// `class_prop_dts` under [`DT_REF_ID`].
+    pub fn merge(&mut self, other: SpotClassStats) {
+        for (k, v) in other.class_counts {
+            *self.class_counts.entry(k).or_insert(0) += v;
+        }
+        merge_class_prop_map(&mut self.class_prop_dts, other.class_prop_dts);
+        merge_class_prop_map(&mut self.class_prop_langs, other.class_prop_langs);
+        merge_class_prop_map(&mut self.class_prop_refs, other.class_prop_refs);
+    }
+}
+
+/// Union one `(g_id, class) → p_id → inner_key → count` map into another,
+/// summing counts on colliding leaves. Generic over the innermost key (`u16`
+/// for datatype/lang maps, `u64` for ref target-class maps).
+fn merge_class_prop_map<K: std::hash::Hash + Eq>(
+    dst: &mut ClassPropCountMap<K>,
+    src: ClassPropCountMap<K>,
+) {
+    for (class_key, prop_map) in src {
+        let dst_props = dst.entry(class_key).or_default();
+        for (p_id, inner) in prop_map {
+            let dst_inner = dst_props.entry(p_id).or_default();
+            for (inner_key, count) in inner {
+                *dst_inner.entry(inner_key).or_insert(0) += count;
+            }
+        }
+    }
+}
+
+/// Build JSON array for class→property→datatype stats from SPOT merge results.
+///
+/// Resolves class sid64 → (ns_code, suffix) via targeted binary search into
+/// flat dict files (avoids loading the full BinaryIndexStore).
+///
+/// Shared between the import pipeline and rebuild pipeline.
+pub fn build_class_stats_json(
+    cs: &SpotClassStats,
+    predicate_sids: &[(u16, String)],
+    run_dir: &std::path::Path,
+    namespace_codes: &HashMap<u16, String>,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    use crate::run_index::dict_io;
+
+    use fluree_db_core::subject_id::SubjectId;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if cs.class_counts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sids_path = run_dir.join("subjects.sids");
+    let idx_path = run_dir.join("subjects.idx");
+    let fwd_path = run_dir.join("subjects.fwd");
+
+    let sids_vec = dict_io::read_subject_sid_map(&sids_path)?;
+    let (fwd_offsets, fwd_lens) = dict_io::read_forward_index(&idx_path)?;
+    let mut fwd_file = std::fs::File::open(&fwd_path)?;
+
+    // Helper: resolve sid64 → (ns_code, suffix_string).
+    // subjects.sids is sorted (both vocab_merge and persist_merge_artifacts
+    // guarantee monotonic sid64 order), so binary_search is safe.
+    let resolve_sid = |sid64: u64, file: &mut std::fs::File| -> Option<(u16, String)> {
+        let subj = SubjectId::from_u64(sid64);
+        let ns_code = subj.ns_code();
+        let pos = sids_vec.binary_search(&sid64).ok()?;
+        let off = fwd_offsets[pos];
+        let len = fwd_lens[pos] as usize;
+        let mut iri_buf = vec![0u8; len];
+        file.seek(SeekFrom::Start(off)).ok()?;
+        file.read_exact(&mut iri_buf).ok()?;
+        let iri = std::str::from_utf8(&iri_buf).ok()?;
+        let prefix = namespace_codes
+            .get(&ns_code)
+            .map(std::string::String::as_str)
+            .unwrap_or("");
+        let suffix = if !prefix.is_empty() && iri.starts_with(prefix) {
+            &iri[prefix.len()..]
+        } else {
+            iri
+        };
+        Some((ns_code, suffix.to_string()))
+    };
+
+    // Sort class entries by (g_id, class_sid64) for deterministic output.
+    let mut class_entries: Vec<(&(GraphId, u64), &u64)> = cs.class_counts.iter().collect();
+    class_entries.sort_by_key(|&(key, _)| *key);
+
+    // Per-class ref-target data (if available).
+    let class_refs = &cs.class_prop_refs;
+
+    let classes_json: Vec<serde_json::Value> = class_entries
+        .iter()
+        .filter_map(|&(&(g_id, class_sid64), &count)| {
+            let (ns_code, suffix) = resolve_sid(class_sid64, &mut fwd_file)?;
+
+            // Look up this class's ref-target map (if any).
+            let ref_map = class_refs.get(&(g_id, class_sid64));
+
+            // Build property entries. Each property gets dt breakdown, and
+            // optionally ref-target class info using the DB-R extended object
+            // format: {"ref-classes": [[[ns, suffix], count], ...]}.
+            let prop_json: Vec<serde_json::Value> = if let Some(prop_map) =
+                cs.class_prop_dts.get(&(g_id, class_sid64))
+            {
+                let mut props: Vec<_> = prop_map.iter().collect();
+                props.sort_by_key(|&(pid, _)| *pid);
+
+                props
+                    .iter()
+                    .filter_map(|&(&p_id, dt_map)| {
+                        let psid = predicate_sids.get(p_id as usize)?;
+
+                        // Check if this property has ref-target class data.
+                        let prop_refs = ref_map.and_then(|rm| rm.get(&p_id));
+
+                        if let Some(target_map) = prop_refs {
+                            // Emit DB-R extended object with ref-classes.
+                            let mut targets: Vec<_> = target_map.iter().collect();
+                            targets.sort_by_key(|&(sid, _)| *sid);
+                            let refs_json: Vec<serde_json::Value> = targets
+                                .iter()
+                                .filter_map(|&(&target_sid, &tcount)| {
+                                    let (tns, tsuffix) = resolve_sid(target_sid, &mut fwd_file)?;
+                                    Some(serde_json::json!([[tns, tsuffix], tcount]))
+                                })
+                                .collect();
+                            Some(serde_json::json!(
+                                [[psid.0, &psid.1], {"ref-classes": refs_json}]
+                            ))
+                        } else {
+                            // Standard format: property with datatype counts.
+                            let mut dts: Vec<_> = dt_map.iter().collect();
+                            dts.sort_by_key(|&(dt, _)| *dt);
+                            let dt_json: Vec<serde_json::Value> = dts
+                                .iter()
+                                .map(|&(&dt, &count)| {
+                                    if dt == DT_REF_ID {
+                                        serde_json::json!(["@id", count])
+                                    } else {
+                                        serde_json::json!([dt as u8, count])
+                                    }
+                                })
+                                .collect();
+                            Some(serde_json::json!([[psid.0, &psid.1], dt_json]))
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            Some(serde_json::json!([[ns_code, suffix], [count, prop_json]]))
+        })
+        .collect();
+
+    tracing::info!(classes = classes_json.len(), "class stats resolved to JSON");
+
+    Ok(classes_json)
+}
+
+/// Build `ClassStatEntry` structs from SPOT class stats (struct-based, no JSON).
+///
+/// Returns a per-graph map: `GraphId → Vec<ClassStatEntry>`. Each graph gets its
+/// own class stats reflecting only the subjects and properties within that graph.
+///
+/// Parallel to `build_class_stats_json` but returns typed structs suitable for
+/// binary stats encoding in `IndexRoot`.
+/// `class_ref_targets_override`: when `Some`, this uncapped
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> count` map (e.g. from
+/// `IdStatsHook::finalize_with_aggregate_properties`) is used to derive
+/// `ref_classes`. When `None`, the function falls back to
+/// `cs.class_prop_refs`, which is populated via the legacy 64-class-capped
+/// `ClassBitsetTable` path and yields incomplete ref-class rollups on
+/// ledgers with more than 64 distinct classes.
+pub fn build_class_stat_entries(
+    cs: &SpotClassStats,
+    predicate_sids: &[(u16, String)],
+    language_tags: &[String],
+    class_ref_targets_override: Option<&ClassRefTargets>,
+    run_dir: &std::path::Path,
+    namespace_codes: &HashMap<u16, String>,
+) -> std::io::Result<HashMap<GraphId, Vec<fluree_db_core::ClassStatEntry>>> {
+    use crate::run_index::dict_io;
+    use fluree_db_core::sid::Sid;
+    use fluree_db_core::subject_id::SubjectId;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if cs.class_counts.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let sids_path = run_dir.join("subjects.sids");
+    let idx_path = run_dir.join("subjects.idx");
+    let fwd_path = run_dir.join("subjects.fwd");
+
+    let sids_vec = dict_io::read_subject_sid_map(&sids_path)?;
+    let (fwd_offsets, fwd_lens) = dict_io::read_forward_index(&idx_path)?;
+    let mut fwd_file = std::fs::File::open(&fwd_path)?;
+
+    let mut resolve_sid = |sid64: u64| -> Option<Sid> {
+        let file = &mut fwd_file;
+        let subj = SubjectId::from_u64(sid64);
+        let ns_code = subj.ns_code();
+        let pos = sids_vec.binary_search(&sid64).ok()?;
+        let off = fwd_offsets[pos];
+        let len = fwd_lens[pos] as usize;
+        let mut iri_buf = vec![0u8; len];
+        file.seek(SeekFrom::Start(off)).ok()?;
+        file.read_exact(&mut iri_buf).ok()?;
+        let iri = std::str::from_utf8(&iri_buf).ok()?;
+        let prefix = namespace_codes
+            .get(&ns_code)
+            .map(std::string::String::as_str)
+            .unwrap_or("");
+        let suffix = if !prefix.is_empty() && iri.starts_with(prefix) {
+            &iri[prefix.len()..]
+        } else {
+            iri
+        };
+        Some(Sid::new(ns_code, suffix))
+    };
+
+    Ok(build_class_stat_entries_with(
+        cs,
+        predicate_sids,
+        language_tags,
+        class_ref_targets_override,
+        &mut resolve_sid,
+    ))
+}
+
+/// [`build_class_stat_entries`] resolving class ids through `resolve_sid`
+/// instead of the import's on-disk forward dictionary. A class it cannot
+/// resolve is left out.
+pub fn build_class_stat_entries_with(
+    cs: &SpotClassStats,
+    predicate_sids: &[(u16, String)],
+    language_tags: &[String],
+    class_ref_targets_override: Option<&ClassRefTargets>,
+    resolve_sid: &mut dyn FnMut(u64) -> Option<fluree_db_core::sid::Sid>,
+) -> HashMap<GraphId, Vec<fluree_db_core::ClassStatEntry>> {
+    use fluree_db_core::sid::Sid;
+    use fluree_db_core::{ClassPropertyUsage, ClassRefCount, ClassStatEntry};
+
+    // Sort by (g_id, class_sid64) for deterministic output.
+    let mut class_entries: Vec<(&(GraphId, u64), &u64)> = cs.class_counts.iter().collect();
+    class_entries.sort_by_key(|&(key, _)| *key);
+
+    // Adapt the override map (counts: i64 deltas, may be negative) to the
+    // FxHashMap<u64, u64> shape that `cs.class_prop_refs` uses, so the
+    // inner property loop is identical regardless of source. Non-positive
+    // deltas are filtered.
+    let override_fx: Option<ClassRefTargetsFx> = class_ref_targets_override.map(|src| {
+        src.iter()
+            .map(|(&key, prop_map)| {
+                let converted: FxHashMap<u32, FxHashMap<u64, u64>> = prop_map
+                    .iter()
+                    .map(|(&p_id, target_map)| {
+                        let targets: FxHashMap<u64, u64> = target_map
+                            .iter()
+                            .filter_map(|(&t_sid, &d)| (d > 0).then_some((t_sid, d as u64)))
+                            .collect();
+                        (p_id, targets)
+                    })
+                    .collect();
+                (key, converted)
+            })
+            .collect()
+    });
+
+    let mut per_graph: HashMap<GraphId, Vec<ClassStatEntry>> = HashMap::new();
+
+    for &(&(g_id, class_sid64), &count) in &class_entries {
+        let class_sid = match resolve_sid(class_sid64) {
+            Some(s) => s,
+            None => continue,
+        };
+        let ref_map = match override_fx {
+            Some(ref m) => m.get(&(g_id, class_sid64)),
+            None => cs.class_prop_refs.get(&(g_id, class_sid64)),
+        };
+
+        let properties: Vec<ClassPropertyUsage> =
+            if let Some(prop_map) = cs.class_prop_dts.get(&(g_id, class_sid64)) {
+                let mut props: Vec<_> = prop_map.iter().collect();
+                props.sort_by_key(|&(pid, _)| *pid);
+
+                props
+                    .iter()
+                    .filter_map(|&(&p_id, dt_map)| {
+                        let psid_pair = predicate_sids.get(p_id as usize)?;
+                        let property_sid = Sid::new(psid_pair.0, &psid_pair.1);
+
+                        // Build per-datatype counts. The collector stores
+                        // `ValueTypeTag::as_u8() as u16` (or `DT_REF_ID` for
+                        // refs), so we can cast directly back to u8 — no
+                        // dictionary lookup needed.
+                        let mut datatypes: Vec<(u8, u64)> = dt_map
+                            .iter()
+                            .map(|(&dt_value, &count)| {
+                                let tag = if dt_value == DT_REF_ID {
+                                    ValueTypeTag::JSON_LD_ID.as_u8()
+                                } else {
+                                    dt_value as u8
+                                };
+                                (tag, count)
+                            })
+                            .collect();
+                        datatypes.sort_by_key(|d| d.0);
+
+                        // Build per-language-tag counts.
+                        let lang_map = cs.class_prop_langs.get(&(g_id, class_sid64));
+                        let langs: Vec<(String, u64)> =
+                            if let Some(prop_langs) = lang_map.and_then(|lm| lm.get(&p_id)) {
+                                let mut lv: Vec<(String, u64)> = prop_langs
+                                    .iter()
+                                    .filter_map(|(&lang_id, &count)| {
+                                        // lang_id is 1-indexed; 0 = no language tag.
+                                        let lang_str = language_tags
+                                            .get((lang_id as usize).wrapping_sub(1))?;
+                                        Some((lang_str.clone(), count))
+                                    })
+                                    .collect();
+                                lv.sort_by(|a, b| a.0.cmp(&b.0));
+                                lv
+                            } else {
+                                Vec::new()
+                            };
+
+                        // Ref-class targets for this property (if any).
+                        let ref_classes: Vec<ClassRefCount> =
+                            if let Some(target_map) = ref_map.and_then(|rm| rm.get(&p_id)) {
+                                let mut targets: Vec<_> = target_map.iter().collect();
+                                targets.sort_by_key(|&(sid, _)| *sid);
+                                targets
+                                    .iter()
+                                    .filter_map(|&(&target_sid, &tcount)| {
+                                        let tsid = resolve_sid(target_sid)?;
+                                        Some(ClassRefCount {
+                                            class_sid: tsid,
+                                            count: tcount,
+                                        })
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                        Some(ClassPropertyUsage {
+                            property_sid,
+                            datatypes,
+                            langs,
+                            ref_classes,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        per_graph.entry(g_id).or_default().push(ClassStatEntry {
+            class_sid,
+            count,
+            properties,
+        });
+    }
+
+    let total_classes: usize = per_graph.values().map(std::vec::Vec::len).sum();
+    tracing::info!(
+        classes = total_classes,
+        graphs = per_graph.len(),
+        "class stats resolved to per-graph entries"
+    );
+    per_graph
+}

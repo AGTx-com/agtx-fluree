@@ -1,0 +1,3915 @@
+//! HTTP client for remote ledger query/update operations
+//!
+//! Used by the CLI's "track" mode to forward data operations to a remote
+//! Fluree server instead of executing them locally. This is distinct from
+//! `fluree-db-nameservice-sync`'s `HttpRemoteClient`, which handles only
+//! nameservice ref-level operations (lookup, push, snapshot).
+//!
+//! When a `RefreshConfig` is provided, the client automatically attempts
+//! token refresh on 401 responses and retries the request once. Callers
+//! should check `take_refreshed_tokens()` after operations to persist any
+//! updated tokens.
+
+use parking_lot::Mutex;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use reqwest::{Client, StatusCode};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+// RFC 3986 §3.3 — a path segment may contain `pchar = unreserved / pct-encoded
+// / sub-delims / ":" / "@"`. We encode only the characters that must not appear
+// literally in a URL path: the generic-delims that would otherwise reframe the
+// URL (`?`, `#`), whitespace, literal `%`, and a handful of hostile-looking
+// ASCII. Crucially, `:` is left untouched so ledger identifiers like
+// `ledger:branch` round-trip correctly through the server's path router.
+// `/` is preserved so ledger names with path separators still land in the
+// server's wildcard (`/*ledger`) capture.
+const LEDGER_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'%');
+
+// Single-segment variant for routes that use a `:alias` matcher instead of a
+// wildcard; `/` must be encoded or it would split the URL path.
+const LEDGER_SEGMENT: &AsciiSet = &LEDGER_PATH.add(b'/');
+
+/// `Accept` header for the NDJSON streaming query endpoint.
+const NDJSON_ACCEPT: &str = "application/x-ndjson";
+
+fn encode_ledger_path(s: &str) -> Cow<'_, str> {
+    utf8_percent_encode(s, LEDGER_PATH).into()
+}
+
+fn encode_ledger_segment(s: &str) -> Cow<'_, str> {
+    utf8_percent_encode(s, LEDGER_SEGMENT).into()
+}
+
+use crate::cli::PolicyArgs;
+use fluree_db_api::{ExportCommitsResponse, PushCommitsResponse};
+use fluree_db_core::pack::{
+    decode_frame, encode_end_frame, encode_manifest_frame, read_stream_preamble, PackError,
+    PackFrame, PackRequest, DEFAULT_MAX_PAYLOAD,
+};
+use fluree_db_nameservice::NsRecord;
+
+/// Build the set of HTTP headers that carry policy enforcement options to a
+/// remote Fluree server.
+///
+/// Returns an empty vec when `policy` is unset. The server accepts:
+///
+/// - `fluree-identity` — the identity IRI to execute as
+/// - `fluree-policy-class` — repeated for each policy class IRI (the server
+///   accumulates all instances; comma-separated values within a single header
+///   are also accepted)
+/// - `fluree-default-allow` — `"true"` to allow access absent matching rules
+///
+/// JSON-LD requests additionally carry the same fields via body `opts` so
+/// future opts-only fields ride through; see [`inject_policy_into_json_opts`].
+pub(crate) fn policy_headers(policy: &PolicyArgs) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(id) = &policy.identity {
+        headers.push(("fluree-identity", id.clone()));
+    }
+    for pc in &policy.policy_class {
+        headers.push(("fluree-policy-class", pc.clone()));
+    }
+    // `--policy` and `--policy-values` are JSON-encoded values transported in
+    // headers as their compact JSON representation. Failures to read/parse the
+    // source flag/file are surfaced earlier (when the CLI builds opts), so a
+    // resolution error here is treated as a no-op.
+    if let Ok(Some(p)) = policy.resolve_policy() {
+        if let Ok(s) = serde_json::to_string(&p) {
+            headers.push(("fluree-policy", s));
+        }
+    }
+    if let Ok(Some(values)) = policy.resolve_policy_values() {
+        let obj: serde_json::Map<String, serde_json::Value> = values.into_iter().collect();
+        if let Ok(s) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+            headers.push(("fluree-policy-values", s));
+        }
+    }
+    // Explicit `false` must travel too: the header is tri-state server-side, so
+    // omitting it would let the ledger's `f:defaultAllow` apply instead of the
+    // fail-closed posture `--no-default-allow` asked for.
+    if let Some(default_allow) = policy.default_allow_opt() {
+        headers.push(("fluree-default-allow", default_allow.to_string()));
+    }
+    headers
+}
+
+/// Inject policy opts into a JSON-LD query/transaction body.
+///
+/// Does nothing when `policy` is unset or `body` is not a JSON object. Uses
+/// the standard `opts.identity` / `opts.policy-class` / `opts.default-allow`
+/// shape the server parses via `GovernanceOptions::from_json`.
+pub(crate) fn inject_policy_into_json_opts(body: &mut serde_json::Value, policy: &PolicyArgs) {
+    if !policy.is_set() {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let opts = obj
+        .entry("opts")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(opts_obj) = opts.as_object_mut() else {
+        return;
+    };
+    if let Some(id) = &policy.identity {
+        opts_obj.insert(
+            "identity".to_string(),
+            serde_json::Value::String(id.clone()),
+        );
+    }
+    if !policy.policy_class.is_empty() {
+        let arr = policy
+            .policy_class
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect();
+        opts_obj.insert("policy-class".to_string(), serde_json::Value::Array(arr));
+    }
+    if let Ok(Some(p)) = policy.resolve_policy() {
+        opts_obj.insert("policy".to_string(), p);
+    }
+    if let Ok(Some(values)) = policy.resolve_policy_values() {
+        let obj: serde_json::Map<String, serde_json::Value> = values.into_iter().collect();
+        opts_obj.insert("policy-values".to_string(), serde_json::Value::Object(obj));
+    }
+    if let Some(default_allow) = policy.default_allow_opt() {
+        opts_obj.insert(
+            "default-allow".to_string(),
+            serde_json::Value::Bool(default_allow),
+        );
+    }
+}
+
+/// Configuration for automatic token refresh on 401.
+#[derive(Clone, Debug)]
+pub struct RefreshConfig {
+    /// Exchange endpoint URL for token refresh.
+    pub exchange_url: String,
+    /// Refresh token for silent renewal.
+    pub refresh_token: String,
+}
+
+/// New token values after a successful refresh. Callers should persist these.
+#[derive(Clone, Debug)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+/// Wire shape for [`RemoteLedgerClient::revert`] and
+/// [`RemoteLedgerClient::revert_preview`]: exactly one of a single commit
+/// reference, a set of references (cherry-pick), or a git-style range.
+///
+/// Lives next to the methods that serialize it. Callers (CLI commands)
+/// construct it from positional args / `--from`/`--to` flags.
+#[derive(Clone, Debug)]
+pub enum RevertPayload {
+    Single(String),
+    Set(Vec<String>),
+    Range { from: String, to: String },
+}
+
+/// HTTP client for ledger data operations against a remote Fluree server.
+///
+/// Supports query (JSON-LD/SPARQL), insert, upsert, transact, ledger-info, and
+/// existence checks via the server's REST API. Optionally performs automatic
+/// token refresh on 401 when a `RefreshConfig` is provided.
+#[derive(Clone)]
+pub struct RemoteLedgerClient {
+    client: Client,
+    base_url: String,
+    token: Arc<Mutex<Option<String>>>,
+    refresh_config: Option<Arc<Mutex<RefreshConfig>>>,
+    refreshed: Arc<Mutex<Option<RefreshedTokens>>>,
+    /// Optional policy flags that are automatically injected as HTTP headers
+    /// on every request and (when the body is JSON-LD) as body-level `opts`
+    /// fields. Set via [`RemoteLedgerClient::with_policy`].
+    policy: PolicyArgs,
+}
+
+/// `.flpack` import capabilities advertised by the server's discovery doc
+/// (`/.well-known/fluree.json` → `import`).
+#[derive(Debug, Clone)]
+pub struct ImportCapability {
+    /// Supported upload modes, e.g. `["direct", "presigned-put", "multipart-put"]`.
+    pub modes: Vec<String>,
+    /// Max body size accepted on the direct `POST /import` path, when advertised.
+    pub direct_max_bytes: Option<u64>,
+}
+
+impl ImportCapability {
+    /// Back-compatible default for servers that don't advertise import
+    /// capabilities: direct streaming only.
+    fn direct_only() -> Self {
+        Self {
+            modes: vec!["direct".to_string()],
+            direct_max_bytes: None,
+        }
+    }
+
+    /// Whether any out-of-band upload mode is offered. The server decides
+    /// single-PUT vs multipart per-archive at mint time, so the client only
+    /// needs to know that *some* negotiated mode exists.
+    fn supports_negotiated(&self) -> bool {
+        self.modes
+            .iter()
+            .any(|m| m == "presigned-put" || m == "multipart-put")
+    }
+
+    /// Whether the server accepts raw source-data uploads (`source-upload`):
+    /// the mint endpoint runs the bulk-import pipeline server-side over the
+    /// same formats `fluree create --from` takes locally.
+    pub fn supports_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload")
+    }
+
+    /// Whether a source upload may name a new graph of an existing ledger
+    /// to import into. A server without it would create a ledger instead.
+    pub fn supports_graph_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload-graph")
+    }
+
+    /// Whether a source upload may salt its blank-node ids. A server without
+    /// it would ignore the namespace and mint different ids.
+    pub fn supports_skolem_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload-skolem")
+    }
+
+    /// Whether an archive of `size` bytes should take the negotiated upload
+    /// path: a negotiated mode must be offered, and either direct isn't offered
+    /// at all or the archive exceeds the advertised direct cap.
+    pub fn needs_negotiated_upload(&self, size: u64) -> bool {
+        if !self.supports_negotiated() {
+            return false;
+        }
+        let direct_offered = self.modes.iter().any(|m| m == "direct");
+        if !direct_offered {
+            return true;
+        }
+        match self.direct_max_bytes {
+            Some(max) => size > max,
+            None => false,
+        }
+    }
+}
+
+/// One part of a minted multipart upload: where to PUT it and the headers to
+/// send. The byte range is derived from the part number and the server's
+/// `part_size` (all parts but the last are `part_size` bytes).
+#[derive(Debug, Clone)]
+pub struct MintedPart {
+    pub part_number: u32,
+    pub url: String,
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// A part the client finished uploading, reported back on `complete`.
+#[derive(Debug, Clone)]
+pub struct CompletedPart {
+    pub part_number: u32,
+    pub etag: String,
+}
+
+impl fmt::Debug for RemoteLedgerClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteLedgerClient")
+            .field("base_url", &self.base_url)
+            .field("has_token", &self.token.lock().is_some())
+            .field("has_refresh", &self.refresh_config.is_some())
+            .finish()
+    }
+}
+
+/// Error type for remote ledger operations.
+#[derive(Debug)]
+pub enum RemoteLedgerError {
+    /// Network or connection error
+    Network(String),
+    /// 401 Unauthorized
+    Unauthorized,
+    /// 403 Forbidden (includes server message if any, such as the reason a
+    /// policy gives for denying a write)
+    Forbidden(String),
+    /// 404 Not Found (includes server message if any)
+    NotFound(String),
+    /// 400 Bad Request (includes server error message)
+    BadRequest(String),
+    /// 409 Conflict (includes server error message)
+    Conflict(String),
+    /// 422 Unprocessable Entity / validation error
+    ValidationError(String),
+    /// 415 Unsupported Media Type: the server does not read this body format
+    UnsupportedMediaType(String),
+    /// 5xx Server Error (includes server error message)
+    ServerError(String),
+    /// Request could not be serialized (client-side bug)
+    InvalidRequest(String),
+    /// Response could not be parsed as expected
+    InvalidResponse(String),
+}
+
+impl fmt::Display for RemoteLedgerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoteLedgerError::Network(msg) => write!(f, "network error: {msg}"),
+            RemoteLedgerError::Unauthorized => write!(
+                f,
+                "authentication failed (401). Token may be expired or revoked.\n  \
+                 Run `fluree auth login` to store a new token, or \
+                 `fluree auth status` to check expiry."
+            ),
+            RemoteLedgerError::Forbidden(msg) if msg.is_empty() => write!(f, "access denied (403)"),
+            RemoteLedgerError::Forbidden(msg) => write!(f, "access denied (403): {msg}"),
+            RemoteLedgerError::NotFound(msg) => write!(f, "not found: {msg}"),
+            RemoteLedgerError::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            RemoteLedgerError::Conflict(msg) => write!(f, "conflict (409): {msg}"),
+            RemoteLedgerError::ValidationError(msg) => write!(f, "validation error (422): {msg}"),
+            RemoteLedgerError::UnsupportedMediaType(msg) => {
+                write!(f, "unsupported media type (415): {msg}")
+            }
+            RemoteLedgerError::ServerError(msg) => write!(f, "server error: {msg}"),
+            RemoteLedgerError::InvalidRequest(msg) => write!(f, "invalid request: {msg}"),
+            RemoteLedgerError::InvalidResponse(msg) => write!(f, "invalid response: {msg}"),
+        }
+    }
+}
+
+impl RemoteLedgerClient {
+    /// Default HTTP request timeout (5 minutes).
+    ///
+    /// Long-running queries and transactions are expected; the server should
+    /// be the authority on when to time out. This client-side value is a
+    /// safety net, not a policy knob.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Per-call timeout override for `POST /reindex`.
+    ///
+    /// A full commit-history rebuild on a large ledger can legitimately run
+    /// longer than the default 5-minute request timeout; if the client
+    /// abandons the connection, the server keeps rebuilding but the user
+    /// loses the result. 1 hour is a pragmatic ceiling — the server still
+    /// owns hard cutoffs.
+    pub const REINDEX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+    /// Create a new remote ledger client with the default 5-minute timeout.
+    ///
+    /// `base_url` is the Fluree API base (e.g., `http://localhost:8090/fluree`
+    /// or `https://example.com/v1/fluree`). Trailing slashes are stripped.
+    pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        Self::with_timeout(base_url, auth_token, Self::DEFAULT_TIMEOUT)
+    }
+
+    /// Create a new remote ledger client with a custom timeout.
+    pub fn with_timeout(base_url: &str, auth_token: Option<String>, timeout: Duration) -> Self {
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("Failed to build HTTP client");
+
+        Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: Arc::new(Mutex::new(auth_token)),
+            refresh_config: None,
+            refreshed: Arc::new(Mutex::new(None)),
+            policy: PolicyArgs::default(),
+        }
+    }
+
+    /// Attach refresh configuration for automatic 401 retry.
+    pub fn with_refresh(mut self, config: RefreshConfig) -> Self {
+        self.refresh_config = Some(Arc::new(Mutex::new(config)));
+        self
+    }
+
+    /// Attach policy flags that are automatically applied to every request.
+    ///
+    /// Policy is transported as HTTP headers (`fluree-identity`,
+    /// `fluree-policy-class`, `fluree-default-allow`) on all requests, and
+    /// additionally injected into the body-level `opts` object for JSON-LD
+    /// query/transaction requests (enabling multi-value `policy-class` and
+    /// future opts-only fields). No-op when `policy` is empty.
+    pub fn with_policy(mut self, policy: PolicyArgs) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Take any refreshed tokens (consuming them). Callers should persist
+    /// these back to config.toml after the operation completes.
+    pub fn take_refreshed_tokens(&self) -> Option<RefreshedTokens> {
+        self.refreshed.lock().take()
+    }
+
+    /// The bearer token requests currently carry — the refreshed one once a
+    /// refresh has happened.
+    pub fn current_token(&self) -> Option<String> {
+        self.token.lock().clone()
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let token = self.token.lock();
+        if let Some(ref t) = *token {
+            req.bearer_auth(t)
+        } else {
+            req
+        }
+    }
+
+    /// Map a non-2xx response to a `RemoteLedgerError`.
+    async fn map_error(resp: reqwest::Response) -> RemoteLedgerError {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let message = extract_error_message(&body);
+
+        match status {
+            StatusCode::UNAUTHORIZED => RemoteLedgerError::Unauthorized,
+            StatusCode::FORBIDDEN => RemoteLedgerError::Forbidden(message),
+            StatusCode::NOT_FOUND => RemoteLedgerError::NotFound(if message.is_empty() {
+                "resource not found".to_string()
+            } else {
+                message
+            }),
+            StatusCode::BAD_REQUEST => RemoteLedgerError::BadRequest(if message.is_empty() {
+                "bad request".to_string()
+            } else {
+                message
+            }),
+            StatusCode::CONFLICT => RemoteLedgerError::Conflict(if message.is_empty() {
+                "conflict".to_string()
+            } else {
+                message
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY => {
+                RemoteLedgerError::ValidationError(if message.is_empty() {
+                    "validation error".to_string()
+                } else {
+                    message
+                })
+            }
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+                RemoteLedgerError::UnsupportedMediaType(if message.is_empty() {
+                    "unsupported media type".to_string()
+                } else {
+                    message
+                })
+            }
+            s if s.is_server_error() => RemoteLedgerError::ServerError(if message.is_empty() {
+                format!("status {s}")
+            } else {
+                message
+            }),
+            _ => RemoteLedgerError::ServerError(if message.is_empty() {
+                format!("unexpected status {status}")
+            } else {
+                format!("unexpected status {status}: {message}")
+            }),
+        }
+    }
+
+    /// Map a reqwest error (network/timeout) to a `RemoteLedgerError`.
+    fn map_network_error(e: reqwest::Error) -> RemoteLedgerError {
+        if e.is_timeout() {
+            RemoteLedgerError::Network(format!("request timed out: {e}"))
+        } else if e.is_connect() {
+            RemoteLedgerError::Network(format!("connection failed: {e}"))
+        } else {
+            RemoteLedgerError::Network(e.to_string())
+        }
+    }
+
+    /// Attempt to refresh the access token using the stored refresh_token.
+    /// Returns true if refresh succeeded and the token was updated.
+    async fn try_refresh(&self) -> bool {
+        let refresh_cfg = match &self.refresh_config {
+            Some(cfg) => cfg.clone(),
+            None => return false,
+        };
+
+        let (exchange_url, refresh_token) = {
+            let cfg = refresh_cfg.lock();
+            (cfg.exchange_url.clone(), cfg.refresh_token.clone())
+        };
+
+        if !exchange_url.starts_with("https://") {
+            tracing::warn!(
+                url = %exchange_url,
+                "token refresh exchange URL is not HTTPS — credentials may be sent in cleartext"
+            );
+        }
+
+        let answer =
+            match crate::account::post_refresh(&self.client, &exchange_url, &refresh_token).await {
+                Ok(a) if a.status.is_success() => a,
+                _ => return false,
+            };
+        let Some(new_access) = answer.access_token().map(str::to_string) else {
+            return false;
+        };
+        let new_refresh = answer.refresh_token().map(String::from);
+
+        // Update the token
+        *self.token.lock() = Some(new_access.clone());
+
+        // Update refresh_token if a new one was provided
+        if let Some(ref new_rt) = new_refresh {
+            refresh_cfg.lock().refresh_token = new_rt.clone();
+        }
+
+        // Store refreshed tokens for caller to persist
+        *self.refreshed.lock() = Some(RefreshedTokens {
+            access_token: new_access,
+            refresh_token: new_refresh,
+        });
+
+        eprintln!("  (token refreshed automatically)");
+        true
+    }
+
+    // =========================================================================
+    // Generic request execution with 401 retry
+    // =========================================================================
+
+    /// Execute a request. On 401, attempt token refresh and retry once.
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        body: Option<RequestBody<'_>>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        // First attempt
+        let resp = self
+            .build_request(method.clone(), url, content_type, &body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            // Retry with refreshed token
+            let resp2 = self
+                .build_request(method, url, content_type, &body)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Execute a JSON request with a per-call timeout override.
+    ///
+    /// Used for operations (e.g. `/reindex`) whose legitimate duration can
+    /// exceed `DEFAULT_TIMEOUT`. On 401, attempts token refresh and retries once.
+    async fn send_json_with_timeout(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        body: Option<RequestBody<'_>>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let resp = self
+            .build_request(method.clone(), url, content_type, &body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self
+                .build_request(method, url, content_type, &body)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Execute a request with additional headers. On 401, attempt token refresh and retry once.
+    async fn send_json_with_headers(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        extra_headers: &[(&'static str, String)],
+        body: Option<RequestBody<'_>>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        // First attempt
+        let mut req = self.build_request(method.clone(), url, content_type, &body);
+        for (k, v) in extra_headers {
+            req = req.header(*k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            // Retry with refreshed token
+            let mut req2 = self.build_request(method, url, content_type, &body);
+            for (k, v) in extra_headers {
+                req2 = req2.header(*k, v);
+            }
+            let resp2 = req2.send().await.map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Execute a request, returning the raw response. On 401, attempt
+    /// token refresh and retry once. Returns the response for caller to
+    /// interpret status codes (except 401, which is handled here).
+    async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        accept: Option<&str>,
+        body: Option<RequestBody<'_>>,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let mut req = self.build_request(method.clone(), url, content_type, &body);
+        if let Some(a) = accept {
+            req = req.header("Accept", a);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if self.try_refresh().await {
+                let mut req2 = self.build_request(method, url, content_type, &body);
+                if let Some(a) = accept {
+                    req2 = req2.header("Accept", a);
+                }
+                let resp2 = req2.send().await.map_err(Self::map_network_error)?;
+                if resp2.status() == StatusCode::UNAUTHORIZED {
+                    return Err(RemoteLedgerError::Unauthorized);
+                }
+                return Ok(resp2);
+            }
+            return Err(RemoteLedgerError::Unauthorized);
+        }
+
+        Ok(resp)
+    }
+
+    /// Like [`send_raw`](Self::send_raw) but attaches extra request headers
+    /// (e.g. `fluree-max-fuel`) before sending. On 401, refresh and retry once.
+    async fn send_raw_with_headers(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        accept: Option<&str>,
+        extra_headers: &[(&'static str, String)],
+        body: Option<RequestBody<'_>>,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let build = |me: &Self| {
+            let mut req = me.build_request(method.clone(), url, content_type, &body);
+            if let Some(a) = accept {
+                req = req.header("Accept", a);
+            }
+            for (k, v) in extra_headers {
+                req = req.header(*k, v);
+            }
+            req
+        };
+
+        let resp = build(self).send().await.map_err(Self::map_network_error)?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if self.try_refresh().await {
+                let resp2 = build(self).send().await.map_err(Self::map_network_error)?;
+                if resp2.status() == StatusCode::UNAUTHORIZED {
+                    return Err(RemoteLedgerError::Unauthorized);
+                }
+                return Ok(resp2);
+            }
+            return Err(RemoteLedgerError::Unauthorized);
+        }
+        Ok(resp)
+    }
+
+    fn build_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        body: &Option<RequestBody<'_>>,
+    ) -> reqwest::RequestBuilder {
+        let mut req = self.add_auth(self.client.request(method, url));
+        req = req.header("Content-Type", content_type);
+        // Policy flags transport as HTTP headers on every request; servers read
+        // them for SPARQL (which has no body opts) and merge them into body opts
+        // for JSON-LD (with body values taking precedence).
+        for (k, v) in policy_headers(&self.policy) {
+            req = req.header(k, v);
+        }
+        match body {
+            Some(RequestBody::Json(v)) => {
+                // For JSON-LD bodies, also inject opts so multi-value
+                // policy-class and any future opts-only fields ride through.
+                if self.policy.is_set() {
+                    let mut cloned = (*v).clone();
+                    inject_policy_into_json_opts(&mut cloned, &self.policy);
+                    req.json(&cloned)
+                } else {
+                    req.json(*v)
+                }
+            }
+            Some(RequestBody::Text(s)) => req.body(s.to_string()),
+            None => req,
+        }
+    }
+
+    fn ledger_tail(ledger: &str) -> &str {
+        ledger.trim_start_matches('/')
+    }
+
+    fn op_url(&self, op: &str, ledger: &str) -> String {
+        format!(
+            "{}/{}/{}",
+            self.base_url,
+            op,
+            encode_ledger_path(Self::ledger_tail(ledger)),
+        )
+    }
+
+    fn op_url_root(&self, op: &str) -> String {
+        format!("{}/{}", self.base_url, op)
+    }
+
+    fn with_default_context_param(mut url: String) -> String {
+        url.push_str("?default-context=true");
+        url
+    }
+
+    // =========================================================================
+    // Query
+    // =========================================================================
+
+    /// Execute a JSON-LD query against a ledger.
+    pub async fn query_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Execute a SPARQL query against a ledger.
+    pub async fn query_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// Execute a SPARQL query and return the raw response bytes with a custom Accept header.
+    ///
+    /// Used by the CLI to request delimited formats (TSV/CSV) directly from the server,
+    /// bypassing JSON serialization on both sides.
+    pub async fn query_sparql_accept_bytes(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        accept: &str,
+    ) -> Result<bytes::Bytes, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        let resp = self
+            .send_raw(
+                reqwest::Method::POST,
+                &url,
+                "application/sparql-query",
+                Some(accept),
+                Some(RequestBody::Text(sparql)),
+            )
+            .await?;
+
+        if resp.status().is_success() {
+            resp.bytes()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Execute a connection-scoped SPARQL query and return raw response bytes with a custom Accept header.
+    pub async fn query_connection_sparql_accept_bytes(
+        &self,
+        sparql: &str,
+        accept: &str,
+    ) -> Result<bytes::Bytes, RemoteLedgerError> {
+        let url = self.op_url_root("query");
+        let resp = self
+            .send_raw(
+                reqwest::Method::POST,
+                &url,
+                "application/sparql-query",
+                Some(accept),
+                Some(RequestBody::Text(sparql)),
+            )
+            .await?;
+
+        if resp.status().is_success() {
+            resp.bytes()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped SPARQL query as NDJSON from
+    /// `POST /v1/fluree/stream/query/<ledger>`. Returns the raw streaming
+    /// response; the caller drives the body incrementally (see
+    /// [`crate::commands::query_stream`]). Policy flags ride through as headers
+    /// / body opts via [`Self::with_policy`].
+    pub async fn stream_query_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/sparql-query",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Text(sparql)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped JSON-LD query as NDJSON. See
+    /// [`Self::stream_query_sparql`].
+    pub async fn stream_query_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Json(body)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Execute a JSON-LD connection query (ledger specified via `from` in body).
+    pub async fn query_connection_jsonld(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url_root("query"));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Execute a SPARQL connection query (ledger specified via `FROM` clause).
+    pub async fn query_connection_sparql(
+        &self,
+        sparql: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("query");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// Execute a multi-query envelope. The envelope's `queries` map carries
+    /// per-alias sub-queries (JSON-LD and/or SPARQL); each sub-query
+    /// declares its own `from`. The server runs them in parallel against a
+    /// single shared snapshot moment and returns a per-alias response.
+    ///
+    /// See [`docs/api/multi-query.md`] for the envelope wire format.
+    pub async fn multi_query(
+        &self,
+        envelope: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.multi_query_with_headers(envelope, &[]).await
+    }
+
+    /// Execute a multi-query envelope with extra request headers (e.g.
+    /// `fluree-output-format`, `fluree-normalize-arrays`). Mirrors
+    /// [`Self::multi_query`] but attaches caller-supplied headers so the
+    /// server can pick the per-alias [`FormatterConfig`].
+    pub async fn multi_query_with_headers(
+        &self,
+        envelope: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("multi-query");
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            extra_headers,
+            Some(RequestBody::Json(envelope)),
+        )
+        .await
+    }
+
+    // -------------------------------------------------------------------------
+    // Tracked variants
+    //
+    // These mirror the four query methods above but attach arbitrary extra
+    // request headers (typically `fluree-track-*` / `fluree-max-fuel`). When
+    // tracking headers are present the server returns a `TrackedQueryResponse`
+    // JSON envelope `{ status, result, time, fuel, policy }`; the caller is
+    // responsible for extracting `result` for display and the sibling fields
+    // for the tally.
+    // -------------------------------------------------------------------------
+
+    /// JSON-LD ledger-scoped query with extra request headers.
+    pub async fn query_jsonld_with_headers(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            extra_headers,
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// SPARQL ledger-scoped query with extra request headers.
+    pub async fn query_sparql_with_headers(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            extra_headers,
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// JSON-LD connection-scoped query (ledger in body `from`) with extra
+    /// request headers.
+    pub async fn query_connection_jsonld_with_headers(
+        &self,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url_root("query"));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            extra_headers,
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// SPARQL connection-scoped query (ledger in `FROM` clause) with extra
+    /// request headers.
+    pub async fn query_connection_sparql_with_headers(
+        &self,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("query");
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            extra_headers,
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Explain
+    // =========================================================================
+
+    /// Explain a JSON-LD query plan against a ledger.
+    pub async fn explain_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("explain", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Explain a SPARQL query plan against a ledger.
+    pub async fn explain_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("explain", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// Explain a Cypher query plan against a ledger. The body may be raw
+    /// Cypher or a `{"cypher": ..., "params": ...}` envelope; the server
+    /// extracts it.
+    pub async fn explain_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("explain", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(cypher)),
+        )
+        .await
+    }
+
+    /// Explain a JSON-LD connection query plan (ledger specified via `from` in body).
+    pub async fn explain_connection_jsonld(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("explain");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Explain a SPARQL connection query plan (ledger specified via `FROM` clause).
+    pub async fn explain_connection_sparql(
+        &self,
+        sparql: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("explain");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Insert
+    // =========================================================================
+
+    /// Insert JSON-LD data into a ledger.
+    pub async fn insert_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("insert", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Insert Turtle data into a ledger.
+    pub async fn insert_turtle(
+        &self,
+        ledger: &str,
+        turtle: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("insert", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "text/turtle",
+            Some(RequestBody::Text(turtle)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Upsert
+    // =========================================================================
+
+    /// Upsert JSON-LD data into a ledger.
+    pub async fn upsert_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("upsert", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Upsert Turtle data into a ledger.
+    pub async fn upsert_turtle(
+        &self,
+        ledger: &str,
+        turtle: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("upsert", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "text/turtle",
+            Some(RequestBody::Text(turtle)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Sync (graph synchronization)
+    // =========================================================================
+
+    /// Synchronize a graph: make its contents exactly `body`, committing
+    /// only the delta. `graph: None` is the default graph.
+    ///
+    /// `POST {base}/sync/{ledger}[?graph=<iri>][&dryRun=true][&allowEmpty=true]`
+    /// with a JSON-LD body. A dry run answers with the delta report; a real
+    /// run with the standard transact response.
+    pub async fn sync_jsonld(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &serde_json::Value,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with a TriG body, sent as
+    /// `application/trig`. Its graph blocks must name `graph`.
+    pub async fn sync_trig(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.sync_rdf(
+            ledger,
+            graph,
+            body,
+            "application/trig",
+            dry_run,
+            allow_empty,
+        )
+        .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with an RDF text body sent as
+    /// `content_type` (`text/turtle`, `application/n-triples`,
+    /// `application/trig`). A server that does not read RDF bodies on
+    /// `/sync` refuses before staging anything, so the caller may retry in
+    /// another format: 415 ([`RemoteLedgerError::UnsupportedMediaType`]), or
+    /// on v4.2.0 and v4.2.1 a 400 ([`RemoteLedgerError::BadRequest`]) asking
+    /// for JSON-LD.
+    pub async fn sync_rdf(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        content_type: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            content_type,
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    fn sync_url(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> String {
+        let mut params = Vec::new();
+        if let Some(graph) = graph {
+            params.push(format!("graph={}", urlencoding::encode(graph)));
+        }
+        if dry_run {
+            params.push("dryRun=true".to_string());
+        }
+        if allow_empty {
+            params.push("allowEmpty=true".to_string());
+        }
+        let mut url = self.op_url("sync", ledger);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        url
+    }
+
+    // =========================================================================
+    // Update (WHERE/DELETE/INSERT)
+    // =========================================================================
+
+    /// Execute a JSON-LD update (WHERE/DELETE/INSERT) via the update endpoint.
+    pub async fn update_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Execute a SPARQL UPDATE via the update endpoint.
+    pub async fn update_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-update",
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher write (with optional parameters) via the update
+    /// endpoint. The body is the `{cypher, params}` envelope the server's
+    /// `application/cypher` handler accepts — the transport behind `fluree
+    /// load`'s batched `UNWIND $batch` upserts.
+    pub async fn update_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        let envelope = match params {
+            Some(p) => serde_json::json!({ "cypher": cypher, "params": p }),
+            None => serde_json::json!({ "cypher": cypher }),
+        };
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Json(&envelope)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher write via the ledger-scoped `update` endpoint, sending
+    /// `body` verbatim as the `application/cypher` payload — either raw Cypher
+    /// text or a `{cypher, params}` envelope; the server reads it as a string
+    /// and extracts the envelope itself. Unlike [`update_cypher`], the caller
+    /// need not pre-split the envelope. Returns the server's response JSON — a
+    /// commit receipt for a plain write, or a cypher-json document when the
+    /// statement carries a `RETURN`.
+    pub async fn update_cypher_body(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher read query via the ledger-scoped `query` endpoint.
+    ///
+    /// `body` is sent verbatim as the `application/cypher` payload — either raw
+    /// Cypher text or a `{cypher, params}` envelope; the server's handler reads
+    /// it as a string and extracts the envelope itself. The response is a
+    /// cypher-json document (`application/vnd.fluree.cypher+json`), which
+    /// `send_json` parses as JSON.
+    pub async fn query_cypher(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("query", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Ledger Info / Exists
+    // =========================================================================
+
+    /// Get ledger info from the remote server.
+    ///
+    /// When `graph` is `Some`, scopes the `stats` block to that named graph
+    /// (well-known name or IRI).
+    pub async fn ledger_info(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("info", ledger);
+        if let Some(g) = graph {
+            url.push_str("?graph=");
+            url.push_str(&urlencoding::encode(g));
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Get a decoded commit from the remote server.
+    ///
+    /// Calls `GET {base_url}/show/{ledger}?commit={commit_ref}`.
+    pub async fn commit_show(
+        &self,
+        ledger: &str,
+        commit_ref: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!(
+            "{}/show/{}?commit={}",
+            self.base_url,
+            encode_ledger_path(Self::ledger_tail(ledger)),
+            urlencoding::encode(commit_ref),
+        );
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Check if a ledger exists on the remote server.
+    pub async fn ledger_exists(&self, ledger: &str) -> Result<bool, RemoteLedgerError> {
+        let url = self.op_url("exists", ledger);
+
+        let resp = self
+            .build_request(reqwest::Method::GET, &url, "application/json", &None)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))?;
+            Ok(body
+                .get("exists")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false))
+        } else if resp.status() == StatusCode::NOT_FOUND {
+            Ok(false)
+        } else if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            // Retry after refresh
+            let resp2 = self
+                .build_request(reqwest::Method::GET, &url, "application/json", &None)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?;
+
+            if resp2.status().is_success() {
+                let body: serde_json::Value = resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))?;
+                Ok(body
+                    .get("exists")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))
+            } else if resp2.status() == StatusCode::NOT_FOUND {
+                Ok(false)
+            } else {
+                Err(Self::map_error(resp2).await)
+            }
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    // =========================================================================
+    // Create ledger
+    // =========================================================================
+
+    /// Create a new empty ledger on the remote server.
+    ///
+    /// Calls `POST {base_url}/create` with `{"ledger": "<alias>"}`.
+    /// Returns 201 on success, 409 if the ledger already exists.
+    pub async fn create_ledger(
+        &self,
+        ledger: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("create");
+        let body = serde_json::json!({ "ledger": ledger });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Restore a ledger on the remote from a local `.flpack` archive file.
+    ///
+    /// Streams the file to `POST {base_url}/import/<ledger>` (admin-gated), so
+    /// the server creates a NEW ledger named `ledger` from the archive without
+    /// a local staging instance. The file body is streamed, never buffered
+    /// whole, so multi-gigabyte archives upload without exhausting memory.
+    pub async fn import_ledger(
+        &self,
+        ledger: &str,
+        file_path: &std::path::Path,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("import", ledger);
+
+        let resp = self.send_flpack_file(&url, file_path).await?;
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+        // A streamed body is consumed on send, so the 401-refresh retry
+        // re-opens the file rather than replaying the request.
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self.send_flpack_file(&url, file_path).await?;
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Open `file_path` and POST it as a streaming `.flpack` body.
+    async fn send_flpack_file(
+        &self,
+        url: &str,
+        file_path: &std::path::Path,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+        self.add_auth(self.client.post(url))
+            .header("Content-Type", "application/x-fluree-pack")
+            .body(body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)
+    }
+
+    // ========================================================================
+    // Negotiated upload import (for size-capped servers)
+    // ========================================================================
+
+    /// Fetch the server's discovery document, or `None` when it cannot be
+    /// read or parsed.
+    async fn fetch_discovery(&self) -> Option<serde_json::Value> {
+        let disco_url = reqwest::Url::parse(&self.base_url)
+            .and_then(|u| u.join("/.well-known/fluree.json"))
+            .ok()?;
+        let resp = self
+            .add_auth(self.client.get(disco_url))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    }
+
+    /// Whether the server takes the commits a push's merges brought in, on
+    /// `POST /push-merges`.
+    ///
+    /// A server that does not advertise it is treated as unable to. That
+    /// includes one whose discovery document cannot be read.
+    pub async fn supports_push_merges(&self) -> bool {
+        self.fetch_discovery()
+            .await
+            .and_then(|doc| doc["push"]["merged_commits"].as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Read the server's `.flpack` import capabilities from discovery.
+    ///
+    /// Best-effort: any failure (old server, no discovery, parse error) yields
+    /// the back-compatible default — direct streaming only.
+    pub async fn fetch_import_capability(&self) -> ImportCapability {
+        let Some(doc) = self.fetch_discovery().await else {
+            return ImportCapability::direct_only();
+        };
+        let import = &doc["import"];
+        if !import.is_object() {
+            return ImportCapability::direct_only();
+        }
+        let modes = import["modes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["direct".to_string()]);
+        let direct_max_bytes = import["direct_max_bytes"].as_u64();
+        ImportCapability {
+            modes,
+            direct_max_bytes,
+        }
+    }
+
+    /// Mint an upload slot: `POST {base_url}/import-upload`.
+    ///
+    /// Returns the raw JSON response (`import_id` + `upload` descriptor).
+    pub async fn mint_import_upload(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("import-upload");
+        let mut body = serde_json::json!({ "ledger": ledger });
+        if let Some(size) = size {
+            body["size"] = serde_json::Value::from(size);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Mint a raw source-data upload slot. The server keeps the filename's
+    /// extension, applies the CSV/Cypher conversion options, and runs the
+    /// bulk-import pipeline on `complete`: creating `ledger`, or with `graph`
+    /// filling that new graph of it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mint_source_import_upload(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+        filename: &str,
+        edge_policy: fluree_db_api::csv_import::EdgePolicy,
+        base_iri: Option<&str>,
+        graph: Option<&str>,
+        skolem_namespace: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("import-upload");
+        let edge_properties = match edge_policy {
+            fluree_db_api::csv_import::EdgePolicy::Annotated => "annotated",
+            fluree_db_api::csv_import::EdgePolicy::Plain => "plain",
+            fluree_db_api::csv_import::EdgePolicy::Nary => "nary",
+        };
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "source_kind": "source",
+            "filename": filename,
+            "edge_properties": edge_properties,
+        });
+        if let Some(size) = size {
+            body["size"] = serde_json::Value::from(size);
+        }
+        if let Some(base_iri) = base_iri {
+            body["base_iri"] = serde_json::Value::from(base_iri);
+        }
+        if let Some(graph) = graph {
+            body["graph"] = serde_json::Value::from(graph);
+        }
+        if let Some(namespace) = skolem_namespace {
+            body["skolem_namespace"] = serde_json::Value::from(namespace);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// PUT a `.flpack` file to a minted upload URL.
+    ///
+    /// `url` may be absolute (a real presigned object-store URL) or relative
+    /// (the reference backend's own blob endpoint) — relative URLs resolve
+    /// against the server origin. The minted URL is the capability, so **no
+    /// bearer auth** is attached (it would break a presigned signature); only
+    /// the server-specified `headers` are sent.
+    pub async fn put_upload_file(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        file_path: &std::path::Path,
+    ) -> Result<(), RemoteLedgerError> {
+        let resolved = self.resolve_upload_url(url)?;
+
+        // Set Content-Length explicitly so the streamed body is sent
+        // length-delimited. Without it, `wrap_stream` produces an
+        // unknown-length body and reqwest falls back to
+        // `Transfer-Encoding: chunked`, which real S3 presigned PUTs reject
+        // (`NotImplemented: ... Transfer-Encoding`). This keeps the file
+        // streaming (no buffering) while satisfying S3's fixed-length
+        // requirement.
+        let len = tokio::fs::metadata(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to stat {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+
+        let mut req = self
+            .client
+            .put(&resolved)
+            .header(reqwest::header::CONTENT_LENGTH, len.len())
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Resolve a minted upload URL: absolute URLs (real presigned object-store
+    /// links) pass through; relative ones (the reference backend's own endpoint)
+    /// resolve against the server origin.
+    fn resolve_upload_url(&self, url: &str) -> Result<String, RemoteLedgerError> {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            Ok(url.to_string())
+        } else {
+            reqwest::Url::parse(&self.base_url)
+                .and_then(|u| u.join(url))
+                .map_err(|e| {
+                    RemoteLedgerError::InvalidResponse(format!("invalid upload url '{url}': {e}"))
+                })
+                .map(|u| u.to_string())
+        }
+    }
+
+    /// Upload `file_path` to a minted multipart plan, one PUT per part, with
+    /// bounded concurrency. Each part's byte range is `[(n-1)*part_size, …)`,
+    /// the last part being the remainder. Returns the `(part_number, etag)`
+    /// list the caller reports on `complete`.
+    ///
+    /// Like [`Self::put_upload_file`], each part PUT sets `Content-Length`
+    /// (length-delimited, no chunked encoding) and carries **no bearer auth** —
+    /// the minted URL is the capability. The body is a streamed file slice, so
+    /// no part is ever buffered whole in memory.
+    pub async fn put_upload_parts(
+        &self,
+        parts: &[MintedPart],
+        part_size: u64,
+        file_path: &std::path::Path,
+    ) -> Result<Vec<CompletedPart>, RemoteLedgerError> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        let total = tokio::fs::metadata(file_path)
+            .await
+            .map_err(|e| {
+                RemoteLedgerError::InvalidRequest(format!(
+                    "failed to stat {}: {e}",
+                    file_path.display()
+                ))
+            })?
+            .len();
+
+        // Up to 4 parts in flight — the point of multipart is throughput on a
+        // large transfer, but unbounded concurrency would open one socket and
+        // file handle per part.
+        const MAX_INFLIGHT: usize = 4;
+
+        let completed: Vec<CompletedPart> = futures::stream::iter(parts.iter().map(|part| {
+            let offset = u64::from(part.part_number - 1) * part_size;
+            let len = part_size.min(total.saturating_sub(offset));
+            async move {
+                let etag = self
+                    .put_one_part(&part.url, &part.headers, file_path, offset, len)
+                    .await?;
+                Ok::<CompletedPart, RemoteLedgerError>(CompletedPart {
+                    part_number: part.part_number,
+                    etag,
+                })
+            }
+        }))
+        .buffer_unordered(MAX_INFLIGHT)
+        .try_collect()
+        .await?;
+
+        Ok(completed)
+    }
+
+    /// PUT a single byte range `[offset, offset+len)` of `file_path` to a part
+    /// URL; returns the part's ETag from the response (quotes stripped).
+    async fn put_one_part(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        file_path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<String, RemoteLedgerError> {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+        let resolved = self.resolve_upload_url(url)?;
+
+        let mut file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| {
+                RemoteLedgerError::InvalidRequest(format!(
+                    "failed to seek {} to {offset}: {e}",
+                    file_path.display()
+                ))
+            })?;
+        // `take(len)` bounds the streamed body to exactly this part's bytes.
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file.take(len)));
+
+        let mut req = self
+            .client
+            .put(&resolved)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+        // S3 returns the part ETag in the `ETag` header (quoted). Fall back to
+        // an empty string for backends that omit it — the server tolerates that.
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+        Ok(etag)
+    }
+
+    /// Notify the server that the upload is complete and the restore may begin:
+    /// `POST {base_url}/import-upload/{import_id}/complete`.
+    ///
+    /// For a multipart upload, pass the `(part_number, etag)` list from
+    /// [`Self::put_upload_parts`]; for a single-PUT upload pass an empty slice.
+    pub async fn complete_import_upload(
+        &self,
+        import_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}/complete", self.base_url, import_id);
+        if parts.is_empty() {
+            return self
+                .send_json(reqwest::Method::POST, &url, "application/json", None)
+                .await;
+        }
+        let body = serde_json::json!({
+            "parts": parts
+                .iter()
+                .map(|p| serde_json::json!({ "part_number": p.part_number, "etag": p.etag }))
+                .collect::<Vec<_>>(),
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Poll import status: `GET {base_url}/import-upload/{import_id}`.
+    pub async fn import_upload_status(
+        &self,
+        import_id: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}", self.base_url, import_id);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Drop a ledger or graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/drop` with `{"ledger": "<name>", "hard": true|false}`.
+    /// The server resolves the name as a ledger first, then as a graph source.
+    pub async fn drop_resource(
+        &self,
+        name: &str,
+        hard: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("drop");
+        let body = serde_json::json!({
+            "ledger": name,
+            "hard": hard,
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // RDF export
+    // =========================================================================
+
+    /// Fetch an RDF export of a ledger from the remote.
+    ///
+    /// Calls `POST {base_url}/export/<ledger>` with the JSON body documented
+    /// in the `/export` Contract. Returns the raw response bytes (the
+    /// requested RDF format) — the caller is responsible for writing them
+    /// to the desired sink.
+    pub async fn export_rdf(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<bytes::Bytes, RemoteLedgerError> {
+        let url = self.op_url("export", ledger);
+        let req_body = Some(RequestBody::Json(body));
+
+        let resp = self
+            .build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            self.build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?
+        } else {
+            resp
+        };
+
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+
+        resp.bytes()
+            .await
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("read body: {e}")))
+    }
+
+    // =========================================================================
+    // Default context
+    // =========================================================================
+
+    /// Fetch the default JSON-LD context for a ledger.
+    ///
+    /// Calls `GET {base_url}/context/<ledger>`. Server returns
+    /// `{ "@context": <object|null> }`. Returns the unwrapped context value
+    /// (object or `Null`).
+    pub async fn get_context(&self, ledger: &str) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        let resp = self
+            .send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await?;
+        Ok(resp
+            .get("@context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Replace the default JSON-LD context for a ledger.
+    ///
+    /// Calls `PUT {base_url}/context/<ledger>` with `context` as the body.
+    /// `context` should be the bare prefix→IRI object; the server also
+    /// accepts a `{ "@context": {...} }` wrapper.
+    pub async fn set_context(
+        &self,
+        ledger: &str,
+        context: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        self.send_json(
+            reqwest::Method::PUT,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(context)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Commit log
+    // =========================================================================
+
+    /// Fetch lightweight commit summaries from the remote.
+    ///
+    /// Calls `GET {base_url}/log/<ledger>?limit=<N>`. The server returns
+    /// summaries newest-first by `t`, capped at the server's hard maximum.
+    pub async fn commit_log(
+        &self,
+        ledger: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("log", ledger);
+        if let Some(n) = limit {
+            url.push_str(&format!("?limit={n}"));
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    // =========================================================================
+    // Reindex
+    // =========================================================================
+
+    /// Trigger a full reindex on the remote server.
+    ///
+    /// Calls `POST {base_url}/reindex` with `{"ledger": "<alias>"}`. The server
+    /// rebuilds the ledger's index from commit history using whatever indexer
+    /// settings it is configured with. Uses `REINDEX_TIMEOUT` (1 hour) because
+    /// full rebuilds can legitimately exceed the default client timeout on
+    /// large ledgers.
+    ///
+    /// An `opts` field is reserved in the request contract for future
+    /// per-request overrides but is currently ignored by the server.
+    pub async fn reindex(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::ReindexResponse, RemoteLedgerError> {
+        let url = self.op_url_root("reindex");
+        self.post_ledger_op(&url, ledger, "reindex").await
+    }
+
+    /// Report which index artifacts a sweep would reclaim, without deleting.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: planning walks every branch's index chain and
+    /// expands each root, so it scales with index size the same way a rebuild
+    /// does.
+    pub async fn sweep_plan(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepPlanResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep/plan");
+        self.post_ledger_op(&url, ledger, "sweep plan").await
+    }
+
+    /// Reclaim index artifacts that no index chain references.
+    pub async fn sweep(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep");
+        self.post_ledger_op(&url, ledger, "sweep").await
+    }
+
+    /// POST a `{"ledger": ...}` body to an admin operation and decode the
+    /// response.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: each of these walks or rebuilds the index,
+    /// so they scale with index size rather than request size.
+    async fn post_ledger_op<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        ledger: &str,
+        operation: &str,
+    ) -> Result<T, RemoteLedgerError> {
+        let body = serde_json::json!({ "ledger": ledger });
+        let raw = self
+            .send_json_with_timeout(
+                reqwest::Method::POST,
+                url,
+                "application/json",
+                Some(RequestBody::Json(&body)),
+                Self::REINDEX_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("{operation} response: {e}")))
+    }
+
+    // =========================================================================
+    // Encryption key rotation
+    // =========================================================================
+
+    /// Key ids the server holds: `GET {base_url}/encryption`.
+    pub async fn encryption_keys(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// The rotation progress record: `GET {base_url}/encryption/rotate/status`.
+    pub async fn encryption_rotate_status(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/status");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Start or resume a rotation: `POST {base_url}/encryption/rotate`.
+    pub async fn encryption_rotate(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Pause or cancel the sweep on the node that holds it:
+    /// `POST {base_url}/encryption/rotate/{signal}`.
+    pub async fn encryption_rotate_signal(
+        &self,
+        signal: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("encryption/rotate/{signal}"));
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Verify a rotation: `POST {base_url}/encryption/rotate/verify`. Shares
+    /// `REINDEX_TIMEOUT`: it reads every blob's header in the store.
+    pub async fn encryption_rotate_verify(
+        &self,
+        retire_key_id: u32,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/verify");
+        let body = serde_json::json!({ "retire_key_id": retire_key_id });
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
+    }
+
+    // =========================================================================
+    // List ledgers
+    // =========================================================================
+
+    /// List all ledgers on the remote server.
+    ///
+    /// Calls `GET {base_url}/ledgers`. The response is expected to be a JSON
+    /// array of objects with at minimum a `name` field.
+    pub async fn list_ledgers(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/ledgers", self.base_url);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    // =========================================================================
+    // Branch management
+    // =========================================================================
+
+    /// Create a new branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/branch` with a JSON body. `at` optionally
+    /// specifies the point on the source to branch from, passed through
+    /// unparsed: the server reads it with `TimeSpec::parse_at`, as the local
+    /// path does (e.g. `"t:5"`, `"time:2026-01-01T00:00:00Z"`, a hex digest).
+    pub async fn create_branch(
+        &self,
+        ledger: &str,
+        branch: &str,
+        source: Option<&str>,
+        at: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("branch");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        if let Some(s) = source {
+            body["source"] = serde_json::Value::String(s.to_string());
+        }
+        if let Some(a) = at {
+            body["at"] = serde_json::Value::String(a.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Drop a branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/drop-branch` with a JSON body.
+    pub async fn drop_branch(
+        &self,
+        ledger: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("drop-branch");
+        let body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Drop a named graph from a branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/drop-graph` with a JSON body. `ledger` is a
+    /// full ledger identifier (e.g. `"mydb:main"`); `graph` is the full
+    /// IRI of the named graph to drop.
+    pub async fn drop_named_graph(
+        &self,
+        ledger: &str,
+        graph: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("drop-graph");
+        let body = serde_json::json!({
+            "ledger": ledger,
+            "graph": graph,
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Rebase a branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/rebase` with a JSON body.
+    pub async fn rebase_branch(
+        &self,
+        ledger: &str,
+        branch: &str,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("rebase");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        if let Some(s) = strategy {
+            body["strategy"] = serde_json::Value::String(s.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Merge a branch into its target on the remote server.
+    ///
+    /// Calls `POST {base_url}/merge`.
+    pub async fn merge_branch(
+        &self,
+        ledger: &str,
+        source: &str,
+        target: Option<&str>,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("merge");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "source": source,
+        });
+        if let Some(t) = target {
+            body["target"] = serde_json::Value::String(t.to_string());
+        }
+        if let Some(s) = strategy {
+            body["strategy"] = serde_json::Value::String(s.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Revert one or more commits on `branch` of `ledger`.
+    ///
+    /// Calls `POST {base_url}/revert`. The body is a [`RevertPayload`]
+    /// describing exactly one of: a single commit, a list of commits, or a
+    /// git-style range. Each commit reference is a string parsed by
+    /// [`fluree_db_api::CommitRef::parse`] on the server.
+    pub async fn revert(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &RevertPayload,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("revert");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        match payload {
+            RevertPayload::Single(c) => {
+                body["commit"] = serde_json::Value::String(c.clone());
+            }
+            RevertPayload::Set(items) => {
+                body["commits"] = serde_json::Value::Array(
+                    items
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
+            }
+            RevertPayload::Range { from, to } => {
+                body["range"] = serde_json::json!({ "from": from, "to": to });
+            }
+        }
+        if let Some(s) = strategy {
+            body["strategy"] = serde_json::Value::String(s.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Read-only preview of a revert.
+    ///
+    /// Calls `GET {base_url}/revert-preview/{ledger}?branch=&commit=...`. The
+    /// shape of the query string depends on `payload`:
+    /// - `Single` ⇒ `&commit=<ref>`
+    /// - `Set`    ⇒ `&commits=<ref1>,<ref2>,...` (comma-separated)
+    /// - `Range`  ⇒ `&from=<ref>&to=<ref>`
+    pub async fn revert_preview(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &RevertPayload,
+        strategy: Option<&str>,
+        include_validation: Option<bool>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("revert-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "branch",
+            urlencoding::encode(branch).into_owned(),
+        );
+        match payload {
+            RevertPayload::Single(c) => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commit",
+                    urlencoding::encode(c).into_owned(),
+                );
+            }
+            RevertPayload::Set(items) => {
+                let csv = items.join(",");
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commits",
+                    urlencoding::encode(&csv).into_owned(),
+                );
+            }
+            RevertPayload::Range { from, to } => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "from",
+                    urlencoding::encode(from).into_owned(),
+                );
+                push(
+                    &mut url,
+                    &mut sep,
+                    "to",
+                    urlencoding::encode(to).into_owned(),
+                );
+            }
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
+        }
+
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// List all branches for a ledger on the remote server.
+    ///
+    /// Calls `GET {base_url}/branch/{ledger}`.
+    pub async fn list_branches(
+        &self,
+        ledger: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/branch/{}", self.base_url, ledger);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Read-only merge preview between two branches on the remote server.
+    ///
+    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=&include_changes=&max_changes=&changes_after_subject=`.
+    /// The ledger path segment is URL-encoded (via [`op_url`](Self::op_url))
+    /// so names containing spaces, `?`, `#`, `%`, etc. produce well-formed URLs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_preview(
+        &self,
+        ledger: &str,
+        source: &str,
+        target: Option<&str>,
+        max_commits: Option<usize>,
+        max_conflict_keys: Option<usize>,
+        include_conflicts: Option<bool>,
+        include_conflict_details: Option<bool>,
+        strategy: Option<&str>,
+        include_changes: Option<bool>,
+        max_changes: Option<usize>,
+        changes_after_subject: Option<&str>,
+        include_validation: Option<bool>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("merge-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "source",
+            urlencoding::encode(source).into_owned(),
+        );
+        if let Some(t) = target {
+            push(
+                &mut url,
+                &mut sep,
+                "target",
+                urlencoding::encode(t).into_owned(),
+            );
+        }
+        if let Some(n) = max_commits {
+            push(&mut url, &mut sep, "max_commits", n.to_string());
+        }
+        if let Some(n) = max_conflict_keys {
+            push(&mut url, &mut sep, "max_conflict_keys", n.to_string());
+        }
+        if let Some(b) = include_conflicts {
+            push(&mut url, &mut sep, "include_conflicts", b.to_string());
+        }
+        if let Some(b) = include_conflict_details {
+            push(
+                &mut url,
+                &mut sep,
+                "include_conflict_details",
+                b.to_string(),
+            );
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+        if let Some(b) = include_changes {
+            push(&mut url, &mut sep, "include_changes", b.to_string());
+        }
+        if let Some(n) = max_changes {
+            push(&mut url, &mut sep, "max_changes", n.to_string());
+        }
+        if let Some(c) = changes_after_subject {
+            push(
+                &mut url,
+                &mut sep,
+                "changes_after_subject",
+                urlencoding::encode(c).into_owned(),
+            );
+        }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
+        }
+
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    // =========================================================================
+    // Push commits
+    // =========================================================================
+
+    /// Push precomputed commit blobs to the remote server.
+    pub async fn push_commits(
+        &self,
+        ledger: &str,
+        request: &fluree_db_api::PushCommitsRequest,
+    ) -> Result<PushCommitsResponse, RemoteLedgerError> {
+        // Merged commits go only to `push-merges`. A server predating that
+        // endpoint answers 404 there, where `push` would drop them.
+        let op = if request.merged_commits.is_empty() {
+            "push"
+        } else {
+            "push-merges"
+        };
+        let url = self.op_url(op, ledger);
+        let body = serde_json::to_value(request)
+            .map_err(|e| RemoteLedgerError::InvalidRequest(e.to_string()))?;
+
+        // Deterministic across retries: allows servers to implement idempotent push replay.
+        let idempotency_key = push_idempotency_key(ledger, request);
+        let resp = self
+            .send_json_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                &[("Idempotency-Key", idempotency_key)],
+                Some(RequestBody::Json(&body)),
+            )
+            .await?;
+
+        serde_json::from_value(resp).map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+    }
+
+    // =========================================================================
+    // Pack / Sync
+    // =========================================================================
+
+    /// Attempt to fetch a pack stream from the remote.
+    ///
+    /// Returns `Ok(Some(response))` on 200 (caller feeds to `ingest_pack_stream`),
+    /// `Ok(None)` on 404/405/406 (pack not supported by server).
+    pub async fn fetch_pack_response(
+        &self,
+        ledger: &str,
+        request: &PackRequest,
+    ) -> Result<Option<reqwest::Response>, RemoteLedgerError> {
+        let url = self.op_url("pack", ledger);
+        let body = serde_json::to_value(request)
+            .map_err(|e| RemoteLedgerError::InvalidRequest(e.to_string()))?;
+
+        let resp = self
+            .send_raw(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some("application/x-fluree-pack"),
+                Some(RequestBody::Json(&body)),
+            )
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(Some(resp))
+        } else if status == StatusCode::NOT_FOUND
+            || status == StatusCode::METHOD_NOT_ALLOWED
+            || status == StatusCode::NOT_ACCEPTABLE
+            || status == StatusCode::NOT_IMPLEMENTED
+        {
+            Ok(None)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a `.flpack` archive of a remote ledger to `writer`.
+    ///
+    /// Builds a `PackRequest` for the ledger's current head and POSTs to
+    /// `/pack/{ledger}`. As frames arrive, they are written through to
+    /// `writer` unchanged **except** for the terminating End frame: we
+    /// swap that for a synthesized `phase: "nameservice"` manifest frame
+    /// (constructed from the supplied `ns_record`) followed by End. The
+    /// resulting byte stream is byte-compatible with `Fluree::archive_ledger`
+    /// and importable via `fluree create --from <file>.flpack`.
+    ///
+    /// Surfaces a server `Error` frame as a `RemoteLedgerError` and stops
+    /// without writing the End — callers should clean up partial output.
+    /// Returns the count of pack frames forwarded (header / data / inner
+    /// manifest), excluding the synthesized nameservice manifest and End.
+    pub async fn archive_ledger_to_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        ledger: &str,
+        request: &PackRequest,
+        ns_record: &NsRecord,
+        writer: &mut W,
+    ) -> Result<usize, RemoteLedgerError> {
+        use futures::StreamExt as _;
+
+        let resp = self.fetch_pack_response(ledger, request).await?;
+        let resp = resp.ok_or_else(|| {
+            RemoteLedgerError::ServerError(format!(
+                "remote does not support /pack for '{ledger}' (404/405/406/501)"
+            ))
+        })?;
+
+        let manifest = build_archive_manifest(ns_record, request.want_index_root_id.is_some());
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
+        splice_archive_stream(stream, writer, &manifest).await
+    }
+
+    /// Fetch the NsRecord via the storage proxy.
+    ///
+    /// Returns `Ok(Some(record))` on 200, `Ok(None)` on 404.
+    pub async fn fetch_ns_record(
+        &self,
+        ledger: &str,
+    ) -> Result<Option<NsRecord>, RemoteLedgerError> {
+        let url = format!(
+            "{}/storage/ns/{}",
+            self.base_url,
+            encode_ledger_segment(ledger)
+        );
+
+        let resp = self
+            .send_raw(reqwest::Method::GET, &url, "application/json", None, None)
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            let record: NsRecord = resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))?;
+            Ok(Some(record))
+        } else if status == StatusCode::NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    // =========================================================================
+    // Fetch commits (export)
+    // =========================================================================
+
+    /// Fetch paginated commits from the remote server.
+    ///
+    /// Uses address-cursor pagination. Pass `cursor: None` for the first page
+    /// (starts from head). Each response includes `next_cursor` for the next page,
+    /// or `None` when genesis has been reached.
+    ///
+    /// Requests `lineage` mode: the first-parent line as `commits`, and the
+    /// commits its merges brought in as `merged_commits`. The export stops
+    /// above `base`, or runs to genesis when it is `None`. A server predating
+    /// that mode ignores the request and answers with `lineage` unset.
+    pub async fn fetch_commits(
+        &self,
+        ledger: &str,
+        cursor: Option<&str>,
+        base: Option<&fluree_db_core::ContentId>,
+        limit: usize,
+    ) -> Result<ExportCommitsResponse, RemoteLedgerError> {
+        let mut url = self.op_url("commits", ledger);
+        url.push_str(&format!("?limit={limit}&lineage=true"));
+        if let Some(c) = cursor {
+            url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+        }
+        if let Some(base) = base {
+            url.push_str(&format!(
+                "&base_id={}",
+                urlencoding::encode(&base.to_string())
+            ));
+        }
+
+        let resp = self
+            .send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await?;
+
+        serde_json::from_value(resp).map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+    }
+}
+
+/// Request body variants for the generic send method.
+enum RequestBody<'a> {
+    Json(&'a serde_json::Value),
+    Text(&'a str),
+}
+
+/// Build the `phase: "nameservice"` manifest emitted at the end of a
+/// `.flpack` archive. Mirrors `Fluree::archive_ledger`'s synthesis: index
+/// fields ride along only when index artifacts are actually archived.
+pub(crate) fn build_archive_manifest(
+    ns_record: &NsRecord,
+    archived_index: bool,
+) -> serde_json::Value {
+    let mut manifest = serde_json::json!({
+        "phase": "nameservice",
+        "ledger_id": ns_record.ledger_id,
+        "name": ns_record.name,
+        "branch": ns_record.branch,
+        "commit_t": ns_record.commit_t,
+    });
+    if let Some(cid) = ns_record.commit_head_id.as_ref() {
+        manifest["commit_head_id"] = serde_json::Value::String(cid.to_string());
+    }
+    if archived_index {
+        if let Some(cid) = ns_record.index_head_id.as_ref() {
+            manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
+            manifest["index_t"] = serde_json::Value::from(ns_record.index_t);
+        }
+    }
+    manifest
+}
+
+/// Drive a pack-stream copy from `stream` to `writer`, swapping the
+/// terminal End frame for `manifest_frame` + End. Splitting this out from
+/// `archive_ledger_to_writer` lets us test the frame-walking logic without
+/// a real HTTP server: feed in pre-encoded chunks and compare the writer's
+/// captured bytes byte-for-byte.
+///
+/// The `stream` yields chunked archive bytes; chunk boundaries are
+/// arbitrary (frames may straddle them). Returns the count of pack frames
+/// forwarded, excluding the synthesized manifest and End.
+pub(crate) async fn splice_archive_stream<S, W>(
+    stream: S,
+    writer: &mut W,
+    manifest_frame: &serde_json::Value,
+) -> Result<usize, RemoteLedgerError>
+where
+    S: futures::Stream<Item = std::result::Result<Vec<u8>, String>> + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    use futures::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = stream;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut preamble_consumed = false;
+    let mut frames_forwarded: usize = 0;
+    let mut end_seen = false;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| RemoteLedgerError::Network(format!("pack stream: {e}")))?;
+        buf.extend_from_slice(&bytes);
+
+        // Drain any complete preamble + frames out of the buffer.
+        // Distinguish `PackError::Incomplete` (need more bytes — not a
+        // protocol error) from every other variant. Without that split,
+        // a corrupt magic / oversize payload / invalid frame type would
+        // be swallowed as "need more" and the loop would buffer until
+        // EOF, defeating the decoder's max-payload guard and surfacing
+        // a misleading "ended before End frame" error.
+        loop {
+            if !preamble_consumed {
+                match read_stream_preamble(&buf) {
+                    Ok(consumed) => {
+                        writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                            RemoteLedgerError::Network(format!("archive write: {e}"))
+                        })?;
+                        buf.drain(..consumed);
+                        preamble_consumed = true;
+                    }
+                    Err(PackError::Incomplete(_)) => break,
+                    Err(e) => {
+                        return Err(RemoteLedgerError::InvalidResponse(format!(
+                            "invalid pack stream preamble: {e}"
+                        )));
+                    }
+                }
+            }
+
+            if end_seen {
+                break;
+            }
+
+            match decode_frame(&buf, DEFAULT_MAX_PAYLOAD) {
+                Ok((frame, consumed)) => match frame {
+                    PackFrame::End => {
+                        buf.drain(..consumed);
+                        end_seen = true;
+                    }
+                    PackFrame::Error(msg) => {
+                        return Err(RemoteLedgerError::ServerError(format!(
+                            "remote pack error: {msg}"
+                        )));
+                    }
+                    PackFrame::Header(_) | PackFrame::Data { .. } | PackFrame::Manifest(_) => {
+                        writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                            RemoteLedgerError::Network(format!("archive write: {e}"))
+                        })?;
+                        buf.drain(..consumed);
+                        frames_forwarded += 1;
+                    }
+                },
+                Err(PackError::Incomplete(_)) => break,
+                Err(e) => {
+                    return Err(RemoteLedgerError::InvalidResponse(format!(
+                        "invalid pack frame: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if !end_seen {
+        return Err(RemoteLedgerError::InvalidResponse(
+            "pack stream ended before End frame".to_string(),
+        ));
+    }
+
+    let mut tail = Vec::with_capacity(512);
+    encode_manifest_frame(manifest_frame, &mut tail)
+        .map_err(|e| RemoteLedgerError::InvalidRequest(format!("archive manifest: {e}")))?;
+    encode_end_frame(&mut tail);
+    writer
+        .write_all(&tail)
+        .await
+        .map_err(|e| RemoteLedgerError::Network(format!("archive write: {e}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| RemoteLedgerError::Network(format!("archive flush: {e}")))?;
+
+    Ok(frames_forwarded)
+}
+
+fn extract_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Prefer the structured server error envelope when present:
+    // {"error":"...","status":409,"@type":"err:...","cause":{...}}
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+                return msg.to_string();
+            }
+            if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                return err.to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+impl RemoteLedgerClient {
+    // =========================================================================
+    // Iceberg graph source operations
+    // =========================================================================
+
+    /// Map a SQL endpoint as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/sql/map`.
+    pub async fn sql_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("sql/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Map Delta tables as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/delta/map`.
+    pub async fn delta_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("delta/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// One of the read-only Delta endpoints: `catalog/browse`, `r2rml/generate`, ….
+    ///
+    /// Calls `POST {base_url}/delta/{route}`.
+    pub async fn delta_read(
+        &self,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("delta/{route}"));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Map an Iceberg table as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/iceberg/map`.
+    pub async fn iceberg_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("iceberg/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // BM25 graph source operations
+    // =========================================================================
+
+    /// Create a BM25 full-text index on the remote server.
+    ///
+    /// Calls `POST {base_url}/bm25/create`.
+    pub async fn bm25_create(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("bm25/create");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Sync a BM25 full-text index on the remote server.
+    ///
+    /// Calls `POST {base_url}/bm25/sync`, or `…/bm25/sync?t=<t>` to sync
+    /// through a specific source-ledger `t` rather than its head.
+    pub async fn bm25_sync(
+        &self,
+        index: &str,
+        target_t: Option<i64>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url_root("bm25/sync");
+        if let Some(t) = target_t {
+            url.push_str(&format!("?t={t}"));
+        }
+        let body = serde_json::json!({ "index": index });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+}
+
+fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluree-push-v1\0");
+    hasher.update(ledger.as_bytes());
+    hasher.update([0u8]);
+
+    for commit in &request.commits {
+        hasher.update((commit.0.len() as u64).to_be_bytes());
+        hasher.update(&commit.0);
+    }
+
+    let mut blobs: Vec<(&String, &fluree_db_api::Base64Bytes)> = request.blobs.iter().collect();
+    blobs.sort_by_key(|(a, _)| *a);
+    for (k, v) in blobs {
+        hasher.update(k.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((v.0.len() as u64).to_be_bytes());
+        hasher.update(&v.0);
+    }
+
+    // Hashed only when present, so a push without merges keeps the key it
+    // had before this field existed.
+    if !request.merged_commits.is_empty() {
+        hasher.update(b"merged\0");
+        for commit in &request.merged_commits {
+            hasher.update((commit.0.len() as u64).to_be_bytes());
+            hasher.update(&commit.0);
+        }
+    }
+
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_debug_hides_token() {
+        let client = RemoteLedgerClient::new("http://localhost:8090", Some("secret".to_string()));
+        let debug = format!("{client:?}");
+        assert!(debug.contains("RemoteLedgerClient"));
+        assert!(debug.contains("localhost:8090"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn test_client_strips_trailing_slash() {
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree/", None);
+        assert_eq!(client.base_url, "http://localhost:8090/fluree");
+    }
+
+    fn default_allow_header(policy: &PolicyArgs) -> Option<String> {
+        policy_headers(policy)
+            .into_iter()
+            .find(|(name, _)| *name == "fluree-default-allow")
+            .map(|(_, value)| value)
+    }
+
+    /// The producer/consumer seam: `--no-default-allow` is only meaningful
+    /// remotely if the header actually travels. Sending it solely for `true`
+    /// would silently drop the fail-closed posture over HTTP while it kept
+    /// working embedded.
+    #[test]
+    fn default_allow_header_travels_in_both_directions() {
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                default_allow: true,
+                ..Default::default()
+            }),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            }),
+            Some("false".to_string())
+        );
+        // Unset sends no header, leaving the ledger's f:defaultAllow in force.
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    /// Same tri-state on the JSON-LD body-opts path.
+    #[test]
+    fn default_allow_body_opts_travel_in_both_directions() {
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["opts"]["default-allow"],
+            serde_json::Value::Bool(false)
+        );
+
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            },
+        );
+        assert!(body["opts"].get("default-allow").is_none());
+    }
+
+    /// `put_upload_file` must send a fixed `Content-Length` and NOT
+    /// `Transfer-Encoding: chunked` — real S3 presigned PUTs reject chunked
+    /// encoding (`NotImplemented: ... Transfer-Encoding`). The reference dev
+    /// backend tolerates chunked, so this asserts the wire shape directly
+    /// against a raw socket that records the request headers.
+    #[tokio::test]
+    async fn put_upload_file_sends_content_length_not_chunked() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            // Read until the end of the header block.
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+
+            // Drain the body so the client's write completes cleanly.
+            let content_length: usize = header_text
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let path = std::env::temp_dir().join(format!("flpack-put-test-{}.bin", std::process::id()));
+        let payload = b"hello flpack archive bytes";
+        std::fs::write(&path, payload).unwrap();
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let result = client
+            .put_upload_file(
+                &format!("http://{addr}/upload"),
+                &std::collections::HashMap::new(),
+                &path,
+            )
+            .await;
+        let _ = std::fs::remove_file(&path);
+        result.expect("put_upload_file should succeed");
+
+        let headers = server.await.unwrap();
+        assert!(
+            headers.contains(&format!("content-length: {}", payload.len())),
+            "PUT must send a fixed Content-Length; headers were:\n{headers}"
+        );
+        assert!(
+            !headers.contains("transfer-encoding: chunked"),
+            "PUT must not use chunked encoding (S3 presigned PUT rejects it); headers were:\n{headers}"
+        );
+    }
+
+    /// `stream_query_sparql` must POST to `/v1/fluree/stream/query/<ledger>`
+    /// and return the streaming response so the NDJSON consumer can drive it
+    /// to completion (head → rows → end).
+    #[tokio::test]
+    async fn stream_query_sparql_posts_to_stream_endpoint_and_streams_rows() {
+        use crate::commands::query_stream::{drive_response, NdjsonConsumer};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            // Drain the request body so the client's write completes.
+            let content_length: usize = header_text
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let body = "{\"type\":\"head\",\"vars\":[\"name\"]}\n\
+                 {\"type\":\"row\",\"row\":{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}}\n\
+                 {\"type\":\"end\",\"rows\":1}\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let response = client
+            .stream_query_sparql("mydb:main", "SELECT ?name WHERE { ?s ?p ?name }", &[])
+            .await
+            .expect("stream request should succeed");
+
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = {
+            let mut consumer = NdjsonConsumer::new(&mut out, false);
+            drive_response(response, &mut consumer).await.unwrap();
+            consumer.finish().unwrap()
+        };
+        assert_eq!(outcome.rows, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}\n"
+        );
+
+        let request_headers = server.await.unwrap();
+        let first_line = request_headers.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("POST /v1/fluree/stream/query/"),
+            "expected POST to the stream endpoint, got: {first_line}"
+        );
+    }
+
+    /// `put_upload_parts` must split the file into the server-specified part
+    /// size, PUT each byte range to its own URL with a fixed `Content-Length`
+    /// (never chunked), and return the per-part ETags from the responses.
+    #[tokio::test]
+    async fn put_upload_parts_splits_byte_ranges_and_captures_etags() {
+        use std::collections::HashMap;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 25-byte file, 10-byte parts → parts of 10, 10, 5.
+        let payload: Vec<u8> = (0u8..25).collect();
+        let part_size = 10u64;
+        let num_parts = 3u32;
+
+        // Handle exactly `num_parts` PUTs; record (part_number, body, chunked?).
+        let server = tokio::spawn(async move {
+            let mut recorded: Vec<(u32, Vec<u8>, bool)> = Vec::new();
+            for _ in 0..num_parts {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let lower = header_text.to_lowercase();
+                let chunked = lower.contains("transfer-encoding: chunked");
+                // `PUT /part/2 HTTP/1.1`
+                let part_number: u32 = header_text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split('/').nth(2))
+                    .and_then(|seg| seg.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap();
+                let content_length: usize = lower
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = buf[header_end..header_end + content_length].to_vec();
+                recorded.push((part_number, body, chunked));
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"etag-{part_number}\"\r\nContent-Length: 0\r\n\r\n"
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            recorded
+        });
+
+        let path =
+            std::env::temp_dir().join(format!("flpack-parts-test-{}.bin", std::process::id()));
+        std::fs::write(&path, &payload).unwrap();
+
+        let parts: Vec<MintedPart> = (1..=num_parts)
+            .map(|n| MintedPart {
+                part_number: n,
+                url: format!("http://{addr}/part/{n}"),
+                headers: HashMap::new(),
+            })
+            .collect();
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let mut completed = client
+            .put_upload_parts(&parts, part_size, &path)
+            .await
+            .expect("put_upload_parts should succeed");
+        let _ = std::fs::remove_file(&path);
+
+        completed.sort_by_key(|p| p.part_number);
+        assert_eq!(completed.len(), 3);
+        assert_eq!(completed[0].etag, "etag-1");
+        assert_eq!(completed[2].etag, "etag-3");
+
+        let mut recorded = server.await.unwrap();
+        recorded.sort_by_key(|(n, _, _)| *n);
+        // Reassembling the recorded part bodies in order yields the original.
+        let reassembled: Vec<u8> = recorded.iter().flat_map(|(_, b, _)| b.clone()).collect();
+        assert_eq!(reassembled, payload, "parts must cover the file exactly");
+        // Part sizes: 10, 10, 5 — and none chunked.
+        assert_eq!(recorded[0].1.len(), 10);
+        assert_eq!(recorded[1].1.len(), 10);
+        assert_eq!(recorded[2].1.len(), 5);
+        assert!(
+            recorded.iter().all(|(_, _, chunked)| !chunked),
+            "no part may use chunked encoding (S3 presigned PUT rejects it)"
+        );
+    }
+
+    /// Serve one HTTP request with a 200 JSON `body`. Returns the base URL
+    /// and a handle yielding the request line the client sent.
+    async fn serve_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if n == 0 {
+                    break buf.len();
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length: usize = headers
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            headers.lines().next().unwrap_or_default().to_string()
+        });
+        (format!("http://{addr}/v1/fluree"), server)
+    }
+
+    const PUSH_RESPONSE: &str = r#"{"ledger":"mydb:main","accepted":1,
+        "head":{"t":2,"commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"},
+        "indexing":{"enabled":false,"needed":false,"novelty_size":0,"index_t":0,"commit_t":2}}"#;
+
+    /// Merged commits go only to `push-merges`. A push without them keeps
+    /// using `push`, which every server accepts.
+    #[tokio::test]
+    async fn push_commits_picks_the_endpoint_by_content() {
+        for (merged_commits, expected) in [
+            (Vec::new(), "POST /v1/fluree/push/mydb:main "),
+            (
+                vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+                "POST /v1/fluree/push-merges/mydb:main ",
+            ),
+        ] {
+            let (base_url, server) = serve_once(PUSH_RESPONSE).await;
+            let request = fluree_db_api::PushCommitsRequest {
+                commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+                merged_commits,
+                ..Default::default()
+            };
+            RemoteLedgerClient::new(&base_url, None)
+                .push_commits("mydb:main", &request)
+                .await
+                .expect("push should succeed");
+            let request_line = server.await.unwrap();
+            assert!(
+                request_line.starts_with(expected),
+                "expected {expected:?}, got {request_line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_push_merges_reads_discovery() {
+        for (doc, expected) in [
+            (r#"{"version":1,"push":{"merged_commits":true}}"#, true),
+            (r#"{"version":1}"#, false),
+        ] {
+            let (base_url, server) = serve_once(doc).await;
+            assert_eq!(
+                RemoteLedgerClient::new(&base_url, None)
+                    .supports_push_merges()
+                    .await,
+                expected,
+                "discovery document: {doc}"
+            );
+            assert!(server
+                .await
+                .unwrap()
+                .starts_with("GET /.well-known/fluree.json "));
+        }
+    }
+
+    /// Pull asks for the first-parent line, stopping above the local head.
+    #[tokio::test]
+    async fn fetch_commits_requests_the_line_above_the_base() {
+        let page = r#"{"ledger":"mydb:main",
+            "head_commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "head_t":2,"commits":[],"newest_t":0,"oldest_t":0,"next_cursor_id":null,
+            "count":0,"effective_limit":100,"lineage":true}"#;
+        let (base_url, server) = serve_once(page).await;
+        let base: fluree_db_core::ContentId =
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+                .parse()
+                .unwrap();
+        let response = RemoteLedgerClient::new(&base_url, None)
+            .fetch_commits("mydb:main", None, Some(&base), 100)
+            .await
+            .expect("fetch should succeed");
+        assert!(response.lineage);
+
+        let request_line = server.await.unwrap();
+        assert!(request_line.contains("lineage=true"), "{request_line}");
+        assert!(
+            request_line.contains(&format!("base_id={base}")),
+            "{request_line}"
+        );
+    }
+
+    /// Two pushes that differ only in their merged commits must not share
+    /// an idempotency key. A server would replay the first one's response.
+    #[test]
+    fn push_idempotency_key_covers_merged_commits() {
+        let plain = fluree_db_api::PushCommitsRequest {
+            commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+            ..Default::default()
+        };
+        let with_merges = fluree_db_api::PushCommitsRequest {
+            merged_commits: vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+            ..plain.clone()
+        };
+        assert_ne!(
+            push_idempotency_key("mydb:main", &plain),
+            push_idempotency_key("mydb:main", &with_merges)
+        );
+    }
+
+    #[test]
+    fn test_error_display() {
+        let err = RemoteLedgerError::Unauthorized;
+        let msg = format!("{err}");
+        assert!(msg.contains("authentication failed"));
+        assert!(msg.contains("fluree auth login"));
+
+        let err = RemoteLedgerError::BadRequest("invalid query syntax".to_string());
+        assert_eq!(format!("{err}"), "bad request: invalid query syntax");
+    }
+
+    /// A write a modify policy denies is a 403 whose body carries the
+    /// policy's reason; the error shows it.
+    #[tokio::test]
+    async fn test_forbidden_keeps_the_server_message() {
+        let response = |body: &'static str| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(403)
+                    .body(body)
+                    .expect("response"),
+            )
+        };
+        let err = RemoteLedgerClient::map_error(response(
+            r#"{"error":"Employees may not modify document content.","status":403}"#,
+        ))
+        .await;
+        assert_eq!(
+            err.to_string(),
+            "access denied (403): Employees may not modify document content."
+        );
+        let err = RemoteLedgerClient::map_error(response("")).await;
+        assert_eq!(err.to_string(), "access denied (403)");
+    }
+
+    #[test]
+    fn test_extract_error_message_json_envelope() {
+        let body = r#"{"error":"conflict","status":409,"@type":"err:test"}"#;
+        assert_eq!(extract_error_message(body), "conflict");
+    }
+
+    #[test]
+    fn test_extract_error_message_plain_text() {
+        assert_eq!(extract_error_message("  nope  "), "nope");
+    }
+
+    #[test]
+    fn test_encode_ledger_path_preserves_colon_and_slash() {
+        // `:` is a valid pchar and MUST pass through so `ledger:branch`
+        // round-trips correctly through the server's path router.
+        assert_eq!(
+            encode_ledger_path("trigger-test:testing"),
+            "trigger-test:testing"
+        );
+        // `/` is preserved so nested ledger names land in the wildcard capture.
+        assert_eq!(encode_ledger_path("org/name:branch"), "org/name:branch");
+        // Truly unsafe chars still get encoded.
+        assert_eq!(encode_ledger_path("a b"), "a%20b");
+        assert_eq!(encode_ledger_path("a?b"), "a%3Fb");
+        assert_eq!(encode_ledger_path("a#b"), "a%23b");
+    }
+
+    #[test]
+    fn test_encode_ledger_segment_encodes_slash_preserves_colon() {
+        assert_eq!(encode_ledger_segment("ledger:branch"), "ledger:branch");
+        assert_eq!(encode_ledger_segment("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn test_op_url_branched_ledger() {
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree", None);
+        assert_eq!(
+            client.op_url("query", "trigger-test:testing"),
+            "http://localhost:8090/fluree/query/trigger-test:testing"
+        );
+    }
+
+    #[test]
+    fn test_op_url_merge_preview_encodes_unsafe_chars() {
+        // Regression: merge-preview previously interpolated the ledger raw,
+        // breaking on names with spaces/?/#/% etc. The implementation now
+        // routes through `op_url` so these get URL-encoded the same as
+        // every other ledger-tailed endpoint.
+        let client = RemoteLedgerClient::new("http://localhost:8090/fluree", None);
+        assert_eq!(
+            client.op_url("merge-preview", "weird name?:branch#x"),
+            "http://localhost:8090/fluree/merge-preview/weird%20name%3F:branch%23x"
+        );
+    }
+
+    #[test]
+    fn test_with_refresh_config() {
+        let client = RemoteLedgerClient::new("http://localhost:8090", Some("token".to_string()))
+            .with_refresh(RefreshConfig {
+                exchange_url: "http://localhost:8090/auth/exchange".to_string(),
+                refresh_token: "rt_123".to_string(),
+            });
+        let debug = format!("{client:?}");
+        assert!(debug.contains("has_refresh: true"));
+    }
+
+    // =========================================================================
+    // splice_archive_stream — frame substitution tests
+    // =========================================================================
+    //
+    // These exercise the End → manifest+End swap without needing a real
+    // server: build a valid pack stream in-memory, feed it as one or many
+    // chunks to `splice_archive_stream`, and assert the writer sees
+    // [preamble][header][data...][synthesized manifest][End], with the
+    // original End dropped.
+
+    use fluree_db_core::pack::{
+        encode_data_frame, encode_end_frame, encode_error_frame, encode_header_frame,
+        write_stream_preamble, PackHeader, PREAMBLE_SIZE,
+    };
+    use fluree_db_core::{ContentId, ContentKind};
+    use futures::stream;
+
+    fn sample_ns_record() -> NsRecord {
+        let mut record = NsRecord::new("mydb:main");
+        record.commit_head_id = Some(ContentId::new(ContentKind::Commit, b"head"));
+        record.commit_t = 7;
+        record.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"idx"));
+        record.index_t = 5;
+        record
+    }
+
+    /// Build a minimal valid pack stream:
+    /// [preamble][header frame][N data frames][end].
+    fn build_pack_stream(data_payloads: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_stream_preamble(&mut buf);
+        let header = PackHeader::commits_only(Some(data_payloads.len() as u32), true);
+        encode_header_frame(&header, &mut buf).unwrap();
+        for (i, payload) in data_payloads.iter().enumerate() {
+            let cid = ContentId::new(ContentKind::Commit, format!("commit-{i}").as_bytes());
+            encode_data_frame(&cid, payload, &mut buf).unwrap();
+        }
+        encode_end_frame(&mut buf);
+        buf
+    }
+
+    fn drive_splice(
+        chunks: Vec<Vec<u8>>,
+        manifest: serde_json::Value,
+    ) -> Result<(usize, Vec<u8>), RemoteLedgerError> {
+        let stream = stream::iter(chunks.into_iter().map(Ok::<Vec<u8>, String>));
+        let mut output: Vec<u8> = Vec::new();
+        let frames = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::splice_archive_stream(stream, &mut output, &manifest))?;
+        Ok((frames, output))
+    }
+
+    #[test]
+    fn splice_drops_end_and_appends_manifest_then_end() {
+        let pack = build_pack_stream(&[b"commit-bytes-1", b"commit-bytes-2"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), true);
+        let (frames, output) = drive_splice(vec![pack.clone()], manifest.clone()).unwrap();
+
+        // Header + 2 data frames forwarded; manifest + End synthesized below.
+        assert_eq!(frames, 3);
+
+        // Output must NOT match the input bytes verbatim — End was replaced.
+        assert_ne!(output, pack);
+
+        // First (PREAMBLE_SIZE + header_frame_len) bytes of input must
+        // appear unchanged at the start of the output.
+        assert!(output.starts_with(&pack[..PREAMBLE_SIZE]));
+
+        // The original End is one byte (FRAME_END = 0xFF). The output's
+        // last byte should also be that same End byte, but preceded by an
+        // injected manifest frame rather than appearing immediately after
+        // the last data frame.
+        let last = *output.last().expect("output not empty");
+        assert_eq!(last, 0xFF, "trailing byte must still be End frame");
+
+        // Decode the output and verify the new manifest sits where the End
+        // used to be.
+        let mut pos = read_stream_preamble(&output).expect("valid preamble");
+        let mut frames_seen: Vec<&'static str> = Vec::new();
+        let mut last_manifest: Option<serde_json::Value> = None;
+        loop {
+            let (frame, consumed) =
+                decode_frame(&output[pos..], DEFAULT_MAX_PAYLOAD).expect("decodable");
+            pos += consumed;
+            match frame {
+                PackFrame::Header(_) => frames_seen.push("header"),
+                PackFrame::Data { .. } => frames_seen.push("data"),
+                PackFrame::Manifest(json) => {
+                    last_manifest = Some(json);
+                    frames_seen.push("manifest");
+                }
+                PackFrame::End => {
+                    frames_seen.push("end");
+                    break;
+                }
+                PackFrame::Error(_) => panic!("unexpected error frame"),
+            }
+        }
+        assert_eq!(
+            frames_seen,
+            vec!["header", "data", "data", "manifest", "end"]
+        );
+        let m = last_manifest.expect("manifest frame present");
+        assert_eq!(m.get("phase").and_then(|v| v.as_str()), Some("nameservice"));
+        assert_eq!(m.get("ledger_id"), manifest.get("ledger_id"));
+        assert_eq!(m.get("commit_t"), manifest.get("commit_t"));
+        assert_eq!(m.get("index_head_id"), manifest.get("index_head_id"));
+    }
+
+    #[test]
+    fn splice_handles_chunk_boundaries_inside_frames() {
+        // Same pack, but split across many small chunks so that frame
+        // boundaries fall inside individual chunks. The buffered decode
+        // path must still produce identical output.
+        let pack = build_pack_stream(&[b"first-commit", b"second-commit"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), true);
+
+        let (frames_one, output_one) = drive_splice(vec![pack.clone()], manifest.clone()).unwrap();
+        let chunked: Vec<Vec<u8>> = pack.chunks(7).map(<[u8]>::to_vec).collect();
+        let (frames_many, output_many) = drive_splice(chunked, manifest).unwrap();
+
+        assert_eq!(frames_one, frames_many);
+        assert_eq!(output_one, output_many);
+    }
+
+    #[test]
+    fn splice_omits_index_fields_when_archived_index_is_false() {
+        let pack = build_pack_stream(&[b"commit"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), /* archived_index */ false);
+        assert!(manifest.get("index_head_id").is_none());
+        assert!(manifest.get("index_t").is_none());
+
+        let (_, output) = drive_splice(vec![pack], manifest).unwrap();
+        let mut pos = read_stream_preamble(&output).unwrap();
+        let mut found_manifest_without_index = false;
+        loop {
+            let (frame, consumed) = decode_frame(&output[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+            pos += consumed;
+            match frame {
+                PackFrame::Manifest(json)
+                    if json.get("phase").and_then(|v| v.as_str()) == Some("nameservice") =>
+                {
+                    assert!(json.get("index_head_id").is_none());
+                    assert!(json.get("index_t").is_none());
+                    found_manifest_without_index = true;
+                }
+                PackFrame::End => break,
+                _ => {}
+            }
+        }
+        assert!(
+            found_manifest_without_index,
+            "nameservice manifest must be present without index fields"
+        );
+    }
+
+    #[test]
+    fn splice_propagates_server_error_frame() {
+        // Build a stream that emits an Error frame instead of End — the
+        // server signals failure mid-pack. We must surface this rather
+        // than silently truncating the archive.
+        let mut buf = Vec::new();
+        write_stream_preamble(&mut buf);
+        let header = PackHeader::commits_only(Some(0), true);
+        encode_header_frame(&header, &mut buf).unwrap();
+        encode_error_frame("simulated remote pack failure", &mut buf).unwrap();
+        encode_end_frame(&mut buf);
+
+        let manifest = build_archive_manifest(&sample_ns_record(), false);
+        let result = drive_splice(vec![buf], manifest);
+        match result {
+            Err(RemoteLedgerError::ServerError(msg)) => {
+                assert!(msg.contains("simulated remote pack failure"));
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn splice_rejects_invalid_magic_promptly_not_as_incomplete() {
+        // First 4 bytes should be the FPK1 magic; corrupt them and feed
+        // the rest of a valid stream. The decoder's preamble check must
+        // surface as a fatal `InvalidResponse` rather than being swallowed
+        // as "need more bytes" until EOF.
+        let mut bad = build_pack_stream(&[b"commit"]);
+        bad[0] = 0x00; // break the magic
+        bad[1] = 0x00;
+
+        let manifest = build_archive_manifest(&sample_ns_record(), false);
+        let result = drive_splice(vec![bad], manifest);
+        match result {
+            Err(RemoteLedgerError::InvalidResponse(msg)) => {
+                assert!(
+                    msg.contains("preamble") || msg.contains("magic"),
+                    "expected magic/preamble error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidResponse for bad magic, got {other:?}"),
+        }
+    }
+}

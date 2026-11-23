@@ -1,0 +1,403 @@
+# Policy in Queries
+
+Query-time enforcement uses Fluree's [policy model](policy-model.md) to filter individual flakes during query execution. The query plan is the same regardless of policy — what changes is which flakes the engine returns. The application sees a query result; the policy filtering is invisible.
+
+This page documents how query-time enforcement works, how patterns interact with the plan, and how to test policies from the CLI. For the policy node shape and combining algorithm, see the [policy model reference](policy-model.md). For the underlying concept, see [Policy enforcement](../concepts/policy-enforcement.md).
+
+## How query-time filtering works
+
+When a query is executed against a `PolicyContext`:
+
+1. The engine resolves the request's policy set: identity-driven `f:policyClass` lookups + any inline `opts.policy` array.
+2. The plan executes normally — same join order, same indices.
+3. Each flake the plan would emit is checked against the policies whose target matches it (`f:onProperty`, `f:onClass`, `f:onSubject`, or default for untargeted policies).
+4. A flake survives only if the [combining algorithm](policy-model.md#combining-algorithm) approves it.
+5. Surviving flakes flow through the rest of the plan (joins, filters, aggregates) as normal.
+
+Filtering is at the flake level — a single subject can appear in the result with some properties visible and others elided.
+
+## Worked example
+
+Two users in a `mydb:main` ledger:
+
+```bash
+fluree insert '{
+  "@context": {"schema": "http://schema.org/", "ex": "http://example.org/"},
+  "@graph": [
+    {"@id": "ex:alice", "schema:name": "Alice", "ex:role": "engineer", "ex:salary": 130000},
+    {"@id": "ex:bob",   "schema:name": "Bob",   "ex:role": "manager",  "ex:salary": 155000}
+  ]
+}'
+```
+
+A required policy that hides `ex:salary` unless the requester is a manager:
+
+```bash
+fluree insert '{
+  "@context": {"f": "https://ns.flur.ee/db#", "ex": "http://example.org/"},
+  "@graph": [
+    {
+      "@id": "ex:salary-restriction",
+      "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+      "f:required": true,
+      "f:onProperty": [{"@id": "ex:salary"}],
+      "f:action": [{"@id": "f:view"}],
+      "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"manager\"}}"
+    },
+    {
+      "@id": "ex:default-view",
+      "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+      "f:action": [{"@id": "f:view"}],
+      "f:allow": true
+    },
+    {"@id": "ex:aliceIdentity", "f:policyClass": [{"@id": "ex:CorpPolicy"}], "ex:role": "engineer"},
+    {"@id": "ex:bobIdentity",   "f:policyClass": [{"@id": "ex:CorpPolicy"}], "ex:role": "manager"}
+  ]
+}'
+```
+
+The same query, executed as different identities:
+
+```bash
+# As Bob (manager) — sees salaries
+fluree query --as ex:bobIdentity --policy-class ex:CorpPolicy \
+  'SELECT ?name ?salary WHERE { ?p <http://schema.org/name> ?name ; <http://example.org/salary> ?salary }'
+# → Alice 130000, Bob 155000
+
+# As Alice (engineer) — salary flakes filtered out
+fluree query --as ex:aliceIdentity --policy-class ex:CorpPolicy \
+  'SELECT ?name ?salary WHERE { ?p <http://schema.org/name> ?name ; <http://example.org/salary> ?salary }'
+# → no results: the join requires ?salary which is filtered for Alice
+```
+
+To get Alice's name back without the salary join, use `OPTIONAL`:
+
+```sparql
+SELECT ?name ?salary WHERE {
+  ?p <http://schema.org/name> ?name .
+  OPTIONAL { ?p <http://example.org/salary> ?salary }
+}
+```
+
+Now Alice sees both names, with `?salary` unbound — exactly the behavior an application expects when a property is suppressed by policy.
+
+## Enforcement across query operations
+
+Filtering happens wherever the plan reads flakes, so every query operation enforces the same per-flake policy — not just basic triple patterns:
+
+- **Triple patterns / BGPs** — the common case shown above; each matched flake is checked.
+- **OPTIONAL, joins, aggregates, `COUNT`** — these operate over already-filtered flakes, so a hidden flake is absent from joins and excluded from counts. `SELECT (COUNT(?o) ...) WHERE { ?s ex:salary ?o }` counts only the salary flakes the identity may view.
+- **Property paths** (`?x :knows+ ?y`, `:reportsTo*`, sequence/alternation) — traversal only follows edges the identity can view. A hidden `:knows` flake is not walked, so nodes reachable *only* through hidden edges do not appear in the result. You traverse exactly the graph you can see.
+- **Full-text and vector search** (embedded indexes) — a search hit is returned only if the identity can view the indexed content that produced the match. If the policy hides the indexed property's flake for a subject, that subject is dropped from the search results — even when selecting only the hit id/score with no constraining pattern. (This applies to Fluree's embedded search indexes; an external/dedicated search service enforces its own access controls.) Full-text **scores**, though, come from BM25 statistics over every document of the property, including documents the identity cannot see: a reader gets the same score for a visible document as an unrestricted request does. A consequence is that a reader can tell from their scores when hidden documents containing a term are added or removed.
+
+In every case the rule is the same: the engine never emits — or traverses, or counts, or returns as a search hit — a flake the identity is not allowed to see.
+
+## Reasoning (RDFS / OWL / datalog)
+
+Reasoning and view policy compose, but the contract is specific:
+
+- **OWL 2 QL** rewrites the query and runs it through the normal scan path under your identity, so it is filtered exactly like any other query.
+- **OWL 2 RL and datalog** materialize *derived* facts into the query's overlay. Those derived facts are filtered by the **same per-flake view policy as base data** — a derived flake you may not view is dropped just like a stored one.
+
+What the engine does **not** do is trace a derived fact's *provenance*: a derived flake is judged by its own `(subject, predicate, object)`, not by the base facts it was computed from. So if a rule or ontology axiom re-expresses hidden data under a different, viewable predicate — e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule that writes `ex:isHighEarner` from a hidden `ex:salary` — the derived value can surface even though the source is hidden.
+
+The two approaches can therefore disagree under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing with `"reasoning": "rdfs"`, since the rewritten query scans `ex:ssn` under your identity. With `"reasoning": "owl2rl"` it returns the value, since the materialized `ex:identifier` fact is judged by its own predicate. Materialized facts are computed once over all of the ledger's data and shared across callers; policy applies when rows are read.
+
+**So when you enable reasoning under a non-root policy, your policy must cover the derived properties and classes.** Either deny them explicitly, or run with `default-allow: false` so any predicate you did not explicitly allow — including reasoning-introduced ones — is hidden by default. Inline per-query ontologies (`f:schemaSource`) are subject to the same rule: any class/property they entail must be covered by your policy.
+
+Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
+
+Class membership and `f:query` conditions read the state the query reads: derived facts in a reasoning query, stored facts in a plain one. A derived fact can therefore grant access as well as deny it, and a deny on a derived class does not reach a caller's plain queries; to make reasoning unavoidable, set the ledger's reasoning defaults with `f:overrideControl` `f:OverrideNone` ([Reasoning under access policy](../query/reasoning.md#reasoning-under-access-policy)).
+
+### Performance under a policy
+
+Enforcement runs per flake, so the engine's raw-row lanes — the binary index cursor, the batched leaflet probes, and the range semi-join's leaflet walk — cannot be used for a predicate the policy might touch. They stay on for predicates the policy provably cannot touch: a scan or probe of one fixed predicate keeps its lane when no `f:onProperty` rule names it and the default allows, and returns empty without reading anything when the default denies. Any `f:onClass`, `f:onSubject`, or default-target rule can apply to every predicate, so a policy containing one puts every scan on the filtered path. A policy made entirely of property rules therefore costs only on the properties it names.
+
+## Targeting patterns
+
+### Property-level (`f:onProperty`)
+
+Restricts a flake whose predicate matches:
+
+```json
+{
+  "@id": "ex:hide-ssn",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/role\": \"hr\"}}"
+}
+```
+
+Flakes whose predicate is not `schema:ssn` are unaffected by this policy.
+
+### Class-level (`f:onClass`)
+
+Restricts flakes whose subject has one of the listed `rdf:type`s:
+
+```json
+{
+  "@id": "ex:employee-data-only",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onClass": [{"@id": "http://example.org/Employee"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"@type\": \"http://example.org/Employee\"}}"
+}
+```
+
+Flakes about non-`Employee` subjects fall through to other policies.
+
+### Subject-level (`f:onSubject`)
+
+Restricts flakes about specific subjects:
+
+```json
+{
+  "@id": "ex:hide-internal-doc",
+  "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
+  "f:required": true,
+  "f:onSubject": [{"@id": "http://example.org/secret-doc"}],
+  "f:action": [{"@id": "f:view"}],
+  "f:allow": false
+}
+```
+
+### Default (no targeting)
+
+A policy with no `f:onProperty` / `f:onClass` / `f:onSubject` applies to **every** flake. Use sparingly — default policies are evaluated against every emitted flake, which is more expensive than targeted policies.
+
+## SPARQL queries
+
+A SPARQL query selects policy with [`# PRAGMA` comments](../query/sparql.md#request-options--pragma), the counterpart of a JSON-LD body's `opts`:
+
+```sparql
+# PRAGMA identity: ex:aliceIdentity
+# PRAGMA policy-class: ex:CorpPolicy
+# PRAGMA default-allow: false
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?p <http://schema.org/name> ?name }
+```
+
+or with headers:
+
+```bash
+curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:main' \
+  -H 'Content-Type: application/sparql-query' \
+  -H "Authorization: Bearer $JWT" \
+  -H 'fluree-identity: http://example.org/ns/aliceIdentity' \
+  -H 'fluree-policy-class: http://example.org/ns/CorpPolicy' \
+  -H 'fluree-default-allow: false' \
+  -d 'SELECT ?name WHERE { ?p <http://schema.org/name> ?name }'
+```
+
+On an unauthenticated request, a pragma wins over the header that names the same option. On an authenticated one, the headers' policy selection stands: a policy pragma may repeat it or narrow `default-allow` to `false`, and anything else is refused with a `403`. If the headers select no policy, the pragmas do. Either way, the selection is held to the caller's credential. A pragma's prefixed name expands against the query's own `PREFIX` declarations; a header takes the IRI as written. The inline policy document has no pragma: send it with the `fluree-policy` header. The full header set is documented in the [policy model](policy-model.md#request-time-options).
+
+## JSON-LD queries
+
+JSON-LD queries put policy in `opts`:
+
+```json
+{
+  "from": "mydb:main",
+  "select": ["?name", "?salary"],
+  "where": [
+    {"@id": "?p", "schema:name": "?name"},
+    ["optional", {"@id": "?p", "ex:salary": "?salary"}]
+  ],
+  "opts": {
+    "identity": "ex:aliceIdentity",
+    "policy-class": ["ex:CorpPolicy"],
+    "default-allow": false
+  }
+}
+```
+
+Inline policies, additional `policy-values`, and multiple `policy-class` entries all live under `opts`. The full vocabulary is in the [policy model reference](policy-model.md#request-time-options).
+
+## Multi-graph queries
+
+Policies apply per-flake, regardless of which named graph the flake came from. A query that pulls from multiple `from-named` graphs sees a uniformly filtered result — there's no per-graph policy override.
+
+If different graphs need different policy regimes, use targeted policies (`f:onClass` for type-scoped restrictions, `f:onSubject` for explicit subject lists). For wholly separate access regimes, use separate ledgers.
+
+## Graph sources (Iceberg / SQL)
+
+A virtual graph source is enforced inside its R2RML scan rather than by the
+flake filter: static targeting (`f:onProperty`, `f:onClass`, `f:onSubject`,
+untargeted, `f:required`, `default-allow`) behaves as on a native ledger, and
+`f:onClass` / `f:onProperty` entail through a model ledger's hierarchy when the
+source was registered with `--model`. `f:query` policies cannot run against a
+virtual source and fail closed. Stored policies and identity `f:policyClass`
+assignments live in the model ledger. Details and the exact supported matrix:
+[Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
+## Time-travel queries
+
+Policy evaluation honors the query's `t`. When you query `--at` a past `t`:
+
+- The policy set itself is resolved at that `t` (so retired policies still apply when you time-travel back to when they were live).
+- Identity attributes used in `f:query` are evaluated at that `t`.
+
+This makes audit-style queries — *"What could Alice see on 2024-06-15?"* — directly expressible:
+
+```bash
+fluree query --as ex:aliceIdentity --policy-class ex:CorpPolicy --at 2024-06-15T00:00:00Z \
+  'SELECT ?p ?o WHERE { <http://example.org/financial-report> ?p ?o }'
+```
+
+## Performance considerations
+
+Two phases: load the policy set once per request; apply it to each touched flake.
+
+- **Target policies whenever possible.** A policy with `f:onProperty` only runs against flakes whose predicate matches. Default policies (no targeting) run against every flake.
+- **Keep `f:query` cheap.** It runs once per flake-target. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
+- **Avoid deep recursion in `f:query`.** Each level of indirection multiplies the per-flake cost.
+- **Required policies short-circuit on the first failed gate.** Required policies are AND gates — every one must grant. As soon as any required gate fails (an explicit deny, or an `f:query` returning no rows), the flake is denied and the remaining required policies are skipped.
+- **Targeted policies keep fast paths fast.** Cardinality and scalar-aggregate fast paths (e.g. a bare `COUNT` over a single predicate) still answer directly from index metadata when the active policy provably cannot restrict the scanned predicate — a policy that only targets `ex:salary` does not slow a `COUNT` over `schema:name`. A policy that *could* apply to the scanned predicate (including any default/subject-targeted policy) forces the per-flake filtered scan instead. This is another reason to prefer targeted policies.
+
+For complex deployments, the [explain plan](../query/explain.md) shows whether a query is dominated by policy filtering and which policies contribute.
+
+## Detecting that policy was applied
+
+Filtering itself is invisible by design: a policy-filtered result and a
+genuinely empty result look the same, and no response field reports how many
+flakes were withheld. That is deliberate — a "rows were suppressed" indicator
+would be a data-dependent oracle, answerable per query and searchable with
+filters, which is exactly what row-level enforcement exists to prevent.
+
+What a caller *can* ask for is whether policy governed the request. Turn on
+policy tracking — `"opts": {"meta": {"policy": true}}` in a JSON-LD body, or
+`# PRAGMA meta: policy` in a SPARQL request, or the `fluree-track-policy: true`
+request header — and the response gains two siblings:
+
+```json
+{
+  "status": 200,
+  "result": [],
+  "policy": {},
+  "policy_enforcement": { "enforced": true, "denies_all_data": true }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `policy` | Per-policy counters, `{policy-id: {executed, allowed}}`. A policy appears only once it actually runs, so this map is **empty whenever no policy ran** — which happens both when nothing is enforced and when enforcement grants nothing. |
+| `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" A selection that yields no rules under `default-allow: true` is root, so the field is absent for it too. |
+| `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
+| `policy_enforcement.unevaluable_policies` | Ids of `f:query` policies a virtual graph source (Iceberg / SQL) could not evaluate and therefore denied. Omitted when empty; never set on a native ledger. |
+| `policy_enforcement.undecidable_class_maps` | Triples maps of a virtual graph source whose rows a class-targeted policy hid because their subjects could also hold classes another map declares (see [Iceberg → Class policies over subjects several rows mint](../graph-sources/iceberg.md#class-policies-over-subjects-several-rows-mint)). Omitted when empty; never set on a native ledger. |
+
+The same values ride the `x-fdb-policy` (base64 JSON) and
+`x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read
+them for CSV, TSV, and other formats whose body has no room for a tally.
+
+On the NDJSON streaming endpoint (`/v1/fluree/stream/query/*`) the same
+`policy_enforcement` object rides the terminal `end` record, under the same
+presence rule:
+
+```json
+{"type":"end","rows":0,"t":7,"policy_enforcement":{"enforced":true,"denies_all_data":true}}
+```
+
+The state is settled before the first row is pulled, but it is reported with
+the rest of the per-request metadata at the end of the stream. `policy` (the
+per-policy counters) is not carried on the streaming surface — the `end` record
+reports only the request-level metadata.
+
+Both `policy_enforcement` bits are settled before execution, from the request's
+policy inputs and the policy set they resolve to. That set is built from stored
+policy nodes — ledger data, selected through the identity's own `f:policyClass`
+assignments — so this is not a claim that no ledger data participates. The
+claim is narrower and is what matters: the value does not depend on the data
+the query reads or on the query itself. It is identical for every query a
+caller issues under the same policy context, changes only when the policy
+configuration or the caller's own assignments change, and you must already be
+acting as that identity to see it. So it reports your own authorization
+posture, and cannot be varied to probe for the existence of any particular row.
+
+**What `denies_all_data` does not say.** It does not mean the result is empty.
+Schema flakes — `rdf:type` with a schema-class object, `rdfs:subClassOf`,
+`rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range` — bypass view policy, so a
+query over the ontology still returns rows under a total data denial. (Writing
+them does not bypass modify policy: see
+[Schema writes](policy-in-transactions.md#schema-writes).) Read it
+as "no *data* flake could have been returned", not "nothing was returned".
+
+**Reading an empty result.** With tracking on:
+
+- `policy_enforcement` absent → the request was unenforced: no policy input,
+  or an input that selected no rules under `default-allow: true`. An empty
+  result is an empty result.
+- `enforced: true`, `denies_all_data: true` → the caller's policy configuration
+  grants no view of the data at all. This is the common misconfiguration:
+  supplying an identity that has no `f:policyClass` assignments, on a ledger
+  with no `f:defaultAllow true`. Anonymous requests to the same ledger see
+  everything, so authenticating appears to *lose* data.
+- `enforced: true`, `denies_all_data: false`, `policy` non-empty → policies ran.
+  Compare `allowed` against `executed` to see how selective they were.
+- `enforced: true`, `denies_all_data: false`, `policy` empty → enforcement was
+  active but no policy was ever consulted for this query's flakes. Most often
+  the query touched only properties no policy targets, and the request's
+  `default-allow` decided the outcome.
+
+For a positive control, run the same query with and without the identity, or
+against a subject you know the identity may read.
+
+## Testing policies from the CLI
+
+The `fluree` CLI supports policy-enforced queries so you can verify that the policies you've configured filter results as expected — without writing any client code.
+
+### Flags
+
+Available on `fluree query` (and on `fluree insert`, `upsert`, `update` for write-time enforcement):
+
+| Flag | Purpose |
+|------|---------|
+| `--as <IRI>` | Execute as this identity. Resolves `f:policyClass` on the identity subject to collect applicable policies, and binds `?$identity`. |
+| `--policy-class <IRI>` | Apply stored policies of the given class IRI. Repeatable. Narrows to the intersection with the identity's policies, or applies directly without `--as`. |
+| `--default-allow` | Allow when no matching policy exists for the operation. Defaults to `false` (deny-by-default). |
+
+### Workflow
+
+1. Transact your policy rules (and the identities with their `f:policyClass` assignments) into the ledger, using any of the normal insert / upsert / update commands.
+2. Re-run the same query as different identities to confirm results differ as the policies prescribe:
+
+```bash
+# Full result set (no policy enforcement)
+fluree query 'SELECT ?name ?salary WHERE { ?p <http://schema.org/name> ?name ; <http://example.org/salary> ?salary }'
+
+# As an HR user — should see all salaries
+fluree query --as ex:hrIdentity --policy-class ex:CorpPolicy \
+  'SELECT ?name ?salary WHERE { ?p <http://schema.org/name> ?name ; <http://example.org/salary> ?salary }'
+
+# As a regular employee — policies should hide salary field
+fluree query --as ex:engineerIdentity --policy-class ex:CorpPolicy \
+  'SELECT ?name ?salary WHERE { ?p <http://schema.org/name> ?name ; <http://example.org/salary> ?salary }'
+```
+
+### Local vs remote
+
+The flags work in both modes:
+
+- **Local** (default, or with `--direct`): the CLI loads the ledger directly and applies policy via the in-process query engine.
+- **Remote** (with `--remote <name>`, or auto-routed through a running local server): the CLI sends the flags to the server as HTTP headers (`fluree-identity`, `fluree-policy-class`, `fluree-default-allow`) and, for JSON-LD bodies, also injects them into `opts`. Multi-value `--policy-class` rides through the body opts only; SPARQL transport is single-valued via the header.
+
+### Remote impersonation: how it's authorized
+
+Authenticated requests use verified policy selection. With ordinary or fixed-delegation credentials, `--as`, class, inline-policy, and policy-value options must match that selection; conflicts return HTTP 403. Signed request bodies use their signing identity. A policy-free identity record does not confer delegation authority. Applications with an explicit `"fluree.policy": "request"` credential may select request policies dynamically. Downstream clients use a fixed signed `fluree.policy` selection from a configured policy authority; embedded applications construct a typed context. See [Trusted policy authorization](policy-authorization.md) for configuration, scopes, and migration.
+
+Direct local queries and intentionally anonymous private-server requests retain caller-selected policy options. Explicit caller default-deny can narrow an authenticated selection's default.
+
+## Related documentation
+
+- [Policy model and inputs](policy-model.md) — node shape, combining algorithm, request-time options
+- [Policy enforcement (concepts)](../concepts/policy-enforcement.md) — model overview
+- [Policy in transactions](policy-in-transactions.md) — write-time enforcement
+- [Cross-ledger policy](cross-ledger-policy.md) — query-time engagement under cross-ledger `f:policySource`
+- [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked patterns
+- [Programmatic policy API (Rust)](programmatic-policy.md) — building `PolicyContext` in code
+- [Query reference](../query/README.md) — SPARQL, JSON-LD, and Cypher syntax
+- [Explain plans](../query/explain.md) — diagnosing policy filter overhead

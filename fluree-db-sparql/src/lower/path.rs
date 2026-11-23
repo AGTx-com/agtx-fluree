@@ -1,0 +1,1138 @@
+//! Property path lowering.
+//!
+//! Converts SPARQL property path patterns (e.g., `?s ex:parent+ ?o`) to the
+//! query engine's pattern representation. Supports:
+//! - one-or-more (`+`) and zero-or-more (`*`) → `PropertyPathPattern`
+//! - inverse (`^`) → `TriplePattern` with subject/object swapped
+//! - alternative (`|`) → `Union` of triple branches
+//! - sequence (`/`) → chain of `TriplePattern` joined by `?__pp{n}` variables
+
+use std::sync::Arc;
+
+use crate::ast::path::{NegatedPredicate, PropertyPath as SparqlPropertyPath};
+use crate::ast::term::{ObjectTerm, SubjectTerm};
+use crate::span::SourceSpan;
+
+use fluree_db_core::{DatatypeConstraint, FlakeValue};
+use fluree_db_query::ir::path::PathStep;
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::{Expression, Function, PathModifier, Pattern, PropertyPathPattern};
+use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::var_registry::VarId;
+use fluree_vocab::rdf::TYPE;
+
+use super::{LowerError, LoweringContext, Result};
+
+/// Maximum number of expanded chains when distributing alternatives in a
+/// sequence path. Prevents combinatorial explosion from expressions like
+/// `(a|b)/(c|d)/(e|f)/...`.
+const MAX_SEQUENCE_EXPANSION: usize = 64;
+
+/// The object endpoint of a property path.
+///
+/// SPARQL 1.1 §19.8 reaches a path's object through `GraphNodePath`, which
+/// admits `RDFLiteral` / `NumericLiteral` / `BooleanLiteral`, so
+/// `?s ex:ofMaker/ex:name "Acme"` is an ordinary matchable shape. Most path
+/// arms only ever place the endpoint in the *object* slot of a
+/// `TriplePattern`, where a literal is representable; the arms that put it in
+/// subject or `PropertyPathPattern` position narrow it to a [`Ref`] themselves.
+/// Carrying it as a [`Term`] keeps the narrowing per-arm instead of up front.
+#[derive(Clone)]
+pub(super) struct PathObject {
+    term: Term,
+    /// Datatype / language constraint for a literal endpoint. The annotation
+    /// surface pins every literal to its exact datatype; the plain surface
+    /// pins only language-tagged and explicitly typed literals (see
+    /// `lower_object_with_term_constraint`).
+    dtc: Option<DatatypeConstraint>,
+}
+
+impl PathObject {
+    pub(super) fn new(term: Term, dtc: Option<DatatypeConstraint>) -> Self {
+        Self { term, dtc }
+    }
+
+    /// The endpoint narrowed to a [`Ref`], or `None` when it is a literal.
+    fn to_ref(&self) -> Option<Ref> {
+        Ref::try_from(self.term.clone()).ok()
+    }
+
+    /// Build `s p <endpoint>`, carrying the endpoint's datatype constraint.
+    fn triple(&self, s: Ref, p: Ref) -> TriplePattern {
+        TriplePattern {
+            s,
+            p,
+            o: self.term.clone(),
+            dtc: self.dtc.clone(),
+        }
+    }
+}
+
+impl From<Ref> for PathObject {
+    fn from(r: Ref) -> Self {
+        Self {
+            term: r.into(),
+            dtc: None,
+        }
+    }
+}
+
+/// A pattern that matches nothing while keeping `vars` in scope.
+///
+/// RDF has no literal subjects, so a path arm that would place a literal in
+/// subject position can never match. SPARQL 1.1 asks for the empty solution
+/// sequence there, not an error; an empty `VALUES` gives exactly that and still
+/// declares the arm's variables so `SELECT *` projection is unchanged.
+fn never_matches(vars: impl IntoIterator<Item = VarId>) -> Pattern {
+    Pattern::Values {
+        vars: vars.into_iter().collect(),
+        rows: Vec::new(),
+    }
+}
+
+/// Narrow, deliberate divergence for path forms whose IR endpoints are typed
+/// [`Ref`] and so cannot hold a literal.
+///
+/// These shapes are legal SPARQL 1.1 — the message says so, because the
+/// alternative is a user reading `err:db/InvalidQuery` as "my query is wrong".
+fn literal_endpoint_unsupported(form: &str, example: &str, span: SourceSpan) -> LowerError {
+    LowerError::invalid_property_path(
+        format!(
+            "{form} with a literal object are not yet supported (e.g. `{example}`). This shape is \
+             legal SPARQL 1.1; the restriction is a Fluree limitation, not a spec rule. Rewrite it \
+             with a variable endpoint and a filter, e.g. `?s <path> ?o . FILTER(?o = <literal>)`."
+        ),
+        span,
+    )
+}
+
+impl<E: IriEncoder> LoweringContext<'_, E> {
+    pub(super) fn lower_property_path(
+        &mut self,
+        subject: &SubjectTerm,
+        path: &SparqlPropertyPath,
+        object: &ObjectTerm,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        // Lower subject term (already a Ref, so no literal validation needed)
+        let s = self.lower_subject(subject)?;
+
+        // The object may legally be a literal (`?s ex:ofMaker/ex:name "Acme"`);
+        // arms that cannot represent one narrow it themselves. A tagged or
+        // explicitly typed literal keeps its constraint so the final hop
+        // matches that exact term.
+        let (term, dtc) = self.lower_object_with_term_constraint(object)?;
+        let o = PathObject::new(term, dtc);
+
+        self.lower_path_dispatch(&s, path, &o, span)
+    }
+
+    /// Dispatch on path type to produce the appropriate pattern(s).
+    ///
+    /// `pub(super)` so the annotation-block lowering can reuse it for
+    /// path verbs inside `{| ... |}` bodies (subject = the reifier).
+    pub(super) fn lower_path_dispatch(
+        &mut self,
+        s: &Ref,
+        path: &SparqlPropertyPath,
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        // Rewrite complex inverses (^(a/b), ^(a|b), ^(^x)) before dispatching.
+        let rewritten;
+        let effective_path = if let Some(r) = Self::rewrite_inverse_of_complex(path) {
+            rewritten = r;
+            &rewritten
+        } else {
+            path
+        };
+
+        match effective_path {
+            // Transitive: one-or-more / zero-or-more / zero-or-one → PropertyPathPattern
+            SparqlPropertyPath::OneOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrOne { path: inner, .. } => {
+                // Both endpoints constant (`:a (:p)* :b`) is a reachability test:
+                // the operator's both-Sid arm emits one empty solution iff a
+                // path exists, none otherwise — no variable required.
+                //
+                // A transitive over an alternation of simple predicates —
+                // `(a|b)*` / `(a|b)+` — becomes an alternation-transitive path
+                // whose closure follows an edge of any branch per hop.
+                // Collapse directly-nested modifiers (`((:p)*)*`, `(:p+)?`, …) to a
+                // single modifier over the innermost path before extracting
+                // predicates. `inner` is consumed via `innermost` below.
+                let _ = inner;
+                // `PropertyPathPattern`'s endpoints are `Ref`s, so a literal
+                // endpoint cannot be represented. `?s ex:p+ "lit"` and
+                // `?s ex:p* "lit"` are both evaluable under SPARQL 1.1 (the
+                // latter via the zero-length path, which binds `?s` to the
+                // literal), so this is a divergence, not a spec restriction.
+                let Some(o) = o.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Transitive property paths (+, *, ?)",
+                        "?s ex:p+ \"lit\"",
+                        span,
+                    ));
+                };
+                let o = &o;
+                let ((zero, unbounded), innermost) = Self::collapse_modifiers(effective_path);
+                let modifier = match (unbounded, zero) {
+                    (true, true) => PathModifier::ZeroOrMore,
+                    (true, false) => PathModifier::OneOrMore,
+                    (false, _) => PathModifier::ZeroOrOne,
+                };
+
+                // `(^X)+ ≡ ^(X+)`: an inverse wrapper around the repeated unit is
+                // equivalent to swapping endpoints and traversing X forward. Peel
+                // each inverse layer, toggling the swap, so `(^p)+`, `(^(a|b))+`,
+                // and `(^(a/b))+` all reduce to a forward path with swapped ends.
+                let mut swapped = false;
+                let mut core = innermost;
+                while let SparqlPropertyPath::Inverse { path: inner, .. } = core {
+                    swapped = !swapped;
+                    core = Self::unwrap_group(inner);
+                }
+                let (pp_subject, pp_object) = if swapped { (o, s) } else { (s, o) };
+
+                // Composite (sequence) inner — `(p1/p2/…)+` — becomes a
+                // composite-transitive path whose every hop follows the whole
+                // sub-path. A single-step or alternation inner takes the simpler
+                // alternation-transitive form below.
+                if matches!(core, SparqlPropertyPath::Sequence { .. }) {
+                    let steps = self.extract_composite_steps(core, span)?;
+                    let pp = PropertyPathPattern::new_composite(
+                        pp_subject.clone(),
+                        steps,
+                        modifier,
+                        pp_object.clone(),
+                    );
+                    return Ok(vec![Pattern::PropertyPath(pp)]);
+                }
+
+                let iris = self.extract_transitive_predicate_iris(core, span)?;
+                let mut predicate_sids = Vec::with_capacity(iris.len());
+                for iri in &iris {
+                    predicate_sids.push(
+                        self.encoder
+                            .encode_iri(iri)
+                            .ok_or_else(|| LowerError::unknown_namespace(iri, span))?,
+                    );
+                }
+                let pp = PropertyPathPattern::new_alternatives(
+                    pp_subject.clone(),
+                    predicate_sids,
+                    modifier,
+                    pp_object.clone(),
+                );
+                Ok(vec![Pattern::PropertyPath(pp)])
+            }
+
+            // Inverse: ^path
+            SparqlPropertyPath::Inverse { path: inner, .. } => match inner.as_ref() {
+                // Inverse-transitive: ^p+ or ^p* or ^p? → PropertyPathPattern with swapped s/o
+                SparqlPropertyPath::OneOrMore { path: tp_inner, .. }
+                | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. }
+                | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
+                    // Both-constants is a reachability test (handled by the
+                    // operator's both-Sid arm), not an error.
+                    let Some(o) = o.to_ref() else {
+                        return Err(literal_endpoint_unsupported(
+                            "Transitive property paths (+, *, ?)",
+                            "?s ^ex:p+ \"lit\"",
+                            span,
+                        ));
+                    };
+                    let iri = self.extract_simple_predicate_iri(tp_inner, span)?;
+                    let modifier = match inner.as_ref() {
+                        SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                        SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
+                        _ => PathModifier::ZeroOrMore,
+                    };
+                    let predicate_sid = self
+                        .encoder
+                        .encode_iri(&iri)
+                        .ok_or_else(|| LowerError::unknown_namespace(&iri, span))?;
+                    // Swap subject/object for inverse traversal
+                    let pp =
+                        PropertyPathPattern::new(o.clone(), predicate_sid, modifier, s.clone());
+                    Ok(vec![Pattern::PropertyPath(pp)])
+                }
+                // Simple inverse: ^p → Triple with s/o swapped
+                _ => {
+                    let iri = self.extract_simple_predicate_iri(inner, span)?;
+                    let p = Ref::Iri(Arc::from(iri.as_str()));
+                    // `?s ^ex:p "lit"` puts the literal in subject position:
+                    // zero solutions, not an error (W3C `syn-pp-in-collection`
+                    // writes exactly this as `[ ^:r "hello" ]`).
+                    let Some(o) = o.to_ref() else {
+                        return Ok(vec![never_matches(s.as_var())]);
+                    };
+                    Ok(vec![Pattern::Triple(TriplePattern::new(
+                        o,
+                        p,
+                        s.clone().into(),
+                    ))])
+                }
+            },
+
+            // Alternative: path|path → Union of triple branches
+            SparqlPropertyPath::Alternative { .. } => {
+                let mut leaves = Vec::new();
+                Self::flatten_alternatives(effective_path, &mut leaves);
+                let branches: Vec<Vec<Pattern>> = leaves
+                    .into_iter()
+                    .map(|leaf| self.lower_alternative_branch(leaf, s, o, span))
+                    .collect::<Result<_>>()?;
+                Ok(vec![Pattern::Union(branches)])
+            }
+
+            // Simple IRI without modifier shouldn't appear as a path pattern
+            SparqlPropertyPath::Iri(_) => Err(LowerError::invalid_property_path(
+                "Simple predicate should be a triple pattern, not a property path. Use + or * modifier for transitive paths.",
+                span,
+            )),
+
+            SparqlPropertyPath::A { span: a_span } => Err(LowerError::invalid_property_path(
+                "Simple 'a' predicate should be a triple pattern, not a property path. Use + or * modifier for transitive paths.",
+                *a_span,
+            )),
+
+            // Sequence: path/path → chain of triple patterns joined by ?__pp{n} variables
+            SparqlPropertyPath::Sequence { .. } => {
+                let mut steps = Vec::new();
+                Self::flatten_sequence(effective_path, &mut steps);
+                self.lower_sequence_chain(s, &steps, o, span)
+            }
+            // Negated property set: `!iri`, `!(a|b)`, `!(^p)`, `!(a|^p)`.
+            SparqlPropertyPath::NegatedSet { iris, .. } => {
+                // A negated set's inverse branch reverses subject and object,
+                // so the endpoint must be a `Ref` for the branch split to be
+                // expressible as written.
+                let Some(o) = o.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Negated property sets (!)",
+                        "?s !(ex:a) \"lit\"",
+                        span,
+                    ));
+                };
+                self.lower_negated_set(s, iris, &o, span)
+            }
+
+            // Grouped path - unwrap and recurse
+            SparqlPropertyPath::Group { path: inner, .. } => {
+                self.lower_path_dispatch(s, inner, o, span)
+            }
+        }
+    }
+
+    /// Lower a negated property set `!(...)` to triple-pattern(s) over a fresh
+    /// predicate variable, filtered to exclude the listed predicates.
+    ///
+    /// Per SPARQL 1.1 §18.2, members partition by direction: forward members
+    /// produce a forward branch `s ?p o` filtered to exclude them; inverse
+    /// members produce a reversed branch `o ?p s` filtered likewise. A set with
+    /// members in both directions yields a `Union` of the two branches; a
+    /// single-direction set yields just that branch (no spurious opposite-side
+    /// matches — see W3C `nps_a` / `nps_inverse`).
+    fn lower_negated_set(
+        &mut self,
+        s: &Ref,
+        members: &[NegatedPredicate],
+        o: &Ref,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        let mut forward_iris: Vec<String> = Vec::new();
+        let mut inverse_iris: Vec<String> = Vec::new();
+        for member in members {
+            match member {
+                NegatedPredicate::Forward(iri) => forward_iris.push(self.expand_iri(iri)?),
+                NegatedPredicate::ForwardA { .. } => forward_iris.push(TYPE.to_string()),
+                NegatedPredicate::Inverse(iri) => inverse_iris.push(self.expand_iri(iri)?),
+                NegatedPredicate::InverseA { .. } => inverse_iris.push(TYPE.to_string()),
+            }
+        }
+
+        if forward_iris.is_empty() && inverse_iris.is_empty() {
+            return Err(LowerError::invalid_property_path(
+                "Negated property set must list at least one predicate",
+                span,
+            ));
+        }
+
+        // Forward branch: `s ?p o` excluding the forward predicates.
+        let forward =
+            (!forward_iris.is_empty()).then(|| self.negated_branch(s, &forward_iris, o, false));
+        // Inverse branch: `o ?p s` excluding the inverse predicates.
+        let inverse =
+            (!inverse_iris.is_empty()).then(|| self.negated_branch(s, &inverse_iris, o, true));
+
+        match (forward, inverse) {
+            (Some(f), None) => Ok(f),
+            (None, Some(i)) => Ok(i),
+            (Some(f), Some(i)) => Ok(vec![Pattern::Union(vec![f, i])]),
+            (None, None) => unreachable!("checked non-empty above"),
+        }
+    }
+
+    /// Build one direction of a negated property set: a triple over a fresh
+    /// predicate variable plus a `FILTER` excluding `excluded`. When `inverse`
+    /// is set the triple is reversed (`o ?p s`).
+    fn negated_branch(
+        &mut self,
+        s: &Ref,
+        excluded: &[String],
+        o: &Ref,
+        inverse: bool,
+    ) -> Vec<Pattern> {
+        let pvar = self
+            .vars
+            .get_or_insert(&format!("?__np{}", self.pp_counter));
+        self.pp_counter += 1;
+
+        let (subj, obj) = if inverse { (o, s) } else { (s, o) };
+        let triple = Pattern::Triple(TriplePattern::new(
+            subj.clone(),
+            Ref::Var(pvar),
+            obj.clone().into(),
+        ));
+        let filter = Pattern::Filter(Self::predicate_exclusion_filter(pvar, excluded));
+        vec![triple, filter]
+    }
+
+    /// `FILTER(?p != iri1 && ?p != iri2 && …)` over a predicate variable. Each
+    /// IRI is wrapped in `IRI()` so it compares as a resolved term (Sid), not a
+    /// plain string — matching how a hand-written `FILTER(?p != :iri)` lowers.
+    fn predicate_exclusion_filter(pvar: VarId, excluded: &[String]) -> Expression {
+        let conds: Vec<Expression> = excluded
+            .iter()
+            .map(|iri| Expression::Call {
+                func: Function::Ne,
+                args: vec![
+                    Expression::Var(pvar),
+                    Expression::Call {
+                        func: Function::Iri,
+                        args: vec![Expression::Const(FlakeValue::String(iri.clone()))],
+                    },
+                ],
+            })
+            .collect();
+        if conds.len() == 1 {
+            conds.into_iter().next().unwrap()
+        } else {
+            Expression::and(conds)
+        }
+    }
+
+    /// Flatten a binary `Alternative` tree into a list of leaf paths.
+    ///
+    /// SPARQL parses `a|b|c` as `Alternative(Alternative(a, b), c)`.
+    /// This collects all leaves into a flat vec: `[a, b, c]`.
+    fn flatten_alternatives<'p>(
+        path: &'p SparqlPropertyPath,
+        out: &mut Vec<&'p SparqlPropertyPath>,
+    ) {
+        match path {
+            SparqlPropertyPath::Alternative { left, right, .. } => {
+                Self::flatten_alternatives(left, out);
+                Self::flatten_alternatives(right, out);
+            }
+            SparqlPropertyPath::Group { path: inner, .. } => {
+                Self::flatten_alternatives(inner, out);
+            }
+            other => out.push(other),
+        }
+    }
+
+    /// Flatten a binary `Sequence` tree into a list of leaf paths.
+    ///
+    /// SPARQL parses `a/b/c` as `Sequence(Sequence(a, b), c)`.
+    /// This collects all leaves into a flat vec: `[a, b, c]`.
+    fn flatten_sequence<'p>(path: &'p SparqlPropertyPath, out: &mut Vec<&'p SparqlPropertyPath>) {
+        match path {
+            SparqlPropertyPath::Sequence { left, right, .. } => {
+                Self::flatten_sequence(left, out);
+                Self::flatten_sequence(right, out);
+            }
+            SparqlPropertyPath::Group { path: inner, .. } => {
+                Self::flatten_sequence(inner, out);
+            }
+            other => out.push(other),
+        }
+    }
+
+    /// Lower a sequence path into a chain of triple patterns.
+    ///
+    /// Each step produces a triple, with adjacent steps joined by generated
+    /// intermediate variables (`?__pp0`, `?__pp1`, …).
+    ///
+    /// Example: `[a, b, c]` with subject `?s` and object `?o`:
+    /// ```text
+    ///   Triple(?s,     a, ?__pp0)
+    ///   Triple(?__pp0, b, ?__pp1)
+    ///   Triple(?__pp1, c, ?o)
+    /// ```
+    ///
+    /// Alternative steps (`(a|b)`) are distributed into a `Union` of simple chains.
+    fn lower_sequence_chain(
+        &mut self,
+        s: &Ref,
+        steps: &[&SparqlPropertyPath],
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        debug_assert!(
+            !steps.is_empty(),
+            "BUG: flatten_sequence produced empty step list"
+        );
+
+        // Degenerate single-step sequence (shouldn't happen, but guard)
+        if steps.len() == 1 {
+            return self.lower_sequence_step(steps[0], s, o, span);
+        }
+
+        // Build step choices: each step → vec of simple alternatives.
+        // Non-alternative steps → single-element vec. Alternative steps → branches.
+        let mut step_choices: Vec<Vec<&SparqlPropertyPath>> = Vec::with_capacity(steps.len());
+        let mut has_alt = false;
+
+        for step in steps {
+            let unwrapped = Self::unwrap_group(step);
+            match unwrapped {
+                SparqlPropertyPath::Alternative { .. } => {
+                    has_alt = true;
+                    let leaves = Self::collect_alt_leaves(unwrapped);
+                    for leaf in &leaves {
+                        Self::validate_simple_sparql_step(leaf, span)?;
+                    }
+                    step_choices.push(leaves);
+                }
+                _ => {
+                    step_choices.push(vec![unwrapped]);
+                }
+            }
+        }
+
+        if has_alt {
+            return self.lower_distributed_sequence(s, &step_choices, o, span);
+        }
+
+        // Fast path: no alternatives — generate simple triple chain
+        let mut patterns = Vec::with_capacity(steps.len());
+        let mut prev = s.clone();
+
+        for (i, step) in steps.iter().enumerate() {
+            let is_last = i == steps.len() - 1;
+            if is_last {
+                // Only the final hop can carry a literal endpoint; the
+                // intermediate joins are always fresh variables.
+                patterns.push(self.lower_sequence_step_pattern(step, &prev, o, span)?);
+                break;
+            }
+
+            let var_name = format!("?__pp{}", self.pp_counter);
+            self.pp_counter += 1;
+            let next = Ref::Var(self.vars.get_or_insert(&var_name));
+
+            let pat = self.lower_sequence_step_pattern(step, &prev, &next.clone().into(), span)?;
+            patterns.push(pat);
+
+            prev = next;
+        }
+
+        Ok(patterns)
+    }
+
+    /// Recursively strip `Group` wrappers from a SPARQL property path.
+    ///
+    /// SPARQL AST wraps parenthesized expressions in `Group { path, .. }`.
+    /// E.g., `(ex:name|ex:nick)` parses as `Group { path: Alternative { .. } }`.
+    fn unwrap_group(path: &SparqlPropertyPath) -> &SparqlPropertyPath {
+        match path {
+            SparqlPropertyPath::Group { path: inner, .. } => Self::unwrap_group(inner),
+            other => other,
+        }
+    }
+
+    /// Collapse a chain of directly-nested transitive/optional modifiers (through
+    /// any `Group` layers) into a single modifier over the innermost path.
+    ///
+    /// Returns `((allows_zero, unbounded), innermost)`. Each layer contributes:
+    /// `+` → (no-zero, unbounded), `*` → (zero, unbounded), `?` → (zero, bounded);
+    /// the chain allows a zero-length match if ANY layer does, and is unbounded if
+    /// ANY layer repeats (`+`/`*`). So `(:p*)*`→`*`, `(:p+)?`→`*`, `(:p?)?`→`?`.
+    fn collapse_modifiers(path: &SparqlPropertyPath) -> ((bool, bool), &SparqlPropertyPath) {
+        let mut cur = Self::unwrap_group(path);
+        let (mut zero, mut unbounded) = (false, false);
+        loop {
+            let (layer_zero, layer_unbounded, inner) = match cur {
+                SparqlPropertyPath::OneOrMore { path: inner, .. } => (false, true, inner),
+                SparqlPropertyPath::ZeroOrMore { path: inner, .. } => (true, true, inner),
+                SparqlPropertyPath::ZeroOrOne { path: inner, .. } => (true, false, inner),
+                _ => break,
+            };
+            zero |= layer_zero;
+            unbounded |= layer_unbounded;
+            cur = Self::unwrap_group(inner);
+        }
+        ((zero, unbounded), cur)
+    }
+
+    /// Recursively rewrite `Inverse(Sequence/Alternative)` so that `Inverse`
+    /// only appears directly around leaf IRIs. Also cancels double-inverse
+    /// (`^(^x)` → `x`).
+    ///
+    /// Rewrite rules (applied recursively):
+    ///   `^(^x)`    → `normalize(x)` — double-inverse cancellation
+    ///   `^(a/b/c)` → `(^c)/(^b)/(^a)` — reverse sequence, invert each step
+    ///   `^(a|b|c)` → `(^a)|(^b)|(^c)` — distribute inverse into each branch
+    ///
+    /// Returns `Some(rewritten)` if the input was a complex inverse,
+    /// `None` if no rewrite was needed (simple/transitive inverse).
+    fn rewrite_inverse_of_complex(path: &SparqlPropertyPath) -> Option<SparqlPropertyPath> {
+        match path {
+            SparqlPropertyPath::Inverse { path: inner, span } => {
+                let unwrapped = Self::unwrap_group(inner);
+                match unwrapped {
+                    // Double inverse: ^(^x) → x (then normalize)
+                    SparqlPropertyPath::Inverse {
+                        path: inner_inner, ..
+                    } => {
+                        let cancelled = inner_inner.as_ref().clone();
+                        Some(Self::rewrite_inverse_of_complex(&cancelled).unwrap_or(cancelled))
+                    }
+                    // ^(a/b/c) → (^c)/(^b)/(^a)
+                    SparqlPropertyPath::Sequence { .. } => {
+                        let mut steps = Vec::new();
+                        Self::flatten_sequence(unwrapped, &mut steps);
+                        let inv_steps: Vec<SparqlPropertyPath> = steps
+                            .into_iter()
+                            .rev()
+                            .map(|step| {
+                                let inv = SparqlPropertyPath::Inverse {
+                                    path: Box::new(step.clone()),
+                                    span: *span,
+                                };
+                                Self::rewrite_inverse_of_complex(&inv).unwrap_or(inv)
+                            })
+                            .collect();
+                        Some(Self::build_sequence_from_vec(inv_steps, *span))
+                    }
+                    // ^(a|b|c) → (^a)|(^b)|(^c)
+                    SparqlPropertyPath::Alternative { .. } => {
+                        let mut leaves = Vec::new();
+                        Self::flatten_alternatives(unwrapped, &mut leaves);
+                        let inv_leaves: Vec<SparqlPropertyPath> = leaves
+                            .into_iter()
+                            .map(|leaf| {
+                                let inv = SparqlPropertyPath::Inverse {
+                                    path: Box::new(leaf.clone()),
+                                    span: *span,
+                                };
+                                Self::rewrite_inverse_of_complex(&inv).unwrap_or(inv)
+                            })
+                            .collect();
+                        Some(Self::build_alternative_from_vec(inv_leaves, *span))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Build a right-associative `Sequence` binary tree from a vec of paths.
+    ///
+    /// `[a, b, c]` → `Sequence(a, Sequence(b, c))`
+    fn build_sequence_from_vec(
+        paths: Vec<SparqlPropertyPath>,
+        span: SourceSpan,
+    ) -> SparqlPropertyPath {
+        debug_assert!(paths.len() >= 2, "BUG: sequence needs at least 2 steps");
+        let mut iter = paths.into_iter().rev();
+        let mut acc = iter.next().unwrap();
+        for step in iter {
+            acc = SparqlPropertyPath::Sequence {
+                left: Box::new(step),
+                right: Box::new(acc),
+                span,
+            };
+        }
+        acc
+    }
+
+    /// Build a right-associative `Alternative` binary tree from a vec of paths.
+    ///
+    /// `[a, b, c]` → `Alternative(a, Alternative(b, c))`
+    fn build_alternative_from_vec(
+        paths: Vec<SparqlPropertyPath>,
+        span: SourceSpan,
+    ) -> SparqlPropertyPath {
+        debug_assert!(
+            paths.len() >= 2,
+            "BUG: alternative needs at least 2 branches"
+        );
+        let mut iter = paths.into_iter().rev();
+        let mut acc = iter.next().unwrap();
+        for branch in iter {
+            acc = SparqlPropertyPath::Alternative {
+                left: Box::new(branch),
+                right: Box::new(acc),
+                span,
+            };
+        }
+        acc
+    }
+
+    /// Collect the leaf paths from an `Alternative` binary tree.
+    fn collect_alt_leaves(path: &SparqlPropertyPath) -> Vec<&SparqlPropertyPath> {
+        let mut leaves = Vec::new();
+        Self::flatten_alternatives(path, &mut leaves);
+        leaves
+    }
+
+    /// Validate that a leaf inside an Alternative (within a sequence step) is a
+    /// "simple" step: `Iri(_)`, `A`, `Inverse { path: Iri(_) | A }`, or a transitive
+    /// modifier (`+`/`*`) applied to a simple predicate (and inverse of those).
+    fn validate_simple_sparql_step(step: &SparqlPropertyPath, span: SourceSpan) -> Result<()> {
+        let unwrapped = Self::unwrap_group(step);
+        match unwrapped {
+            SparqlPropertyPath::Iri(_) | SparqlPropertyPath::A { .. } => Ok(()),
+            SparqlPropertyPath::OneOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrMore { path: inner, .. } => {
+                let inner_unwrapped = Self::unwrap_group(inner);
+                match inner_unwrapped {
+                    SparqlPropertyPath::Iri(_) | SparqlPropertyPath::A { .. } => Ok(()),
+                    other => Err(LowerError::invalid_property_path(
+                        format!(
+                            "Transitive steps within a sequence must apply +/* to a simple predicate; got {}",
+                            sparql_path_name(other),
+                        ),
+                        span,
+                    )),
+                }
+            }
+            SparqlPropertyPath::Inverse { path: inner, .. } => {
+                let inner_unwrapped = Self::unwrap_group(inner);
+                match inner_unwrapped {
+                    SparqlPropertyPath::Iri(_) | SparqlPropertyPath::A { .. } => Ok(()),
+                    SparqlPropertyPath::OneOrMore { path: tp_inner, .. }
+                    | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. } => {
+                        let tp_unwrapped = Self::unwrap_group(tp_inner);
+                        match tp_unwrapped {
+                            SparqlPropertyPath::Iri(_) | SparqlPropertyPath::A { .. } => Ok(()),
+                            other => Err(LowerError::invalid_property_path(
+                                format!(
+                                    "Transitive inverse steps within a sequence must apply +/* to a simple predicate; got inverse of {}",
+                                    sparql_path_name(other),
+                                ),
+                                span,
+                            )),
+                        }
+                    }
+                    other => Err(LowerError::invalid_property_path(
+                        format!(
+                            "Alternative steps within a sequence must be simple predicates or \
+                             inverse simple predicates (^ex:p); got inverse of {}",
+                            sparql_path_name(other),
+                        ),
+                        span,
+                    )),
+                }
+            }
+            other => Err(LowerError::invalid_property_path(
+                format!(
+                    "Alternative steps within a sequence must be simple predicates or \
+                     inverse simple predicates (^ex:p); got {}",
+                    sparql_path_name(other),
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// Compute the Cartesian product of SPARQL step choices.
+    fn cartesian_product_sparql<'p>(
+        step_choices: &'p [Vec<&'p SparqlPropertyPath>],
+    ) -> Vec<Vec<&'p SparqlPropertyPath>> {
+        let mut result: Vec<Vec<&SparqlPropertyPath>> = vec![vec![]];
+        for choices in step_choices {
+            let mut new_result = Vec::new();
+            for existing in &result {
+                for choice in choices {
+                    let mut combo = existing.clone();
+                    combo.push(choice);
+                    new_result.push(combo);
+                }
+            }
+            result = new_result;
+        }
+        result
+    }
+
+    /// Lower a distributed sequence (containing alternative steps) into a Union.
+    ///
+    /// Expands the Cartesian product of step choices into individual simple chains,
+    /// each becoming a branch of a `Pattern::Union`.
+    fn lower_distributed_sequence(
+        &mut self,
+        s: &Ref,
+        step_choices: &[Vec<&SparqlPropertyPath>],
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        let combos = Self::cartesian_product_sparql(step_choices);
+        let n = combos.len();
+        if n > MAX_SEQUENCE_EXPANSION {
+            return Err(LowerError::invalid_property_path(
+                format!(
+                    "Property path sequence expands to {n} chains (limit {MAX_SEQUENCE_EXPANSION})",
+                ),
+                span,
+            ));
+        }
+
+        let branches: Vec<Vec<Pattern>> = combos
+            .into_iter()
+            .map(|combo| self.lower_simple_sequence_chain(s, &combo, o, span))
+            .collect::<Result<_>>()?;
+
+        Ok(vec![Pattern::Union(branches)])
+    }
+
+    /// Lower a simple sequence chain (no alternative steps) to a list of triple patterns.
+    ///
+    /// Each step must be a simple predicate. Adjacent steps are joined by
+    /// generated intermediate variables (`?__pp{n}`).
+    fn lower_simple_sequence_chain(
+        &mut self,
+        s: &Ref,
+        steps: &[&SparqlPropertyPath],
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        let mut patterns = Vec::with_capacity(steps.len());
+        let mut prev = s.clone();
+
+        for (i, step) in steps.iter().enumerate() {
+            let is_last = i == steps.len() - 1;
+            if is_last {
+                patterns.push(self.lower_sequence_step_pattern(step, &prev, o, span)?);
+                break;
+            }
+
+            let var_name = format!("?__pp{}", self.pp_counter);
+            self.pp_counter += 1;
+            let next = Ref::Var(self.vars.get_or_insert(&var_name));
+
+            let pat = self.lower_sequence_step_pattern(step, &prev, &next.clone().into(), span)?;
+            patterns.push(pat);
+
+            prev = next;
+        }
+
+        Ok(patterns)
+    }
+
+    /// Lower a single sequence step to a pattern (`Triple` or `PropertyPath`).
+    ///
+    /// Forward step `p`: `Triple(prev, p, next)`
+    /// Inverse step `^p`: `Triple(next, p, prev)` (swapped)
+    /// Transitive step `p+`/`p*`: `PropertyPath(prev, p, next)`
+    /// Inverse-transitive step `^p+`/`^p*`: `PropertyPath(next, p, prev)` (swapped)
+    ///
+    /// Note: Alternative steps (`(a|b)`) are handled by distribution in
+    /// `lower_sequence_chain` before this method is called.
+    fn lower_sequence_step_pattern(
+        &mut self,
+        step: &SparqlPropertyPath,
+        prev: &Ref,
+        next: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Pattern> {
+        match step {
+            SparqlPropertyPath::Iri(iri) => {
+                let expanded = self.expand_iri(iri)?;
+                let p = Ref::Iri(Arc::from(expanded.as_str()));
+                Ok(Pattern::Triple(next.triple(prev.clone(), p)))
+            }
+            SparqlPropertyPath::A { .. } => {
+                let p = Ref::Iri(Arc::from(TYPE));
+                Ok(Pattern::Triple(next.triple(prev.clone(), p)))
+            }
+            SparqlPropertyPath::Inverse { path: inner, .. } => {
+                match inner.as_ref() {
+                    SparqlPropertyPath::OneOrMore { path: tp_inner, .. }
+                    | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. }
+                    | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
+                        // Inverse-transitive step: ^p+ / ^p* / ^p?
+                        let Some(next) = next.to_ref() else {
+                            return Err(literal_endpoint_unsupported(
+                                "Transitive property paths (+, *, ?)",
+                                "?s ex:a/^ex:p+ \"lit\"",
+                                span,
+                            ));
+                        };
+                        if prev.is_bound() && next.is_bound() {
+                            return Err(LowerError::invalid_property_path(
+                                "Property path requires at least one variable (cannot have both subject and object as constants)",
+                                span,
+                            ));
+                        }
+                        let iri = self.extract_simple_predicate_iri(tp_inner, span)?;
+                        let modifier = match inner.as_ref() {
+                            SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                            SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
+                            _ => PathModifier::ZeroOrMore,
+                        };
+                        let predicate_sid = self
+                            .encoder
+                            .encode_iri(&iri)
+                            .ok_or_else(|| LowerError::unknown_namespace(&iri, span))?;
+                        Ok(Pattern::PropertyPath(PropertyPathPattern::new(
+                            next,
+                            predicate_sid,
+                            modifier,
+                            prev.clone(),
+                        )))
+                    }
+                    _ => {
+                        // Simple inverse: ^p → Triple with s/o swapped
+                        let iri = self.extract_simple_predicate_iri(inner, span)?;
+                        let p = Ref::Iri(Arc::from(iri.as_str()));
+                        // A literal endpoint lands in subject position here —
+                        // no RDF triple has a literal subject, so the whole
+                        // chain matches nothing.
+                        let Some(next) = next.to_ref() else {
+                            return Ok(never_matches(prev.as_var()));
+                        };
+                        Ok(Pattern::Triple(TriplePattern::new(
+                            next,
+                            p,
+                            prev.clone().into(),
+                        )))
+                    }
+                }
+            }
+            SparqlPropertyPath::OneOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrOne { path: inner, .. } => {
+                let Some(next) = next.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Transitive property paths (+, *, ?)",
+                        "?s ex:a/ex:p+ \"lit\"",
+                        span,
+                    ));
+                };
+                if prev.is_bound() && next.is_bound() {
+                    return Err(LowerError::invalid_property_path(
+                        "Property path requires at least one variable (cannot have both subject and object as constants)",
+                        span,
+                    ));
+                }
+                let iri = self.extract_simple_predicate_iri(inner, span)?;
+                let modifier = match step {
+                    SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                    SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
+                    _ => PathModifier::ZeroOrMore,
+                };
+                let predicate_sid = self
+                    .encoder
+                    .encode_iri(&iri)
+                    .ok_or_else(|| LowerError::unknown_namespace(&iri, span))?;
+                Ok(Pattern::PropertyPath(PropertyPathPattern::new(
+                    prev.clone(),
+                    predicate_sid,
+                    modifier,
+                    next,
+                )))
+            }
+            other => Err(LowerError::invalid_property_path(
+                format!(
+                    "Sequence (/) steps must be simple predicates, inverse simple predicates \
+                     (^ex:p), transitive predicates (ex:p+ or ex:p*), or alternatives of simple \
+                     predicates ((ex:a|ex:b)); got {}",
+                    sparql_path_name(other),
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// Lower a degenerate single-step sequence to a pattern list.
+    fn lower_sequence_step(
+        &mut self,
+        step: &SparqlPropertyPath,
+        s: &Ref,
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        let pat = self.lower_sequence_step_pattern(step, s, o, span)?;
+        Ok(vec![pat])
+    }
+
+    /// Lower a single branch of an alternative path to pattern(s).
+    ///
+    /// Supports simple IRIs (forward), inverse of simple IRIs, and sequence chains.
+    fn lower_alternative_branch(
+        &mut self,
+        leaf: &SparqlPropertyPath,
+        s: &Ref,
+        o: &PathObject,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        match leaf {
+            SparqlPropertyPath::Iri(iri) => {
+                let expanded = self.expand_iri(iri)?;
+                let p = Ref::Iri(Arc::from(expanded.as_str()));
+                Ok(vec![Pattern::Triple(o.triple(s.clone(), p))])
+            }
+            SparqlPropertyPath::A { .. } => {
+                let p = Ref::Iri(Arc::from(TYPE));
+                Ok(vec![Pattern::Triple(o.triple(s.clone(), p))])
+            }
+            SparqlPropertyPath::Inverse { path: inner, .. } => {
+                let iri = self.extract_simple_predicate_iri(inner, span)?;
+                let p = Ref::Iri(Arc::from(iri.as_str()));
+                // Literal endpoint in subject position: this branch of the
+                // union contributes no solutions.
+                let Some(o) = o.to_ref() else {
+                    return Ok(vec![never_matches(s.as_var())]);
+                };
+                Ok(vec![Pattern::Triple(TriplePattern::new(
+                    o,
+                    p,
+                    s.clone().into(),
+                ))])
+            }
+            SparqlPropertyPath::Sequence { .. } => {
+                let mut steps = Vec::new();
+                Self::flatten_sequence(leaf, &mut steps);
+                self.lower_sequence_chain(s, &steps, o, span)
+            }
+            other => Err(LowerError::invalid_property_path(
+                format!(
+                    "Alternative (|) branches support simple predicates, inverse simple \
+                     predicates (^ex:p), or sequence chains (ex:a/ex:b); got {}",
+                    sparql_path_name(other),
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// Extract a simple predicate IRI from a property path.
+    ///
+    /// The path must be a simple IRI or the `a` keyword.
+    /// Predicate IRIs traversed by a transitive path (`+`/`*`). A simple inner
+    /// predicate yields one IRI; an alternation of simple predicates `(a|b|…)`
+    /// yields one per branch (for an alternation-transitive `(a|b)*`). Each
+    /// branch must be a simple predicate (`Iri`/`a`, possibly grouped); a
+    /// non-simple branch (inverse, sequence, nested modifier) is rejected.
+    fn extract_transitive_predicate_iris(
+        &mut self,
+        path: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<Vec<String>> {
+        let unwrapped = Self::unwrap_group(path);
+        match unwrapped {
+            SparqlPropertyPath::Alternative { .. } => {
+                let leaves = Self::collect_alt_leaves(unwrapped);
+                let mut iris = Vec::with_capacity(leaves.len());
+                for leaf in leaves {
+                    iris.push(self.extract_simple_predicate_iri(leaf, span)?);
+                }
+                Ok(iris)
+            }
+            _ => Ok(vec![self.extract_simple_predicate_iri(unwrapped, span)?]),
+        }
+    }
+
+    /// Extract the per-step [`PathStep`]s for a composite-transitive path
+    /// `(p1/p2/…)+`. Each sequence step must be a simple predicate, an
+    /// alternation of simple predicates, or either of those inverted (`^p`,
+    /// `^(a|b)`); nested transitives or further sequences are rejected.
+    fn extract_composite_steps(
+        &mut self,
+        path: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<Vec<PathStep>> {
+        let mut step_paths = Vec::new();
+        Self::flatten_sequence(path, &mut step_paths);
+        let mut steps = Vec::with_capacity(step_paths.len());
+        for step in step_paths {
+            steps.push(self.extract_composite_step(step, span)?);
+        }
+        Ok(steps)
+    }
+
+    /// Lower a single composite-path step to a [`PathStep`], honoring an inverse
+    /// wrapper (`^p`, `^(a|b)`).
+    fn extract_composite_step(
+        &mut self,
+        step: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<PathStep> {
+        // The transitive extractor accepts a simple predicate or an alternation
+        // of simple predicates and rejects everything else (sequence, nested
+        // modifier, …) with a clear error — reuse it for the inner path.
+        let (inner, inverse) = match Self::unwrap_group(step) {
+            SparqlPropertyPath::Inverse { path: inner, .. } => (Self::unwrap_group(inner), true),
+            other => (other, false),
+        };
+        let iris = self.extract_transitive_predicate_iris(inner, span)?;
+        let mut sids = Vec::with_capacity(iris.len());
+        for iri in &iris {
+            sids.push(
+                self.encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| LowerError::unknown_namespace(iri, span))?,
+            );
+        }
+        Ok(PathStep {
+            predicates: sids,
+            inverse,
+        })
+    }
+
+    fn extract_simple_predicate_iri(
+        &mut self,
+        path: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<String> {
+        match path {
+            SparqlPropertyPath::Iri(iri) => self.expand_iri(iri),
+
+            SparqlPropertyPath::A { .. } => {
+                // `a` is shorthand for rdf:type
+                Ok(TYPE.to_string())
+            }
+
+            SparqlPropertyPath::Group { path: inner, .. } => {
+                self.extract_simple_predicate_iri(inner, span)
+            }
+
+            // Any other path form is not a simple predicate
+            _ => Err(LowerError::invalid_property_path(
+                "Transitive paths (+, *) require a simple predicate IRI, not a complex path expression",
+                span,
+            )),
+        }
+    }
+}
+
+/// Human-readable name for a SPARQL property path variant (for error messages).
+fn sparql_path_name(path: &SparqlPropertyPath) -> &'static str {
+    match path {
+        SparqlPropertyPath::Iri(_) => "IRI",
+        SparqlPropertyPath::A { .. } => "a (rdf:type)",
+        SparqlPropertyPath::Inverse { .. } => "Inverse (^)",
+        SparqlPropertyPath::Sequence { .. } => "Sequence (/)",
+        SparqlPropertyPath::Alternative { .. } => "Alternative (|)",
+        SparqlPropertyPath::ZeroOrMore { .. } => "ZeroOrMore (*)",
+        SparqlPropertyPath::OneOrMore { .. } => "OneOrMore (+)",
+        SparqlPropertyPath::ZeroOrOne { .. } => "ZeroOrOne (?)",
+        SparqlPropertyPath::NegatedSet { .. } => "NegatedSet (!)",
+        SparqlPropertyPath::Group { .. } => "Group (())",
+    }
+}

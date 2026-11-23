@@ -1,0 +1,723 @@
+//! Admin endpoints: /health, /v1/fluree/stats, /v1/fluree/whoami, /.well-known/fluree.json, /swagger.json
+
+use crate::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
+use crate::error::Result;
+use crate::extract::FlureeHeaders;
+use crate::state::AppState;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::Json;
+use serde::Serialize;
+use std::sync::Arc;
+use tracing::Instrument;
+
+/// Health check response
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+}
+
+/// Health check endpoint
+///
+/// GET /health
+///
+/// Returns a simple health check response to verify the server is running.
+pub async fn health() -> Json<HealthResponse> {
+    // Simple health check - no complex span needed
+    tracing::debug!("health check requested");
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+/// Server statistics response
+#[derive(Serialize)]
+pub struct StatsResponse {
+    /// Server uptime in seconds
+    pub uptime_secs: u64,
+    /// Storage type (memory or file)
+    pub storage_type: &'static str,
+    /// Whether indexing is enabled
+    pub indexing_enabled: bool,
+    /// Number of cached ledgers
+    pub cached_ledgers: usize,
+    /// Server version
+    pub version: &'static str,
+}
+
+/// Server statistics endpoint
+///
+/// GET /v1/fluree/stats
+///
+/// Returns server statistics including uptime, storage type, and cache info.
+pub async fn stats(
+    State(state): State<Arc<AppState>>,
+    _headers: FlureeHeaders,
+) -> Json<StatsResponse> {
+    let span = tracing::debug_span!("stats");
+    async move {
+        tracing::info!("server stats requested");
+
+        Json(StatsResponse {
+            uptime_secs: state.uptime_secs(),
+            storage_type: state.config.storage_type_str(),
+            indexing_enabled: state.config.indexing_enabled,
+            cached_ledgers: match state.fluree.ledger_manager() {
+                Some(mgr) => mgr.cached_count().await,
+                None => 0,
+            },
+            version: env!("CARGO_PKG_VERSION"),
+        })
+    }
+    .instrument(span)
+    .await
+}
+
+/// Who-am-I diagnostic endpoint
+///
+/// GET /v1/fluree/whoami
+///
+/// Verifies the Bearer token (if present) using the same cryptographic
+/// verification paths as data endpoints, then returns a summary of the
+/// verified principal. If verification fails, includes the error and
+/// unverified decoded claims (marked as such) for debugging.
+pub async fn whoami(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Json<WhoAmIResponse> {
+    let token = crate::extract::extract_bearer_token(&headers);
+    let Some(token) = token else {
+        return Json(WhoAmIResponse {
+            token_present: false,
+            ..Default::default()
+        });
+    };
+
+    // Attempt cryptographic verification through the same path data endpoints use
+    #[cfg(feature = "oidc")]
+    let verify_result = {
+        let jwks_cache = state.jwks_cache.as_deref();
+        crate::token_verify::verify_bearer_token(&token, jwks_cache).await
+    };
+
+    #[cfg(not(feature = "oidc"))]
+    let verify_result = {
+        let _ = &state; // suppress unused warning
+        verify_embedded_jwk_for_whoami(&token)
+    };
+
+    match verify_result {
+        Ok(verified) => {
+            let payload = &verified.payload;
+            Json(WhoAmIResponse {
+                token_present: true,
+                verified: true,
+                auth_method: Some(if verified.is_oidc {
+                    "oidc".to_string()
+                } else {
+                    "embedded_jwk".to_string()
+                }),
+                issuer: Some(verified.issuer),
+                subject: payload.sub.clone(),
+                identity: payload.resolve_identity(),
+                expires_at: Some(payload.exp),
+                scopes: Some(scopes_from_payload(payload)),
+                ..Default::default()
+            })
+        }
+        Err(e) => {
+            // Verification failed — include unverified decoded claims for debugging
+            let decoded = decode_unverified_claims(&token);
+            Json(WhoAmIResponse {
+                token_present: true,
+                verified: false,
+                error: Some(e.to_string()),
+                issuer: decoded.as_ref().and_then(|d| d.issuer.clone()),
+                subject: decoded.as_ref().and_then(|d| d.subject.clone()),
+                identity: decoded.as_ref().and_then(|d| d.identity.clone()),
+                expires_at: decoded.as_ref().and_then(|d| d.expires_at),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// Verify via embedded JWK for the non-oidc build. Returns the same shape
+/// as `token_verify::VerifiedToken` but without the OIDC module dependency.
+#[cfg(not(feature = "oidc"))]
+fn verify_embedded_jwk_for_whoami(
+    token: &str,
+) -> std::result::Result<WhoAmIVerified, crate::error::ServerError> {
+    use fluree_db_credential::jwt_claims::EventsTokenPayload;
+
+    let jws_verified = fluree_db_credential::verify_jws(token)
+        .map_err(|e| crate::error::ServerError::unauthorized(format!("Invalid token: {e}")))?;
+
+    let payload: EventsTokenPayload = serde_json::from_str(&jws_verified.payload).map_err(|e| {
+        crate::error::ServerError::unauthorized(format!("Invalid token claims: {e}"))
+    })?;
+
+    Ok(WhoAmIVerified {
+        payload,
+        issuer: jws_verified.did,
+        is_oidc: false,
+    })
+}
+
+/// Minimal verified token for non-oidc builds (mirrors `token_verify::VerifiedToken`).
+#[cfg(not(feature = "oidc"))]
+struct WhoAmIVerified {
+    payload: fluree_db_credential::jwt_claims::EventsTokenPayload,
+    issuer: String,
+    is_oidc: bool,
+}
+
+/// Whoami response shape.
+#[derive(Serialize, Default)]
+pub struct WhoAmIResponse {
+    /// Whether a Bearer token was present in the request.
+    pub token_present: bool,
+    /// Whether the token's cryptographic signature was successfully verified.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub verified: bool,
+    /// Verification method used: `"embedded_jwk"` (Ed25519) or `"oidc"` (JWKS/RS256).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<WhoAmIScopes>,
+    /// Verification error message (only present when `verified` is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Scope summary for the whoami response.
+#[derive(Serialize, Default)]
+pub struct WhoAmIScopes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_read_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_write_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_all: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_read_ledgers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_write_ledgers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_ledgers: Option<Vec<String>>,
+}
+
+/// Extract scope fields from a verified payload into the response shape.
+///
+/// Ledger lists are the scopes authorization applies: `mydb` reads as
+/// `mydb:main`, and an entry that grants nothing is left out.
+fn scopes_from_payload(p: &fluree_db_credential::jwt_claims::EventsTokenPayload) -> WhoAmIScopes {
+    let effective = |scopes: &Option<Vec<String>>| {
+        scopes.as_ref().map(|listed| {
+            let mut ids: Vec<String> = crate::extract::parse_scopes(Some(listed))
+                .into_iter()
+                .map(String::from)
+                .collect();
+            ids.sort();
+            ids
+        })
+    };
+    WhoAmIScopes {
+        ledger_read_all: p.ledger_read_all,
+        ledger_write_all: p.ledger_write_all,
+        storage_all: p.storage_all,
+        ledger_read_ledgers: effective(&p.ledger_read_ledgers),
+        ledger_write_ledgers: effective(&p.ledger_write_ledgers),
+        storage_ledgers: effective(&p.storage_ledgers),
+    }
+}
+
+/// Unverified claims for the error-path debugging output.
+struct DecodedClaims {
+    issuer: Option<String>,
+    subject: Option<String>,
+    identity: Option<String>,
+    expires_at: Option<u64>,
+}
+
+/// Decode JWT claims without verification (for error-path debugging only).
+fn decode_unverified_claims(token: &str) -> Option<DecodedClaims> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+
+    Some(DecodedClaims {
+        issuer: claims.get("iss").and_then(|v| v.as_str()).map(String::from),
+        subject: claims.get("sub").and_then(|v| v.as_str()).map(String::from),
+        identity: claims
+            .get("fluree.identity")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        expires_at: claims.get("exp").and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// Auth discovery endpoint
+///
+/// GET /.well-known/fluree.json
+///
+/// Returns a discovery document that tells the CLI how to authenticate.
+/// For standalone `fluree-server` this advertises `"type": "token"` when any
+/// auth mode accepts tokens (Optional or Required), signalling that the CLI
+/// should prompt for a manual Bearer token. When all auth modes are `None`,
+/// the `auth` block is omitted (no token needed).
+///
+/// Solo (or other OIDC-capable products) can override this endpoint to return
+/// full `oidc_device` configuration.
+///
+/// See docs/design/auth-contract.md for the full contract.
+pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let config = &state.config;
+
+    // Any auth mode other than None means the server accepts (or requires) tokens.
+    let any_auth_enabled = config.events_auth().mode != EventsAuthMode::None
+        || config.data_auth().mode != DataAuthMode::None
+        || config.admin_auth().mode != AdminAuthMode::None;
+
+    let mut doc = serde_json::json!({
+        "version": 1,
+        // Versioned API base path (resolved against discovery origin by the CLI).
+        "api_base_url": "/v1/fluree",
+    });
+
+    if any_auth_enabled {
+        doc["auth"] = serde_json::json!({
+            "type": "token",
+        });
+    }
+
+    // Key rotation is available whenever the storage encrypts at rest.
+    if let Ok(status) = state.fluree.key_rotation_status().await {
+        doc["encryption"] = serde_json::json!({
+            "current_key_id": status.current_key_id,
+            "key_ids": status.key_ids,
+            "rotation": true,
+        });
+    }
+
+    // Advertise `.flpack` import capabilities so clients can negotiate the
+    // upload path. `direct` is always available (streaming POST /import);
+    // `presigned-put` is offered when the operator enables the negotiated
+    // upload flow for size-capped clients. `direct_max_bytes` only gates the
+    // choice when `presigned-put` is also offered.
+    let mut import_modes = vec!["direct"];
+    let mut source_upload = false;
+    if config.import_presign_enabled {
+        // `presigned-put` (single PUT) and `multipart-put` (parts) are minted by
+        // the same `/import-upload` endpoint; the server picks per-archive by
+        // size at mint time. Advertising both lets the client know multipart is
+        // available for archives over the single-PUT 5 GiB ceiling.
+        import_modes.push("presigned-put");
+        import_modes.push("multipart-put");
+        // `source-upload`: the mint endpoint also accepts raw source data
+        // (`source_kind: "source"` + `filename`) and runs the bulk-import
+        // pipeline server-side — the same formats as `fluree create --from`.
+        // Not offered on Raft-replicated servers (the pipeline publishes
+        // nameservice heads outside the replicated log).
+        source_upload = crate::routes::import::source_import_supported(&state);
+        if source_upload {
+            import_modes.push("source-upload");
+            // A source upload may name a new graph of an existing ledger
+            // (`"graph"` on mint). A server without this mode would ignore
+            // the field and create a ledger, so clients check for it.
+            import_modes.push("source-upload-graph");
+            // A source upload may salt its blank-node ids
+            // (`"skolem_namespace"` on mint); without this mode the field is
+            // ignored and the ids differ from a direct import's.
+            import_modes.push("source-upload-skolem");
+        }
+    }
+    let mut import_doc = serde_json::json!({
+        "modes": import_modes,
+        "direct_max_bytes": config.import_direct_max_bytes,
+        "multipart_threshold_bytes": config.import_multipart_threshold_bytes,
+        "multipart_part_size_bytes": config.import_multipart_part_size_bytes,
+    });
+    if source_upload {
+        import_doc["source_formats"] =
+            serde_json::json!(crate::routes::import::advertised_source_formats());
+    }
+    doc["import"] = import_doc;
+
+    // Advertise that `POST /push-merges` exists. A client refuses to push a
+    // history containing a merge to a server without it, rather than send a
+    // bundle that server would store incompletely.
+    doc["push"] = serde_json::json!({
+        "merged_commits": true,
+    });
+
+    // Advertise server-wide serving capabilities so clients can negotiate
+    // query-shipping vs peer (block-fetch) mode before authenticating.
+    // Per-ledger posture (f:servingDefaults) is advertised on the
+    // authenticated NS record lookup; this block is the coarse server-level
+    // view: queries are always served, blocks only when the storage proxy is
+    // enabled.
+    doc["serving"] = serde_json::json!({
+        "query": true,
+        "blocks": config.storage_proxy().enabled,
+    });
+
+    Json(doc)
+}
+
+/// OpenAPI specification endpoint
+///
+/// GET /swagger.json
+///
+/// Returns the OpenAPI specification for the Fluree server API.
+/// TODO: Generate from utoipa annotations
+pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
+    // Minimal OpenAPI spec - will be expanded with utoipa
+    let spec = serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "Fluree DB Server",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "HTTP REST API for Fluree DB"
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "responses": {
+                        "200": {
+                            "description": "Server is healthy"
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/encryption": {
+                "get": {
+                    "summary": "Encryption key ids held by this node (admin)",
+                    "responses": {"200": {"description": "encrypted flag, key_ids, current_key_id"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate": {
+                "post": {
+                    "summary": "Start or resume a key rotation sweep (admin; runs on the leader)",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "retire_key_id": {"type": "integer", "description": "Key whose blobs are rewritten under the current key"},
+                                        "dry_run": {"type": "boolean"},
+                                        "ledger": {"type": "string", "description": "Limit to one ledger (name or branch-qualified id)"},
+                                        "max_bytes_per_sec": {"type": "integer"}
+                                    },
+                                    "required": ["retire_key_id"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "The progress record"}, "409": {"description": "A rotation is already running"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/status": {
+                "get": {
+                    "summary": "Rotation progress record (admin; any node)",
+                    "responses": {"200": {"description": "key_ids, current_key_id, progress, active_here, seconds_since_update, stalled, released"}}
+                }
+            },
+            "/v1/fluree/encryption/rotate/pause": {
+                "post": {"summary": "Pause the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/cancel": {
+                "post": {"summary": "Cancel the sweep running on this node (admin)", "responses": {"200": {"description": "ok"}}}
+            },
+            "/v1/fluree/encryption/rotate/verify": {
+                "post": {
+                    "summary": "Count blobs still on a retiring key and stamp the record (admin)",
+                    "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"retire_key_id": {"type": "integer"}}, "required": ["retire_key_id"]}}}},
+                    "responses": {"200": {"description": "The progress record with its completion stamp"}}
+                }
+            },
+            "/v1/fluree/create": {
+                "post": {
+                    "summary": "Create a new ledger",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Ledger alias"
+                                        }
+                                    },
+                                    "required": ["ledger"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/bm25/create": {
+                "post": {
+                    "summary": "Create a BM25 full-text search index over a ledger",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {
+                                            "type": "string",
+                                            "description": "Graph-source name for the index (no ':'); the alias is <name>:<branch>"
+                                        },
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Source ledger alias to index"
+                                        },
+                                        "branch": {
+                                            "type": "string",
+                                            "description": "Branch for the index graph source (default \"main\")"
+                                        },
+                                        "query": {
+                                            "type": "object",
+                                            "description": "Indexing query (FQL / JSON-LD) selecting the documents and text properties to index; must select @id"
+                                        },
+                                        "k1": {
+                                            "type": "number",
+                                            "description": "Term-frequency saturation (default 1.2)"
+                                        },
+                                        "b": {
+                                            "type": "number",
+                                            "description": "Document-length normalization, 0..=1 (default 0.75)"
+                                        }
+                                    },
+                                    "required": ["name", "ledger", "query"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/bm25/sync": {
+                "post": {
+                    "summary": "Sync a BM25 full-text index",
+                    "description": "Syncs through the source ledger's head, or through `t` when supplied",
+                    "parameters": [
+                        {
+                            "name": "t",
+                            "in": "query",
+                            "required": false,
+                            "description": "Source-ledger commit t to sync through. Omit to sync through the source's current head.",
+                            "schema": {
+                                "type": "integer",
+                                "format": "int64",
+                                "minimum": 1
+                            }
+                        }
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "index": {
+                                            "type": "string",
+                                            "description": "Index graph-source alias to sync (e.g. \"docsearch:main\")"
+                                        }
+                                    },
+                                    "required": ["index"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/sweep": {
+                "post": {
+                    "summary": "Reclaim orphaned index artifacts",
+                    "description": "Releases index artifacts that no live index chain references. Covers every branch of the ledger, since dictionary blobs are shared across branches. Holds off index builds for the duration and aborts without deleting if any root cannot be read or any prefix cannot be listed. Single-process deployments only: the hold does not exclude an external indexer.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Ledger name, without a branch suffix"
+                                        }
+                                    },
+                                    "required": ["ledger"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Sweep complete, including when nothing was reclaimable",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ledger": {
+                                                "type": "string"
+                                            },
+                                            "reclaimed": {
+                                                "type": "integer",
+                                                "description": "Artifacts released"
+                                            },
+                                            "failures": {
+                                                "type": "array",
+                                                "description": "Artifacts that could not be released; they stay in storage and the next sweep retries them",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "address": {
+                                                            "type": "string"
+                                                        },
+                                                        "error": {
+                                                            "type": "string"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Ledger does not exist"
+                        },
+                        "409": {
+                            "description": "Another maintenance operation holds one of the ledger's branches"
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/sweep/plan": {
+                "post": {
+                    "summary": "Report what a sweep would reclaim",
+                    "description": "Same request body, hold, and admin protection as /v1/fluree/sweep, but deletes nothing.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Ledger name, without a branch suffix"
+                                        }
+                                    },
+                                    "required": ["ledger"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Plan computed",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ledger": {
+                                                "type": "string"
+                                            },
+                                            "orphan_count": {
+                                                "type": "integer",
+                                                "description": "Artifacts that would be released"
+                                            },
+                                            "scanned": {
+                                                "type": "integer",
+                                                "description": "Artifacts examined across every swept prefix"
+                                            },
+                                            "live": {
+                                                "type": "integer",
+                                                "description": "Distinct artifacts reachable from a live index chain"
+                                            },
+                                            "orphans": {
+                                                "type": "array",
+                                                "description": "Every address that would be released, in full",
+                                                "items": {
+                                                    "type": "string"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Ledger does not exist"
+                        },
+                        "409": {
+                            "description": "Another maintenance operation holds one of the ledger's branches"
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/query": {
+                "post": {
+                    "summary": "Execute a query",
+                    "description": "Execute JSON-LD or SPARQL queries"
+                }
+            },
+            "/v1/fluree/update": {
+                "post": {
+                    "summary": "Execute an update transaction"
+                }
+            }
+        }
+    });
+
+    Ok(Json(spec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token that lists `mydb` and an id that parses to nothing shows what
+    /// it authorizes, not what it says.
+    #[test]
+    fn whoami_reports_the_scopes_that_authorize() {
+        let payload: fluree_db_credential::jwt_claims::EventsTokenPayload =
+            serde_json::from_value(serde_json::json!({
+                "iss": "did:key:z6Mk",
+                "exp": 0,
+                "fluree.ledger.read.ledgers": ["mydb", "bad@x", "other:dev"],
+                "fluree.storage.ledgers": ["mydb#g"],
+            }))
+            .unwrap();
+        let scopes = scopes_from_payload(&payload);
+        assert_eq!(
+            scopes.ledger_read_ledgers.unwrap(),
+            ["mydb:main", "other:dev"]
+        );
+        assert_eq!(scopes.storage_ledgers.unwrap(), Vec::<String>::new());
+        assert!(scopes.ledger_write_ledgers.is_none());
+    }
+}

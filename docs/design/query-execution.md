@@ -1,0 +1,246 @@
+---
+title: Query execution and overlay merge
+---
+
+This document describes the **single query execution pipeline** in Fluree DB and how it combines:
+
+- **Indexed data** (binary columnar indexes)
+- **Overlay data** (novelty + staged flakes)
+
+It also calls out where **graph scoping** (`g_id`) is applied so named graphs remain isolated.
+
+## Pipeline overview
+
+```mermaid
+flowchart TD
+  LedgerState -->|produces| LedgerSnapshot
+  LedgerSnapshot -->|shared substrate| GraphDb
+  GraphDb -->|single-ledger| QueryRunner
+  GraphDb -->|member_of| DataSetDb
+  DataSetDb -->|federated| QueryRunner
+  QueryRunner -->|scan index + merge overlay| DatasetOperator
+  DatasetOperator -->|per-graph| BinaryScanOperator
+  BinaryScanOperator -->|fast path| BinaryCursor
+  BinaryScanOperator -->|fallback| range_with_overlay
+  BinaryCursor -->|graph-scoped decode| BinaryGraphView
+  range_with_overlay -->|delegates| RangeProvider
+```
+
+## Where this exists in code
+
+- **API entrypoints**
+  - `fluree-db-api/src/view/query.rs`: single-ledger `GraphDb` queries (`query`)
+  - `fluree-db-api/src/view/dataset_query.rs`: dataset queries (`DataSetDb`)
+
+- **Unified query runner**
+  - `fluree-db-query/src/execute/runner.rs`
+    - `prepare_execution(db: GraphDbRef<'_>, query: &ExecutableQuery)` builds derived facts/ontology (if enabled), rewrites patterns, and builds the operator tree.
+    - `execute_prepared(...)` runs the operator tree using an `ExecutionContext`.
+
+- **Dataset operator**
+  - `fluree-db-query/src/dataset_operator.rs`
+    - `DatasetOperator` wraps every triple-pattern scan. In single-graph mode (the common case) it passes through to one inner `BinaryScanOperator` with negligible overhead. In multi-graph mode (FROM/FROM NAMED datasets) it fans out one inner operator per active graph, drives their lifecycles, and stamps ledger provenance (`Binding::IriMatch`) on results that span multiple ledgers.
+    - `DatasetBuilder` trait (factory pattern): the planner constructs a `ScanDatasetBuilder` at plan time; `DatasetOperator` calls `build()` at execution time during `open()` to produce per-graph `BinaryScanOperator`s.
+    - Nested composition: inner operators can themselves be `DatasetOperator`s — provenance stamping passes `IriMatch` through unchanged.
+    - Default-union SET semantics (SPARQL §13.2): when the active default graph is a `>= 2`-member `FROM` union in current mode, `DatasetOperator` deduplicates emitted rows across members (`BatchDeduper`, reusing `DistinctOperator`'s `EqualityNorm` so encoded/decoded twins collapse). Cost model: this is the one place a scan is not bounded-memory streaming — the seen-set grows O(distinct emitted rows), each retained row charges one unit of fuel, and `COUNT(*)` over a union forgoes the per-member count-only shortcut (EXPLAIN reports `default_union_set_merge`). Single-graph, `FROM NAMED`-only, and history-mode scans are untouched (history unions stay bags: per-event rows must not merge). The plan must emit every variable column when the dedup can arm (`emit_is_full`), and the operator fails loud otherwise.
+
+- **Scan operators**
+  - `fluree-db-query/src/binary_scan.rs`
+    - `BinaryScanOperator` handles single-graph scanning only. Selects between binary cursor (streaming, integer-ID pipeline) and range fallback at `open()` time based on the `ExecutionContext`.
+
+- **Range fallback**
+  - `fluree-db-core/src/range.rs`: `range_with_overlay(snapshot, g_id, overlay, ...)`
+  - `fluree-db-core/src/range_provider.rs`: `RangeProvider` trait implemented by the binary range provider
+
+## Graph scoping (`g_id`)
+
+Graph scoping is applied at two key boundaries:
+
+- **Binary streaming path**: `BinaryCursor` operates on a `BinaryGraphView` (graph-scoped decode handle), ensuring leaf/leaflet decoding, predicate dictionaries, and specialty arenas are graph-isolated.
+- **Range path**: `range_with_overlay(snapshot, g_id, overlay, ...)` passes `g_id` into the `RangeProvider`, which routes the range query to the correct per-graph index segments.
+
+Overlay providers are **graph-scoped** at the trait boundary: the overlay hook receives `g_id` and must only return flakes for that graph. This keeps multi-tenant named graphs isolated even when overlay data is sourced externally.
+
+## Overlay merge semantics (high level)
+
+Both scan paths implement the same logical behavior:
+
+- Read matching flakes from the **indexed base** (binary files)
+- Read matching flakes from the **overlay** (novelty/staged)
+- Merge them using `(t, op)` semantics so retractions cancel assertions as-of the query time bound
+
+The details differ:
+
+- `BinaryScanOperator` translates overlay flakes into integer-ID space and merges them into the decoded columnar stream.
+- `RangeScanOperator` delegates to `range_with_overlay`, which combines `RangeProvider` output with overlay output.
+
+## Bound-term resolution and the overlay-only fallback
+
+`BinaryScanOperator::open()` translates each bound term of the triple pattern
+into a persisted dictionary id (`BinaryFilter`). A term that fails to translate
+cannot constrain the base scan, so the scan would degrade into a wide walk. How
+that is handled depends on *why* the translation failed:
+
+- **Conclusive miss** — the dictionary was consulted and answered "absent"
+  (`find_subject_id` / `find_string_id` returning `Ok(None)`, or a value that
+  does not encode). The term names no base row at all, so the scan takes
+  `open_overlay_only_fallback` and reads novelty exclusively.
+- **Undecidable** — the dictionary could not answer (an I/O error). Absence is
+  unproven, so the scan stays widened and correctness is preserved by a
+  row-by-row check.
+
+A bound **subject** needs one extra step before that split. Pattern SIDs are
+encoded against `ctx.original_snapshot`, but the filter resolves them through
+`ctx.active_snapshot`, and in a per-graph context those namespace tables differ.
+`open()` therefore keeps the decoded IRI in `unresolved_bound_subject_iri` and
+probes it against the store's subject dictionary directly before deciding — so
+the common case (a subject that simply does not exist) is a single dictionary
+lookup rather than a full predicate-partition walk with an IRI resolution per
+row. This matters well beyond point queries: `join.rs` and `optional.rs` rebind
+a correlated subject to `Ref::Iri` once per driving row, so a non-batched probe
+loop pays this cost per probe.
+
+The overlay-only walk is itself key-bounded. `Segment::range`
+(`fluree-db-novelty`) seeks with `partition_point` on both ends and
+`may_overlap` prunes whole segments, so `open_overlay_only_fallback` passes
+bounds derived from whichever bound terms lead the active index order
+(`overlay_walk_bounds`). Passing `None`/`None` instead walks every flake in the
+graph's novelty on every probe.
+
+Bounds are an **optimization only** — the per-flake equality checks inside the
+walk remain the correctness backstop, the same contract as
+`fast_path_common::collect_resolved_overlay_ops`. A bound must therefore never
+be too tight: pin only components that lead the sort order *and* are fixed by an
+equality match, and let every trailing component span its full range. `first` is
+left-exclusive (hence `t: i64::MIN`); `rhs` is inclusive.
+
+## Planner fast paths
+
+Before building the generic operator tree, `build_operator_tree_inner`
+(`fluree-db-query/src/execute/operator_tree.rs`) runs a chain of `detect_*`
+shape recognizers. When one matches, it builds a specialized `FastPathOperator`
+that captures the slow generic tree as a `fallback`; the operator returns
+`Ok(None)` from its `open()`-time closure to defer to that fallback whenever its
+runtime preconditions do not hold. The whole chain is disabled in History mode
+(`!planning.is_history()`).
+
+Fast paths choose one of two overlay strategies (`fast_path_common.rs`):
+
+- **strategy (a) — bail:** `fast_path_store` / `allow_fast_path` decline when
+  there is uncommitted overlay (`epoch != 0`), `to_t < max_t`, multi-ledger, a
+  `from_t`, or non-root policy. Used by base-only micro-optimizations.
+- **strategy (b) — merge:** `allow_cursor_fast_path` admits overlay and
+  time-travel because the operator reads through an overlay-merging
+  `BinaryCursor` (`build_psot_cursor_for_predicate` /
+  `build_post_cursor_for_predicate`) that folds novelty and honors `to_t`.
+
+### Reverse-POST `ORDER BY DESC(?o) LIMIT k`
+
+`detect_post_order_desc_limit` → `fast_post_order_limit::post_order_desc_limit_operator`.
+
+Recognizes `SELECT ?s ?o WHERE { ?s <p> ?o [ ; ?s a <Class> ] } ORDER BY DESC(?o) LIMIT k`
+(optional `OFFSET`/`DISTINCT`; `DISTINCT` requires `?o` projected). The POST
+index is sorted `(p_id, o_type, o_key, o_i, s_id)`, so for a predicate whose
+objects share one **order-preserving** `o_type` (numeric / temporal / boolean —
+`fast_path_common::is_post_desc_orderable`), the physical tail of the predicate's
+POST range is exactly the DESC top-k. The operator walks POST leaf entries from
+the tail, decodes only the rows it keeps, and stops after `OFFSET + LIMIT`
+survivors — avoiding a full-predicate drain into the top-k `SortOperator`.
+
+Correctness is enforced at runtime (the detector is shape-only):
+
+- A directory prepass proves the predicate's objects are a single
+  order-preserving `o_type` before collecting. If they are not — dict-backed
+  strings/refs (which sort *above* numerics/temporals), a mixed leaflet, or more
+  than one `o_type` — the operator bails to the generic top-k rather than emit a
+  wrong order. (A full prepass, not a streaming check, is required because the
+  tail walk stops after `OFFSET + LIMIT` rows.)
+- Profitability: for the `?s a <Class>` shape, `detect_post_order_desc_limit`
+  consults `StatsView` and declines (defers to the generic plan) when the class
+  is selective — i.e. the estimated tail rows to collect `OFFSET + LIMIT` class
+  members (`need / (class_count / ndv_subjects(p))`) exceeds `class_count`, so
+  anchoring on the class directly is cheaper. The bare shape (no class) always
+  wins; missing stats fall through to a runtime scan budget that bails after a
+  bounded number of inspected rows. (Note the detector already rejects any other
+  pattern, so an arbitrary selective filter like `?s :employeeId 1234` never
+  reaches this path — it goes to the generic planner, which anchors on it.)
+
+The gate is `allow_cursor_fast_path` + `to_t >= index_t` (deep time-travel, which
+needs the history sidecar, defers). Two lanes split on whether novelty is present:
+
+- **Base lane** (`epoch == 0`, `to_t == index_t`): a plain reverse leaf-walk over
+  the persisted index. Class membership uses `batched_lookup_predicate_refs`
+  (persisted is exact here).
+- **Overlay lane** (`epoch != 0`): the same reverse leaf-walk is merged, in
+  descending value order, with the predicate's resolved novelty ops — a *row-set*
+  merge (skip base rows retracted by overlay; add overlay asserts; dedup by the
+  full V3 fact identity `(s_id, o_key, o_i)` within the single proven `o_type` —
+  `o_i` keeps repeated/list values distinct), which sidesteps the "base + asserts
+  − retracts" arithmetic pitfall that only afflicts overlay-aware *counting*.
+  `rdf:type` class membership is likewise evaluated overlay-correctly (persisted
+  base ± novelty type asserts/retracts), and novelty-only subjects are
+  materialized through a novelty-aware graph view (the persisted-dict
+  `encoded_sid` form would not resolve them).
+
+## WHERE-level early dedup (projection + distinct between joins)
+
+Deep existential chains (`?a p1 ?b . ?b p2 ?c . ?c p3 ?x` where only `?x` is
+projected/aggregated) can carry compounding duplicate multiplicity: once `?a`
+is dead, every distinct `?b` is repeated once per `?a` that produced it, and
+each join multiplies the redundancy into the next hop. On a real 6-hop
+biomedical query this reached 10.17M intermediate rows carrying 4,086 distinct
+values (2,490× redundancy, ~400× slowdown).
+
+The WHERE planner (`fluree-db-query/src/execute/where_plan.rs`,
+`build_sequential_join_block` / `build_sequential_triple_chain`) counters this
+with **early dedup**: at each join step it computes the live-variable set
+(post-WHERE required vars ∪ vars referenced by not-yet-executed
+patterns/filters/binds), trims dead columns from the join output
+(`with_out_schema`), and — when dedup is licensed — wraps the step in a
+streaming `DistinctOperator` so duplicates collapse before the next join.
+
+**Soundness gate** (`where_dedup_safe`, computed in
+`build_operator_tree_inner`): collapsing duplicate rows is only legal when
+downstream cannot observe WHERE-output multiplicity —
+
+- **grouping present** → *both* of:
+  - every aggregate must be *duplicate-insensitive*:
+    `AggregateFn::duplicate_insensitive()` = any `DISTINCT`-marked aggregate
+    (`COUNT/SUM/AVG/MEDIAN/VARIANCE/STDDEV/GROUP_CONCAT/collect DISTINCT`) plus
+    `MIN`/`MAX`/`SAMPLE`. A single plain `COUNT`/`SUM`/… blocks dedup for the
+    whole WHERE.
+  - no variable may pass through the grouping stage *raw*: every var in
+    `VariableDeps::required_aggregate_vars` must be a `GROUP BY` key or an
+    aggregate output. A non-key variable that survives grouping is emitted as
+    a per-group **list** (`Binding::Grouped`, the JSON-LD grouped-projection
+    feature — SPARQL rejects the shape), and that list observes row
+    multiplicity. This clause also covers the `GROUP BY ?g` case with *no*
+    aggregation stage, where the aggregate check alone is vacuously true.
+- **no grouping** → the query itself must be `SELECT DISTINCT`.
+
+Both clauses are checked against `variable_deps`; when it is `None`
+(wildcard/boolean/construct) dedup is off anyway, since projection pushdown —
+and therefore the live-var trimming that triggers dedup — is disabled.
+
+An outer `SELECT DISTINCT` over an aggregate query does **not** license WHERE
+dedup — it dedups *result* rows after aggregation, while a plain `COUNT` under
+it still observes pre-aggregation multiplicity (this exact miswiring was a
+correctness bug fixed alongside the aggregate-aware gate).
+
+The dedup is inserted only at steps where trimming actually dropped a dead
+variable, so queries whose variables all stay live (e.g. same-subject stars
+feeding the projection) pay nothing. Note the memory trade: `DistinctOperator`
+holds an uncapped, non-spilling hash set of the distinct rows seen at each
+insertion point, so an aggregate query that previously streamed (e.g. a
+`MAX`-only chain whose intermediates are large and already near-distinct)
+becomes resident-memory-bound for no gain. The gate errs toward the speed win. Subqueries dedup at their own boundary
+(`apply_solution_modifiers` applies the subquery's `DISTINCT`) rather than
+per-step.
+
+
+## Related
+
+This document covers the pipeline and overlay-merge semantics. For the full
+performance picture — the cost model, the specialized join operators, the
+complete fast-path catalog, frontier traversal, and where parallelism is
+applied — see [Performance architecture](performance.md).

@@ -1,0 +1,1158 @@
+use fluree_db_core::VerifiedIdentity;
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
+
+use crate::view::{DataSetDb, QueryInput};
+use crate::{
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider,
+    QueryExecutionOptions, Result, Tracker, TrackingOptions, VarRegistry,
+};
+
+use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_core::LedgerSnapshot;
+use fluree_db_query::ir::Query;
+use fluree_db_query::parse::parse_query_in_dataset;
+
+use super::QueryResult;
+
+// =============================================================================
+// Query Parsing Helpers
+// =============================================================================
+
+/// Parse a JSON-LD query and prepare it for execution.
+///
+/// If the query has no `@context` (or `context`) key and a `default_context`
+/// is provided, the default is injected so that prefix resolution succeeds
+/// without requiring the caller to repeat prefixes on every query.
+///
+/// Returns the variable registry and parsed query.
+pub(crate) fn parse_jsonld_query(
+    query_json: &JsonValue,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    strict_compact_iri: Option<bool>,
+) -> Result<(VarRegistry, Query)> {
+    parse_jsonld_query_for_dataset(
+        query_json,
+        snapshot,
+        default_context,
+        strict_compact_iri,
+        &DataSetDb::new(),
+    )
+}
+
+/// [`parse_jsonld_query`] for a query run against `dataset`: a
+/// `["graph", …]` name the dataset registers is kept as written, even when
+/// the body does not list it in `fromNamed`.
+pub(crate) fn parse_jsonld_query_for_dataset(
+    query_json: &JsonValue,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    strict_compact_iri: Option<bool>,
+    dataset: &DataSetDb,
+) -> Result<(VarRegistry, Query)> {
+    let has_context = query_json.get("@context").is_some() || query_json.get("context").is_some();
+
+    let effective_query;
+    let query_ref = if !has_context {
+        if let Some(ctx) = default_context {
+            effective_query = {
+                let mut q = query_json.clone();
+                if let Some(obj) = q.as_object_mut() {
+                    obj.insert("@context".to_string(), ctx.clone());
+                }
+                q
+            };
+            &effective_query
+        } else {
+            query_json
+        }
+    } else {
+        query_json
+    };
+
+    let mut vars = VarRegistry::new();
+    let dataset_names = dataset.named.keys().map(ToString::to_string).collect();
+    let parsed = parse_query_in_dataset(
+        query_ref,
+        snapshot,
+        &mut vars,
+        strict_compact_iri,
+        &dataset_names,
+    )?;
+    Ok((vars, parsed))
+}
+
+/// Parse a SPARQL query and prepare it for execution.
+///
+/// If `default_context` is provided (a JSON-LD `@context` object mapping
+/// short prefix → namespace IRI), any prefixes not explicitly declared in
+/// the SPARQL prologue are injected as defaults. This lets queries omit
+/// `PREFIX` declarations for prefixes that were established during import.
+///
+/// Returns the variable registry and parsed query.
+pub(crate) fn parse_sparql_to_ir(
+    parsed: Option<&SparqlParse>,
+    sparql: &str,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_sparql::ParamMap>,
+    rdf_list_view: bool,
+) -> Result<(VarRegistry, Query)> {
+    let ast = parse_and_validate_sparql_from(parsed, sparql, params)?;
+    lower_sparql_ast(ast, snapshot, default_context, sparql, rdf_list_view)
+}
+
+/// Inject default prefixes from the ledger's stored `@context`, but only when
+/// the query declares no `PREFIX` of its own. Any explicit `PREFIX` declaration
+/// (even `PREFIX : <>`) signals the user is managing their own prefix
+/// environment, so default injection is skipped entirely.
+pub(crate) fn inject_default_prefixes(
+    ast: &mut fluree_db_sparql::SparqlAst,
+    default_context: Option<&JsonValue>,
+) {
+    if ast.prologue.prefixes.is_empty() {
+        if let Some(ctx_obj) = default_context.and_then(|v| v.as_object()) {
+            for (short, iri_val) in ctx_obj {
+                if let Some(iri) = iri_val.as_str() {
+                    ast.prologue
+                        .prefixes
+                        .push(fluree_db_sparql::ast::PrefixDecl::new(
+                            short.as_str(),
+                            iri,
+                            fluree_db_sparql::SourceSpan::new(0, 0),
+                        ));
+                }
+            }
+        }
+    }
+}
+
+/// Lower an already parsed + validated SPARQL AST to IR, injecting default
+/// prefixes first. Callers that parsed the AST for another reason (e.g. to
+/// resolve a `FROM` clause) reuse it here instead of re-parsing the string —
+/// see #1473. Behaviour matches [`parse_sparql_to_ir`], which is now a thin
+/// parse-then-lower wrapper over this.
+///
+/// `rdf_list_view` reads lists as their RDF cells, for the Graph Store `GET`
+/// ([`crate::QueryExecutionOptions::with_rdf_list_view`]); SPARQL itself
+/// reads a list's members as values.
+pub(crate) fn lower_sparql_ast(
+    mut ast: fluree_db_sparql::SparqlAst,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    sparql: &str,
+    rdf_list_view: bool,
+) -> Result<(VarRegistry, Query)> {
+    inject_default_prefixes(&mut ast, default_context);
+
+    let mut vars = VarRegistry::new();
+    let mut parsed =
+        fluree_db_sparql::lower_sparql_with_source(&ast, snapshot, &mut vars, Some(sparql))?;
+    parsed.rdf_list_view = rdf_list_view;
+    Ok((vars, parsed))
+}
+
+/// Whether a parsed SPARQL AST carries a dataset clause (`FROM` / `FROM NAMED`).
+/// `UPDATE` requests have no dataset clause of this form.
+pub(crate) fn sparql_ast_has_dataset(ast: &fluree_db_sparql::SparqlAst) -> bool {
+    match &ast.body {
+        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Update(_) => false,
+    }
+}
+
+/// Parse a Cypher (openCypher 9) query and prepare it for execution.
+///
+/// Cypher has no prologue/prefix syntax of its own. Bare identifiers
+/// (labels/types/property keys) are plain namespace-0 names by
+/// default; the ledger's default JSON-LD context can opt into RDF
+/// compat by supplying `@vocab` (a prefix for bare identifiers) and
+/// named term mappings (per-name overrides).
+pub(crate) fn parse_cypher_to_ir(
+    cypher: &str,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_cypher::ParamMap>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
+) -> Result<(VarRegistry, Query)> {
+    let ast = substituted_cypher_ast(cypher, params)?;
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
+}
+
+/// Statements longer than this are parsed but never cached: unique bulk
+/// payloads (inline CREATE data) would evict the short, hot statements the
+/// cache exists for, and entry count — not bytes — bounds the LRU.
+const MAX_CACHED_STATEMENT_LEN: usize = 8 * 1024;
+
+/// Process-wide parsed-AST LRU, keyed on statement text.
+///
+/// The cached value is the **pre-substitution** AST: text-only key, ledger
+/// independent, immutable. Callers clone the `Arc`'d AST and run
+/// `substitute_params` on the clone, so per-request cost under a hit is
+/// clone + substitute instead of a full parse. Capacity comes from
+/// `FLUREE_CYPHER_AST_CACHE` (entries, default 512; `0` disables), read once.
+#[allow(clippy::type_complexity)]
+fn cypher_ast_cache(
+) -> Option<&'static parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>
+{
+    use std::num::NonZeroUsize;
+    use std::sync::OnceLock;
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Option<parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>,
+    > = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let capacity = std::env::var("FLUREE_CYPHER_AST_CACHE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            NonZeroUsize::new(capacity).map(|c| parking_lot::Mutex::new(lru::LruCache::new(c)))
+        })
+        .as_ref()
+}
+
+/// Parse Cypher source through the process-wide AST cache.
+///
+/// Only successful parses are cached; parse failures re-parse on every call
+/// so diagnostics stay exact. Returns the shared pre-substitution AST — do
+/// not mutate through the `Arc`; clone first (see [`substituted_cypher_ast`]).
+pub(crate) fn parse_cypher_ast_cached(cypher: &str) -> Result<Arc<fluree_db_cypher::CypherAst>> {
+    if let Some(cache) = cypher_ast_cache() {
+        if let Some(hit) = cache.lock().get(cypher) {
+            return Ok(Arc::clone(hit));
+        }
+    }
+    let out = fluree_db_cypher::parse_cypher(cypher);
+    if out.has_errors() {
+        let msg = out
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::cypher(msg, out.diagnostics));
+    }
+    let ast = Arc::new(
+        out.ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?,
+    );
+    if cypher.len() <= MAX_CACHED_STATEMENT_LEN {
+        if let Some(cache) = cypher_ast_cache() {
+            cache.lock().put(cypher.into(), Arc::clone(&ast));
+        }
+    }
+    Ok(ast)
+}
+
+/// Parse (via the AST cache) and return a param-substituted AST clone.
+///
+/// Substitution always runs (empty map when no params were supplied) so a
+/// `$param` with no value reports a clear missing-parameter error rather
+/// than reaching the lowering as an unsupported node.
+pub(crate) fn substituted_cypher_ast(
+    cypher: &str,
+    params: Option<&fluree_db_cypher::ParamMap>,
+) -> Result<fluree_db_cypher::CypherAst> {
+    let ast = parse_cypher_ast_cached(cypher)?;
+    let mut ast = (*ast).clone();
+    let empty = fluree_db_cypher::ParamMap::new();
+    fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+        .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+    Ok(ast)
+}
+
+/// Lower an already-parsed, param-substituted Cypher read AST to the shared
+/// query IR. Used by `parse_cypher_to_ir` and by the conditional-write probes,
+/// which build read ASTs in code.
+pub(crate) fn lower_cypher_ast_to_ir(
+    ast: &fluree_db_cypher::CypherAst,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
+) -> Result<(VarRegistry, Query)> {
+    // Pull `@vocab` and named-term overrides out of the default
+    // context, then build a `LoweringContext` and pass it to the
+    // context-aware lower entry so the ledger's IRI mappings actually
+    // apply to bare Cypher identifiers.
+    let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
+
+    // Procedure shims (`CALL db.labels() YIELD …`) answer from ledger stats:
+    // rewrite the statement to a constant-rows query, then lower that.
+    let rewritten;
+    let ast = if let fluree_db_cypher::ast::Statement::CallProcedure(call) = &ast.statement {
+        let query = crate::cypher_procedures::procedure_call_query(
+            call,
+            snapshot,
+            overlay.map(|(o, _)| o),
+            vocab.as_deref(),
+            &overrides,
+            policy,
+        )?;
+        rewritten = fluree_db_cypher::CypherAst {
+            statement: fluree_db_cypher::ast::Statement::Query(query),
+            span: ast.span,
+        };
+        &rewritten
+    } else {
+        ast
+    };
+
+    let mut vars = VarRegistry::new();
+    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
+        .with_vocab_opt(vocab.clone())
+        .with_allow_full_scan(cypher_full_scan_enabled())
+        .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
+    if !overrides.is_empty() {
+        ctx = ctx.with_overrides(overrides);
+    }
+    let mut parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
+    // Carried to `labels()`/`type()`/`keys()` evaluation so name compaction
+    // matches `db.labels()` (vocab-strip or full IRI).
+    parsed.cypher_vocab = vocab.map(std::sync::Arc::from);
+    Ok((vars, parsed))
+}
+
+/// Whether any reified edge can exist in the queried view — the gate for
+/// value-only bound relationship variables' per-hop OPTIONAL annotation
+/// probe. Three tiers, each conservative (`true`) when it can't decide:
+///
+/// 1. Dictionary: `f:reifiesSubject` never entered the dictionary — no
+///    annotation was ever written; certain `false`.
+/// 2. Index stats: per-property counts show `f:reifiesSubject` facts.
+/// 3. Overlay: one PSOT walk answering "any `f:reifiesSubject` flake in
+///    novelty?", cached process-wide on `content_version` — callers that
+///    can't supply the overlay stay conservative.
+fn reified_edges_possible(
+    snapshot: &LedgerSnapshot,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+) -> bool {
+    let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::reifies_iris::SUBJECT) else {
+        return false;
+    };
+    if index_has_reified_edges(snapshot, &reifies_sid) {
+        return true;
+    }
+    match overlay {
+        None => true,
+        Some((overlay, g_id)) => overlay_has_reified_edges(overlay, g_id, &reifies_sid),
+    }
+}
+
+fn index_has_reified_edges(snapshot: &LedgerSnapshot, reifies_sid: &fluree_db_core::Sid) -> bool {
+    let Some(stats) = &snapshot.stats else {
+        return true;
+    };
+    let Some(props) = &stats.properties else {
+        return true;
+    };
+    props.iter().any(|p| {
+        p.count > 0
+            && p.sid.0 == reifies_sid.namespace_code
+            && p.sid.1.as_str() == reifies_sid.name.as_ref()
+    })
+}
+
+fn overlay_has_reified_edges(
+    overlay: &dyn OverlayProvider,
+    g_id: u16,
+    reifies_sid: &fluree_db_core::Sid,
+) -> bool {
+    use std::sync::OnceLock;
+    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, u16), bool>>;
+    static CACHE: OnceLock<ReifiesCache> = OnceLock::new();
+
+    if overlay.is_effectively_empty() {
+        return false;
+    }
+    let Some(version) = overlay.content_version() else {
+        return true;
+    };
+    let cache = CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    });
+    if let Some(&hit) = cache.lock().get(&(version, g_id)) {
+        return hit;
+    }
+    let mut found = false;
+    overlay.for_each_overlay_flake(
+        g_id,
+        fluree_db_core::IndexType::Psot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |flake| {
+            if flake.p == *reifies_sid {
+                found = true;
+            }
+        },
+    );
+    cache.lock().put((version, g_id), found);
+    found
+}
+
+/// Whether bare `MATCH (n)` whole-graph scans are opted in for Cypher
+/// (`FLUREE_CYPHER_ALLOW_FULL_SCAN=1|true`). Read once per process.
+fn cypher_full_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUREE_CYPHER_ALLOW_FULL_SCAN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Extract `@vocab` and bare-identifier → IRI overrides from a
+/// JSON-LD `@context` object.
+///
+/// Shared by the read path (`parse_cypher_to_ir`) and the write path
+/// (`Fluree::transact_cypher`) so both surfaces honor the same
+/// ledger-context mappings.
+pub(crate) fn extract_cypher_iri_mapping(
+    default_context: Option<&JsonValue>,
+) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let mut vocab = None;
+    let mut overrides = std::collections::HashMap::new();
+    if let Some(obj) = default_context.and_then(|v| v.as_object()) {
+        if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
+            vocab = Some(v.to_string());
+        }
+        for (k, v) in obj {
+            if k.starts_with('@') {
+                continue;
+            }
+            if let Some(s) = v.as_str() {
+                // Skip prefix-style entries (`"ex": "http://..."`); use
+                // only full-term mappings. Heuristic: a prefix entry
+                // ends in `#` or `/` and the key looks like a short
+                // prefix. We don't try to be exhaustive here.
+                if s.ends_with('#') || s.ends_with('/') {
+                    continue;
+                }
+                overrides.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    (vocab, overrides)
+}
+
+/// Prepare a parsed query for execution.
+pub(crate) fn prepare_for_execution(parsed: &Query) -> ExecutableQuery {
+    ExecutableQuery::simple(parsed.clone())
+}
+
+// =============================================================================
+// Query Result Building
+// =============================================================================
+
+/// Build a QueryResult from execution results and parsed query metadata.
+///
+/// This consolidates the repetitive QueryResult construction that appears
+/// in every query method.
+pub(crate) fn build_query_result(
+    vars: VarRegistry,
+    parsed: Query,
+    batches: Vec<Batch>,
+    t: Option<i64>,
+    novelty: Option<Arc<dyn OverlayProvider>>,
+    binary_graph: Option<BinaryGraphView>,
+) -> QueryResult {
+    QueryResult {
+        vars,
+        t,
+        novelty,
+        context: parsed.context,
+        orig_context: parsed.orig_context,
+        output: parsed.output,
+        batches,
+        binary_graph,
+        // Default: not a graph-source result. The R2RML execution path
+        // (`query_view_with_r2rml_options`) overrides this to true so the
+        // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
+        from_graph_source: false,
+        advisories: Vec::new(),
+    }
+}
+
+// =============================================================================
+// R2RML Provider Macro
+// =============================================================================
+
+/// Macro to create the appropriate R2RML provider based on feature flags.
+///
+/// When the `iceberg` feature is enabled, creates a `FlureeR2rmlProvider` using the given
+/// Fluree instance. Otherwise, creates a `NoOpR2rmlProvider`.
+///
+/// # Usage
+///
+/// ```ignore
+/// // In a method on Fluree
+/// let r2rml_provider = r2rml_provider!(self);
+/// ```
+///
+/// This replaces the repetitive pattern:
+/// ```ignore
+/// #[cfg(feature = "iceberg")]
+/// let r2rml_provider = crate::graph_source::FlureeR2rmlProvider::new(self);
+/// #[cfg(not(feature = "iceberg"))]
+/// let r2rml_provider = NoOpR2rmlProvider::new();
+/// ```
+#[macro_export]
+macro_rules! r2rml_provider {
+    ($fluree:expr) => {{
+        #[cfg(feature = "iceberg")]
+        {
+            $crate::graph_source::FlureeR2rmlProvider::new($fluree)
+        }
+        #[cfg(not(feature = "iceberg"))]
+        {
+            $crate::NoOpR2rmlProvider::new()
+        }
+    }};
+}
+
+// Per-thread count of `parse_and_validate_sparql` calls, for the #1473
+// "parse SPARQL once" regression tests. Compiled only under `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static SPARQL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the per-thread SPARQL parse counter (test-only).
+#[cfg(test)]
+pub(crate) fn reset_sparql_parse_count() {
+    SPARQL_PARSE_COUNT.with(|c| c.set(0));
+}
+
+/// Read the per-thread SPARQL parse counter (test-only).
+#[cfg(test)]
+pub(crate) fn sparql_parse_count() -> usize {
+    SPARQL_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
+/// Parse and validate `sparql`, then substitute `params` into it. Without
+/// parameters this is the parse alone.
+pub(crate) fn parse_and_validate_sparql(
+    sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
+) -> Result<fluree_db_sparql::SparqlAst> {
+    parse_and_validate_sparql_from(None, sparql, params)
+}
+
+/// [`parse_and_validate_sparql`], reading `parsed` — the request's own parse
+/// of this text, handed over by its caller (see [`SparqlParse`]) — instead of
+/// parsing again. A parse of other text is ignored.
+pub(crate) fn parse_and_validate_sparql_from(
+    parsed: Option<&SparqlParse>,
+    sparql: &str,
+    params: Option<&fluree_db_sparql::ParamMap>,
+) -> Result<fluree_db_sparql::SparqlAst> {
+    let mut ast = match parsed.filter(|parsed| parsed.is_of(sparql)) {
+        Some(parsed) => parsed.accepted_ast()?.clone(),
+        None => parse_accepted_ast(sparql)?,
+    };
+    if let Some(params) = params {
+        fluree_db_sparql::substitute_params(&mut ast, params)
+            .map_err(|e| ApiError::invalid_query(e.to_string()))?;
+    }
+    Ok(ast)
+}
+
+/// Every SPARQL parse the API makes goes through here, so the #1473 tests
+/// can count them.
+fn parse_sparql_counted(
+    sparql: &str,
+) -> fluree_db_sparql::ParseOutput<fluree_db_sparql::SparqlAst> {
+    #[cfg(test)]
+    SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+    fluree_db_sparql::parse_sparql(sparql)
+}
+
+fn parse_accepted_ast(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+    let output = parse_sparql_counted(sparql);
+    let has_errors = output.has_errors();
+    match output.ast {
+        Some(ast) if !has_errors => {
+            let errors = sparql_validation_errors(&ast);
+            if errors.is_empty() {
+                Ok(ast)
+            } else {
+                Err(sparql_error(errors, "SPARQL validation error"))
+            }
+        }
+        _ => Err(sparql_error(
+            sparql_parse_errors(&output.diagnostics),
+            "SPARQL parse error",
+        )),
+    }
+}
+
+/// Why the API refuses `output`: parse errors first — authoritative even when
+/// recovery produced an AST (see [`parse_sparql_strict`]) — then validation.
+fn sparql_rejection(
+    output: &fluree_db_sparql::ParseOutput<fluree_db_sparql::SparqlAst>,
+) -> ApiError {
+    let errors = sparql_parse_errors(&output.diagnostics);
+    match output.ast.as_ref() {
+        Some(ast) if errors.is_empty() => {
+            sparql_error(sparql_validation_errors(ast), "SPARQL validation error")
+        }
+        _ => sparql_error(errors, "SPARQL parse error"),
+    }
+}
+
+fn sparql_parse_errors(
+    diagnostics: &[fluree_db_sparql::Diagnostic],
+) -> Vec<fluree_db_sparql::Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .cloned()
+        .collect()
+}
+
+/// Validation errors for `ast` against Fluree's capabilities/restrictions.
+fn sparql_validation_errors(
+    ast: &fluree_db_sparql::SparqlAst,
+) -> Vec<fluree_db_sparql::Diagnostic> {
+    fluree_db_sparql::validate(ast, &fluree_db_sparql::Capabilities::default())
+        .into_iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .collect()
+}
+
+fn sparql_error(errors: Vec<fluree_db_sparql::Diagnostic>, fallback: &str) -> ApiError {
+    let message = errors
+        .first()
+        .map(|d| d.message.clone())
+        .unwrap_or_else(|| fallback.to_string());
+    ApiError::sparql(message, errors)
+}
+
+/// One parse of a request's SPARQL text, checked as the API runs it.
+///
+/// The server parses a request's SPARQL to route it — dataset clause, query
+/// form, response format — and hands that parse to the run with
+/// [`QueryExecutionOptions::with_sparql_parse`](crate::QueryExecutionOptions::with_sparql_parse),
+/// so the request is parsed once. It belongs to the one request: nothing is
+/// shared between requests.
+#[derive(Debug)]
+pub struct SparqlParse {
+    text: Box<str>,
+    output: fluree_db_sparql::ParseOutput<fluree_db_sparql::SparqlAst>,
+    /// No error diagnostic, and valid against Fluree's capabilities.
+    accepted: bool,
+}
+
+/// A [`SparqlParse`] for the routing and the run of one request.
+pub type SharedSparqlParse = Arc<SparqlParse>;
+
+impl SparqlParse {
+    /// Parse `sparql` and check it as the API would before running it.
+    pub fn new(sparql: &str) -> Self {
+        let output = parse_sparql_counted(sparql);
+        let accepted = !output.has_errors()
+            && output
+                .ast
+                .as_ref()
+                .is_some_and(|ast| sparql_validation_errors(ast).is_empty());
+        Self {
+            text: sparql.into(),
+            output,
+            accepted,
+        }
+    }
+
+    /// The AST as the parser returned it — possibly recovered from errors, as
+    /// [`fluree_db_sparql::parse_sparql`] returns it.
+    pub fn ast(&self) -> Option<&fluree_db_sparql::SparqlAst> {
+        self.output.ast.as_ref()
+    }
+
+    /// The parser's diagnostics.
+    pub fn diagnostics(&self) -> &[fluree_db_sparql::Diagnostic] {
+        &self.output.diagnostics
+    }
+
+    fn is_of(&self, sparql: &str) -> bool {
+        *self.text == *sparql
+    }
+
+    fn accepted_ast(&self) -> Result<&fluree_db_sparql::SparqlAst> {
+        match (self.accepted, self.output.ast.as_ref()) {
+            (true, Some(ast)) => Ok(ast),
+            _ => Err(sparql_rejection(&self.output)),
+        }
+    }
+}
+
+/// Parse a SPARQL query. Return an error if the parser produced any
+/// error-severity diagnostic, even when error recovery still produced an AST.
+pub(crate) fn parse_sparql_strict(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+    let parse_output = fluree_db_sparql::parse_sparql(sparql);
+
+    // Parse errors: return ApiError::sparql with structured diagnostics.
+    //
+    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
+    // error recovery produced an AST. A recovered AST silently drops or
+    // rewrites exactly the parts of the query the parser flagged, so
+    // executing it answers a different question than the user asked
+    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
+    // swallowed these diagnostics whenever an AST survived recovery).
+    // Recovery itself is unchanged — `parse_sparql` still returns the AST
+    // plus diagnostics for tooling — and warning-severity diagnostics never
+    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
+    // already enforces the same rule.
+    let has_parse_errors = parse_output.has_errors();
+    match parse_output.ast {
+        Some(ast) if !has_parse_errors => Ok(ast),
+        _ => {
+            let errors: Vec<_> = parse_output
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+                .collect();
+            let message = errors
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "SPARQL parse error".to_string());
+            Err(ApiError::sparql(message, errors))
+        }
+    }
+}
+
+/// Creates a tracker for "tracked" query endpoints.
+///
+/// If the query specifies tracking options via `opts.meta`, those are used.
+/// Otherwise, all tracking (time, fuel, policy) is enabled by default since
+/// the caller explicitly used a "tracked" endpoint.
+pub(crate) fn tracker_for_tracked_endpoint(query_json: &JsonValue) -> Tracker {
+    let opts = query_json.as_object().and_then(|o| o.get("opts"));
+    let tracking = TrackingOptions::from_opts_value(opts);
+
+    // If no tracking options were specified, enable all tracking by default
+    if tracking.any_enabled() {
+        Tracker::new(tracking)
+    } else {
+        Tracker::new(TrackingOptions::all_enabled())
+    }
+}
+
+/// Charge the one-time query floor at execution entry.
+///
+/// Every fuel-tracked query is charged [`schedule::QUERY_FLOOR_MICRO_FUEL`]
+/// once, before parsing, so that (a) a successful query always reports at least
+/// 1.000 fuel, (b) a parse/plan error with tracking still reports the floor, and
+/// (c) the floor counts toward any `max-fuel` budget. No-op when fuel isn't
+/// tracked (disabled tracker or `track_fuel == false`), since `consume_fuel`
+/// short-circuits in that case.
+///
+/// Returns the same `FuelExceededError` a mid-execution overrun would, so a
+/// `max-fuel` below the floor is rejected up front.
+pub(crate) fn charge_query_floor(
+    tracker: &Tracker,
+) -> std::result::Result<(), fluree_db_core::FuelExceededError> {
+    tracker.consume_fuel(fluree_db_core::tracking::schedule::QUERY_FLOOR_MICRO_FUEL)
+}
+
+/// Tracker for a "tracked" query path: an explicit `tracking_override` if given,
+/// otherwise what the request names — JSON-LD `opts.meta` / `max-fuel`, or a
+/// SPARQL request's `# PRAGMA meta` / `max-fuel` — falling back to all tracking.
+/// This is the single derivation shared by the view/dataset tracked entry
+/// points and [`floor_only_tally`]. `sparql_ast` is the request's AST when the
+/// caller has already parsed it, so its pragmas are not parsed again.
+pub(crate) fn tracked_query_tracker(
+    input: &QueryInput<'_>,
+    tracking_override: &Option<TrackingOptions>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Tracker {
+    match tracking_override {
+        Some(opts) => Tracker::new(opts.clone()),
+        None => match input {
+            QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
+            QueryInput::Sparql(sparql) => {
+                let tracking = sparql_tracking_options(sparql, sparql_ast);
+                if tracking.any_enabled() {
+                    Tracker::new(tracking)
+                } else {
+                    Tracker::new(TrackingOptions::all_enabled())
+                }
+            }
+        },
+    }
+}
+
+/// Fuel-limit tracker for an untracked query: see [`input_fuel_limit`].
+pub(crate) fn tracker_for_input_limits(
+    input: &QueryInput<'_>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Tracker {
+    limits_tracker(input_fuel_limit(input, sparql_ast))
+}
+
+/// The fuel limit an untracked query names: the JSON-LD body's `max-fuel`, or
+/// a SPARQL request's `# PRAGMA max-fuel`, read from `sparql_ast` when the
+/// caller has already parsed the request.
+pub(crate) fn input_fuel_limit(
+    input: &QueryInput<'_>,
+    sparql_ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> Option<u64> {
+    match input {
+        QueryInput::JsonLd(json) => {
+            let opts = json.as_object().and_then(|o| o.get("opts"));
+            TrackingOptions::from_opts_value(opts).max_fuel
+        }
+        QueryInput::Sparql(sparql) => sparql_tracking_options(sparql, sparql_ast).max_fuel,
+    }
+}
+
+pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
+    let opts = query_json.as_object().and_then(|o| o.get("opts"));
+    limits_tracker(TrackingOptions::from_opts_value(opts).max_fuel)
+}
+
+pub(crate) fn limits_tracker(max_fuel: Option<u64>) -> Tracker {
+    match max_fuel.filter(|limit| *limit > 0) {
+        Some(limit) => Tracker::new(TrackingOptions {
+            track_time: false,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: Some(limit),
+        }),
+        None => Tracker::disabled(),
+    }
+}
+
+/// The tracking a SPARQL request's `# PRAGMA meta` / `max-fuel` names — the
+/// twin of [`TrackingOptions::from_opts_value`]. Read from `ast` when the
+/// caller has already parsed the request; otherwise from the text, where a
+/// request whose pragmas do not parse gets none (the parse that runs it
+/// reports the error).
+pub(crate) fn sparql_tracking_options(
+    sparql: &str,
+    ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> TrackingOptions {
+    match ast {
+        Some(ast) => sparql_pragma_tracking(&ast.pragmas),
+        None => {
+            sparql_pragma_tracking(&fluree_db_sparql::request_pragmas(sparql).unwrap_or_default())
+        }
+    }
+}
+
+/// The tracking a SPARQL request's `# PRAGMA meta` / `max-fuel` name.
+pub fn sparql_pragma_tracking(pragmas: &fluree_db_sparql::Pragmas) -> TrackingOptions {
+    let meta = pragmas.meta.unwrap_or_default();
+    let max_fuel = pragmas
+        .max_fuel
+        .map(fluree_db_core::tracking::fuel_to_micro);
+    TrackingOptions {
+        track_time: meta.time,
+        track_fuel: meta.fuel || max_fuel.is_some(),
+        track_policy: meta.policy,
+        max_fuel,
+    }
+}
+
+pub(crate) fn parse_dataset_spec(
+    query_json: &JsonValue,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::invalid_query(e.to_string()))
+}
+
+/// [`parse_dataset_spec`] on behalf of an auth-layer-verified caller.
+///
+/// `GovernanceOptions::from_json` never reads `server_identity` from the body,
+/// so the request-level transport (`QueryExecutionOptions::server_identity`)
+/// has to be stamped onto the parsed options here, before anything wraps
+/// policy. Use this rather than `parse_dataset_spec` wherever execution
+/// options are in scope so the stamp cannot be forgotten.
+pub(crate) fn parse_dataset_spec_as(
+    query_json: &JsonValue,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (spec, mut qc_opts) = parse_dataset_spec(query_json)?;
+    qc_opts.server_identity = server_identity.cloned();
+    Ok((spec, qc_opts))
+}
+
+/// The dataset a JSON-LD connection query reads, and its connection options:
+/// [`parse_dataset_spec_as`] for the caller `options` carries, with each
+/// member read at the ledger time `options` fixes for it, if any
+/// ([`QueryExecutionOptions::ledger_times`]).
+pub(crate) fn connection_dataset_spec(
+    query_json: &JsonValue,
+    options: &QueryExecutionOptions,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (mut spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok((spec, qc_opts))
+}
+
+/// The dataset a SPARQL connection query reads: [`extract_sparql_dataset_spec`],
+/// with each member read at the ledger time `options` fixes for it, if any.
+pub(crate) fn connection_sparql_dataset_spec(
+    ast: &fluree_db_sparql::SparqlAst,
+    options: &QueryExecutionOptions,
+) -> Result<DatasetSpec> {
+    let mut spec = extract_sparql_dataset_spec(ast)?;
+    if let Some(times) = &options.ledger_times {
+        spec.read_unpinned_at(times);
+    }
+    Ok(spec)
+}
+
+/// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED),
+/// its IRIs expanded against the prologue (prefixes applied, BASE resolved).
+pub(crate) fn extract_sparql_dataset_spec(
+    ast: &fluree_db_sparql::SparqlAst,
+) -> Result<DatasetSpec> {
+    DatasetSpec::from_sparql_ast(ast).map_err(|e| ApiError::invalid_query(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cypher_ast_cache_returns_shared_ast() {
+        let text = "MATCH (n:CacheHitTest) RETURN n";
+        let first = parse_cypher_ast_cached(text).expect("parse");
+        let second = parse_cypher_ast_cached(text).expect("parse");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same statement text must hit the cache"
+        );
+    }
+
+    #[test]
+    fn cypher_ast_cache_skips_oversized_statements() {
+        let filler = "x".repeat(MAX_CACHED_STATEMENT_LEN);
+        let text = format!("MATCH (n:Big) WHERE n.name <> \"{filler}\" RETURN n");
+        let first = parse_cypher_ast_cached(&text).expect("parse");
+        let second = parse_cypher_ast_cached(&text).expect("parse");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "oversized statements must not be cached"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cypher_parse_errors_are_not_cached() {
+        let text = "MATCH (n:Broken RETURN";
+        assert!(parse_cypher_ast_cached(text).is_err());
+        assert!(parse_cypher_ast_cached(text).is_err());
+    }
+
+    #[test]
+    fn substitution_clones_and_leaves_cached_ast_pristine() {
+        let text = "MATCH (n:SubstTest {id: $id}) RETURN n";
+        let mut params_a = fluree_db_cypher::ParamMap::new();
+        params_a.insert("id".into(), serde_json::json!(1));
+        let mut params_b = fluree_db_cypher::ParamMap::new();
+        params_b.insert("id".into(), serde_json::json!(2));
+
+        let a = substituted_cypher_ast(text, Some(&params_a)).expect("subst a");
+        let b = substituted_cypher_ast(text, Some(&params_b)).expect("subst b");
+        assert_ne!(a, b, "different params must produce different ASTs");
+
+        // Missing param still errors through the cached path.
+        assert!(substituted_cypher_ast(text, None).is_err());
+    }
+
+    /// The request's own parse, handed over, is read instead of parsing the
+    /// text again.
+    #[test]
+    fn a_handed_off_parse_is_read_instead_of_parsing() {
+        let text = "SELECT ?s WHERE { ?s <http://ex.org/p> ?o }";
+        let parsed = SparqlParse::new(text);
+        reset_sparql_parse_count();
+
+        let ast = parse_and_validate_sparql_from(Some(&parsed), text, None).expect("accepted");
+
+        assert_eq!(
+            sparql_parse_count(),
+            0,
+            "the handed-off parse must be reused"
+        );
+        assert_eq!(Some(&ast), parsed.ast());
+    }
+
+    #[test]
+    fn a_handed_off_parse_of_other_text_is_ignored() {
+        let parsed = SparqlParse::new("SELECT ?s WHERE { ?s <http://ex.org/p> ?o }");
+        let other = "SELECT ?o WHERE { ?s <http://ex.org/q> ?o }";
+        reset_sparql_parse_count();
+
+        let ast = parse_and_validate_sparql_from(Some(&parsed), other, None).expect("accepted");
+
+        assert_eq!(sparql_parse_count(), 1);
+        assert_eq!(
+            ast,
+            fluree_db_sparql::parse_sparql(other).ast.expect("parse")
+        );
+    }
+
+    /// A handed-off parse the API refuses reports exactly what a fresh parse
+    /// of the text would: parse errors, then validation errors.
+    #[test]
+    fn a_rejected_handed_off_parse_reports_the_same_errors() {
+        for text in [
+            "SELECT ?s WHERE { ?s <http://ex.org/p> ",
+            "SELECT * WHERE { ?s ?p ?o } GROUP BY ?s",
+        ] {
+            let parsed = SparqlParse::new(text);
+            let handed_off = parse_and_validate_sparql_from(Some(&parsed), text, None)
+                .expect_err("rejected")
+                .to_string();
+            let fresh = parse_and_validate_sparql(text, None)
+                .expect_err("rejected")
+                .to_string();
+            assert_eq!(handed_off, fresh, "{text}");
+        }
+    }
+
+    /// Parameters bind into a copy: the handed-off parse keeps its variable.
+    #[test]
+    fn params_bind_a_copy_of_the_handed_off_parse() {
+        let text = "SELECT ?s WHERE { ?s <http://ex.org/name> ?name }";
+        let parsed = SparqlParse::new(text);
+        let mut params = fluree_db_sparql::ParamMap::new();
+        params.insert("name".into(), serde_json::json!("Alice"));
+
+        let bound =
+            parse_and_validate_sparql_from(Some(&parsed), text, Some(&params)).expect("bound");
+
+        let fresh = fluree_db_sparql::parse_sparql(text).ast.expect("parse");
+        assert_ne!(
+            Some(&bound),
+            parsed.ast(),
+            "the binding must change the copy"
+        );
+        assert_eq!(
+            parsed.ast(),
+            Some(&fresh),
+            "the handed-off parse is unchanged"
+        );
+    }
+
+    use fluree_db_core::LedgerSnapshot;
+
+    /// #1473: lowering reuses an already-parsed AST rather than re-lexing the
+    /// string. A single `parse_and_validate_sparql` call covers both
+    /// dataset-clause resolution and IR lowering, so the parse counter must stay
+    /// at 1 across a parse-then-lower sequence — the parse-once guarantee the
+    /// entry methods rely on.
+    #[test]
+    fn lower_sparql_ast_reuses_parsed_ast() {
+        reset_sparql_parse_count();
+
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+        let ast = parse_and_validate_sparql(sparql, None).expect("parse");
+        assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let _ = lower_sparql_ast(ast, &snapshot, None, sparql, false).expect("lower");
+
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "lower_sparql_ast must consume the AST, not re-parse the string"
+        );
+    }
+
+    /// The `parse_sparql_to_ir` convenience wrapper is exactly parse-then-lower,
+    /// so it performs one parse — matching the reused-AST path.
+    #[test]
+    fn parse_sparql_to_ir_parses_once() {
+        reset_sparql_parse_count();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let _ = parse_sparql_to_ir(
+            None,
+            "SELECT * WHERE { ?s ?p ?o }",
+            &snapshot,
+            None,
+            None,
+            false,
+        )
+        .expect("lower");
+        assert_eq!(sparql_parse_count(), 1);
+    }
+
+    /// End-to-end parse-once through the ENTRY methods (#1483 review: the
+    /// primitive tests above can't catch a second parse reintroduced inside
+    /// an entry method). Counter is thread-local, so the single-threaded
+    /// `#[tokio::test]` runtime keeps the count coherent.
+    #[tokio::test]
+    async fn entry_methods_parse_sparql_once_end_to_end() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger("parseonce:main")
+            .await
+            .expect("create ledger");
+        let db = fluree.db("parseonce:main").await.expect("db");
+
+        // Buffered entry, no dataset clause.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_with_options(
+                &db,
+                "SELECT * WHERE { ?s ?p ?o }",
+                crate::QueryExecutionOptions::default(),
+            )
+            .await
+            .expect("no-FROM query");
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_with_options (no FROM) must parse exactly once"
+        );
+
+        // Buffered entry, within-ledger FROM (the ledger alias addresses the
+        // default graph) — the dataset route previously re-lexed up to 3x.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_with_options(
+                &db,
+                "SELECT * FROM <parseonce:main> WHERE { ?s ?p ?o }",
+                crate::QueryExecutionOptions::default(),
+            )
+            .await
+            .expect("FROM query");
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_with_options (within-ledger FROM) must parse exactly once"
+        );
+
+        // Tracked entry, no dataset clause.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_tracked_with_options(
+                &db,
+                crate::QueryInput::Sparql("SELECT * WHERE { ?s ?p ?o }"),
+                None,
+                None,
+                crate::QueryExecutionOptions::default(),
+            )
+            .await;
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_tracked_with_options must parse exactly once"
+        );
+    }
+}

@@ -1,0 +1,1858 @@
+//! ComparableValue type and conversions
+//!
+//! This module contains the intermediate value type used during filter
+//! evaluation, along with conversions to/from FlakeValue.
+
+use crate::binding::Binding;
+use crate::context::ExecutionContext;
+use crate::error::QueryError;
+use crate::ir::ArithmeticOp;
+use bigdecimal::BigDecimal;
+use fluree_db_core::temporal::{
+    Date as FlureeDate, DateTime as FlureeDateTime, DayTimeDuration, Time as FlureeTime,
+    YearMonthDuration,
+};
+use fluree_db_core::{coerce_value, FlakeValue, GeoPointBits};
+use num_bigint::BigInt;
+use num_traits::Zero;
+use std::sync::Arc;
+use thiserror::Error;
+
+use super::helpers::WELL_KNOWN_DATATYPES;
+use crate::parse::encode::IriEncoder;
+use crate::parse::UnresolvedDatatypeConstraint;
+
+/// Errors that can occur during arithmetic operations
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum ArithmeticError {
+    /// Division by zero
+    #[error("division by zero")]
+    DivideByZero,
+
+    /// Integer overflow
+    #[error("integer overflow")]
+    Overflow,
+
+    /// Type mismatch or non-numeric operands
+    #[error("type mismatch: cannot perform arithmetic on these types")]
+    TypeMismatch,
+}
+
+/// Errors that can occur during comparison operations
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum ComparisonError {
+    /// Ordering comparison between incompatible types
+    #[error("type mismatch: cannot compare {left_type} with {right_type} using '{operator}'")]
+    TypeMismatch {
+        operator: &'static str,
+        left_type: &'static str,
+        right_type: &'static str,
+    },
+}
+
+/// Error when converting a FlakeValue that has no ComparableValue equivalent
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("cannot convert null value")]
+pub struct NullValueError;
+
+/// Significant-digit cap for the `xsd:integer / xsd:integer` → `xsd:decimal`
+/// result. `BigDecimal::div` otherwise expands recurring quotients to its
+/// default 100-digit precision (e.g. 1 / 3 = 0.3333…). 34 digits matches
+/// IEEE-754 decimal128 — well past xsd:double precision but bounded. Mirrors
+/// `AVG_DECIMAL_PRECISION` in `aggregate.rs`, which applies the same XPath rule.
+const DIVISION_DECIMAL_PRECISION: u64 = 34;
+
+/// Divide two decimals with bounded precision and a canonical (normalized)
+/// scale, for the integer-division case where the result is an `xsd:decimal`.
+fn integer_divide(a: BigDecimal, b: BigDecimal) -> BigDecimal {
+    (a / b).with_prec(DIVISION_DECIMAL_PRECISION).normalized()
+}
+
+impl ArithmeticOp {
+    /// Apply this arithmetic operation to two ComparableValue operands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Division by zero is attempted (`ArithmeticError::DivideByZero`)
+    /// - Integer overflow occurs (`ArithmeticError::Overflow`)
+    /// - Operands are non-numeric or incompatible (`ArithmeticError::TypeMismatch`)
+    pub fn apply(
+        self,
+        left: ComparableValue,
+        right: ComparableValue,
+    ) -> Result<ComparableValue, ArithmeticError> {
+        use num_traits::ToPrimitive;
+
+        // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float,
+        // whose value is stored as a String) into their primitive numeric
+        // variant so the type-promotion arms below apply. Non-numeric typed
+        // literals pass through unchanged and fall to the TypeMismatch arm.
+        let left = left.coerce_numeric_operand();
+        let right = right.coerce_numeric_operand();
+
+        match (left, right) {
+            // Long <op> Long
+            (ComparableValue::Long(a), ComparableValue::Long(b)) => match self {
+                ArithmeticOp::Add => Ok(ComparableValue::Long(
+                    a.checked_add(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                ArithmeticOp::Sub => Ok(ComparableValue::Long(
+                    a.checked_sub(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                ArithmeticOp::Mul => Ok(ComparableValue::Long(
+                    a.checked_mul(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                ArithmeticOp::Mod => {
+                    if b == 0 {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::Long(
+                        a.checked_rem(b).ok_or(ArithmeticError::Overflow)?,
+                    ))
+                }
+                // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields
+                // xsd:decimal (e.g. 10 / 4 = 2.5), not a truncated integer.
+                ArithmeticOp::Div => {
+                    if b == 0 {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                        BigDecimal::from(a),
+                        BigDecimal::from(b),
+                    ))))
+                }
+            },
+            // Double + Double = Double
+            (ComparableValue::Double(a), ComparableValue::Double(b)) => {
+                let result = match self {
+                    ArithmeticOp::Add => a + b,
+                    ArithmeticOp::Sub => a - b,
+                    ArithmeticOp::Mul => a * b,
+                    ArithmeticOp::Mod => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a % b
+                    }
+                    ArithmeticOp::Div => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a / b
+                    }
+                };
+                Ok(ComparableValue::Double(result))
+            }
+            // Float <op> Float = Float (xsd:float stays float under promotion)
+            (ComparableValue::Float(a), ComparableValue::Float(b)) => {
+                let result = match self {
+                    ArithmeticOp::Add => a + b,
+                    ArithmeticOp::Sub => a - b,
+                    ArithmeticOp::Mul => a * b,
+                    ArithmeticOp::Mod => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a % b
+                    }
+                    ArithmeticOp::Div => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a / b
+                    }
+                };
+                Ok(ComparableValue::Float(result))
+            }
+            // BigInt <op> BigInt
+            (ComparableValue::BigInt(a), ComparableValue::BigInt(b)) => match self {
+                ArithmeticOp::Add => Ok(ComparableValue::BigInt(Box::new(*a + &*b))),
+                ArithmeticOp::Sub => Ok(ComparableValue::BigInt(Box::new(*a - &*b))),
+                ArithmeticOp::Mul => Ok(ComparableValue::BigInt(Box::new(*a * &*b))),
+                ArithmeticOp::Mod => {
+                    if b.is_zero() {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::BigInt(Box::new(*a % &*b)))
+                }
+                // integer / integer → xsd:decimal (see the Long/Long arm).
+                ArithmeticOp::Div => {
+                    if b.is_zero() {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                        BigDecimal::from(*a),
+                        BigDecimal::from(*b),
+                    ))))
+                }
+            },
+            // Decimal + Decimal = Decimal
+            (ComparableValue::Decimal(a), ComparableValue::Decimal(b)) => {
+                let result = match self {
+                    ArithmeticOp::Add => &*a + &*b,
+                    ArithmeticOp::Sub => &*a - &*b,
+                    ArithmeticOp::Mul => &*a * &*b,
+                    ArithmeticOp::Mod => {
+                        if b.is_zero() {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        &*a % &*b
+                    }
+                    ArithmeticOp::Div => {
+                        if b.is_zero() {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        &*a / &*b
+                    }
+                };
+                Ok(ComparableValue::Decimal(Box::new(result)))
+            }
+            // Mixed numeric types -> promote to higher precision
+            // Long <-> Double -> Double
+            (ComparableValue::Long(a), ComparableValue::Double(b)) => self.apply(
+                ComparableValue::Double(a as f64),
+                ComparableValue::Double(b),
+            ),
+            (ComparableValue::Double(a), ComparableValue::Long(b)) => self.apply(
+                ComparableValue::Double(a),
+                ComparableValue::Double(b as f64),
+            ),
+            // Long <-> BigInt -> BigInt
+            (ComparableValue::Long(a), ComparableValue::BigInt(b)) => self.apply(
+                ComparableValue::BigInt(Box::new(BigInt::from(a))),
+                ComparableValue::BigInt(b),
+            ),
+            (ComparableValue::BigInt(a), ComparableValue::Long(b)) => self.apply(
+                ComparableValue::BigInt(a),
+                ComparableValue::BigInt(Box::new(BigInt::from(b))),
+            ),
+            // Long <-> Decimal -> Decimal
+            (ComparableValue::Long(a), ComparableValue::Decimal(b)) => self.apply(
+                ComparableValue::Decimal(Box::new(BigDecimal::from(a))),
+                ComparableValue::Decimal(b),
+            ),
+            (ComparableValue::Decimal(a), ComparableValue::Long(b)) => self.apply(
+                ComparableValue::Decimal(a),
+                ComparableValue::Decimal(Box::new(BigDecimal::from(b))),
+            ),
+            // BigInt <-> Decimal -> Decimal
+            (ComparableValue::BigInt(a), ComparableValue::Decimal(b)) => self.apply(
+                ComparableValue::Decimal(Box::new(BigDecimal::from((*a).clone()))),
+                ComparableValue::Decimal(b),
+            ),
+            (ComparableValue::Decimal(a), ComparableValue::BigInt(b)) => self.apply(
+                ComparableValue::Decimal(a),
+                ComparableValue::Decimal(Box::new(BigDecimal::from((*b).clone()))),
+            ),
+            // Double <-> BigInt -> Double (lossy)
+            (ComparableValue::Double(a), ComparableValue::BigInt(b)) => {
+                let bf = b.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(a), ComparableValue::Double(bf))
+            }
+            (ComparableValue::BigInt(a), ComparableValue::Double(b)) => {
+                let af = a.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(af), ComparableValue::Double(b))
+            }
+            // Double <-> Decimal -> Double. xsd:double is the widest type in the
+            // XPath promotion lattice (integer < decimal < float < double), so a
+            // double∘decimal is a double, not a decimal (tP-03/29, expr-ops).
+            (ComparableValue::Double(a), ComparableValue::Decimal(b)) => {
+                let bd = b.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(a), ComparableValue::Double(bd))
+            }
+            (ComparableValue::Decimal(a), ComparableValue::Double(b)) => {
+                let ad = a.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(ad), ComparableValue::Double(b))
+            }
+            // Float <-> {Long, BigInt, Decimal} -> Float; Float <-> Double ->
+            // Double. Per XPath, integer/decimal promote up to float, and float
+            // promotes up to double (tP-04/05/21/30, unplus-2/unminus-2).
+            (ComparableValue::Float(a), ComparableValue::Long(b)) => {
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(b as f32))
+            }
+            (ComparableValue::Long(a), ComparableValue::Float(b)) => {
+                self.apply(ComparableValue::Float(a as f32), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::BigInt(b)) => {
+                let bf = b.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(bf))
+            }
+            (ComparableValue::BigInt(a), ComparableValue::Float(b)) => {
+                let af = a.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(af), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::Decimal(b)) => {
+                let bf = b.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(bf))
+            }
+            (ComparableValue::Decimal(a), ComparableValue::Float(b)) => {
+                let af = a.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(af), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::Double(b)) => self.apply(
+                ComparableValue::Double(a as f64),
+                ComparableValue::Double(b),
+            ),
+            (ComparableValue::Double(a), ComparableValue::Float(b)) => self.apply(
+                ComparableValue::Double(a),
+                ComparableValue::Double(b as f64),
+            ),
+            // Temporal subtraction, per XPath op:subtract-dateTimes /
+            // op:subtract-dates / op:subtract-times. Neither SPARQL 1.1 nor the
+            // 1.2 draft maps `-` over temporal operands; this follows SEP-0002,
+            // which every engine that implements it agrees on — the result is an
+            // xsd:dayTimeDuration.
+            //
+            // dateTime matches XPath exactly: the value is a UTC instant. date
+            // and time carry no offset at all (it is discarded at parse — see
+            // fluree_db_core::temporal), so where XPath would anchor an operand
+            // in its own timezone these subtract calendar dates / wall clocks.
+            // Deviation documented in docs/reference/compatibility.md and
+            // pinned by it_temporal_lane_stability.
+            //
+            // The guard matters: only `-` is defined here. `+`, `*`, `/` and `%`
+            // on temporal operands fall through to the type error below, as they
+            // must — adding two dateTimes is meaningless.
+            (ComparableValue::DateTime(a), ComparableValue::DateTime(b))
+                if self == ArithmeticOp::Sub =>
+            {
+                day_time_duration_between(a.epoch_micros(), b.epoch_micros())
+            }
+            (ComparableValue::Date(a), ComparableValue::Date(b)) if self == ArithmeticOp::Sub => {
+                day_time_duration_between(a.epoch_micros(), b.epoch_micros())
+            }
+            (ComparableValue::Time(a), ComparableValue::Time(b)) if self == ArithmeticOp::Sub => {
+                day_time_duration_between(a.micros_since_midnight(), b.micros_since_midnight())
+            }
+            // Temporal ± duration, per XPath / SEP-0002. `xsd:time` has no
+            // months to carry, so `time ± yearMonthDuration` is not defined and
+            // falls through to the type error, as XPath has it.
+            (ComparableValue::DateTime(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::DateTime),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::DateTime),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Date(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Date),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::Date),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Time(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Time)
+                        .ok_or(ArithmeticError::Overflow),
+                    Duration::YearMonth(_) => Err(ArithmeticError::TypeMismatch),
+                }
+            }
+            // Duration ± duration. XPath defines these; SEP-0002's operator
+            // table does not list them, but it says outright that it does not
+            // enumerate every relevant operator, and summing durations is the
+            // first thing a caller reaches for after computing one. Mixing the
+            // two duration families has no XPath operator and stays an error.
+            (ref lhs, ref rhs)
+                if self.is_additive()
+                    && Duration::from_operand(lhs).is_some()
+                    && Duration::from_operand(rhs).is_some() =>
+            {
+                match (
+                    Duration::from_operand(lhs).expect("checked by guard"),
+                    Duration::from_operand(rhs).expect("checked by guard"),
+                ) {
+                    (Duration::DayTime(a), Duration::DayTime(b)) => a
+                        .checked_add(self.signed(b))
+                        .map(day_time_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    (Duration::YearMonth(a), Duration::YearMonth(b)) => a
+                        .checked_add(self.signed_months(b))
+                        .map(year_month_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    _ => Err(ArithmeticError::TypeMismatch),
+                }
+            }
+            // Non-numeric types can't do arithmetic
+            _ => Err(ArithmeticError::TypeMismatch),
+        }
+    }
+
+    /// Whether this is `+` or `-`, the only operators defined over a temporal
+    /// or duration operand.
+    fn is_additive(self) -> bool {
+        matches!(self, ArithmeticOp::Add | ArithmeticOp::Sub)
+    }
+
+    /// Flip the sign of a microsecond magnitude for `-`.
+    fn signed(self, micros: i64) -> i64 {
+        if self == ArithmeticOp::Sub {
+            -micros
+        } else {
+            micros
+        }
+    }
+
+    /// Flip the sign of a month magnitude for `-`.
+    fn signed_months(self, months: i32) -> i32 {
+        if self == ArithmeticOp::Sub {
+            -months
+        } else {
+            months
+        }
+    }
+}
+
+/// A duration operand, in the unit its family is measured in. The two families
+/// are deliberately not interconvertible: months have no fixed length.
+enum Duration {
+    DayTime(i64),
+    YearMonth(i32),
+}
+
+impl Duration {
+    /// Durations have no dedicated `ComparableValue` variant — they ride as a
+    /// `TypedLiteral` wrapping the `FlakeValue`.
+    fn from_operand(v: &ComparableValue) -> Option<Self> {
+        let ComparableValue::TypedLiteral { val, .. } = v else {
+            return None;
+        };
+        match val {
+            FlakeValue::DayTimeDuration(d) => Some(Duration::DayTime(d.micros())),
+            FlakeValue::YearMonthDuration(d) => Some(Duration::YearMonth(d.months())),
+            _ => None,
+        }
+    }
+}
+
+/// Wrap a microsecond count as an `xsd:dayTimeDuration` result.
+fn day_time_duration(micros: i64) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::DayTimeDuration(Box::new(DayTimeDuration::from_micros(micros))),
+        dtc: None,
+    }
+}
+
+/// Wrap a month count as an `xsd:yearMonthDuration` result.
+fn year_month_duration(months: i32) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::YearMonthDuration(Box::new(YearMonthDuration::from_months(months))),
+        dtc: None,
+    }
+}
+
+/// Build the `xsd:dayTimeDuration` separating two instants, both expressed as
+/// microseconds against a shared origin.
+fn day_time_duration_between(
+    lhs_micros: i64,
+    rhs_micros: i64,
+) -> Result<ComparableValue, ArithmeticError> {
+    let micros = lhs_micros
+        .checked_sub(rhs_micros)
+        .ok_or(ArithmeticError::Overflow)?;
+    Ok(day_time_duration(micros))
+}
+
+/// Comparable value extracted from expression evaluation
+///
+/// This is the internal representation used during filter evaluation.
+/// It normalizes different binding types into a common format for comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComparableValue {
+    Long(i64),
+    Double(f64),
+    /// xsd:float, kept distinct from Double so XPath numeric promotion keeps a
+    /// float result float (float∘{integer,decimal,float}→float) while
+    /// float∘double→double. xsd:float is *stored* as f64 (`coerce.rs`); the f32
+    /// here only tags the type — arithmetic/comparison widen to f64 as needed.
+    Float(f32),
+    String(Arc<str>),
+    Bool(bool),
+    Sid(fluree_db_core::Sid),
+    Vector(Arc<[f64]>),
+    // Extended numeric types
+    BigInt(Box<BigInt>),
+    Decimal(Box<BigDecimal>),
+    // Temporal types
+    DateTime(FlureeDateTime),
+    Date(FlureeDate),
+    Time(FlureeTime),
+    // Geo types
+    GeoPoint(GeoPointBits),
+    // IRI/URI
+    Iri(Arc<str>),
+    // Typed literal with optional datatype IRI constraint
+    TypedLiteral {
+        val: FlakeValue,
+        dtc: Option<UnresolvedDatatypeConstraint>,
+    },
+}
+
+/// Compute the Effective Boolean Value (EBV) of a ComparableValue.
+///
+/// EBV is used in SPARQL FILTER and conditional expressions.
+/// See: <https://www.w3.org/TR/sparql11-query/#ebv>
+impl From<ComparableValue> for bool {
+    fn from(value: ComparableValue) -> bool {
+        match value {
+            ComparableValue::Bool(b) => b,
+            ComparableValue::String(s) => !s.is_empty(),
+            ComparableValue::Iri(s) => !s.is_empty(),
+            ComparableValue::Long(n) => n != 0,
+            ComparableValue::Double(d) => !d.is_nan() && d != 0.0,
+            ComparableValue::Float(f) => !f.is_nan() && f != 0.0,
+            ComparableValue::BigInt(n) => !n.is_zero(),
+            ComparableValue::Decimal(d) => !d.is_zero(),
+            // Other types: Sid, Vector, DateTime, etc. are truthy if present
+            _ => true,
+        }
+    }
+}
+
+impl ComparableValue {
+    /// Return a human-readable type name for error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ComparableValue::Long(_) => "long",
+            ComparableValue::Double(_) => "double",
+            ComparableValue::Float(_) => "float",
+            ComparableValue::String(_) => "string",
+            ComparableValue::Bool(_) => "boolean",
+            ComparableValue::Sid(_) => "sid",
+            ComparableValue::Vector(_) => "vector",
+            ComparableValue::BigInt(_) => "bigint",
+            ComparableValue::Decimal(_) => "decimal",
+            ComparableValue::DateTime(_) => "dateTime",
+            ComparableValue::Date(_) => "date",
+            ComparableValue::Time(_) => "time",
+            ComparableValue::GeoPoint(_) => "geoPoint",
+            ComparableValue::Iri(_) => "iri",
+            ComparableValue::TypedLiteral { .. } => "typedLiteral",
+        }
+    }
+
+    /// Normalize a numeric value carried as a [`ComparableValue::TypedLiteral`]
+    /// into its primitive numeric variant, so arithmetic type promotion can
+    /// apply.
+    ///
+    /// `xsd:float` casts store their value as a String (to avoid f32→f64 display
+    /// artifacts — see `eval/cast.rs`), and other numeric XSD literals may arrive
+    /// wrapped as a `TypedLiteral`. Arithmetic needs the numeric value, so the
+    /// inner value is unwrapped (or parsed, for the string-encoded cases) here.
+    /// Non-numeric typed literals — and all other variants — are returned
+    /// unchanged, so they still fall to a `TypeMismatch` in [`ArithmeticOp::apply`].
+    pub(crate) fn coerce_numeric_operand(self) -> ComparableValue {
+        let ComparableValue::TypedLiteral { val, dtc } = self else {
+            return self;
+        };
+        match val {
+            FlakeValue::Long(n) => ComparableValue::Long(n),
+            FlakeValue::Double(d) => ComparableValue::Double(d),
+            FlakeValue::BigInt(n) => ComparableValue::BigInt(n),
+            FlakeValue::Decimal(d) => ComparableValue::Decimal(d),
+            FlakeValue::String(s) => {
+                // Delegate string→numeric parsing to the canonical coercion
+                // layer (`fluree_db_core::coerce_value`), which covers the full
+                // XSD numeric lattice: the integer family (with BigInt overflow
+                // and per-type range validation), xsd:decimal, and
+                // xsd:float/double including the INF/-INF/NaN lexicals. Only a
+                // numeric result is adopted; non-numeric datatypes and parse
+                // failures keep the literal as-is so it still falls to a
+                // TypeMismatch in `apply`.
+                if let Some(UnresolvedDatatypeConstraint::Explicit(iri)) = &dtc {
+                    if let Ok(coerced) = coerce_value(FlakeValue::String(s.clone()), iri.as_ref()) {
+                        // xsd:float coerces (via coerce.rs) to an f64; tag it
+                        // Float so promotion keeps a float result float.
+                        if iri.as_ref() == fluree_vocab::xsd::FLOAT {
+                            if let FlakeValue::Double(d) = coerced {
+                                return ComparableValue::Float(d as f32);
+                            }
+                        }
+                        if let Ok(
+                            cv @ (ComparableValue::Long(_)
+                            | ComparableValue::Double(_)
+                            | ComparableValue::BigInt(_)
+                            | ComparableValue::Decimal(_)),
+                        ) = ComparableValue::try_from(coerced)
+                        {
+                            return cv;
+                        }
+                    }
+                    // Text an earlier bulk import stored for INF / -INF.
+                    if let Some(d) = legacy_import_infinity(&s) {
+                        if iri.as_ref() == fluree_vocab::xsd::DOUBLE {
+                            return ComparableValue::Double(d);
+                        }
+                        if iri.as_ref() == fluree_vocab::xsd::FLOAT {
+                            return ComparableValue::Float(d as f32);
+                        }
+                    }
+                }
+                ComparableValue::TypedLiteral {
+                    val: FlakeValue::String(s),
+                    dtc,
+                }
+            }
+            other => ComparableValue::TypedLiteral { val: other, dtc },
+        }
+    }
+
+    /// Get a string slice if this value is a String, Iri, or TypedLiteral containing a string.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            ComparableValue::String(s) => Some(s.as_ref()),
+            ComparableValue::Iri(s) => Some(s.as_ref()),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
+                ..
+            } => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// String content of a value usable as a SPARQL string-builtin argument:
+    /// a literal whose datatype [`reads_as_text`]. Unlike
+    /// [`as_str`](Self::as_str), this rejects an IRI and a literal of any
+    /// other datatype, so a builtin that requires a string argument
+    /// (CONTAINS/STRSTARTS/CONCAT/…) keeps raising a type error on those while
+    /// staying transparent to a language tag.
+    pub fn string_arg(&self) -> Option<&str> {
+        match self {
+            ComparableValue::String(s) => Some(s.as_ref()),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
+                dtc,
+            } if reads_as_text(dtc.as_ref()) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Convert this value to a string-typed ComparableValue (for STR function).
+    ///
+    /// Consumes self and returns a `ComparableValue::String` containing the
+    /// string representation of the value. Returns `None` for types that
+    /// cannot be converted to strings (e.g., vectors).
+    ///
+    /// **Note**: For SID values, this returns the internal `{code}:{name}` form.
+    /// Use [`into_string_value_with_namespaces`] to expand SIDs to full IRIs.
+    pub fn into_string_value(self) -> Option<ComparableValue> {
+        match self {
+            ComparableValue::String(s) => Some(ComparableValue::String(s)),
+            ComparableValue::Iri(s) => Some(ComparableValue::String(s)),
+            ComparableValue::Sid(sid) => Some(ComparableValue::String(Arc::from(format!(
+                "{}:{}",
+                sid.namespace_code, sid.name
+            )))),
+            ComparableValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
+            // STR() must return the literal's lexical form — the same W3C
+            // canonical form the RDF-lexical serializers emit for the same
+            // term (#1695; the serializer side was #1445). `f64::to_string()`
+            // gave "1" for 1.0 and "inf" for INF, so `STR(?d)` disagreed with
+            // the value printed two fields over in the same result set.
+            ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))),
+            // A `Float` here is a value computed in f32 (arithmetic, casts);
+            // its canonical form is the f32 one. A STORED float never takes
+            // this arm for STR(): `Float` cannot recover the full-precision
+            // stored f64 (`lit_to_comparable` narrows), so `eval_str` reads
+            // the f64 off the binding first (`stored_float_f64`) and renders
+            // the serializer's `canonical_xsd_double` — see #1776 for the
+            // variant-vs-datatype conflation underneath.
+            ComparableValue::Float(f) => Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_float(f),
+            ))),
+            ComparableValue::Bool(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
+            ComparableValue::BigInt(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
+            ComparableValue::Decimal(d) => {
+                Some(ComparableValue::String(Arc::from(d.to_plain_string())))
+            }
+            ComparableValue::DateTime(dt) => {
+                Some(ComparableValue::String(Arc::from(dt.to_string())))
+            }
+            ComparableValue::Date(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+            ComparableValue::Time(t) => Some(ComparableValue::String(Arc::from(t.to_string()))),
+            ComparableValue::GeoPoint(bits) => {
+                // Convert to WKT format: POINT(lng lat)
+                Some(ComparableValue::String(Arc::from(bits.to_string())))
+            }
+            ComparableValue::Vector(_) => None, // Vectors don't have a string representation
+            ComparableValue::TypedLiteral { val, .. } => match val {
+                FlakeValue::String(s) | FlakeValue::Json(s) => {
+                    Some(ComparableValue::String(Arc::from(s)))
+                }
+                FlakeValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
+                // Same canonical form as the bare `Double` arm above (#1695).
+                FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                    fluree_graph_ir::canonical_xsd_double(d),
+                ))),
+                FlakeValue::Boolean(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
+                _ => None,
+            },
+        }
+    }
+
+    /// Convert this value to a string-typed ComparableValue, expanding SIDs
+    /// to full IRIs using the provided namespace codes.
+    ///
+    /// Per W3C SPARQL spec, `STR()` on an IRI must return the full IRI string,
+    /// not an internal compact form. This method looks up the namespace prefix
+    /// for SID values and reconstructs the full IRI.
+    ///
+    /// Falls back to `into_string_value()` for non-SID values or when
+    /// namespace codes are unavailable.
+    pub fn into_string_value_with_namespaces(
+        self,
+        namespace_codes: Option<&std::collections::HashMap<u16, String>>,
+    ) -> Option<ComparableValue> {
+        match &self {
+            ComparableValue::Sid(sid)
+                if fluree_vocab::namespaces::is_full_iri(sid.namespace_code) =>
+            {
+                Some(ComparableValue::String(Arc::clone(&sid.name)))
+            }
+            ComparableValue::Sid(sid) => {
+                if let Some(prefix) = namespace_codes.and_then(|ns| ns.get(&sid.namespace_code)) {
+                    Some(ComparableValue::String(Arc::from(format!(
+                        "{}{}",
+                        prefix, sid.name
+                    ))))
+                } else {
+                    // Fallback: no namespace codes available or code not found
+                    self.into_string_value()
+                }
+            }
+            _ => self.into_string_value(),
+        }
+    }
+
+    /// Convert this value to a Binding.
+    ///
+    /// The `ctx` parameter is required for `Iri` and `TypedLiteral` variants
+    /// which need database access to resolve IRIs to Sids.
+    pub fn to_binding(self, ctx: Option<&ExecutionContext<'_>>) -> crate::error::Result<Binding> {
+        let datatypes = &*WELL_KNOWN_DATATYPES;
+        match self {
+            ComparableValue::Long(n) => Ok(Binding::lit(
+                FlakeValue::Long(n),
+                datatypes.xsd_integer.clone(),
+            )),
+            ComparableValue::Double(d) => Ok(Binding::lit(
+                FlakeValue::Double(d),
+                datatypes.xsd_double.clone(),
+            )),
+            // xsd:float renders its lexical form from the f32 (avoiding f64
+            // display artifacts) and carries the xsd:float datatype. This
+            // CONSTRUCTS a float literal, so it keeps the cast-side rendering
+            // (`format_f32`) rather than STR()'s canonical form.
+            //
+            // DELIBERATE consequence: one float VALUE can spell two ways by
+            // provenance — a stored `"1.0E0"^^xsd:float` serializes
+            // canonically while `BIND(?f + 0 AS ?y)` mints `"1"^^xsd:float`.
+            // The minted term is internally consistent (the serializer,
+            // `STR()`, and `xsd:string()` of it all return this one string
+            // verbatim, the per-term invariant #1695 is about), and minting
+            // the canonical form instead would break the cast on the rebound
+            // term: `xsd:string(?y)` reads the stored lexical verbatim, and
+            // XPath requires `"1"`, not `"1.0E0"`. Cross-provenance
+            // canonicalization is the serializer-side variant-vs-datatype
+            // conflation, tracked in #1776.
+            ComparableValue::Float(f) => Ok(Binding::lit(
+                FlakeValue::String(super::cast::format_f32(f)),
+                datatypes.xsd_float.clone(),
+            )),
+            ComparableValue::String(s) => Ok(Binding::lit(
+                FlakeValue::String(s.to_string()),
+                datatypes.xsd_string.clone(),
+            )),
+            ComparableValue::Bool(b) => Ok(Binding::lit(
+                FlakeValue::Boolean(b),
+                datatypes.xsd_boolean.clone(),
+            )),
+            ComparableValue::Sid(sid) => stamp_minted(Binding::sid(sid), ctx),
+            ComparableValue::Vector(v) => Ok(Binding::lit(
+                FlakeValue::Vector(v),
+                datatypes.fluree_vector.clone(),
+            )),
+            ComparableValue::BigInt(n) => Ok(Binding::lit(
+                FlakeValue::BigInt(n),
+                datatypes.xsd_integer.clone(),
+            )),
+            ComparableValue::Decimal(d) => Ok(Binding::lit(
+                FlakeValue::Decimal(d),
+                datatypes.xsd_decimal.clone(),
+            )),
+            ComparableValue::DateTime(dt) => Ok(Binding::lit(
+                FlakeValue::DateTime(Box::new(dt)),
+                datatypes.xsd_datetime.clone(),
+            )),
+            ComparableValue::Date(d) => Ok(Binding::lit(
+                FlakeValue::Date(Box::new(d)),
+                datatypes.xsd_date.clone(),
+            )),
+            ComparableValue::Time(t) => Ok(Binding::lit(
+                FlakeValue::Time(Box::new(t)),
+                datatypes.xsd_time.clone(),
+            )),
+            ComparableValue::GeoPoint(bits) => Ok(Binding::lit(
+                FlakeValue::GeoPoint(bits),
+                datatypes.geo_wkt_literal.clone(),
+            )),
+            ComparableValue::Iri(iri) => {
+                // Try to encode to a SID if we have database context,
+                // but fall back to Binding::Iri for constructed IRIs
+                // (UUID, IRI() function) that don't exist in the database.
+                if let Some(ctx) = ctx {
+                    if let Some(sid) = ctx.active_snapshot.encode_iri_strict(&iri) {
+                        return stamp_minted(Binding::sid(sid), Some(ctx));
+                    }
+                }
+                Ok(Binding::Iri(iri))
+            }
+            ComparableValue::TypedLiteral { val, dtc } => match dtc {
+                Some(UnresolvedDatatypeConstraint::LangTag(lang)) => {
+                    Ok(Binding::lit_lang(val, lang))
+                }
+                Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)) => {
+                    let ctx = ctx.ok_or_else(|| {
+                        QueryError::InvalidFilter(
+                            "bind evaluation requires database context for str-dt/str-lang"
+                                .to_string(),
+                        )
+                    })?;
+                    // Any IRI is a datatype (§17.4.2.9), including one in a
+                    // namespace this ledger has never seen.
+                    let dt = ctx.active_snapshot.encode_datatype(&dt_iri);
+                    Ok(Binding::lit(val, dt))
+                }
+                // No datatype constraint rides along on the value, so recover it
+                // from the value itself. Only string-shaped values default to
+                // xsd:string: the temporal, duration and gregorian variants
+                // reach here (they have no dedicated `ComparableValue` arm) and
+                // stamping those xsd:string would re-type a duration or a gYear
+                // as a string on the way out.
+                None => {
+                    let dt = match &val {
+                        FlakeValue::DateTime(_) => datatypes.xsd_datetime.clone(),
+                        FlakeValue::Date(_) => datatypes.xsd_date.clone(),
+                        FlakeValue::Time(_) => datatypes.xsd_time.clone(),
+                        FlakeValue::GYear(_) => datatypes.xsd_g_year.clone(),
+                        FlakeValue::GYearMonth(_) => datatypes.xsd_g_year_month.clone(),
+                        FlakeValue::GMonth(_) => datatypes.xsd_g_month.clone(),
+                        FlakeValue::GDay(_) => datatypes.xsd_g_day.clone(),
+                        FlakeValue::GMonthDay(_) => datatypes.xsd_g_month_day.clone(),
+                        FlakeValue::Duration(_) => datatypes.xsd_duration.clone(),
+                        FlakeValue::DayTimeDuration(_) => datatypes.xsd_day_time_duration.clone(),
+                        FlakeValue::YearMonthDuration(_) => {
+                            datatypes.xsd_year_month_duration.clone()
+                        }
+                        _ => datatypes.xsd_string.clone(),
+                    };
+                    Ok(Binding::lit(val, dt))
+                }
+            },
+        }
+    }
+}
+
+// =============================================================================
+// From implementations for primitive types
+// =============================================================================
+
+impl From<i64> for ComparableValue {
+    fn from(n: i64) -> Self {
+        ComparableValue::Long(n)
+    }
+}
+
+impl From<f64> for ComparableValue {
+    fn from(d: f64) -> Self {
+        ComparableValue::Double(d)
+    }
+}
+
+impl From<bool> for ComparableValue {
+    fn from(b: bool) -> Self {
+        ComparableValue::Bool(b)
+    }
+}
+
+impl From<String> for ComparableValue {
+    fn from(s: String) -> Self {
+        ComparableValue::String(Arc::from(s))
+    }
+}
+
+impl From<&str> for ComparableValue {
+    fn from(s: &str) -> Self {
+        ComparableValue::String(Arc::from(s))
+    }
+}
+
+impl From<Arc<str>> for ComparableValue {
+    fn from(s: Arc<str>) -> Self {
+        ComparableValue::String(s)
+    }
+}
+
+// =============================================================================
+// Conversions from FlakeValue
+// =============================================================================
+
+/// A reference minted by an expression (`BIND(<iri> AS ?x)`, `IRI(..)`,
+/// `DATATYPE(..)`) is encoded in the ACTIVE snapshot's space. Inside a
+/// cross-ledger SERVICE or multi-ledger GRAPH body every scan output is
+/// stamped to `IriMatch`, and `Sid` vs `IriMatch` never compares equal — so
+/// the minted term carries provenance too, or the fused-BIND clobber check
+/// and `?x = ?y` drop rows that should join. Stamped in the active snapshot's
+/// own ledger (the SERVICE path switches it to the target; the GRAPH path
+/// keeps the primary and lets the scans re-encode), so the alias always names
+/// the table the SID was encoded against. A pass-through everywhere else.
+fn stamp_minted(
+    binding: Binding,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> crate::error::Result<Binding> {
+    let Some(ctx) = ctx.filter(|c| c.scan_provenance_ledger.is_some()) else {
+        return Ok(binding);
+    };
+    let Binding::Sid { sid, .. } = binding else {
+        return Ok(binding);
+    };
+    let iri = ctx.active_snapshot.decode_sid(&sid).ok_or_else(|| {
+        QueryError::Internal(format!(
+            "failed to decode minted SID (ns={}, name={:?}) in ledger {:?}",
+            sid.namespace_code, sid.name, ctx.active_snapshot.ledger_id
+        ))
+    })?;
+    Ok(Binding::iri_match(
+        iri,
+        sid,
+        Arc::<str>::from(ctx.active_snapshot.ledger_id.as_str()),
+    ))
+}
+
+/// Whether a literal of this datatype reads as text to the string builtins
+/// (§17.4.3 admits a simple literal, `xsd:string` and a language-tagged
+/// string): those, plus Fluree's `@fulltext` and `rdf:JSON`, whose values are
+/// text a query searches and slices. The one accept-set for every string
+/// builtin. Comparison is separate: `=` and `<` stay term-exact, so an
+/// `@fulltext` or JSON value equals and orders only its own kind.
+pub(crate) fn reads_as_text(dtc: Option<&UnresolvedDatatypeConstraint>) -> bool {
+    match dtc {
+        None | Some(UnresolvedDatatypeConstraint::LangTag(_)) => true,
+        Some(UnresolvedDatatypeConstraint::Explicit(iri)) => matches!(
+            iri.as_ref(),
+            fluree_vocab::xsd::STRING | fluree_vocab::fluree::FULL_TEXT | fluree_vocab::rdf::JSON
+        ),
+    }
+}
+
+/// A JSON value as the evaluator sees it: an `rdf:JSON` literal, not a
+/// string, so `=` and `<` against a string are the type error they are for
+/// any other datatype. The string builtins still read it as text
+/// ([`reads_as_text`]).
+fn json_literal(json: FlakeValue) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: json,
+        dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+            fluree_vocab::rdf::JSON,
+        ))),
+    }
+}
+
+/// Whether `a` and `b` are one `rdf:JSON` term: the same lexical form under
+/// `rdf:JSON`, carried as a JSON value by one and as a string typed
+/// `rdf:JSON` by the other. A valid constant or `STRDT` is the canonical JSON
+/// value already; text that is not JSON is the string, while an import keeps
+/// that text as a JSON value ([`json_literal`]). Derived equality tells the
+/// two apart; term identity must not.
+pub(crate) fn same_json_term(a: &ComparableValue, b: &ComparableValue) -> bool {
+    fn lexical(v: &ComparableValue) -> Option<&str> {
+        match v {
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(iri)),
+            } if iri.as_ref() == fluree_vocab::rdf::JSON => Some(s),
+            _ => None,
+        }
+    }
+    matches!((lexical(a), lexical(b)), (Some(x), Some(y)) if x == y)
+}
+
+impl TryFrom<&FlakeValue> for ComparableValue {
+    type Error = NullValueError;
+
+    fn try_from(val: &FlakeValue) -> Result<Self, Self::Error> {
+        match val {
+            FlakeValue::Long(n) => Ok(ComparableValue::Long(*n)),
+            FlakeValue::Double(d) => Ok(ComparableValue::Double(*d)),
+            FlakeValue::String(s) => Ok(ComparableValue::String(Arc::from(s.as_str()))),
+            FlakeValue::Json(_) => Ok(json_literal(val.clone())),
+            FlakeValue::Boolean(b) => Ok(ComparableValue::Bool(*b)),
+            FlakeValue::Ref(sid) => Ok(ComparableValue::Sid(sid.clone())),
+            FlakeValue::Null => Err(NullValueError),
+            FlakeValue::Vector(v) => Ok(ComparableValue::Vector(Arc::clone(v))),
+            FlakeValue::BigInt(n) => Ok(ComparableValue::BigInt(n.clone())),
+            FlakeValue::Decimal(d) => Ok(ComparableValue::Decimal(d.clone())),
+            FlakeValue::DateTime(dt) => Ok(ComparableValue::DateTime(dt.as_ref().clone())),
+            FlakeValue::Date(d) => Ok(ComparableValue::Date(d.as_ref().clone())),
+            FlakeValue::Time(t) => Ok(ComparableValue::Time(t.as_ref().clone())),
+            FlakeValue::GeoPoint(bits) => Ok(ComparableValue::GeoPoint(*bits)),
+            FlakeValue::GYear(_)
+            | FlakeValue::GYearMonth(_)
+            | FlakeValue::GMonth(_)
+            | FlakeValue::GDay(_)
+            | FlakeValue::GMonthDay(_)
+            | FlakeValue::YearMonthDuration(_)
+            | FlakeValue::DayTimeDuration(_)
+            | FlakeValue::Duration(_) => Ok(ComparableValue::TypedLiteral {
+                val: val.clone(),
+                dtc: None,
+            }),
+        }
+    }
+}
+
+impl TryFrom<FlakeValue> for ComparableValue {
+    type Error = NullValueError;
+
+    fn try_from(val: FlakeValue) -> Result<Self, Self::Error> {
+        match val {
+            FlakeValue::Long(n) => Ok(ComparableValue::Long(n)),
+            FlakeValue::Double(d) => Ok(ComparableValue::Double(d)),
+            FlakeValue::String(s) => Ok(ComparableValue::String(Arc::from(s))),
+            json @ FlakeValue::Json(_) => Ok(json_literal(json)),
+            FlakeValue::Boolean(b) => Ok(ComparableValue::Bool(b)),
+            FlakeValue::Ref(sid) => Ok(ComparableValue::Sid(sid)),
+            FlakeValue::Null => Err(NullValueError),
+            FlakeValue::Vector(v) => Ok(ComparableValue::Vector(v)),
+            FlakeValue::BigInt(n) => Ok(ComparableValue::BigInt(n)),
+            FlakeValue::Decimal(d) => Ok(ComparableValue::Decimal(d)),
+            FlakeValue::DateTime(dt) => Ok(ComparableValue::DateTime(*dt)),
+            FlakeValue::Date(d) => Ok(ComparableValue::Date(*d)),
+            FlakeValue::Time(t) => Ok(ComparableValue::Time(*t)),
+            FlakeValue::GeoPoint(bits) => Ok(ComparableValue::GeoPoint(bits)),
+            val @ (FlakeValue::GYear(_)
+            | FlakeValue::GYearMonth(_)
+            | FlakeValue::GMonth(_)
+            | FlakeValue::GDay(_)
+            | FlakeValue::GMonthDay(_)
+            | FlakeValue::YearMonthDuration(_)
+            | FlakeValue::DayTimeDuration(_)
+            | FlakeValue::Duration(_)) => Ok(ComparableValue::TypedLiteral { val, dtc: None }),
+        }
+    }
+}
+
+// =============================================================================
+// Conversions to FlakeValue
+// =============================================================================
+
+impl From<ComparableValue> for FlakeValue {
+    fn from(val: ComparableValue) -> Self {
+        match val {
+            ComparableValue::Long(n) => FlakeValue::Long(n),
+            ComparableValue::Double(d) => FlakeValue::Double(d),
+            ComparableValue::Float(f) => FlakeValue::Double(f as f64),
+            ComparableValue::String(s) => FlakeValue::String(s.to_string()),
+            ComparableValue::Bool(b) => FlakeValue::Boolean(b),
+            ComparableValue::Sid(sid) => FlakeValue::Ref(sid),
+            ComparableValue::Vector(v) => FlakeValue::Vector(v),
+            ComparableValue::BigInt(n) => FlakeValue::BigInt(n),
+            ComparableValue::Decimal(d) => FlakeValue::Decimal(d),
+            ComparableValue::DateTime(dt) => FlakeValue::DateTime(Box::new(dt)),
+            ComparableValue::Date(d) => FlakeValue::Date(Box::new(d)),
+            ComparableValue::Time(t) => FlakeValue::Time(Box::new(t)),
+            ComparableValue::GeoPoint(bits) => FlakeValue::GeoPoint(bits),
+            ComparableValue::Iri(s) => FlakeValue::String(s.to_string()),
+            ComparableValue::TypedLiteral { val, .. } => val,
+        }
+    }
+}
+
+impl From<&ComparableValue> for FlakeValue {
+    fn from(val: &ComparableValue) -> Self {
+        match val {
+            ComparableValue::Long(n) => FlakeValue::Long(*n),
+            ComparableValue::Double(d) => FlakeValue::Double(*d),
+            ComparableValue::Float(f) => FlakeValue::Double(*f as f64),
+            ComparableValue::String(s) => FlakeValue::String(s.to_string()),
+            ComparableValue::Bool(b) => FlakeValue::Boolean(*b),
+            ComparableValue::Sid(sid) => FlakeValue::Ref(sid.clone()),
+            ComparableValue::Vector(v) => FlakeValue::Vector(Arc::clone(v)),
+            ComparableValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
+            ComparableValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+            ComparableValue::DateTime(dt) => FlakeValue::DateTime(Box::new(dt.clone())),
+            ComparableValue::Date(d) => FlakeValue::Date(Box::new(d.clone())),
+            ComparableValue::Time(t) => FlakeValue::Time(Box::new(t.clone())),
+            ComparableValue::GeoPoint(bits) => FlakeValue::GeoPoint(*bits),
+            ComparableValue::Iri(s) => FlakeValue::String(s.to_string()),
+            ComparableValue::TypedLiteral { val, .. } => val.clone(),
+        }
+    }
+}
+
+/// `INF` / `-INF` as the text earlier versions' bulk import stored for an
+/// `xsd:double` / `xsd:float` value in the index (`inf`, `-inf`). Read-side
+/// only: the write surfaces keep to the XSD lexical space.
+pub(crate) fn legacy_import_infinity(s: &str) -> Option<f64> {
+    match s {
+        "inf" => Some(f64::INFINITY),
+        "-inf" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::Sid;
+
+    // === Temporal subtraction (XPath op:subtract-dateTimes/-dates/-times) ===
+
+    fn dt(s: &str) -> ComparableValue {
+        ComparableValue::DateTime(FlureeDateTime::parse(s).expect("dateTime"))
+    }
+
+    fn date(s: &str) -> ComparableValue {
+        ComparableValue::Date(FlureeDate::parse(s).expect("date"))
+    }
+
+    fn time(s: &str) -> ComparableValue {
+        ComparableValue::Time(FlureeTime::parse(s).expect("time"))
+    }
+
+    /// Canonical lexical form of a duration-valued arithmetic result.
+    fn duration_of(v: Result<ComparableValue, ArithmeticError>) -> String {
+        match v.expect("temporal subtraction should succeed") {
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::DayTimeDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            other => panic!("expected xsd:dayTimeDuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtract_datetimes_yields_day_time_duration() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z"))
+            ),
+            "P1D"
+        );
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T12:30:00Z"), dt("2026-01-01T10:00:00Z"))
+            ),
+            "PT2H30M"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_is_signed() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T00:00:00Z"), dt("2026-01-02T00:00:00Z"))
+            ),
+            "-P1D"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_normalizes_timezones() {
+        // Both operands denote the same instant (10:00Z), so they cancel.
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub
+                    .apply(dt("2026-01-01T12:00:00+02:00"), dt("2026-01-01T10:00:00Z"))
+            ),
+            "PT0S"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_keeps_sub_second_precision() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T00:00:01.500Z"), dt("2026-01-01T00:00:00Z"))
+            ),
+            "PT1.5S"
+        );
+    }
+
+    #[test]
+    fn subtract_dates_yields_day_time_duration() {
+        // XPath op:subtract-dates example: both operands share the implicit
+        // timezone, so it cancels and the answer is a whole number of days.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2000-10-30"), date("1999-11-28"))),
+            "P337D"
+        );
+    }
+
+    #[test]
+    fn subtract_dates_reads_the_stored_calendar_date() {
+        // Previously `subtract_dates_accounts_for_timezone_offset`, asserting
+        // PT5H here: midnight at +05:00 is 19:00Z the previous day, so folding
+        // the offset in made the difference five hours. That is what XPath's
+        // op:subtract-dates says, but the offset is not persisted — only
+        // days_since_epoch reaches the index — so PT5H was reachable in novelty
+        // and PT0S once reindexed. Now the calendar date is read on both lanes,
+        // pinned end-to-end by it_temporal_lane_stability.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2026-01-01Z"), date("2026-01-01+05:00"))),
+            "PT0S"
+        );
+        // Offsets ignored, so a real difference in calendar dates is unaffected.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2026-01-03Z"), date("2026-01-01Z"))),
+            "P2D"
+        );
+    }
+
+    #[test]
+    fn subtract_times_yields_day_time_duration() {
+        // XPath op:subtract-times example, offset-free so it is unaffected.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(time("11:12:00Z"), time("04:00:00Z"))),
+            "PT7H12M"
+        );
+        // This pair used to assert PT0S, on the grounds that 11:00-05:00 and
+        // 21:30+05:30 are both 16:00Z. Only micros_since_midnight is stored, so
+        // that answer held in novelty and became -PT10H30M after a reindex.
+        // Wall clocks are now what is subtracted on both lanes: 11:00 − 21:30.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(time("11:00:00-05:00"), time("21:30:00+05:30"))),
+            "-PT10H30M"
+        );
+    }
+
+    fn dtd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::DayTimeDuration(Box::new(
+                fluree_db_core::temporal::DayTimeDuration::parse(s).expect("dayTimeDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    fn ymd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::YearMonthDuration(Box::new(
+                YearMonthDuration::parse(s).expect("yearMonthDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    /// Lexical form of a temporal-valued arithmetic result.
+    fn lexical_of(v: Result<ComparableValue, ArithmeticError>) -> String {
+        match v.expect("temporal arithmetic should succeed") {
+            ComparableValue::DateTime(d) => d.canonical(),
+            ComparableValue::Date(d) => d.canonical(),
+            ComparableValue::Time(t) => t.canonical(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::DayTimeDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::YearMonthDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_plus_and_minus_day_time_duration() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T12:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T07:00:00Z"
+        );
+        // Crossing a day boundary carries into the date.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T23:00:00Z"), dtd("PT2H"))),
+            "2026-01-02T01:00:00Z"
+        );
+    }
+
+    #[test]
+    fn datetime_plus_year_month_duration_clamps_to_end_of_month() {
+        // The XPath rule: the day is clamped to the last day of the resulting
+        // month rather than overflowing into the next one.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+        // 2028 is a leap year, so the same shift lands on the 29th.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2028-01-31T00:00:00Z"), ymd("P1M"))),
+            "2028-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-03-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn date_plus_duration_keeps_the_date_part() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), ymd("P1Y2M"))),
+            "2027-03-01"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("P2D"))),
+            "2026-01-03"
+        );
+        // Per XPath the date is taken to midnight and the date part of the
+        // shifted instant kept, so a sub-day duration moves nothing.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("PT5H"))),
+            "2026-01-01"
+        );
+    }
+
+    #[test]
+    fn time_plus_day_time_duration_wraps_within_the_day() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("09:30:00Z"), dtd("PT2H"))),
+            "11:30:00"
+        );
+        // A time has no date to carry into, so it wraps.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("23:00:00Z"), dtd("PT2H"))),
+            "01:00:00"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(time("01:00:00Z"), dtd("PT2H"))),
+            "23:00:00"
+        );
+    }
+
+    #[test]
+    fn durations_add_and_subtract_within_their_family() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dtd("PT2H"), dtd("PT3H30M"))),
+            "PT5H30M"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dtd("PT3H"), dtd("PT2H"))),
+            "PT1H"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(ymd("P1Y"), ymd("P2M"))),
+            "P1Y2M"
+        );
+    }
+
+    #[test]
+    fn temporal_duration_arithmetic_rejects_undefined_combinations() {
+        // Months have no fixed length, so the two duration families do not mix.
+        assert_eq!(
+            ArithmeticOp::Add.apply(dtd("PT2H"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // A time carries no months.
+        assert_eq!(
+            ArithmeticOp::Add.apply(time("09:30:00Z"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // Only + and - are defined over these operands.
+        for op in [ArithmeticOp::Mul, ArithmeticOp::Div, ArithmeticOp::Mod] {
+            assert_eq!(
+                op.apply(dt("2026-01-01T00:00:00Z"), dtd("PT2H")),
+                Err(ArithmeticError::TypeMismatch),
+                "{op:?} over dateTime and a duration must stay a type error"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_operands_reject_every_operator_but_subtraction() {
+        for op in [
+            ArithmeticOp::Add,
+            ArithmeticOp::Mul,
+            ArithmeticOp::Div,
+            ArithmeticOp::Mod,
+        ] {
+            assert_eq!(
+                op.apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z")),
+                Err(ArithmeticError::TypeMismatch),
+                "{op:?} on two dateTimes must stay a type error"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_temporal_and_numeric_operands_stay_a_type_error() {
+        assert_eq!(
+            ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), ComparableValue::Long(1)),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // Mismatched temporal kinds have no XPath operator either.
+        assert_eq!(
+            ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), date("2026-01-01")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn subtraction_result_renders_as_xsd_day_time_duration() {
+        // Regression guard for the `dtc: None` arm of `to_binding`, which used
+        // to stamp every non-primitive typed literal xsd:string.
+        let binding = ArithmeticOp::Sub
+            .apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z"))
+            .expect("subtraction")
+            .to_binding(None)
+            .expect("binding");
+        match binding {
+            Binding::Lit { val, dtc, .. } => {
+                assert_eq!(
+                    dtc.datatype(),
+                    &WELL_KNOWN_DATATYPES.xsd_day_time_duration,
+                    "duration must not be re-typed as xsd:string"
+                );
+                assert!(matches!(val, FlakeValue::DayTimeDuration(_)));
+            }
+            other => panic!("expected a literal binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gregorian_typed_literals_keep_their_datatype_on_output() {
+        // Same `to_binding` arm: a gYear round-tripping through the expression
+        // evaluator must not come back as xsd:string either.
+        let g = FlakeValue::GYear(Box::new(
+            fluree_db_core::temporal::GYear::parse("2026").expect("gYear"),
+        ));
+        let binding = ComparableValue::try_from(g)
+            .expect("comparable")
+            .to_binding(None)
+            .expect("binding");
+        match binding {
+            Binding::Lit { dtc, .. } => {
+                assert_eq!(dtc.datatype(), &WELL_KNOWN_DATATYPES.xsd_g_year);
+            }
+            other => panic!("expected a literal binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ebv_bool() {
+        assert!(bool::from(ComparableValue::Bool(true)));
+        assert!(!bool::from(ComparableValue::Bool(false)));
+    }
+
+    #[test]
+    fn test_ebv_numeric() {
+        assert!(bool::from(ComparableValue::Long(1)));
+        assert!(!bool::from(ComparableValue::Long(0)));
+        assert!(bool::from(ComparableValue::Double(0.1)));
+        assert!(!bool::from(ComparableValue::Double(0.0)));
+        assert!(!bool::from(ComparableValue::Double(f64::NAN)));
+    }
+
+    #[test]
+    fn test_ebv_string() {
+        assert!(bool::from(ComparableValue::String(Arc::from("hello"))));
+        assert!(!bool::from(ComparableValue::String(Arc::from(""))));
+    }
+
+    #[test]
+    fn test_arithmetic_long() {
+        let a = ComparableValue::Long(10);
+        let b = ComparableValue::Long(3);
+        assert_eq!(
+            ArithmeticOp::Add.apply(a.clone(), b.clone()),
+            Ok(ComparableValue::Long(13))
+        );
+        assert_eq!(
+            ArithmeticOp::Sub.apply(a.clone(), b.clone()),
+            Ok(ComparableValue::Long(7))
+        );
+        assert_eq!(
+            ArithmeticOp::Mul.apply(a.clone(), b.clone()),
+            Ok(ComparableValue::Long(30))
+        );
+        // Per XPath op:numeric-divide, integer / integer yields xsd:decimal,
+        // not a truncated integer.
+        assert_eq!(
+            ArithmeticOp::Div.apply(a, b),
+            Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                BigDecimal::from(10),
+                BigDecimal::from(3)
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_int_div_is_decimal() {
+        // 10 / 4 = 2.5 (xsd:decimal), not 2 (truncated xsd:integer).
+        assert_eq!(
+            ArithmeticOp::Div.apply(ComparableValue::Long(10), ComparableValue::Long(4)),
+            Ok(ComparableValue::Decimal(Box::new("2.5".parse().unwrap())))
+        );
+        // Exact integer quotient still yields a decimal (canonical form "5").
+        assert_eq!(
+            ArithmeticOp::Div.apply(ComparableValue::Long(10), ComparableValue::Long(2)),
+            Ok(ComparableValue::Decimal(Box::new("5".parse().unwrap())))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_float_typed_literal_promotes() {
+        // xsd:float(?a) is carried as a String-backed TypedLiteral. Dividing it
+        // by an integer promotes to xsd:float (float∘integer→float), keeping the
+        // result float rather than widening to double (D4).
+        let float_ten = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("10".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::FLOAT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Div.apply(float_ten, ComparableValue::Long(4)),
+            Ok(ComparableValue::Float(2.5))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_typed_literal_coercion_covers_full_xsd_lattice() {
+        // xsd:short carried as a typed literal coerces for arithmetic.
+        let short_five = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("5".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::SHORT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(short_five, ComparableValue::Long(2)),
+            Ok(ComparableValue::Long(10))
+        );
+
+        // A large xsd:integer beyond i64 coerces to BigInt rather than failing.
+        let big = "99999999999999999999999999999"; // > i64::MAX
+        let big_lit = ComparableValue::TypedLiteral {
+            val: FlakeValue::String(big.to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::INTEGER,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Add.apply(big_lit, ComparableValue::Long(1)),
+            Ok(ComparableValue::BigInt(Box::new(
+                big.parse::<BigInt>().unwrap() + 1
+            )))
+        );
+
+        // The xsd:float INF lexical coerces to an infinite double.
+        let inf = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("INF".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::FLOAT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(inf, ComparableValue::Long(2)),
+            Ok(ComparableValue::Float(f32::INFINITY))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_div_by_zero() {
+        assert_eq!(
+            ArithmeticOp::Div.apply(ComparableValue::Long(10), ComparableValue::Long(0)),
+            Err(ArithmeticError::DivideByZero)
+        );
+    }
+
+    #[test]
+    fn test_try_from_flake_value() {
+        // Reference conversion
+        let fv = FlakeValue::Long(42);
+        let cv = ComparableValue::try_from(&fv);
+        assert_eq!(cv, Ok(ComparableValue::Long(42)));
+
+        // Owned conversion
+        let fv_owned = FlakeValue::Long(42);
+        let cv_owned = ComparableValue::try_from(fv_owned);
+        assert_eq!(cv_owned, Ok(ComparableValue::Long(42)));
+
+        // Null returns error
+        let fv_null = FlakeValue::Null;
+        let cv_null = ComparableValue::try_from(&fv_null);
+        assert_eq!(cv_null, Err(NullValueError));
+    }
+
+    #[test]
+    fn test_into_flake_value() {
+        // Reference conversion
+        let cv = ComparableValue::Long(42);
+        let fv: FlakeValue = (&cv).into();
+        assert_eq!(fv, FlakeValue::Long(42));
+
+        // Owned conversion
+        let cv_owned = ComparableValue::Long(99);
+        let fv_owned: FlakeValue = cv_owned.into();
+        assert_eq!(fv_owned, FlakeValue::Long(99));
+    }
+
+    #[test]
+    fn test_from_primitives() {
+        // i64
+        let cv: ComparableValue = 42i64.into();
+        assert_eq!(cv, ComparableValue::Long(42));
+
+        // f64
+        let cv: ComparableValue = 2.5f64.into();
+        assert_eq!(cv, ComparableValue::Double(2.5));
+
+        // bool
+        let cv: ComparableValue = true.into();
+        assert_eq!(cv, ComparableValue::Bool(true));
+
+        // &str
+        let cv: ComparableValue = "hello".into();
+        assert_eq!(cv, ComparableValue::String(Arc::from("hello")));
+
+        // String
+        let cv: ComparableValue = String::from("world").into();
+        assert_eq!(cv, ComparableValue::String(Arc::from("world")));
+
+        // Arc<str>
+        let arc: Arc<str> = Arc::from("arc");
+        let cv: ComparableValue = arc.into();
+        assert_eq!(cv, ComparableValue::String(Arc::from("arc")));
+    }
+
+    #[test]
+    fn test_as_str() {
+        let cv = ComparableValue::String(Arc::from("hello"));
+        assert_eq!(cv.as_str(), Some("hello"));
+
+        let cv_long = ComparableValue::Long(42);
+        assert_eq!(cv_long.as_str(), None);
+    }
+
+    #[test]
+    fn test_into_string_value() {
+        let cv = ComparableValue::Long(42);
+        let sv = cv.into_string_value();
+        assert_eq!(sv, Some(ComparableValue::String(Arc::from("42"))));
+    }
+
+    /// #1695: STR()'s stringification of doubles/floats must be the W3C
+    /// canonical XSD lexical form — the exact routine the RDF-lexical
+    /// serializers use — never Rust `Display` ("1", "inf").
+    #[test]
+    fn test_into_string_value_double_float_canonical() {
+        let cases: &[(f64, &str)] = &[
+            (1.0, "1.0E0"),
+            (5.0, "5.0E0"),
+            (1_000_000.0, "1.0E6"),
+            (0.001, "1.0E-3"),
+            (-12.5, "-1.25E1"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+        ];
+        for &(d, expected) in cases {
+            assert_eq!(
+                ComparableValue::Double(d).into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "Double({d:?})"
+            );
+            // A double wrapped in a TypedLiteral takes the same form.
+            let tl = ComparableValue::TypedLiteral {
+                val: FlakeValue::Double(d),
+                dtc: None,
+            };
+            assert_eq!(
+                tl.into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "TypedLiteral(Double({d:?}))"
+            );
+        }
+        // A stored xsd:float materializes as `Float`; its canonical form uses
+        // the f32 shortest-round-trip mantissa.
+        assert_eq!(
+            ComparableValue::Float(33.33).into_string_value(),
+            Some(ComparableValue::String(Arc::from("3.333E1")))
+        );
+        assert_eq!(
+            ComparableValue::Float(f32::NEG_INFINITY).into_string_value(),
+            Some(ComparableValue::String(Arc::from("-INF")))
+        );
+    }
+
+    #[test]
+    fn test_into_string_value_sid_internal_form() {
+        // Without namespace codes, SID falls back to internal code:name form
+        let sid = Sid::new(21, "packageType");
+        let cv = ComparableValue::Sid(sid);
+        let sv = cv.into_string_value();
+        assert_eq!(
+            sv,
+            Some(ComparableValue::String(Arc::from("21:packageType")))
+        );
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_expands_sid() {
+        use std::collections::HashMap;
+        let mut ns = HashMap::new();
+        ns.insert(21u16, "https://taxo.cbcrc.ca/ns/".to_string());
+        ns.insert(2u16, "http://www.w3.org/2001/XMLSchema#".to_string());
+
+        let sid = Sid::new(21, "packageType");
+        let cv = ComparableValue::Sid(sid);
+        let sv = cv.into_string_value_with_namespaces(Some(&ns));
+        assert_eq!(
+            sv,
+            Some(ComparableValue::String(Arc::from(
+                "https://taxo.cbcrc.ca/ns/packageType"
+            )))
+        );
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_unknown_code_fallback() {
+        use std::collections::HashMap;
+        let ns = HashMap::new(); // empty — code 21 not found
+
+        let sid = Sid::new(21, "packageType");
+        let cv = ComparableValue::Sid(sid);
+        let sv = cv.into_string_value_with_namespaces(Some(&ns));
+        // Falls back to internal form
+        assert_eq!(
+            sv,
+            Some(ComparableValue::String(Arc::from("21:packageType")))
+        );
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_full_iri_codes() {
+        use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+        use std::collections::HashMap;
+        let iri = "http://unregistered.example/s";
+        for ns in [None, Some(HashMap::new())] {
+            for code in [EMPTY, OVERFLOW] {
+                let sv = ComparableValue::Sid(Sid::new(code, iri))
+                    .into_string_value_with_namespaces(ns.as_ref());
+                assert_eq!(sv, Some(ComparableValue::String(Arc::from(iri))));
+            }
+        }
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_none_fallback() {
+        let sid = Sid::new(21, "packageType");
+        let cv = ComparableValue::Sid(sid);
+        let sv = cv.into_string_value_with_namespaces(None);
+        // Falls back to internal form
+        assert_eq!(
+            sv,
+            Some(ComparableValue::String(Arc::from("21:packageType")))
+        );
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_non_sid() {
+        use std::collections::HashMap;
+        let ns = HashMap::new();
+
+        // Non-SID types delegate to into_string_value
+        let cv = ComparableValue::Long(42);
+        let sv = cv.into_string_value_with_namespaces(Some(&ns));
+        assert_eq!(sv, Some(ComparableValue::String(Arc::from("42"))));
+    }
+
+    #[test]
+    fn test_string_arg_accept_set() {
+        // #1468: `string_arg` accepts a plain / xsd:string literal and a
+        // language-tagged literal (tag-transparent), but rejects an IRI and a
+        // foreign-datatype literal so string builtins keep raising a type error
+        // on those. Mirrors CONCAT's accept-set.
+        let plain = ComparableValue::String(Arc::from("x"));
+        assert_eq!(plain.string_arg(), Some("x"));
+
+        let lang = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::LangTag(Arc::from("en"))),
+        };
+        assert_eq!(lang.string_arg(), Some("x"));
+
+        let untyped = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: None,
+        };
+        assert_eq!(untyped.string_arg(), Some("x"));
+
+        let foreign = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                "http://example.org/dt",
+            ))),
+        };
+        assert_eq!(foreign.string_arg(), None);
+
+        let iri = ComparableValue::Iri(Arc::from("http://example.org/x"));
+        assert_eq!(iri.string_arg(), None);
+
+        assert_eq!(ComparableValue::Long(1).string_arg(), None);
+    }
+
+    /// Comparisons and arithmetic read `inf` / `-inf` under `xsd:double` or
+    /// `xsd:float`, the text an earlier bulk import stored for INF / -INF, as
+    /// those numbers. Other non-XSD spellings, and other datatypes, stay
+    /// literals.
+    #[test]
+    fn numeric_operand_reads_inf_text_under_double_and_float() {
+        let typed = |text: &str, dt: &str| ComparableValue::TypedLiteral {
+            val: FlakeValue::String(text.to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(dt))),
+        };
+        assert_eq!(
+            typed("inf", fluree_vocab::xsd::DOUBLE).coerce_numeric_operand(),
+            ComparableValue::Double(f64::INFINITY)
+        );
+        assert_eq!(
+            typed("-inf", fluree_vocab::xsd::DOUBLE).coerce_numeric_operand(),
+            ComparableValue::Double(f64::NEG_INFINITY)
+        );
+        assert_eq!(
+            typed("inf", fluree_vocab::xsd::FLOAT).coerce_numeric_operand(),
+            ComparableValue::Float(f32::INFINITY)
+        );
+        for (text, dt) in [
+            ("Infinity", fluree_vocab::xsd::DOUBLE),
+            ("inf", fluree_vocab::xsd::DECIMAL),
+            ("inf", fluree_vocab::xsd::STRING),
+        ] {
+            assert!(
+                matches!(
+                    typed(text, dt).coerce_numeric_operand(),
+                    ComparableValue::TypedLiteral { .. }
+                ),
+                "{text}^^{dt}"
+            );
+        }
+    }
+}

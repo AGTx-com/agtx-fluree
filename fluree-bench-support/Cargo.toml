@@ -1,0 +1,49 @@
+[package]
+name = "fluree-bench-support"
+description = "Shared chassis for Fluree DB benchmarks: helpers, deterministic generators, fixture loading, regression-budget validation, and bench-mode tracing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Internal benchmark tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
+# Library + one small CLI (`bench-baseline`, capture/compare). No benches in
+# this crate — see <workspace>/BENCHMARKING.md and per-crate `benches/`.
+
+[[bin]]
+name = "bench-baseline"
+path = "src/bin/bench_baseline.rs"
+
+[features]
+default = []
+
+[dependencies]
+# Runtime + tracing primitives — match what existing benches already use.
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Deterministic data generation — uses workspace versions where available.
+chrono = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Corpus identity hashing for baseline entries (`meta::CorpusInfo`). Already a
+# workspace dependency — BLAKE3 would hash faster but is not in the tree, and a
+# corpus is hashed once per capture.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Bench helpers are themselves trivially testable; small criterion dep is OK
+# but we keep the surface tiny so this crate doesn't pull criterion into
+# anyone who depends on it.
+
+# `toml` is dev-only — used by the workspace_reconcile integration test
+# (walks every member crate's Cargo.toml to reconcile `[[bench]]` entries
+# with regression-budget.json).
+toml = "0.8"

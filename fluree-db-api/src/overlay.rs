@@ -1,0 +1,119 @@
+//! Overlay utilities for formatting/query results.
+//!
+//! Currently used to support dataset (multi-ledger) hydration formatting by
+//! composing multiple novelty overlays into a single `OverlayProvider`.
+
+use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
+
+/// Composite overlay that merges multiple overlay providers.
+///
+/// Used when hydration formatting needs to "see" unindexed flakes from multiple ledgers
+/// (dataset mode). This is a correctness-first implementation intended for tests and
+/// low-volume usage: it collects flakes from each overlay, sorts them, then streams them
+/// to the callback.
+pub struct CompositeOverlay {
+    epoch: u64,
+    /// Composed from the parts' versions, in order; `None` when any part
+    /// cannot vouch for its own.
+    content_version: Option<u64>,
+    overlays: Vec<std::sync::Arc<dyn OverlayProvider>>,
+}
+
+impl CompositeOverlay {
+    pub fn new(overlays: Vec<std::sync::Arc<dyn OverlayProvider>>) -> Self {
+        // Deterministic combined epoch (cheap and stable).
+        let mut epoch = 0u64;
+        for o in &overlays {
+            epoch = epoch.wrapping_mul(1_000_003).wrapping_add(o.epoch());
+        }
+        let content_version = overlays
+            .iter()
+            .map(|o| o.content_version())
+            .collect::<Option<Vec<u64>>>()
+            .map(|parts| fluree_db_core::overlay::compose_content_version(&parts));
+        Self {
+            epoch,
+            content_version,
+            overlays,
+        }
+    }
+}
+
+impl OverlayProvider for CompositeOverlay {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        let mut all = std::collections::HashSet::new();
+        for overlay in &self.overlays {
+            all.extend(overlay.list_predicates()?.iter().cloned());
+        }
+        Some(std::sync::Arc::new(all))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.content_version
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        self.overlays.iter().all(|o| o.is_effectively_empty())
+    }
+
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        // Unknown for any component ⇒ unknown for the composite.
+        self.overlays
+            .iter()
+            .try_fold(0usize, |acc, o| Some(acc + o.overlay_flake_count(g_id)?))
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // A component's whole-graph count bounds its range count.
+        self.overlays.iter().try_fold(0usize, |acc, o| {
+            let n = o
+                .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+                .or_else(|| o.overlay_flake_count(g_id))?;
+            Some(acc + n)
+        })
+    }
+
+    fn for_each_overlay_flake(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+        to_t: i64,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        if self.overlays.is_empty() {
+            return;
+        }
+
+        let mut flakes: Vec<Flake> = Vec::new();
+        for overlay in &self.overlays {
+            overlay.for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, &mut |f| {
+                flakes.push(f.clone());
+            });
+        }
+
+        flakes.sort_by(|a, b| index.compare(a, b));
+        for flake in &flakes {
+            callback(flake);
+        }
+    }
+}

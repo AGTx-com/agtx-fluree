@@ -1,0 +1,216 @@
+# fluree create
+
+Create a new ledger.
+
+## Usage
+
+```bash
+fluree create <LEDGER> [OPTIONS]
+```
+
+## Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<LEDGER>` | Name for the new ledger |
+
+## Options
+
+| Option | Description |
+|--------|-------------|
+| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). Also accepts property-graph inputs: `.csv` (neo4j-admin header convention) and `.cypher`/`.cyp`/`.cql` scripts of `CREATE` / `MATCH … CREATE` statements — see below. A `.flpack` archive (see [export](export.md)) is restored wholesale instead — full ledger including its prebuilt index. |
+| `--remote <NAME>` | Create on a remote server instead of locally. With no `--from`, creates an empty ledger. With `--from <archive>.flpack`, streams the archive to the server's import endpoint to restore the ledger remotely. With any other `--from` file (TTL/JSON-LD/JSONL/CSV/Cypher …), uploads the source to servers advertising `source-upload` and runs the bulk-import pipeline server-side; single files only (for a directory: create locally then [publish](publish.md), or export to `.flpack`). |
+| `--memory [PATH]` | Import memory history from a git-tracked `.fluree-memory/` directory. Defaults to the current repo if no path is given. Mutually exclusive with `--from`. |
+| `--edge-properties <MODE>` | CSV/Cypher import: how properties on a relationship (edge) are stored. `annotated` (default) keeps them as RDF 1.2 / LPG `@annotation` — readable from Cypher rel-vars (`r.prop`) and SPARQL (`{\| … \|}`); `plain` drops them (every edge a plain triple); `nary` is not implemented yet. |
+| `--base-iri <IRI>` | CSV/Cypher import: base IRI namespace for minted ids, predicates, and classes. CSV defaults to `http://example.org/`; Cypher defaults to **bare names** (namespace 0), which zero-config Cypher queries read directly. |
+| `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
+| `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
+| `--leaflet-rows <N>` | Rows per leaflet in the binary index (default: 25000). Larger values produce fewer, bigger leaflets — less I/O per scan, more memory per read. |
+| `--leaflets-per-leaf <N>` | Leaflets per leaf file (default: 10). Larger values produce fewer leaf files — shallower tree, bigger reads. |
+
+**Global flags** that affect bulk import when using `--from` (see [CLI README](README.md#global-options)):
+
+- `--memory-budget-mb <MB>` — Memory budget in MB (0 = auto: **80% of system RAM** — sized for a dedicated machine). Drives chunk size, concurrency, and indexer run budget. On a shared machine always pass an explicit budget (and consider `--parallelism 2`–`4`): the auto default assumes it owns the box, and a large import at 80% alongside other workloads can OOM the machine. Auto-detected thread count shrinks to fit the budget.
+- `--parallelism <N>` — Number of parallel parse threads (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1).
+- `--skolem-namespace <id>` — Namespace salting the blank-node ids this import mints (default: the ledger id). See [Blank nodes](#blank-nodes).
+
+## Description
+
+Creates a new empty ledger with the given name and sets it as the active ledger. The ledger is stored in `.fluree/storage/`.
+
+Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs, and so does JSON-LD (`.jsonld`, `.jsonl`/`.ndjson`), which writes `@graph` exactly as a transaction does: a node's graph selector (`"@graph": "ex:g"`) puts it and the nodes nested in it in that graph, and a JSON-LD named graph (`{"@id": "ex:g", "@graph": [...]}`) puts its content there. Each `.jsonl`/`.ndjson` line is read as a document of its own under the shared context: its own `@context` resolves its graph names, a top-level bare `"graph"` key is dropped as a transaction drops it, and a line that is an envelope is unwrapped. A JSON-LD import refuses an unknown `@`-keyword on a node (`"@foo"`), naming it, as a transaction does; the JSON-LD 1.1 expansion algorithm would drop the key with a warning instead (see [Standards and Feature Flags](../reference/compatibility.md#json-ld-11)). Named graphs are queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
+
+**Reserved graphs are refused, not imported.** A `GRAPH` block or JSON-LD `@graph` naming the ledger's own `urn:fluree:<ledger>#txn-meta` or `urn:fluree:<ledger>#config` (in JSON-LD also the `"txn-meta"` and `"config"` keywords) fails the import rather than loading. `#txn-meta` is the ledger's commit provenance, which the commit resolvers trust, so no user data may be written into it on any surface. `#config` is a capability gap rather than a policy — ledger configuration *is* writable, just not by bulk import, because the import pipeline has no index pass that populates it; create the ledger first and set its configuration with an ordinary transaction. User-defined named graphs are unaffected, and the `<#txn-meta>` sidecar block (a relative IRI, not the ledger-scoped one) still supplies commit metadata as documented below.
+
+**Ill-typed literals are kept.** A typed literal whose lexical form does not fit its datatype (`"abc"^^xsd:integer`) is imported as text under its declared datatype rather than failing the import, so a dataset from elsewhere loads in one pass. Bulk import is the one lenient write path, here and in [`fluree graph import`](graph.md#fluree-graph-import), which runs the same pipeline into a new graph of an existing ledger: a transaction (insert, upsert, update, graph sync) refuses such a literal with "Cannot parse 'abc' as integer". A query reads the imported literal back with its datatype.
+
+**Datatypes past the limit fail the import.** A ledger holds at most 16,369 distinct datatypes beyond 15 reserved ones (see [Datatype Limit](../concepts/datatypes.md#datatype-limit)). An import whose data uses more fails with a "datatype limit exceeded" error.
+
+**Directory imports (`.ttl`/`.nt`)** are *rechunked by bytes* rather than one-chunk-per-file: large files are sub-split at statement boundaries and many small files are coalesced into `~chunk_size` work items. This keeps the import fully parallel and bounds the number of commits and sorted index runs regardless of how the data is packaged — so a directory of one big file, or of hundreds of tiny shards, both import at full speed. Coalescing engages automatically once a directory holds more than 64 sub-`chunk_size` files; a file containing a labeled blank node (`_:`) or an `@base` directive is never coalesced (it would change RDF document scope) and is imported as its own chunk. Set `FLUREE_IMPORT_COALESCE_THRESHOLD=<n>` to change the gate (`0` disables coalescing — every file becomes its own commit, the legacy behavior). Directories containing any `.trig`/`.nq`/`.jsonld` continue to use the per-file serial path.
+
+### Blank nodes
+
+Import skolemizes every blank node in its source into the reserved `_:fdb-…`
+label space, and queries return those labels as the node's `@id`. The minted id
+is `_:fdb-d<scope>-<label>`, where `<label>` is the label as written in the
+source and `<scope>` identifies the **document** it came from. Only `[0-9a-z-]`
+appears in it, so the id can be written back in SPARQL, Turtle, or JSON-LD to
+edit the node in place — see
+[Editing blank-node structures](../transactions/update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids).
+
+A label unifies across its whole document and stays distinct between documents,
+so `_:x` in two files is two nodes no matter how the importer chunks them. What
+counts as a document:
+
+| source | document |
+|---|---|
+| `.ttl`/`.nt`/`.trig`/`.nq`/`.jsonld` | one file |
+| `.jsonl`/`.ndjson` | one **context segment** (see below) |
+
+The scope is derived from the document's path relative to the import root, so
+importing the same tree from `/tmp/x` and from `/data/x` mints the same ids, and
+adding a file to the directory does not renumber anything.
+
+**ndjson context segments.** A lone `{"@context": …}` line replaces the shared
+context for the lines that follow, which is what makes `cat a.jsonl b.jsonl >
+combined.jsonl` work. Each such switch ends one document and starts the next, so
+`a.jsonl`'s `_:x` and `b.jsonl`'s `_:x` stay distinct through the seam. Within a
+segment a label unifies across every chunk.
+
+> **Caveat.** If you write ndjson in the "every line is an independent document"
+> style — an inline `@context` on *every* line — each line's context, graph
+> names and top-level keys are read as that line's own, but its blank-node
+> labels are still scoped to the segment: a `_:x` reused across such lines
+> resolves to **one** node. That is not what the NDJSON-of-independent-documents
+> convention would suggest. Use a lone context line to separate them, or give
+> the nodes real `@id`s.
+
+**Cross-ledger identity.** The ledger id salts the mint, so importing one source
+tree into two ledgers gives them disjoint blank nodes. Pass the same
+`--skolem-namespace <id>` to both to make them mint *identical* ids instead —
+for a rebuild-and-diff, a sharded load of one logical dataset, or a
+staging/production pair you want to compare node for node.
+
+**Tracing an id back to its file.** Each source document contributes one triple
+to the ledger's `txn-meta` graph:
+
+```sparql
+SELECT ?source WHERE {
+  GRAPH <urn:fluree:mydb:main#txn-meta> {
+    _:fdb-d1t3k9x0abcdef <https://ns.flur.ee/db#importSource> ?source
+  }
+}
+```
+
+The subject is the first 19 characters of the id (`_:fdb-` plus the 14-character
+scope).
+
+### Property-graph imports (CSV & Cypher)
+
+Two property-graph front-ends convert to JSON-LD on the fly and load through
+the same chunked bulk-import pipeline (not the per-transaction write path):
+
+- **CSV** (`.csv`, single file or a directory of them) — node/relationship
+  files in the **neo4j-admin import** header convention (`:ID`, `:LABEL`,
+  `:START_ID`/`:END_ID`, `:TYPE`, `name:type` columns).
+- **Cypher scripts** (`.cypher`/`.cyp`/`.cql`, single file or a directory) —
+  `;`-separated statements in the Neo4j/Memgraph dump idiom: `CREATE` for
+  nodes (and inline paths), and `MATCH (n:L {key: v}), (m:L {key: v})
+  CREATE (n)-[:T]->(m)` for edges between property-matched nodes. Anything
+  else (`MERGE`, `SET`, reads, …) fails the import with its line number.
+
+Cypher node identity is derived from the property sets `MATCH` uses per label
+(learned in a first pass): `CREATE (:User {id: 42, …})` and
+`MATCH (n:User {id: 42})` both resolve to the stable id `User/42`, so edges
+land on the right nodes without replaying statements transactionally. Two
+`CREATE`s with the same key values therefore merge into one node, and an edge
+whose endpoint was never created is skipped (with a warning count) — `MATCH`
+finds nothing, so the statement is a no-op.
+
+By default a Cypher import emits **bare names** (namespace 0), the same
+resolution Cypher's own read/write paths use — the imported data is queryable
+with zero configuration (`MATCH (n:User {id: 42}) RETURN n`). Pass
+`--base-iri` to mint prefixed IRIs instead (RDF-compat; pair it with a ledger
+default context carrying the matching `@vocab`). CSV always mints prefixed
+IRIs (`--base-iri`, default `http://example.org/`).
+
+Edge properties follow `--edge-properties` in both formats. Note the Cypher
+read contract: a plain (property-less) edge is visible to `(a)-[:T]->(b)` and
+`-->` patterns, but a relationship *variable* (`(a)-[r:T]->(b)`) only binds
+reified (annotated) edges.
+
+Use `--memory` to import your project's developer memory history into a time-travel-capable Fluree ledger. Each git commit that touched `.fluree-memory/repo.ttl` (and `.local/user.ttl` unless `--no-user` is set) becomes a Fluree transaction. The git commit message, SHA, and author date are stored as transaction metadata, so you can correlate Fluree `t` values with git history.
+
+### Restoring from a `.flpack` archive
+
+When `--from` points at a `.flpack` file (produced by `fluree export <ledger> --format ledger`), the ledger is restored *wholesale* rather than bulk-imported: every commit, transaction blob, and prebuilt index artifact is streamed straight into storage and the heads are set from the archive — the restored ledger is byte-for-byte identical and immediately queryable, under whatever name you choose.
+
+Add `--remote <name>` to restore onto a server instead of locally; the archive streams to the server's import endpoint, so no local staging instance is needed. This makes `.flpack` the universal way to move any data onto a server — build a ledger locally in any format, export it, then import it remotely. See [pack archive & restore](../operations/pack-archive-restore.md) for the full workflow.
+
+If the remote is size-capped (e.g. an app behind a payload-limited gateway) and advertises it in discovery, the CLI automatically switches to a negotiated upload: it uploads the archive out-of-band to object storage and the server restores from it asynchronously. No extra flags — the path is chosen from the server's capabilities and the archive size.
+
+## Examples
+
+```bash
+# Create an empty ledger
+fluree create mydb
+
+# Create with initial data
+fluree create mydb --from seed-data.ttl
+
+# Create from JSON-LD
+fluree create mydb --from initial.jsonld
+
+# Create with explicit memory and parallelism for a large Turtle file
+fluree create mydb --from large.ttl --memory-budget-mb 4096 --parallelism 8
+
+# Bulk-load a Cypher dump (e.g. a Memgraph/Neo4j benchmark dataset)
+fluree create pokec --from pokec_import.cypher
+
+# Bulk-load neo4j-admin convention CSVs, dropping edge properties
+fluree create snb --from ./csv-dir --edge-properties plain
+
+# Restore a .flpack archive into a new local ledger (any name)
+fluree create restored-db --from mydb.flpack
+
+# Restore a .flpack archive onto a remote server
+fluree create restored-db --remote origin --from mydb.flpack
+
+# Import memory history from the current repo
+fluree create memories --memory
+
+# Import memory history from another repo, excluding user memories
+fluree create memories --memory /path/to/other/repo --no-user
+```
+
+## Output
+
+```
+Created ledger 'mydb'
+Set 'mydb' as active ledger
+```
+
+With `--from`:
+```
+Created ledger 'mydb'
+Committed t=1 (42 flakes)
+Set 'mydb' as active ledger
+```
+
+With `--memory`:
+```
+Created ledger 'memories' with 42 commits (t=1..43)
+  Earliest: bf803255 — initial memory store
+  Latest:   9865e5cd — prevent overrides of fluree txn-meta
+
+Query with time travel:
+  fluree query memories 'SELECT ?id ?content WHERE { ?id a mem:Fact ; mem:content ?content } LIMIT 5'
+  fluree query memories --at-t 2 'SELECT ...'   # state at first commit
+```
+
+## See Also
+
+- [list](list.md) - List all ledgers
+- [use](use.md) - Switch active ledger
+- [drop](drop.md) - Delete a ledger
+- [graph import](graph.md#fluree-graph-import) - Bulk-load files into a new named graph of an existing ledger

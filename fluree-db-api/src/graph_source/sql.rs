@@ -1,0 +1,1143 @@
+//! SQL graph sources: an R2RML mapping over tables reached through a
+//! Trino-protocol HTTP endpoint.
+//!
+//! Registration mirrors the Iceberg/R2RML path (mapping compiled and stored in
+//! CAS, record published under `f:SqlMapping`), and scans are served through
+//! the same [`super::FlureeR2rmlProvider`], which dispatches here when the
+//! record's type is `Sql`. A SQL source has no snapshot to pin, so its build
+//! watermark records the endpoint, table and first-touch time.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
+use fluree_db_query::error::{QueryError, Result as QueryResult};
+use fluree_db_query::r2rml::plan::RelSource;
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, PushdownCapabilities, RelPlan, ScanFilter, ScanValue, TableWatermark,
+};
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_db_sql::{
+    AuthConfig, CmpOp, Literal, LogicalSource, MappingSource, Predicate, ScanRequest, SqlDialect,
+    SqlError, SqlGsConfig, TrinoClient, WireProtocol,
+};
+use fluree_db_tabular::BatchSchema;
+use futures::StreamExt;
+use tracing::{debug, info, warn};
+
+use super::config::R2rmlMappingInput;
+use crate::graph_source::catalog_session::IcebergCatalogSession;
+
+/// Everything needed to register a SQL graph source.
+#[derive(Debug, Clone)]
+pub struct SqlCreateConfig {
+    /// Graph source name (e.g. `"warehouse-sql"`).
+    pub name: String,
+    /// Branch (defaults to `"main"`).
+    pub branch: Option<String>,
+    /// Statement endpoint base URL.
+    pub endpoint: String,
+    pub dialect: SqlDialect,
+    pub protocol: WireProtocol,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    /// `X-Trino-User`; defaults to `fluree`.
+    pub user: Option<String>,
+    pub auth: AuthConfig,
+    pub session: BTreeMap<String, String>,
+    /// The R2RML mapping — inline content or a pre-existing address.
+    pub mapping: R2rmlMappingInput,
+    pub mapping_media_type: Option<String>,
+    /// Accept subject keys the registration probe finds non-unique (the
+    /// pushdown lane otherwise refuses statements over those tables).
+    pub allow_duplicate_subjects: bool,
+    /// Optional model ledger (`name:branch`) whose default graph supplies the
+    /// source's view policies and class/property hierarchy.
+    pub model: Option<String>,
+    /// Optional `default-allow` for governed requests that match no policy.
+    pub default_allow: Option<bool>,
+}
+
+impl SqlCreateConfig {
+    pub fn new(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        mapping_content: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            endpoint: endpoint.into(),
+            dialect: SqlDialect::default(),
+            protocol: WireProtocol::default(),
+            catalog: None,
+            schema: None,
+            user: None,
+            auth: AuthConfig::default(),
+            session: BTreeMap::new(),
+            mapping: R2rmlMappingInput::Content(mapping_content.into()),
+            mapping_media_type: None,
+            allow_duplicate_subjects: false,
+            model: None,
+            default_allow: None,
+        }
+    }
+
+    pub fn effective_branch(&self) -> &str {
+        self.branch.as_deref().unwrap_or("main")
+    }
+
+    pub fn graph_source_id(&self) -> String {
+        format!("{}:{}", self.name, self.effective_branch())
+    }
+
+    /// The persisted config, with the mapping's CAS address filled in.
+    pub fn to_gs_config(&self, mapping_address: &str) -> SqlGsConfig {
+        let mut cfg = SqlGsConfig::new(self.endpoint.clone());
+        cfg.dialect = self.dialect;
+        cfg.protocol = self.protocol;
+        cfg.catalog = self.catalog.clone();
+        cfg.schema = self.schema.clone();
+        if let Some(u) = &self.user {
+            cfg.user = u.clone();
+        }
+        cfg.auth = self.auth.clone();
+        cfg.session = self.session.clone();
+        let media_type = self.mapping_media_type.clone().unwrap_or_else(|| {
+            fluree_db_r2rml::loader::MappingFormat::resolve(None, mapping_address)
+                .media_type()
+                .to_string()
+        });
+        cfg.mapping = Some(MappingSource {
+            source: mapping_address.to_string(),
+            media_type: Some(media_type),
+        });
+        cfg.allow_duplicate_subjects = self.allow_duplicate_subjects;
+        cfg.model = self.model.clone();
+        cfg.default_allow = self.default_allow;
+        cfg
+    }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(crate::ApiError::Config(
+                "graph source name must not be empty".to_string(),
+            ));
+        }
+        if self.name.contains(':') {
+            return Err(crate::ApiError::Config(format!(
+                "graph source name '{}' may not contain ':'",
+                self.name
+            )));
+        }
+        self.to_gs_config("")
+            .validate()
+            .map_err(|e| crate::ApiError::Config(e.to_string()))
+    }
+}
+
+/// What `create_sql_graph_source` reports back.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SqlCreateResult {
+    pub graph_source_id: String,
+    pub endpoint: String,
+    pub mapping_source: String,
+    pub triples_map_count: usize,
+    pub table_count: usize,
+    pub table_names: Vec<String>,
+    /// Whether `SELECT 1` succeeded against the endpoint. A failure is logged,
+    /// not fatal: the record is still created (credentials may arrive later).
+    pub connection_tested: bool,
+    pub mapping_validated: bool,
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate). Empty when no model is set or nothing is amiss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_warnings: Vec<String>,
+    /// Findings of the registration probe: tables whose subject keys repeat,
+    /// or a probe that could not run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_warnings: Vec<String>,
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no key (`f:key`, or the key the probe
+    /// verified) proves subject-unique, which queries deduplicate. Empty when
+    /// the endpoint could not be reached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
+}
+
+/// Result of `fluree sql check`: the re-run uniqueness probe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SqlCheckResult {
+    pub graph_source_id: String,
+    pub duplicate_subject_tables: Vec<String>,
+    pub allow_duplicate_subjects: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_warnings: Vec<String>,
+    /// As [`SqlCreateResult::diagnostics`], under the key this check verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
+}
+
+/// The key columns per table whose uniqueness the mapping assumes: every
+/// subject template column, plus the parent columns of every foreign key
+/// pointing at the map (a repeated parent key multiplies a join).
+fn duplicate_probe_keys(mapping: &CompiledR2rmlMapping) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut maps: Vec<&fluree_db_r2rml::mapping::TriplesMap> =
+        mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    for tm in &maps {
+        let Some(table) = tm.table_name() else {
+            continue;
+        };
+        let mut keys: Vec<String> = tm.subject_columns().into_iter().map(String::from).collect();
+        for child in mapping.find_maps_referencing(&tm.iri) {
+            for pom in &child.predicate_object_maps {
+                if let fluree_db_r2rml::mapping::ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                    if rom.parent_triples_map == tm.iri {
+                        for c in rom.parent_columns() {
+                            if !keys.iter().any(|k| k == c) {
+                                keys.push(c.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(t, _)| t == table) {
+            Some((_, existing)) => {
+                for k in keys {
+                    if !existing.contains(&k) {
+                        existing.push(k);
+                    }
+                }
+            }
+            None => out.push((table.to_string(), keys)),
+        }
+    }
+    out
+}
+
+/// What a duplicate-subject probe found: tables whose keys repeat, tables it
+/// could not probe, warnings, and the key it verified for every other table.
+struct ProbeFindings {
+    flagged: Vec<String>,
+    unverified: Vec<String>,
+    warnings: Vec<String>,
+    verified: BTreeMap<String, Vec<String>>,
+}
+
+impl ProbeFindings {
+    /// Store the findings on `config`: what the lane refuses, and what it
+    /// may trust as a table key.
+    fn record(self, config: &mut SqlGsConfig) -> Vec<String> {
+        config.duplicate_subject_tables = self.flagged;
+        config.unverified_subject_tables = self.unverified;
+        config.verified_subject_keys = Some(self.verified);
+        self.warnings
+    }
+}
+
+/// Probe every table's subject keys for duplicates.
+///
+/// Returns the tables found non-unique, the tables whose probe could not run,
+/// human-readable warnings, and the key verified for each other table. A probe that errors used to warn and leave the
+/// table unflagged, so the lane then ran statements over a table whose
+/// uniqueness was unknown — the one thing the lane's contract does not allow.
+/// Those tables come back separately: the lane refuses them too, with advice
+/// that says which case it is.
+///
+/// Skipped entirely when the source is registered with
+/// `allow_duplicate_subjects`: nothing consumes the verdict, and the probe is
+/// a full-table aggregate whose only ceiling is the request timeout, which on
+/// a large table is enough to fail a registration outright.
+async fn probe_duplicate_subjects(
+    client: &TrinoClient,
+    mapping: &CompiledR2rmlMapping,
+    allow_duplicate_subjects: bool,
+) -> ProbeFindings {
+    let mut flagged = Vec::new();
+    let mut unverified = Vec::new();
+    let mut warnings = Vec::new();
+    let mut verified = BTreeMap::new();
+    if allow_duplicate_subjects {
+        return ProbeFindings {
+            flagged,
+            unverified,
+            warnings,
+            verified,
+        };
+    }
+    for (table, keys) in duplicate_probe_keys(mapping) {
+        let source = match mapping.sql_query_for_table(&table) {
+            Some(sql) => LogicalSource::Query(sql.to_string()),
+            None => LogicalSource::Table(table.clone()),
+        };
+        let sql = fluree_db_sql::render_duplicate_probe(&source, &keys, client.dialect());
+        match client.execute_collect(&sql).await {
+            Ok((_, batches)) => {
+                if batches.iter().any(|b| b.num_rows > 0) {
+                    warnings.push(format!(
+                        "table '{table}': subject key ({}) is not unique; the pushdown lane \
+                         refuses statements over it (register with allow_duplicate_subjects to \
+                         answer over it with set semantics)",
+                        keys.join(", ")
+                    ));
+                    flagged.push(table);
+                    continue;
+                }
+                // Unique under the database's equality; recorded only where
+                // that is the equality of the terms the key's columns render.
+                match client.schema(&source).await {
+                    Ok(schema) => match keys.iter().find(|c| !usable_key_column(&schema, c)) {
+                        None => {
+                            verified.insert(table, keys);
+                        }
+                        Some(column) => warnings.push(format!(
+                            "table '{table}': subject key column '{column}' cannot identify a \
+                             term (floating point, or a timestamp finer than the microsecond its \
+                             values are read to); queries over the table remove repeated solutions"
+                        )),
+                    },
+                    Err(e) => warnings.push(format!(
+                        "table '{table}': could not read its schema to vet the subject key: {e}; \
+                         queries over the table remove repeated solutions until a `check` succeeds"
+                    )),
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "table '{table}': could not probe subject key uniqueness: {e}; the pushdown \
+                     lane refuses statements over it until a `check` succeeds (register with \
+                     allow_duplicate_subjects to proceed anyway)"
+                ));
+                unverified.push(table);
+            }
+        }
+    }
+    ProbeFindings {
+        flagged,
+        unverified,
+        warnings,
+        verified,
+    }
+}
+
+/// A key the duplicate-subject probe found unique on a table.
+enum ProbedKey {
+    /// Recorded by a probe that also vetted its columns' types.
+    Vetted(Vec<String>),
+    /// Inferred for a source registered before the probe recorded its
+    /// findings; its columns are vetted when it is reported.
+    Legacy(Vec<String>),
+}
+
+/// Whether `name` is a timestamp the source reports finer than the
+/// microsecond a value is read to, or without its precision: two values the
+/// database keeps apart can then render one term.
+fn lossy_timestamp(schema: &BatchSchema, name: &str) -> bool {
+    schema.field_by_name(name).is_some_and(|f| {
+        matches!(
+            f.field_type,
+            fluree_db_tabular::FieldType::Timestamp | fluree_db_tabular::FieldType::TimestampTz
+        ) && !schema.fractional_digits(name).is_some_and(|d| d <= 6)
+    })
+}
+
+/// How a relation holds a column a key names, for the shared key rules
+/// ([`fluree_db_r2rml::mapping::usable_in_key`]): a lossy timestamp
+/// ([`lossy_timestamp`]) counts as a type values are not read from exactly.
+fn key_column(schema: &BatchSchema, name: &str) -> fluree_db_r2rml::mapping::KeyColumn {
+    use fluree_db_r2rml::mapping::KeyColumn;
+    match schema.field_by_name(name) {
+        None => KeyColumn::Absent,
+        Some(_) if lossy_timestamp(schema, name) => KeyColumn::Typed(None),
+        Some(field) => KeyColumn::Typed(Some(field.field_type)),
+    }
+}
+
+/// Whether column `name` can be part of a key ([`key_column`]).
+fn usable_key_column(schema: &BatchSchema, name: &str) -> bool {
+    matches!(key_column(schema, name),
+        fluree_db_r2rml::mapping::KeyColumn::Typed(t)
+            if fluree_db_r2rml::mapping::usable_in_key(t.as_ref()))
+}
+
+impl crate::Fluree {
+    /// Register a SQL graph source. Compiles the mapping, stores it in CAS,
+    /// probes the endpoint, and publishes the record.
+    pub async fn create_sql_graph_source(
+        &self,
+        config: SqlCreateConfig,
+    ) -> crate::Result<SqlCreateResult> {
+        let graph_source_id = config.graph_source_id();
+        info!(graph_source_id = %graph_source_id, "Creating SQL graph source");
+        config.validate()?;
+        let mut model_warnings = self.validate_source_model(config.model.as_deref()).await?;
+
+        let registered = self
+            .register_r2rml_mapping(
+                &graph_source_id,
+                &config.mapping,
+                config.mapping_media_type.as_deref(),
+                super::r2rml::SqlQueryPolicy::Execute,
+            )
+            .await?;
+        if config.model.is_some() {
+            if let Some(compiled) = &registered.compiled {
+                model_warnings.extend(fluree_db_query::r2rml::class_overlap_warnings(compiled));
+            }
+        }
+        let (triples_map_count, table_names, mapping_validated) = registered.summary();
+        let mapping_address = registered.address;
+        let compiled_for_probe = registered.compiled;
+
+        let mut gs_config = config.to_gs_config(&mapping_address);
+        let mut mapping_warnings = Vec::new();
+        let connection_tested = match build_sql_client(&gs_config, self.identity_context()).await {
+            Ok(client) => match client.execute_collect("SELECT 1").await {
+                Ok(_) => {
+                    if let Some(mapping) = &compiled_for_probe {
+                        mapping_warnings = probe_duplicate_subjects(
+                            &client,
+                            mapping,
+                            gs_config.allow_duplicate_subjects,
+                        )
+                        .await
+                        .record(&mut gs_config);
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!(graph_source_id = %graph_source_id, error = %e, "SQL endpoint connection test failed; registering anyway");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!(graph_source_id = %graph_source_id, error = %e, "SQL endpoint connection test failed; registering anyway");
+                false
+            }
+        };
+        if !connection_tested {
+            // Nothing was probed, so no table's key is verified.
+            gs_config.verified_subject_keys = Some(BTreeMap::new());
+            mapping_warnings.push(
+                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql \
+                 check` once it is"
+                    .to_string(),
+            );
+        }
+
+        let config_json = gs_config
+            .to_json()
+            .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
+        self.publisher()?
+            .publish_graph_source(
+                &config.name,
+                config.effective_branch(),
+                GraphSourceType::Sql,
+                &config_json,
+                &[],
+            )
+            .await?;
+
+        let diagnostics = match &compiled_for_probe {
+            Some(compiled) if connection_tested => {
+                self.keyless_sql_maps(&graph_source_id, compiled).await
+            }
+            _ => Vec::new(),
+        };
+
+        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created SQL graph source");
+        Ok(SqlCreateResult {
+            model_warnings,
+            mapping_warnings,
+            diagnostics,
+            graph_source_id,
+            endpoint: gs_config.endpoint,
+            mapping_source: mapping_address,
+            triples_map_count,
+            table_count: table_names.len(),
+            table_names,
+            connection_tested,
+            mapping_validated,
+        })
+    }
+
+    /// Re-run the subject key uniqueness probe for a registered SQL source
+    /// (tables are live) and store the result on its record.
+    pub async fn check_sql_graph_source(
+        &self,
+        graph_source_id: &str,
+    ) -> crate::Result<SqlCheckResult> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
+        let record = self
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| crate::ApiError::Config(format!("nameservice: {e}")))?
+            .ok_or_else(|| {
+                crate::ApiError::Config(format!("graph source '{graph_source_id}' not found"))
+            })?;
+        if record.source_type != GraphSourceType::Sql {
+            return Err(crate::ApiError::Config(format!(
+                "graph source '{graph_source_id}' is not a SQL source"
+            )));
+        }
+        let mut config = SqlGsConfig::from_json(&record.config)
+            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let mapping_ref = config.mapping.clone().ok_or_else(|| {
+            crate::ApiError::Config(format!("graph source '{graph_source_id}' has no mapping"))
+        })?;
+        let bytes = if let Ok(cid) = mapping_ref.source.parse::<fluree_db_core::ContentId>() {
+            self.content_store(graph_source_id)
+                .get(&cid)
+                .await
+                .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?
+        } else {
+            let storage = self.admin_storage().ok_or_else(|| {
+                crate::ApiError::Config(
+                    "address-based mappings are not supported on this backend".to_string(),
+                )
+            })?;
+            storage
+                .read_bytes(&mapping_ref.source)
+                .await
+                .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?
+        };
+        let content =
+            String::from_utf8(bytes).map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let compiled = Self::compile_r2rml_content(
+            &content,
+            mapping_ref.media_type.as_deref(),
+            &mapping_ref.source,
+        )?;
+        let client = build_sql_client(&config, self.identity_context())
+            .await
+            .map_err(sql_api_error)?;
+        let mapping_warnings =
+            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects)
+                .await
+                .record(&mut config);
+        let flagged = config.duplicate_subject_tables.clone();
+        let (name, branch) = graph_source_id
+            .rsplit_once(':')
+            .unwrap_or((graph_source_id, "main"));
+        self.publisher()?
+            .publish_graph_source(
+                name,
+                branch,
+                GraphSourceType::Sql,
+                &config
+                    .to_json()
+                    .map_err(|e| crate::ApiError::Config(e.to_string()))?,
+                &[],
+            )
+            .await?;
+        let diagnostics = self
+            .keyless_sql_maps(graph_source_id.as_ref(), &compiled)
+            .await;
+        Ok(SqlCheckResult {
+            graph_source_id: graph_source_id.to_string(),
+            duplicate_subject_tables: flagged,
+            allow_duplicate_subjects: config.allow_duplicate_subjects,
+            mapping_warnings,
+            diagnostics,
+        })
+    }
+
+    /// The `keylessMap` advisories for a published SQL source: each map no
+    /// key proves subject-unique, under the key its last probe verified
+    /// and the mapping's `f:key`, as its queries read them.
+    async fn keyless_sql_maps(
+        &self,
+        graph_source_id: &str,
+        compiled: &CompiledR2rmlMapping,
+    ) -> Vec<fluree_db_r2rml::emit::Diagnostic> {
+        super::r2rml::registered_keyless_maps(
+            &super::r2rml::FlureeR2rmlProvider::new(self),
+            graph_source_id,
+            compiled,
+            super::iceberg_validate::QueryTables::Alias,
+            super::iceberg_validate::KeyRemedy::Declare,
+        )
+        .await
+    }
+
+    /// `SELECT 1` against the endpoint with the configured credentials.
+    pub async fn test_sql_connection(&self, config: &SqlGsConfig) -> crate::Result<()> {
+        let client = build_sql_client(config, self.identity_context())
+            .await
+            .map_err(sql_api_error)?;
+        client
+            .execute_collect("SELECT 1")
+            .await
+            .map(|_| ())
+            .map_err(|e| match e {
+                SqlError::Identity(_) => sql_api_error(e),
+                other => {
+                    crate::ApiError::Config(format!("SQL endpoint connection test failed: {other}"))
+                }
+            })
+    }
+}
+
+/// Hydrate secrets, build the auth provider under `identity`, and construct the
+/// client.
+async fn build_sql_client(
+    config: &SqlGsConfig,
+    identity: &fluree_db_iceberg::IdentityContext,
+) -> Result<TrinoClient, SqlError> {
+    let hydrated = config.hydrate(identity.secret_resolver.as_ref()).await?;
+    let auth = hydrated.auth.create_provider_arc(identity)?;
+    TrinoClient::new(&hydrated, auth)
+}
+
+/// One SQL source resolved from its nameservice record.
+pub(crate) struct SqlSource {
+    pub(crate) graph_source_id: String,
+    pub(crate) config: SqlGsConfig,
+    pub(crate) client: Arc<TrinoClient>,
+}
+
+impl SqlSource {
+    /// Resolve the record's config and the (process-cached) client. The cache
+    /// key is a fingerprint of the RAW config so a secret rotation behind an
+    /// env var / secret ref does not rebuild the client every query.
+    pub(crate) async fn open(
+        fluree: &crate::Fluree,
+        record: &GraphSourceRecord,
+    ) -> QueryResult<Self> {
+        let config = SqlGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse SQL graph source config for '{}': {e}",
+                record.graph_source_id
+            ))
+        })?;
+        let cache = fluree.r2rml_cache();
+        let key = super::r2rml::catalog_client_cache_key(
+            &record.graph_source_id,
+            &record.config,
+            fluree.identity_context(),
+        );
+        let client = match cache.sql_client(&key) {
+            Some(c) => c,
+            None => {
+                let c = Arc::new(
+                    build_sql_client(&config, fluree.identity_context())
+                        .await
+                        .map_err(|e| {
+                            let msg = format!("SQL graph source '{}': {e}", record.graph_source_id);
+                            match e {
+                                SqlError::Identity(refusal) => identity_or(refusal, msg),
+                                _ => QueryError::Internal(msg),
+                            }
+                        })?,
+                );
+                cache.put_sql_client(key, Arc::clone(&c));
+                c
+            }
+        };
+        Ok(Self {
+            graph_source_id: record.graph_source_id.to_string(),
+            config,
+            client,
+        })
+    }
+
+    /// The keys this source reports for `table_name`
+    /// (`R2rmlTableProvider::table_keys`): the key the duplicate-subject probe
+    /// verified, as long as nothing refuses the table. A source registered
+    /// with `allow_duplicate_subjects` probed nothing and reports none.
+    ///
+    /// Refuses the query when a key the mapping declares on the table
+    /// (`f:key`) names a column the relation lacks or one whose values cannot
+    /// identify a row, so no lane trusts a key the table cannot hold.
+    pub(crate) async fn table_keys(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> QueryResult<Option<Vec<Vec<String>>>> {
+        let declared = mapping.declared_keys(table_name);
+        let probed = self.probed_subject_key(mapping, table_name);
+        // A key the probe recorded was vetted against the schema when it ran.
+        if declared.is_empty() {
+            match probed {
+                None => return Ok(None),
+                Some(ProbedKey::Vetted(key)) => return Ok(Some(vec![key])),
+                Some(ProbedKey::Legacy(_)) => {}
+            }
+        }
+        let source = match mapping.sql_query_for_table(table_name) {
+            Some(sql) => RelSource::Query(sql.to_string()),
+            None => RelSource::Table(table_name.to_string()),
+        };
+        let schema = self.source_schema(session, mapping, &source).await?;
+        let refuse = |message: String| {
+            QueryError::InvalidQuery(format!(
+                "Graph source '{}': {message}",
+                self.graph_source_id
+            ))
+        };
+        if let Some(name) = declared
+            .iter()
+            .flatten()
+            .find(|c| lossy_timestamp(&schema, c))
+        {
+            return Err(refuse(format!(
+                "f:key on the logical table \"{table_name}\" names column \"{name}\", a \
+                 timestamp finer than the microsecond its values are read to (or of unreported \
+                 precision), so two of its values can render one term"
+            )));
+        }
+        declared
+            .check_columns(table_name, |c| key_column(&schema, c))
+            .map_err(|e| refuse(e.to_string()))?;
+        Ok(match probed {
+            None => None,
+            Some(ProbedKey::Vetted(key)) => Some(vec![key]),
+            Some(ProbedKey::Legacy(key)) => {
+                let reported = fluree_db_r2rml::TableKeys::new([key])
+                    .retain_usable(|c| key_column(&schema, c));
+                (!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect())
+            }
+        })
+    }
+
+    /// The composite key the duplicate-subject probe verified for
+    /// `table_name`, when the lane does not refuse the table. A source
+    /// registered before the probe recorded what it verified keeps the trust
+    /// the lane always gave it: every table neither flagged nor unverified,
+    /// on the key the probe checks.
+    fn probed_subject_key(
+        &self,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+    ) -> Option<ProbedKey> {
+        let config = &self.config;
+        let named = |tables: &[String]| tables.iter().any(|t| t == table_name);
+        if config.allow_duplicate_subjects
+            || named(&config.duplicate_subject_tables)
+            || named(&config.unverified_subject_tables)
+        {
+            return None;
+        }
+        match &config.verified_subject_keys {
+            Some(verified) => verified.get(table_name).cloned().map(ProbedKey::Vetted),
+            None => duplicate_probe_keys(mapping)
+                .into_iter()
+                .find(|(t, _)| t == table_name)
+                .map(|(_, keys)| ProbedKey::Legacy(keys)),
+        }
+    }
+
+    /// A table name, or the `rr:sqlQuery` text behind a query alias.
+    fn source(&self, mapping: &CompiledR2rmlMapping, table_name: &str) -> LogicalSource {
+        match mapping.sql_query_for_table(table_name) {
+            Some(sql) => LogicalSource::Query(sql.to_string()),
+            None => LogicalSource::Table(table_name.to_string()),
+        }
+    }
+
+    /// Stamp this table into the build watermark on first touch.
+    fn record_watermark(&self, session: &IcebergCatalogSession, table_name: &str) {
+        session.mark_sql_source(&self.graph_source_id);
+        session.record_snapshot(
+            IcebergCatalogSession::snapshot_key(&self.graph_source_id, table_name),
+            TableWatermark {
+                metadata_location: format!(
+                    "sql://{}/{}@{}",
+                    self.config
+                        .endpoint_base()
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://"),
+                    table_name,
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ),
+                snapshot_id: None,
+                sequence_number: None,
+            },
+        );
+    }
+
+    pub(crate) async fn scan(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        let source = self.source(mapping, table_name);
+        let schema = self
+            .client
+            .schema(&source)
+            .await
+            .map_err(|e| sql_query_error(&self.graph_source_id, table_name, e))?;
+        self.record_watermark(session, table_name);
+
+        let request = ScanRequest {
+            source,
+            projection: projection.to_vec(),
+            predicates: filters.iter().map(to_predicate).collect(),
+        };
+        let rendered =
+            fluree_db_sql::dialect::render_scan(&request, &schema, self.client.dialect())
+                .map_err(|e| sql_query_error(&self.graph_source_id, table_name, e))?;
+        if !rendered.declined_predicates.is_empty() {
+            debug!(
+                graph_source_id = %self.graph_source_id,
+                table_name,
+                declined = ?rendered.declined_predicates,
+                "SQL pushdown declined some predicates (in-engine FILTER enforces them)"
+            );
+        }
+        info!(
+            graph_source_id = %self.graph_source_id,
+            table_name,
+            sql = %rendered.sql,
+            "SQL table scan"
+        );
+
+        let gs = self.graph_source_id.clone();
+        let table = table_name.to_string();
+        let stream = self
+            .client
+            .execute(rendered.sql)
+            .map(move |item| item.map_err(|e| sql_query_error(&gs, &table, e)));
+        Ok(Box::pin(stream))
+    }
+
+    /// What the pushdown lane may send this source.
+    pub(crate) fn pushdown_capabilities(&self) -> PushdownCapabilities {
+        fluree_db_sql::pushdown_capabilities(self.client.dialect())
+    }
+
+    /// One statement for a whole block. Every table access is probed for its
+    /// schema (cached per client) so literals render typed; a statement over
+    /// the size budget is refused before it is sent.
+    pub(crate) async fn execute_plan(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        plan: &RelPlan,
+    ) -> QueryResult<(String, ColumnBatchStream)> {
+        if !self.config.allow_duplicate_subjects {
+            // A flagged name is whatever the probe saw, which for an
+            // `rr:sqlQuery`-backed map is the synthetic alias, never the query
+            // text the plan carries. Matching only `RelSource::Table` therefore
+            // let every query-backed map through: flagged at registration,
+            // warned about, then run on the lane anyway with the very row
+            // multiplicities the check exists to refuse. Resolve each flagged
+            // name to the source the plan would use and compare both variants.
+            let as_sources = |names: &[String]| -> Vec<RelSource> {
+                names
+                    .iter()
+                    .map(|t| match mapping.sql_query_for_table(t) {
+                        Some(sql) => RelSource::Query(sql.to_string()),
+                        None => RelSource::Table(t.clone()),
+                    })
+                    .collect()
+            };
+            let touching = |names: &[String]| -> Vec<String> {
+                let sources = as_sources(names);
+                plan.root
+                    .accesses()
+                    .iter()
+                    .filter(|(_, src)| sources.contains(src))
+                    .map(|(_, src)| match src {
+                        RelSource::Table(t) => t.clone(),
+                        RelSource::Query(_) => "<rr:sqlQuery>".to_string(),
+                    })
+                    .collect()
+            };
+            let touched = touching(&self.config.duplicate_subject_tables);
+            if !touched.is_empty() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "SQL graph source '{}': table(s) {} have non-unique subject keys, so a \
+                     statement over them would return wrong row multiplicities; fix the mapping \
+                     (map from a view with distinct keys), or re-register with \
+                     allow_duplicate_subjects to accept duplicate rows",
+                    self.graph_source_id,
+                    touched.join(", ")
+                )));
+            }
+            let unverified = touching(&self.config.unverified_subject_tables);
+            if !unverified.is_empty() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "SQL graph source '{}': subject key uniqueness for table(s) {} could not be \
+                     probed, so a statement over them may return wrong row multiplicities; run \
+                     `fluree sql check` once the endpoint can answer the probe, or re-register \
+                     with allow_duplicate_subjects to proceed without it",
+                    self.graph_source_id,
+                    unverified.join(", ")
+                )));
+            }
+        }
+        let mut schemas: HashMap<String, Arc<BatchSchema>> = HashMap::new();
+        for (alias, source) in plan.root.accesses() {
+            let schema = self.source_schema(session, mapping, source).await?;
+            schemas.insert(alias.to_string(), schema);
+        }
+        let caps = self.pushdown_capabilities();
+        let sql = fluree_db_sql::render_plan(plan, &schemas, self.client.dialect())
+            .map_err(|e| sql_query_error(&self.graph_source_id, "<plan>", e))?;
+        if sql.len() > caps.statement_max_bytes {
+            return Err(QueryError::Internal(format!(
+                "SQL graph source '{}': pushed-down statement is {} bytes, over the {} byte budget",
+                self.graph_source_id,
+                sql.len(),
+                caps.statement_max_bytes
+            )));
+        }
+        info!(
+            graph_source_id = %self.graph_source_id,
+            sql = %sql,
+            "SQL block pushdown"
+        );
+        let gs = self.graph_source_id.clone();
+        let stream = self
+            .client
+            .execute(sql.clone())
+            .map(move |item| item.map_err(|e| sql_query_error(&gs, "<plan>", e)));
+        Ok((sql, Box::pin(stream)))
+    }
+
+    /// The probed schema of one plan relation (cached per client).
+    pub(crate) async fn source_schema(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        source: &RelSource,
+    ) -> QueryResult<Arc<BatchSchema>> {
+        let (logical, table_name) = match source {
+            RelSource::Table(t) => (LogicalSource::Table(t.clone()), t.clone()),
+            RelSource::Query(q) => {
+                let alias_name = mapping
+                    .triples_maps
+                    .values()
+                    .find(|tm| tm.sql_query() == Some(q.as_str()))
+                    .and_then(|tm| tm.table_name())
+                    .unwrap_or("rr:sqlQuery")
+                    .to_string();
+                (LogicalSource::Query(q.clone()), alias_name)
+            }
+        };
+        let schema = self
+            .client
+            .schema(&logical)
+            .await
+            .map_err(|e| sql_query_error(&self.graph_source_id, &table_name, e))?;
+        self.record_watermark(session, &table_name);
+        Ok(schema)
+    }
+
+    pub(crate) async fn row_count(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        table_name: &str,
+        non_null_cols: &[String],
+    ) -> QueryResult<Option<u64>> {
+        let source = self.source(mapping, table_name);
+        self.record_watermark(session, table_name);
+        let n = self
+            .client
+            .count(&source, non_null_cols)
+            .await
+            .map_err(|e| sql_query_error(&self.graph_source_id, table_name, e))?;
+        Ok(Some(n))
+    }
+}
+
+fn sql_query_error(graph_source_id: &str, table_name: &str, e: SqlError) -> QueryError {
+    let msg = format!("SQL graph source '{graph_source_id}', table '{table_name}': {e}");
+    match e {
+        SqlError::Config(_) | SqlError::Unsupported(_) => QueryError::InvalidQuery(msg),
+        SqlError::Identity(refusal) => identity_or(refusal, msg),
+        _ => QueryError::Internal(msg),
+    }
+}
+
+/// An identity refusal as its typed `QueryError` (the wire codes and statuses
+/// an Iceberg source reports), or `fallback` should it not be one.
+fn identity_or(refusal: fluree_db_iceberg::IcebergError, fallback: String) -> QueryError {
+    super::iceberg_catalog::identity_query_error(refusal).unwrap_or(QueryError::Internal(fallback))
+}
+
+/// A SQL client that could not be built or reached, on the admin paths
+/// (check, connection test): an identity refusal keeps its type and code,
+/// anything else is the caller's configuration.
+fn sql_api_error(e: SqlError) -> crate::ApiError {
+    match e {
+        SqlError::Identity(refusal) => {
+            let message = refusal.to_string();
+            crate::ApiError::Query(identity_or(refusal, message))
+        }
+        other => crate::ApiError::Config(other.to_string()),
+    }
+}
+
+fn to_predicate(f: &ScanFilter) -> Predicate {
+    use fluree_db_query::r2rml::ScanCmpOp;
+    Predicate {
+        column: f.column.clone(),
+        op: match f.op {
+            ScanCmpOp::Eq => CmpOp::Eq,
+            ScanCmpOp::NotEq => CmpOp::NotEq,
+            ScanCmpOp::Lt => CmpOp::Lt,
+            ScanCmpOp::LtEq => CmpOp::LtEq,
+            ScanCmpOp::Gt => CmpOp::Gt,
+            ScanCmpOp::GtEq => CmpOp::GtEq,
+            ScanCmpOp::In => CmpOp::In,
+        },
+        value: to_literal(&f.value),
+    }
+}
+
+fn to_literal(v: &ScanValue) -> Literal {
+    match v {
+        ScanValue::Bool(b) => Literal::Bool(*b),
+        ScanValue::Int(i) => Literal::Int(*i),
+        ScanValue::Date(d) => Literal::Date(*d),
+        ScanValue::Str(s) => Literal::Str(s.clone()),
+        ScanValue::Double(d) => Literal::Double(*d),
+        ScanValue::Decimal { unscaled, scale } => Literal::Decimal {
+            unscaled: *unscaled,
+            scale: *scale,
+        },
+        ScanValue::TemplateKey(k) => Literal::TemplateKey(k.clone()),
+        ScanValue::Set(members) => Literal::Set(members.iter().map(to_literal).collect()),
+        ScanValue::Timestamp { micros, tz } => Literal::Timestamp {
+            micros: *micros,
+            tz: *tz,
+        },
+    }
+}
+
+/// The mapping reference of a SQL record, if it has one; `Err` when
+/// its config does not parse.
+pub(crate) fn mapping_source(
+    record: &GraphSourceRecord,
+) -> std::result::Result<Option<MappingSource>, String> {
+    SqlGsConfig::from_json(&record.config)
+        .map(|c| c.mapping)
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {
+    SqlGsConfig::from_json(&record.config)
+        .ok()
+        .map_or((None, None), |c| (c.model, c.default_allow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn google_sql_source() -> SqlGsConfig {
+        let mut config = SqlGsConfig::new("https://trino.invalid");
+        config.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        };
+        config
+    }
+
+    /// A SQL source's identity refusal is typed where its client is built for
+    /// a query and on the admin connection test, with the codes an Iceberg
+    /// source reports.
+    #[tokio::test]
+    async fn a_refused_sql_identity_is_typed_on_query_and_admin_paths() {
+        let fluree = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all());
+        let config = google_sql_source();
+        let record = GraphSourceRecord::new(
+            "sql-identity",
+            "main",
+            GraphSourceType::Sql,
+            config.to_json().unwrap(),
+            vec![],
+        );
+        let query = match SqlSource::open(&fluree, &record).await {
+            Ok(_) => panic!("the policy refuses the metadata server"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&query, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{query:?}"
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403);
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+
+        let tested = fluree.test_sql_connection(&config).await.unwrap_err();
+        assert_eq!(tested.status_code(), 403, "{tested:?}");
+        assert_eq!(
+            tested.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+    }
+
+    /// A Google token exchange the endpoint's auth could not complete, met on
+    /// a scan, keeps its code and Google's status.
+    #[test]
+    fn a_google_exchange_refusal_on_a_sql_scan_keeps_its_code() {
+        let query = sql_query_error(
+            "sql-identity:main",
+            "orders",
+            SqlError::Identity(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            }),
+        );
+        let api = crate::ApiError::Query(query);
+        assert_eq!(api.status_code(), 403, "{api:?}");
+        assert_eq!(
+            api.error_type(),
+            fluree_vocab::errors::GOOGLE_TOKEN_EXCHANGE
+        );
+    }
+
+    #[test]
+    fn create_config_round_trips_into_gs_config() {
+        let mut c = SqlCreateConfig::new("wh", "http://localhost:8080/", "@prefix rr: <x> .");
+        c.catalog = Some("pg".into());
+        c.user = Some("svc".into());
+        assert_eq!(c.graph_source_id(), "wh:main");
+        let gs = c.to_gs_config("bafy123");
+        assert_eq!(gs.endpoint_base(), "http://localhost:8080");
+        assert_eq!(gs.catalog.as_deref(), Some("pg"));
+        assert_eq!(gs.user, "svc");
+        let m = gs.mapping.unwrap();
+        assert_eq!(m.source, "bafy123");
+        assert_eq!(m.media_type.as_deref(), Some("text/turtle"));
+        c.validate().unwrap();
+        c.name = "a:b".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn scan_filters_convert() {
+        let f = ScanFilter {
+            column: "id".into(),
+            op: fluree_db_query::r2rml::ScanCmpOp::In,
+            value: ScanValue::Set(vec![ScanValue::Int(1), ScanValue::TemplateKey("2".into())]),
+        };
+        let p = to_predicate(&f);
+        assert_eq!(p.op, CmpOp::In);
+        assert_eq!(
+            p.value,
+            Literal::Set(vec![Literal::Int(1), Literal::TemplateKey("2".into())])
+        );
+    }
+}

@@ -1,0 +1,441 @@
+//! LRU cache for reasoning results
+//!
+//! This module provides caching infrastructure for OWL2-RL materialization results.
+//! Caching is essential because reasoning can be expensive, and many queries against
+//! the same database state should reuse computed derived facts.
+
+use lru::LruCache;
+use parking_lot::RwLock;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::overlay::DerivedFactsOverlay;
+
+/// Cache key for derived facts
+///
+/// MUST include all state that affects materialization to ensure cache correctness.
+/// A cache hit should only occur when all these values match.
+#[derive(Clone, Debug)]
+pub struct ReasoningCacheKey {
+    /// Ledger alias (identifier for the ledger)
+    pub ledger_id: Arc<str>,
+    /// Commit epoch (more robust than raw t for snapshot/time-travel)
+    pub db_epoch: u64,
+    /// Query "as-of" time (historical query support)
+    pub to_t: i64,
+    /// The overlay's process-unique content stamp
+    /// ([`OverlayProvider::content_version`](fluree_db_core::OverlayProvider::content_version)),
+    /// never its epoch: a staged preview reports the very epoch the committed
+    /// novelty reports once those flakes commit, at the same `to_t`, so an
+    /// epoch key would serve the preview's materialization for the committed
+    /// state. Overlays that cannot vouch for a version are not cached.
+    pub overlay_version: u64,
+    /// Schema version that affects rules
+    pub ontology_epoch: u64,
+    /// Hash of rule-specific options
+    ///
+    /// INCLUDE: enabled RL rule subset, budgets (max_duration, max_facts, max_memory),
+    ///          canonicalize-only vs expand-on-lookup policy, max sameAs expansion fanout
+    /// EXCLUDE: purely observational toggles (collect rules_fired stats) unless they change output
+    pub rule_config_hash: u64,
+}
+
+impl Hash for ReasoningCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ledger_id.hash(state);
+        self.db_epoch.hash(state);
+        self.to_t.hash(state);
+        self.overlay_version.hash(state);
+        self.ontology_epoch.hash(state);
+        self.rule_config_hash.hash(state);
+    }
+}
+
+impl PartialEq for ReasoningCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ledger_id == other.ledger_id
+            && self.db_epoch == other.db_epoch
+            && self.to_t == other.to_t
+            && self.overlay_version == other.overlay_version
+            && self.ontology_epoch == other.ontology_epoch
+            && self.rule_config_hash == other.rule_config_hash
+    }
+}
+
+impl Eq for ReasoningCacheKey {}
+
+/// Budget constraints for reasoning operations
+///
+/// Instead of a hard iteration cap (e.g. max=10), we use
+/// time/memory/fact budgets that can be tuned for different workloads.
+#[derive(Clone, Debug)]
+pub struct ReasoningBudget {
+    /// Max wall-clock time for materialization
+    pub max_duration: Duration,
+    /// Max derived facts before stopping
+    pub max_facts: usize,
+    /// Max memory estimate for overlay (bytes)
+    pub max_memory_bytes: usize,
+}
+
+/// Default fact ceiling: the cap an operator reasons about.
+pub const DEFAULT_MAX_FACTS: usize = 1_000_000;
+
+/// Byte allowance per derived fact used to derive the default memory ceiling.
+///
+/// A derived fact costs roughly `size_of::<Flake>()` (176 bytes on a 64-bit
+/// target) plus its subject, predicate and object names — call it 200 bytes
+/// for ordinary IRIs. The allowance is deliberately well above that so the
+/// FACT cap binds first on ordinary data and the memory cap only fires when
+/// facts are abnormally large (long IRIs, big string or JSON literals). A flat
+/// ceiling instead made memory bind at roughly half the fact cap, so a closure
+/// that completed before could come back silently truncated.
+pub const BYTES_PER_FACT_ALLOWANCE: usize = 512;
+
+impl Default for ReasoningBudget {
+    fn default() -> Self {
+        Self {
+            max_duration: Duration::from_secs(30),
+            max_facts: DEFAULT_MAX_FACTS,
+            max_memory_bytes: Self::memory_for_facts(DEFAULT_MAX_FACTS),
+        }
+    }
+}
+
+impl ReasoningBudget {
+    /// Create a budget with custom limits
+    pub fn new(max_duration: Duration, max_facts: usize, max_memory_bytes: usize) -> Self {
+        Self {
+            max_duration,
+            max_facts,
+            max_memory_bytes,
+        }
+    }
+
+    /// Create an unlimited budget (for testing or small datasets)
+    pub fn unlimited() -> Self {
+        Self {
+            max_duration: Duration::from_secs(3600), // 1 hour
+            max_facts: usize::MAX,
+            max_memory_bytes: usize::MAX,
+        }
+    }
+
+    /// Memory ceiling coherent with a fact ceiling.
+    ///
+    /// Used whenever no explicit memory budget is configured, so raising
+    /// `max_facts` raises the memory the operator has implicitly accepted
+    /// rather than leaving a flat ceiling to bind first.
+    pub fn memory_for_facts(max_facts: usize) -> usize {
+        max_facts.saturating_mul(BYTES_PER_FACT_ALLOWANCE)
+    }
+
+    /// Compute a hash of budget settings for cache key
+    pub fn config_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        self.max_duration.as_millis().hash(&mut h);
+        self.max_facts.hash(&mut h);
+        self.max_memory_bytes.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// Rough heap footprint of one derived flake, for the memory budget.
+///
+/// Counts the `Flake` itself plus the heap behind its subject and predicate
+/// names and its object (string / JSON payload, or a reference's name). An
+/// estimate, not an allocator measurement — it exists so a runaway closure is
+/// capped by size and not only by count.
+pub fn approx_flake_bytes(flake: &fluree_db_core::Flake) -> usize {
+    use fluree_db_core::value::FlakeValue;
+    let heap = match &flake.o {
+        FlakeValue::String(s) | FlakeValue::Json(s) => s.len(),
+        FlakeValue::Ref(sid) => sid.name.len(),
+        // An embedding is the largest thing a derived fact can carry, and
+        // counting it as zero meant a rule that copies vectors was undercounted
+        // by roughly the whole value — the memory cap could not fire where it
+        // was most needed.
+        FlakeValue::Vector(v) => v.len() * std::mem::size_of::<f64>(),
+        FlakeValue::BigInt(_) | FlakeValue::Decimal(_) => {
+            // Boxed arbitrary-precision numbers: the box itself plus a small
+            // allowance for the digit buffer. Exactness is not the point; not
+            // being zero is.
+            std::mem::size_of::<usize>() * 4
+        }
+        _ => 0,
+    };
+    std::mem::size_of::<fluree_db_core::Flake>() + flake.s.name.len() + flake.p.name.len() + heap
+}
+
+/// Diagnostics from a reasoning operation
+///
+/// Always returned alongside the overlay so callers can understand
+/// what happened during materialization.
+#[derive(Clone, Debug, Default)]
+pub struct ReasoningDiagnostics {
+    /// Number of fixpoint iterations performed
+    pub iterations: usize,
+    /// Total number of facts derived
+    pub facts_derived: usize,
+    /// Whether reasoning was capped before reaching fixpoint
+    pub capped: bool,
+    /// Reason for capping, if applicable
+    pub capped_reason: Option<String>,
+    /// Wall-clock duration of reasoning
+    pub duration: Duration,
+    /// Count of how many times each rule fired
+    pub rules_fired: hashbrown::HashMap<String, usize>,
+    /// Datalog rules whose evaluation the cap cut short: those of the
+    /// groups still running when it fired. Empty unless capped.
+    pub capped_rules: Vec<String>,
+    /// Datalog rules that never ran because the cap fired first. Empty
+    /// unless capped.
+    pub pending_rules: Vec<String>,
+    /// The time datalog rule bodies evaluated `NOW()` and `TODAY()` at, when
+    /// a rule called either.
+    pub evaluation_time: Option<String>,
+}
+
+impl ReasoningDiagnostics {
+    /// Create diagnostics for a completed (uncapped) result
+    pub fn completed(iterations: usize, facts: usize, duration: Duration) -> Self {
+        Self {
+            iterations,
+            facts_derived: facts,
+            capped: false,
+            capped_reason: None,
+            duration,
+            ..Self::default()
+        }
+    }
+
+    /// Finalize as capped, preserving accumulated rule-fire counts.
+    pub fn mark_capped(
+        &mut self,
+        reason: impl Into<String>,
+        iterations: usize,
+        facts: usize,
+        duration: Duration,
+    ) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = true;
+        self.capped_reason = Some(reason.into());
+        self.duration = duration;
+    }
+
+    /// Finalize as completed, preserving accumulated rule-fire counts.
+    pub fn mark_completed(&mut self, iterations: usize, facts: usize, duration: Duration) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = false;
+        self.capped_reason = None;
+        self.duration = duration;
+    }
+
+    /// Record that a rule fired
+    pub fn record_rule_fired(&mut self, rule_name: &str) {
+        *self.rules_fired.entry(rule_name.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Combined result of reasoning: overlay + diagnostics
+///
+/// Always returned together so callers have full visibility into what happened.
+#[derive(Debug)]
+pub struct ReasoningResult {
+    /// The derived facts overlay.
+    ///
+    /// `Arc` so cache hits can hand the prebuilt (pre-sorted) overlay
+    /// directly to query execution instead of rebuilding it per query.
+    pub overlay: Arc<DerivedFactsOverlay>,
+    /// Diagnostics about the reasoning process
+    pub diagnostics: ReasoningDiagnostics,
+}
+
+impl ReasoningResult {
+    /// Create a new result
+    pub fn new(overlay: DerivedFactsOverlay, diagnostics: ReasoningDiagnostics) -> Self {
+        Self {
+            overlay: Arc::new(overlay),
+            diagnostics,
+        }
+    }
+}
+
+/// Thread-safe LRU cache for reasoning results
+///
+/// Uses a read-write lock to allow concurrent reads while serializing writes.
+/// The cache stores `Arc<ReasoningResult>` for cheap cloning.
+pub struct ReasoningCache {
+    inner: RwLock<LruCache<ReasoningCacheKey, Arc<ReasoningResult>>>,
+    /// Lookups that found an entry. Observability, and the only way a test can
+    /// tell a hit from a recompute: a recompute of the same materialization
+    /// reports an identical tally, and entry counts race against other queries
+    /// sharing the process-wide cache.
+    hits: AtomicU64,
+    /// Lookups that found nothing and had to materialize.
+    misses: AtomicU64,
+}
+
+impl ReasoningCache {
+    /// Create a new cache with the specified capacity
+    ///
+    /// Default capacity is 16 entries, which is reasonable for typical
+    /// workloads where a small number of database states are queried frequently.
+    pub fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity).expect("capacity must be > 0");
+        Self {
+            inner: RwLock::new(LruCache::new(cap)),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Create a cache with default capacity (16 entries)
+    pub fn with_default_capacity() -> Self {
+        Self::new(16)
+    }
+
+    /// Get a cached result if present
+    ///
+    /// This promotes the entry to most-recently-used.
+    pub fn get(&self, key: &ReasoningCacheKey) -> Option<Arc<ReasoningResult>> {
+        let found = self.inner.write().get(key).cloned();
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// Lookups that found an entry, since process start.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Lookups that found nothing, since process start.
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Peek at a cached result without updating LRU order
+    pub fn peek(&self, key: &ReasoningCacheKey) -> Option<Arc<ReasoningResult>> {
+        self.inner.read().peek(key).cloned()
+    }
+
+    /// Insert a result into the cache
+    pub fn insert(&self, key: ReasoningCacheKey, result: Arc<ReasoningResult>) {
+        self.inner.write().put(key, result);
+    }
+
+    /// Get the number of cached entries
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Check if the cache is empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+
+    /// Clear all cached entries
+    pub fn clear(&self) {
+        self.inner.write().clear();
+    }
+
+    /// Get the cache capacity
+    pub fn capacity(&self) -> usize {
+        self.inner.read().cap().get()
+    }
+}
+
+impl Default for ReasoningCache {
+    fn default() -> Self {
+        Self::with_default_capacity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_key(alias: &str, epoch: u64) -> ReasoningCacheKey {
+        ReasoningCacheKey {
+            ledger_id: alias.into(),
+            db_epoch: epoch,
+            to_t: 0,
+            overlay_version: 0,
+            ontology_epoch: 0,
+            rule_config_hash: 0,
+        }
+    }
+
+    fn make_result() -> Arc<ReasoningResult> {
+        Arc::new(ReasoningResult {
+            overlay: Arc::new(DerivedFactsOverlay::empty()),
+            diagnostics: ReasoningDiagnostics::default(),
+        })
+    }
+
+    #[test]
+    fn test_cache_insert_get() {
+        let cache = ReasoningCache::new(4);
+        let key = make_key("test", 1);
+        let result = make_result();
+
+        assert!(cache.get(&key).is_none());
+
+        cache.insert(key.clone(), result.clone());
+        assert!(cache.get(&key).is_some());
+    }
+
+    #[test]
+    fn test_cache_lru_eviction() {
+        let cache = ReasoningCache::new(2);
+
+        // Insert 3 items into cache with capacity 2
+        for i in 0..3 {
+            cache.insert(make_key("test", i), make_result());
+        }
+
+        // First item should be evicted
+        assert!(cache.get(&make_key("test", 0)).is_none());
+        assert!(cache.get(&make_key("test", 1)).is_some());
+        assert!(cache.get(&make_key("test", 2)).is_some());
+    }
+
+    #[test]
+    fn test_cache_key_equality() {
+        let key1 = make_key("test", 1);
+        let key2 = make_key("test", 1);
+        let key3 = make_key("test", 2);
+
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_budget_defaults() {
+        let budget = ReasoningBudget::default();
+        assert_eq!(budget.max_duration, Duration::from_secs(30));
+        assert_eq!(budget.max_facts, 1_000_000);
+        assert_eq!(
+            budget.max_memory_bytes,
+            ReasoningBudget::memory_for_facts(1_000_000),
+            "the default memory ceiling must be derived from the default fact \
+             ceiling, so the fact cap binds first on ordinary data"
+        );
+        assert!(
+            budget.max_memory_bytes
+                > budget.max_facts * std::mem::size_of::<fluree_db_core::Flake>(),
+            "a closure of max_facts ordinary flakes must fit under the memory cap"
+        );
+    }
+}

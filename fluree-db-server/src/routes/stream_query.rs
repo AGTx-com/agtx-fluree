@@ -1,0 +1,773 @@
+//! Streaming query endpoints:
+//! - `POST /v1/fluree/stream/query/*ledger` — ledger-scoped
+//! - `POST /v1/fluree/stream/query` — connection-scoped (ledger from the request)
+//!
+//! Emits SELECT results incrementally as NDJSON records
+//! (`application/x-ndjson`) instead of buffering the whole result into a single
+//! JSON body. A wall-clock heartbeat keeps the connection alive past proxy idle
+//! timeouts (e.g. CloudFront/ALB ~60s) during long-running queries, and carries
+//! the live fuel total as a progress signal.
+//!
+//! Policy, `from`/`fromNamed`, and multi-ledger queries route to the
+//! connection/dataset path and are enforced exactly like `/query` (for SPARQL,
+//! only the ledger-scoped form enforces per-request policy; the connection form
+//! refuses policy signals). ASK/CONSTRUCT/DESCRIBE, `selectOne`, hydration, and
+//! history (`to` / SPARQL `FROM..TO`) return `4xx` — use `/v1/fluree/query`.
+//!
+//! The standard `/query` endpoint is untouched: these are separate routes with
+//! their own handlers, so the benchmark-critical buffered path never pays for
+//! the streaming machinery.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use tokio::sync::mpsc;
+use tokio::time::{interval, MissedTickBehavior};
+
+use fluree_db_api::format::ndjson_stream;
+use fluree_db_api::{
+    DataSetDb, GraphDb, LedgerState, OwnedStreamQuery, StreamDatasetPlan, StreamQueryPlan, Tracker,
+    TrackingOptions,
+};
+use serde_json::Value as JsonValue;
+
+use crate::error::{Result, ServerError};
+use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::query_control::QueryDisconnectGuard;
+use crate::routes::query::{
+    await_query_min_t_requirements, collect_jsonld_min_t_requirements,
+    collect_sparql_min_t_requirements, enforce_bearer_dataset_scope, get_ledger_id,
+    has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
+    is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
+    requires_dataset_features, resolve_sparql_text, PathLedger, SparqlParams,
+};
+use crate::state::AppState;
+
+/// Backpressure depth of the producer→transport channel. A full channel
+/// suspends the producer at its next `send`, pausing execution.
+const STREAM_CHANNEL_DEPTH: usize = 64;
+
+/// `POST /v1/fluree/stream/query/<ledger...>` — ledger in the greedy path tail.
+pub async fn stream_query_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Response {
+    match stream_query_inner(state, ledger, params, headers, bearer, credential).await {
+        Ok(response) => response,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /v1/fluree/stream/query` — connection-scoped (no path ledger).
+///
+/// Ledgers come entirely from the request: JSON-LD `from`/`fromNamed` (or the
+/// `Fluree-Ledger` header), or SPARQL `FROM`/`FROM NAMED`. Always the
+/// connection/dataset path — there is no single-ledger shortcut.
+pub async fn stream_query_connection(
+    State(state): State<Arc<AppState>>,
+    params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Response {
+    match stream_query_connection_inner(state, params, headers, bearer, credential).await {
+        Ok(response) => response,
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn stream_query_connection_inner(
+    state: Arc<AppState>,
+    mut params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    mut credential: MaybeCredential,
+) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
+    let span = tracing::Span::current();
+
+    let data_auth = state.config.data_auth();
+    if data_auth.mode == crate::config::DataAuthMode::Required
+        && !credential.is_signed()
+        && bearer.0.is_none()
+    {
+        return Err(ServerError::unauthorized(
+            "Authentication required (signed request or Bearer token)",
+        ));
+    }
+    if headers.is_sparql_update() || credential.is_sparql_update {
+        return Err(ServerError::bad_request(
+            "SPARQL UPDATE requests should use the /v1/fluree/update endpoint",
+        ));
+    }
+
+    let fluree = state.fluree.clone();
+
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
+    // Both branches below set it, so there is no default to fall back on.
+    let warn_headers;
+    params.absorb_form_body(&mut credential)?;
+    params.reject_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
+    let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
+        let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
+
+        // Parse once: the scope check, the dataset build, the advisory header
+        // and the plan all read this parse.
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
+
+        // Bearer scope over every FROM/FROM NAMED ledger.
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() {
+                crate::routes::query::authorize_parsed_sparql_dataset(p, &parsed)?;
+            }
+        }
+
+        let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+
+        // The dataset build resolves the clause internally, so nothing here
+        // would otherwise look at it — leaving the one surface whose caller is
+        // least likely to notice a short result set as the only silent one.
+        warn_headers = crate::routes::query::sparql_dataset_warning_headers(parsed.ast());
+
+        // The auth-layer-verified identity gates `f:overrideControl` on the
+        // ledgers' reasoning defaults, so planning carries it too.
+        let plan_options = params
+            .bind(crate::query_control::options_for_identity(
+                headers.server_identity.as_ref(),
+            ))
+            .with_sparql_parse(std::sync::Arc::clone(&parsed));
+        let dataset = fluree
+            .build_stream_dataset_for_sparql_with_options(
+                &sparql,
+                &crate::routes::policy_auth::bound_governance(
+                    headers.identity.as_deref(),
+                    &headers,
+                )?,
+                &plan_options,
+            )
+            .await
+            .map_err(ServerError::Api)?;
+        let input = OwnedStreamQuery::Sparql(sparql);
+        let plan = fluree
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
+            .await
+            .map_err(ServerError::Api)?;
+        (
+            StreamPlan::Dataset { dataset, plan },
+            stream_tracker_from_headers(&headers),
+        )
+    } else {
+        let mut query_json: JsonValue = credential.body_json()?;
+
+        if query_json.get("to").is_some() {
+            return Err(ServerError::bad_request(
+                "history queries (`to`) are not supported on the streaming endpoint; \
+                 use /v1/fluree/query",
+            ));
+        }
+
+        // Representative ledger from `from`/`fromNamed` or the Fluree-Ledger
+        // header; errors if neither is present.
+        let ledger_id = get_ledger_id(None, &headers, &query_json)?;
+
+        // If only a header ledger was given, materialize it as a `from` so the
+        // dataset spec is non-empty. A `fromNamed`-only body already names its
+        // dataset and keeps its empty default graph (§13.2).
+        if crate::routes::query::needs_default_graph_injection(&query_json) {
+            if let Some(obj) = query_json.as_object_mut() {
+                obj.insert("from".to_string(), JsonValue::String(ledger_id.clone()));
+            }
+        }
+        warn_headers = crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
+
+        inject_headers_into_query(&mut query_json, &headers);
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
+        let min_t = collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+        inject_default_context_if_requested(
+            state.as_ref(),
+            &ledger_id,
+            &mut query_json,
+            params.default_context,
+        )
+        .await?;
+
+        let tracker = stream_tracker(Some(&query_json));
+        let dataset = fluree
+            .build_stream_dataset_with_options(&query_json, &plan_options)
+            .await
+            .map_err(ServerError::Api)?;
+        let input = OwnedStreamQuery::JsonLd(query_json);
+        let plan = fluree
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
+            .await
+            .map_err(ServerError::Api)?;
+        (StreamPlan::Dataset { dataset, plan }, tracker)
+    };
+
+    tracing::info!(status = "start", "connection streaming query started");
+    let mut response = finish_stream(&state, fluree, stream_plan, tracker);
+    response.headers_mut().extend(warn_headers);
+    Ok(response)
+}
+
+async fn stream_query_inner(
+    state: Arc<AppState>,
+    ledger: String,
+    mut params: SparqlParams,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    mut credential: MaybeCredential,
+) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
+    let span = tracing::Span::current();
+
+    // Enforce data auth if configured (Bearer token OR signed request).
+    let data_auth = state.config.data_auth();
+    if data_auth.mode == crate::config::DataAuthMode::Required
+        && !credential.is_signed()
+        && bearer.0.is_none()
+    {
+        return Err(ServerError::unauthorized(
+            "Authentication required (signed request or Bearer token)",
+        ));
+    }
+
+    if headers.is_sparql_update() || credential.is_sparql_update {
+        return Err(ServerError::bad_request(
+            "SPARQL UPDATE requests should use the /v1/fluree/update endpoint",
+        ));
+    }
+
+    // The streaming dataset path does not enumerate a ledger's named graphs
+    // under `GRAPH ?g`, so a pinned read here would silently drop them.
+    let path = PathLedger::parse(&ledger)?;
+    if path.pin.is_some() {
+        return Err(ServerError::bad_request(
+            "A time pin in the ledger path is not supported on the streaming endpoint; \
+             use /v1/fluree/query/<ledger>@<pin>",
+        ));
+    }
+    // The typed id, not the path's spelling, drives loading and authorization.
+    let ledger = path.ledger.clone();
+
+    // Resolve into one of two execution shapes, planned before the 200 stream
+    // commits so parse errors / unsupported shapes return a clean 4xx:
+    //  - Single: the lean single-ledger GraphDb path (common case).
+    //  - Dataset: the connection/dataset path (policy, `from`/`fromNamed`,
+    //    multi-ledger), which enforces per-request policy exactly like `/query`.
+    let fluree = state.fluree.clone();
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
+    let mut warn_headers = HeaderMap::new();
+    params.absorb_form_body(&mut credential)?;
+    params.reject_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
+    let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
+        let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        // One parse for the dataset-clause check below and for planning,
+        // which is handed it.
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
+        // Resolve identity + policy the same way /query's SPARQL path does:
+        // SPARQL has no body `opts`, so policy arrives via the resolved identity
+        // (bearer/header), the server default policy class, and the
+        // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
+        let plan_options = params
+            .bind(crate::query_control::options_for_identity(
+                headers.server_identity.as_ref(),
+            ))
+            .with_sparql_parse(std::sync::Arc::clone(&parsed));
+        let identity = headers.identity.clone();
+        let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
+
+        let dataset_clause = parsed.ast().and_then(|ast| match &ast.body {
+            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Update(_) => None,
+        });
+        let has_dataset = dataset_clause
+            .map(|d| {
+                !d.default_graphs.is_empty() || !d.named_graphs.is_empty() || d.to_graph.is_some()
+            })
+            .unwrap_or(false);
+
+        // Freshness barrier parity with /query (header / `@t:` min-t): the
+        // path ledger's, before its registry resolves the dataset.
+        let min_t = crate::routes::query::path_ledger_min_t(
+            &path,
+            headers.min_t,
+            collect_sparql_min_t_requirements(None, &sparql, Some(&ledger))?,
+        );
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+
+        if qc_opts.has_any_policy_inputs() || has_dataset {
+            // Policy and/or FROM → connection/dataset streaming path (enforces
+            // policy exactly like /query). History range FROM..TO is a distinct
+            // path neither streaming path implements.
+            if dataset_clause.and_then(|d| d.to_graph.as_ref()).is_some() {
+                return Err(ServerError::bad_request(
+                    "SPARQL history range (FROM <...> TO <...>) is not supported on the \
+                     streaming endpoint; use /v1/fluree/query",
+                ));
+            }
+            let spec = if has_dataset {
+                let dc = dataset_clause.expect("has_dataset implies a clause");
+                warn_headers =
+                    crate::routes::query::dataset_semantics_warning_headers(dc, parsed.ast());
+                let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast())?
+                    .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
+                let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(
+                    &path.id, &clause, None, &registry,
+                )?
+            } else {
+                fluree_db_api::DatasetSpec::new().with_default(fluree_db_api::GraphSource::ledger(
+                    fluree_db_api::LedgerRef::parse(&ledger)?,
+                ))
+            };
+            // Ensure the head is fresh before view loading.
+            let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            let dataset = fluree
+                .build_stream_dataset_from_spec(&spec, &qc_opts)
+                .await
+                .map_err(ServerError::Api)?;
+            let input = OwnedStreamQuery::Sparql(sparql);
+            let plan = fluree
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
+                .await
+                .map_err(ServerError::Api)?;
+            (
+                StreamPlan::Dataset { dataset, plan },
+                stream_tracker_from_headers(&headers),
+            )
+        } else {
+            // Plain single-ledger SPARQL (no policy, no FROM).
+            let input = OwnedStreamQuery::Sparql(sparql);
+            let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
+            (plan, stream_tracker_from_headers(&headers))
+        }
+    } else {
+        let mut query_json: JsonValue = credential.body_json()?;
+
+        // History queries (top-level `to`) use a distinct execution path that
+        // neither streaming path implements; planning here would silently read
+        // the current view. Reject — use /query.
+        if query_json.get("to").is_some() {
+            return Err(ServerError::bad_request(
+                "history queries (`to`) are not supported on the streaming endpoint; \
+                 use /v1/fluree/query",
+            ));
+        }
+
+        // Mirror /query's ledger-scoped preprocessing: enforce bearer scope
+        // over the path ledger before anything is read from it, normalize
+        // `from` against it, fold header opts in, enforce bearer scope over
+        // every referenced graph, then apply auth-derived identity + default
+        // policy class.
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        if fluree_db_api::jsonld_names_dataset(&query_json) {
+            crate::routes::query::await_path_ledger_min_t_for_jsonld(
+                &state,
+                &path,
+                &headers,
+                &query_json,
+            )
+            .await?;
+            let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
+            normalize_ledger_scoped_from(&path.id, &registry, &mut query_json)?;
+        }
+        inject_headers_into_query(&mut query_json, &headers);
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
+
+        // Freshness barrier + stored-default-context injection, before planning,
+        // to match /query's request controls.
+        let min_t = collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger))?;
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+        inject_default_context_if_requested(
+            state.as_ref(),
+            &ledger,
+            &mut query_json,
+            params.default_context,
+        )
+        .await?;
+
+        let tracker = stream_tracker(Some(&query_json));
+
+        if requires_dataset_features(&query_json) || has_policy_opts(&query_json) {
+            // Dataset path: give the spec the path ledger as its default graph
+            // when the body named no dataset at all, then build the
+            // policy-wrapped dataset and plan against it. A `fromNamed`-only
+            // body keeps its empty default graph (§13.2), matching `/query` and
+            // the SPARQL surface.
+            if crate::routes::query::needs_default_graph_injection(&query_json) {
+                if let Some(obj) = query_json.as_object_mut() {
+                    obj.insert("from".to_string(), JsonValue::String(ledger.clone()));
+                }
+            }
+            warn_headers =
+                crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
+            let dataset = fluree
+                .build_stream_dataset_with_options(&query_json, &plan_options)
+                .await
+                .map_err(ServerError::Api)?;
+            let input = OwnedStreamQuery::JsonLd(query_json);
+            let plan = fluree
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
+                .await
+                .map_err(ServerError::Api)?;
+            (StreamPlan::Dataset { dataset, plan }, tracker)
+        } else {
+            let input = OwnedStreamQuery::JsonLd(query_json);
+            let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
+            (plan, tracker)
+        }
+    };
+
+    tracing::info!(status = "start", ledger = %ledger, "streaming query started");
+    let mut response = finish_stream(&state, fluree, stream_plan, tracker);
+    response.headers_mut().extend(warn_headers);
+    Ok(response)
+}
+
+/// Keep the plain stream path for unconfigured/root views. A configured
+/// filter must travel with the dataset into the producer, not be discarded
+/// when the single-ledger producer reconstructs its view from LedgerState.
+async fn plan_with_ledger_defaults(
+    state: &AppState,
+    ledger_state: LedgerState,
+    input: &OwnedStreamQuery,
+    options: &fluree_db_api::QueryExecutionOptions,
+) -> Result<StreamPlan> {
+    let fluree = &state.fluree;
+    let graph = fluree
+        .wrap_policy_defaults(GraphDb::from_ledger_state(&ledger_state))
+        .await?;
+    if graph.is_root() {
+        let plan = fluree
+            .plan_stream_query_with_options(&graph, input, options)
+            .await?;
+        Ok(StreamPlan::Single { ledger_state, plan })
+    } else {
+        let dataset = DataSetDb::single(graph);
+        let plan = fluree
+            .plan_stream_query_dataset_with_options(&dataset, input, options)
+            .await?;
+        Ok(StreamPlan::Dataset { dataset, plan })
+    }
+}
+
+/// Spawn the producer for a resolved plan and assemble the NDJSON streaming
+/// response (cancellation/disconnect guard + heartbeat). Shared by the
+/// ledger-scoped and connection-scoped handlers.
+fn finish_stream(
+    state: &AppState,
+    fluree: Arc<fluree_db_api::Fluree>,
+    stream_plan: StreamPlan,
+    tracker: Tracker,
+) -> Response {
+    let options =
+        crate::query_control::current_query_execution_options(state.config.query_timeout_ms);
+    // Cancellation handle shared with the operators: a timeout timer already
+    // fires on it; the disconnect guard below also fires it (ClientDisconnected)
+    // when the client drops the response stream mid-execution.
+    let disconnect_guard = options
+        .cancellation
+        .clone()
+        .map(crate::query_control::QueryDisconnectGuard::new);
+
+    let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
+    let producer_tracker = tracker.clone();
+    match stream_plan {
+        StreamPlan::Single { ledger_state, plan } => {
+            tokio::spawn(async move {
+                fluree
+                    .run_stream_query(ledger_state, plan, producer_tracker, options, tx)
+                    .await;
+            });
+        }
+        StreamPlan::Dataset { dataset, plan } => {
+            tokio::spawn(async move {
+                fluree
+                    .run_stream_query_dataset(dataset, plan, producer_tracker, options, tx)
+                    .await;
+            });
+        }
+    }
+
+    let heartbeat = (state.config.stream_heartbeat_ms > 0)
+        .then(|| Duration::from_millis(state.config.stream_heartbeat_ms));
+
+    ndjson_response(rx, tracker, disconnect_guard, heartbeat)
+}
+
+/// The two streaming execution shapes resolved by the handler. Constructed
+/// once and matched immediately, so the inter-variant size difference is not
+/// worth a heap indirection.
+#[allow(clippy::large_enum_variant)]
+enum StreamPlan {
+    Single {
+        ledger_state: LedgerState,
+        plan: StreamQueryPlan,
+    },
+    Dataset {
+        dataset: DataSetDb,
+        plan: StreamDatasetPlan,
+    },
+}
+
+/// A fuel + time tracker for the streaming endpoint, honoring any `max-fuel`
+/// from JSON-LD `opts`. Fuel/time are forced on so heartbeats carry a live
+/// fuel total and the `end` record reports both.
+fn stream_tracker(query_json: Option<&JsonValue>) -> Tracker {
+    let mut opts = TrackingOptions::from_opts_value(query_json.and_then(|j| j.get("opts")));
+    opts.track_fuel = true;
+    opts.track_time = true;
+    Tracker::new(opts)
+}
+
+/// SPARQL has no body `opts`, so its `max-fuel` arrives via the
+/// `Fluree-Max-Fuel` header (parity with `/query`). Fuel/time forced on.
+fn stream_tracker_from_headers(headers: &FlureeHeaders) -> Tracker {
+    let mut opts = headers.to_tracking_options();
+    opts.track_fuel = true;
+    opts.track_time = true;
+    Tracker::new(opts)
+}
+
+/// Assemble the response body: forward producer records and, when `heartbeat`
+/// is set, inject a heartbeat whenever no record has flowed for that interval.
+/// The heartbeat reads the live fuel total from `tracker` (a lock-free atomic
+/// load). `heartbeat = None` disables heartbeats entirely.
+///
+/// `guard` lives in the stream state: if the client drops the response body
+/// mid-stream it is dropped while armed and cancels the producer; on normal
+/// completion we disarm it before the stream ends.
+fn ndjson_response(
+    rx: mpsc::Receiver<Bytes>,
+    tracker: Tracker,
+    guard: Option<QueryDisconnectGuard>,
+    heartbeat: Option<Duration>,
+) -> Response {
+    let body = match heartbeat {
+        None => {
+            let stream =
+                futures::stream::unfold((rx, guard), move |(mut rx, mut guard)| async move {
+                    match rx.recv().await {
+                        Some(bytes) => Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard))),
+                        None => {
+                            if let Some(g) = guard.as_mut() {
+                                g.disarm();
+                            }
+                            None
+                        }
+                    }
+                });
+            Body::from_stream(stream)
+        }
+        Some(period) => {
+            let start = Instant::now();
+            let mut ticker = interval(period);
+            // Don't pile up heartbeats after a slow stretch.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let stream = futures::stream::unfold(
+                (rx, ticker, tracker, start, period, guard),
+                move |(mut rx, mut ticker, tracker, start, period, mut guard)| async move {
+                    loop {
+                        tokio::select! {
+                            msg = rx.recv() => {
+                                match msg {
+                                    Some(bytes) => {
+                                        return Some((
+                                            Ok::<Bytes, std::io::Error>(bytes),
+                                            (rx, ticker, tracker, start, period, guard),
+                                        ));
+                                    }
+                                    None => {
+                                        // Producer finished (terminal already sent).
+                                        if let Some(g) = guard.as_mut() {
+                                            g.disarm();
+                                        }
+                                        return None;
+                                    }
+                                }
+                            }
+                            _ = ticker.tick() => {
+                                // The interval's first tick fires immediately; skip
+                                // it so we never emit a heartbeat before the head.
+                                if start.elapsed() < period {
+                                    continue;
+                                }
+                                let elapsed_ms = start.elapsed().as_millis() as u64;
+                                let hb = ndjson_stream::heartbeat_record(
+                                    elapsed_ms,
+                                    tracker.current_fuel(),
+                                );
+                                return Some((
+                                    Ok(Bytes::from(hb)),
+                                    (rx, ticker, tracker, start, period, guard),
+                                ));
+                            }
+                        }
+                    }
+                },
+            );
+            Body::from_stream(stream)
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ndjson_stream::NDJSON_CONTENT_TYPE)
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .header(header::CACHE_CONTROL, "no-cache, no-transform")
+        .body(body)
+        .expect("response builder cannot fail")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{QueryCancellation, QueryCancellationReason};
+    use http_body_util::BodyExt;
+    use tokio::time::timeout;
+
+    /// Pull the next NDJSON record (one `\n`-terminated line) from a streaming
+    /// response body, buffering across frame boundaries. `None` at body end.
+    async fn next_record(body: &mut Body, buf: &mut Vec<u8>) -> Option<JsonValue> {
+        loop {
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = &line[..line.len() - 1]; // drop the '\n'
+                if line.is_empty() {
+                    continue;
+                }
+                return Some(serde_json::from_slice(line).expect("each NDJSON line is valid JSON"));
+            }
+            let frame = body.frame().await?.expect("body frame");
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+        }
+    }
+
+    /// When the producer goes idle after the head, the transport injects a
+    /// `heartbeat` record on the configured interval to keep the connection
+    /// alive past proxy idle timeouts.
+    #[tokio::test]
+    async fn heartbeat_emitted_during_idle_gap() {
+        let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
+        // Flush the head, then keep `tx` open but idle (a slow query that has
+        // not produced its first row yet).
+        tx.send(Bytes::from(ndjson_stream::head_record(&[
+            "name".to_string()
+        ])))
+        .await
+        .unwrap();
+
+        let resp = ndjson_response(
+            rx,
+            Tracker::disabled(),
+            None,
+            Some(Duration::from_millis(20)),
+        );
+        let mut body = resp.into_body();
+        let mut buf = Vec::new();
+
+        let head = next_record(&mut body, &mut buf).await.expect("head record");
+        assert_eq!(head["type"], "head");
+
+        let hb = timeout(Duration::from_secs(2), next_record(&mut body, &mut buf))
+            .await
+            .expect("a heartbeat arrives within the timeout")
+            .expect("a heartbeat record");
+        assert_eq!(hb["type"], "heartbeat");
+
+        drop(tx); // producer "finishes" → stream ends cleanly
+    }
+
+    /// If the client drops the response body mid-stream, the armed disconnect
+    /// guard held in the stream state fires `ClientDisconnected` on the shared
+    /// cancellation handle so the spawned producer stops at its next checkpoint.
+    #[tokio::test]
+    async fn client_disconnect_cancels_producer() {
+        let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
+        tx.send(Bytes::from(ndjson_stream::head_record(&[
+            "name".to_string()
+        ])))
+        .await
+        .unwrap();
+
+        let cancellation = QueryCancellation::new();
+        let guard = QueryDisconnectGuard::new(cancellation.clone());
+
+        let resp = ndjson_response(rx, Tracker::disabled(), Some(guard), None);
+        let mut body = resp.into_body();
+        let mut buf = Vec::new();
+
+        // Consume the head; the stream (and its armed guard) stays alive because
+        // the producer has not finished — `tx` is still open.
+        let head = next_record(&mut body, &mut buf).await.expect("head record");
+        assert_eq!(head["type"], "head");
+        assert_eq!(cancellation.reason(), None, "armed, not yet cancelled");
+
+        // Client goes away mid-stream.
+        drop(body);
+
+        assert_eq!(
+            cancellation.reason(),
+            Some(QueryCancellationReason::ClientDisconnected),
+            "dropping the body mid-stream cancels the producer",
+        );
+        drop(tx);
+    }
+}

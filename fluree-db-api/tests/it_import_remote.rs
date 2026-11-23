@@ -1,0 +1,551 @@
+//! Integration tests for remote-source bulk import (`import_from_storage`).
+//!
+//! These tests use [`MemoryStorage`] as the remote source so they exercise the
+//! `Arc<dyn StorageRead>` path without requiring LocalStack/S3. They verify
+//! that remote import produces the same query results as the equivalent local
+//! `Files` import.
+
+#![cfg(feature = "native")]
+
+use crate::support;
+use crate::support::hooked_storage::{HookedStorage, StorageHooks};
+
+use async_trait::async_trait;
+use fluree_db_api::{FlureeBuilder, RemoteObject, RemoteSource};
+use fluree_db_core::{MemoryStorage, StorageRead, StorageWrite};
+use serde_json::json;
+use std::sync::Arc;
+
+/// Helper: extract a sorted list of string values from a single-column JSON-LD result.
+fn extract_sorted_strings(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("expected array")
+        .iter()
+        .map(|row| {
+            if let Some(arr) = row.as_array() {
+                arr.first()
+                    .and_then(|v| v.as_str())
+                    .expect("expected string in first column")
+                    .to_string()
+            } else {
+                row.as_str().expect("expected string row").to_string()
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Extract column `n` (0-based) of each row, string values only, sorted.
+fn extract_nth_column(v: &serde_json::Value, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("expected array")
+        .iter()
+        .filter_map(|row| row.as_array().and_then(|cols| cols.get(n)))
+        .filter_map(|c| c.as_str().map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
+const TTL_PREFIX: &str = "@prefix ex: <http://example.org/ns/> .\n\
+@prefix schema: <http://schema.org/> .\n\
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+
+fn chunk_a() -> String {
+    format!(
+        "{TTL_PREFIX}\n\
+        ex:alice a ex:User ;\n\
+            schema:name \"Alice\" ;\n\
+            schema:age 42 .\n\
+        \n\
+        ex:bob a ex:User ;\n\
+            schema:name \"Bob\" ;\n\
+            schema:age 22 .\n"
+    )
+}
+
+fn chunk_b() -> String {
+    format!(
+        "{TTL_PREFIX}\n\
+        ex:cam a ex:User ;\n\
+            schema:name \"Cam\" ;\n\
+            schema:age 34 ;\n\
+            ex:friend ex:alice, ex:bob .\n\
+        \n\
+        ex:dave a ex:User ;\n\
+            schema:name \"Dave\" ;\n\
+            schema:age 28 .\n"
+    )
+}
+
+async fn populate_remote_storage() -> (Arc<MemoryStorage>, Vec<RemoteObject>) {
+    let storage = Arc::new(MemoryStorage::new());
+    let chunks = [
+        ("imports/chunk_0000.ttl", chunk_a()),
+        ("imports/chunk_0001.ttl", chunk_b()),
+    ];
+    let mut objects = Vec::new();
+    for (addr, body) in &chunks {
+        storage.write_bytes(addr, body.as_bytes()).await.unwrap();
+        objects.push(RemoteObject {
+            address: (*addr).to_string(),
+            size_bytes: body.len() as u64,
+        });
+    }
+    (storage, objects)
+}
+
+// ============================================================================
+// OrderedObjects mode — the production-recommended path
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_ordered_objects_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let (storage, objects) = populate_remote_storage().await;
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let storage_dyn: Arc<dyn StorageRead> = storage.clone();
+    let result = fluree
+        .create("test/remote-ordered:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote import (OrderedObjects) should succeed");
+
+    assert_eq!(result.t, 2, "two remote objects => t=2");
+    assert!(result.flake_count > 0);
+    assert!(result.root_id.is_some());
+
+    let ledger = fluree
+        .ledger("test/remote-ordered:main")
+        .await
+        .expect("load ledger");
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names, vec!["Alice", "Bob", "Cam", "Dave"]);
+}
+
+// ============================================================================
+// Prefix mode — lex-sorted listing via list_prefix_with_metadata
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_prefix_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let (storage, _objects) = populate_remote_storage().await;
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let storage_dyn: Arc<dyn StorageRead> = storage.clone();
+    let result = fluree
+        .create("test/remote-prefix:main")
+        .import_from_storage(
+            storage_dyn,
+            RemoteSource::Prefix {
+                prefix: "imports/".into(),
+            },
+        )
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote import (Prefix) should succeed");
+
+    assert_eq!(result.t, 2);
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/remote-prefix:main")
+        .await
+        .expect("load ledger");
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names, vec!["Alice", "Bob", "Cam", "Dave"]);
+}
+
+// ============================================================================
+// Result parity: remote vs local should produce identical flake counts
+// ============================================================================
+
+#[tokio::test]
+async fn remote_import_matches_local_flake_count() {
+    // Local baseline.
+    let db_local = tempfile::tempdir().unwrap();
+    let chunks_dir = tempfile::tempdir().unwrap();
+    std::fs::write(chunks_dir.path().join("chunk_0000.ttl"), chunk_a()).unwrap();
+    std::fs::write(chunks_dir.path().join("chunk_0001.ttl"), chunk_b()).unwrap();
+
+    let local_fluree = FlureeBuilder::file(db_local.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let local_result = local_fluree
+        .create("test/parity-local:main")
+        .import(chunks_dir.path())
+        .threads(2)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("local import");
+
+    // Remote equivalent.
+    let db_remote = tempfile::tempdir().unwrap();
+    let (storage, objects) = populate_remote_storage().await;
+
+    let remote_fluree = FlureeBuilder::file(db_remote.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let storage_dyn: Arc<dyn StorageRead> = storage;
+    let remote_result = remote_fluree
+        .create("test/parity-remote:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote import");
+
+    assert_eq!(
+        remote_result.flake_count, local_result.flake_count,
+        "remote and local imports must produce identical flake counts on the same data"
+    );
+    assert_eq!(remote_result.t, local_result.t);
+}
+
+// ============================================================================
+// Error path: producer fetch failure surfaces as ImportError
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_propagates_fetch_error() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::new());
+
+    // Reference an address that doesn't exist — read_bytes will fail.
+    let bogus = vec![RemoteObject {
+        address: "imports/missing.ttl".into(),
+        size_bytes: 100,
+    }];
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+
+    let storage_dyn: Arc<dyn StorageRead> = storage;
+    let err = fluree
+        .create("test/remote-error:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(bogus))
+        .threads(1)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("import should fail when remote object is missing");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("imports/missing.ttl"),
+        "error should reference the missing address, got: {msg}"
+    );
+}
+
+// ============================================================================
+// JSON-LD round-trip
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_jsonld_then_query() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::new());
+
+    let alice = r#"{
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@id": "ex:alice",
+        "@type": "ex:Person",
+        "schema:name": "Alice"
+    }"#;
+    let bob = r#"{
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@id": "ex:bob",
+        "@type": "ex:Person",
+        "schema:name": "Bob"
+    }"#;
+
+    storage
+        .write_bytes("jsonld/01_alice.jsonld", alice.as_bytes())
+        .await
+        .unwrap();
+    storage
+        .write_bytes("jsonld/02_bob.jsonld", bob.as_bytes())
+        .await
+        .unwrap();
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+
+    let storage_dyn: Arc<dyn StorageRead> = storage;
+    let result = fluree
+        .create("test/remote-jsonld:main")
+        .import_from_storage(
+            storage_dyn,
+            RemoteSource::Prefix {
+                prefix: "jsonld/".into(),
+            },
+        )
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote JSON-LD import should succeed");
+
+    assert_eq!(result.t, 2);
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/remote-jsonld:main")
+        .await
+        .expect("load ledger");
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+// ============================================================================
+// .trig remote import — including named GRAPH blocks — is fully supported.
+// Default-graph and named-graph data both index and become queryable.
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_trig_named_graph_then_query() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::new());
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 schema:description "User login" .
+}
+"#;
+    storage
+        .write_bytes("trig/data.trig", trig.as_bytes())
+        .await
+        .unwrap();
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+
+    let storage_dyn: Arc<dyn StorageRead> = storage;
+    let result = fluree
+        .create("test/remote-trig:main")
+        .import_from_storage(
+            storage_dyn,
+            RemoteSource::Prefix {
+                prefix: "trig/".into(),
+            },
+        )
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote .trig import should succeed");
+    assert!(result.flake_count >= 2, "default + named-graph flakes");
+
+    let ledger = fluree
+        .ledger("test/remote-trig:main")
+        .await
+        .expect("load ledger");
+
+    // Default graph: broad scan must include Alice's name. (Uses a broad
+    // triple scan rather than a prefixed-name pattern to avoid an unrelated
+    // pre-existing prefix-resolution quirk on the TriG default-graph path.)
+    let q_default = json!({
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q_default)
+        .await
+        .expect("default-graph query");
+    assert!(
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2)
+            .contains(&"Alice".to_string()),
+        "default graph must contain Alice"
+    );
+
+    // Named graph: queryable via the #<iri> fragment — the behavior the fix enables.
+    let named_alias = "test/remote-trig:main#http://example.org/graphs/audit";
+    let q_named = json!({
+        "from": named_alias,
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = fluree
+        .query_connection(&q_named)
+        .await
+        .expect("named-graph query should resolve and return data");
+    assert_eq!(
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2),
+        vec!["User login"]
+    );
+}
+
+// ============================================================================
+// Mixed-format rejection: Turtle + JSON-LD => ImportError::MixedFormats
+// ============================================================================
+
+#[tokio::test]
+async fn import_from_storage_rejects_mixed_formats() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MemoryStorage::new());
+    storage
+        .write_bytes("mix/a.ttl", chunk_a().as_bytes())
+        .await
+        .unwrap();
+    storage.write_bytes("mix/b.jsonld", b"{}").await.unwrap();
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+
+    let storage_dyn: Arc<dyn StorageRead> = storage;
+    let err = fluree
+        .create("test/remote-mixed:main")
+        .import_from_storage(
+            storage_dyn,
+            RemoteSource::Prefix {
+                prefix: "mix/".into(),
+            },
+        )
+        .threads(1)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("mixed formats must be rejected");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Turtle") && msg.contains("JSON-LD"),
+        "expected MixedFormats error, got: {msg}"
+    );
+}
+
+// ============================================================================
+// Regression: single-worker runtime must not deadlock when the remote producer
+// re-parks between chunks (in-flight backpressure == 1).
+// ============================================================================
+
+/// Storage hooks that yield to the runtime before each read.
+///
+/// A real async backend (File/S3) hands control to the IO driver mid-read.
+/// `MemoryStorage` resolves reads synchronously. Yielding makes the producer
+/// task depend on the runtime worker being free, as it does with a real backend.
+#[derive(Debug)]
+struct YieldBeforeRead;
+
+#[async_trait]
+impl StorageHooks for YieldBeforeRead {
+    async fn before_read(&self, _address: &str) {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Reproduces the channel-fed remote-import deadlock deterministically.
+///
+/// With `max_inflight_chunks == 1` the remote producer can hold only one chunk
+/// in flight, so it re-parks (waiting for channel capacity, and on each
+/// yielding read) and relies on the single current-thread runtime worker to be
+/// re-polled. If the in-order commit consumer blocks that worker on a plain
+/// `std::sync::mpsc::recv`, the producer can never advance and the import hangs
+/// forever — the load/low-RAM-dependent failure seen on CI. The consumer must
+/// receive off the worker (via `spawn_blocking`) for this to complete.
+///
+/// Pre-fix: this test hangs (caught by nextest's `terminate-after`).
+/// Post-fix: it completes in well under a second.
+#[tokio::test]
+async fn remote_import_single_inflight_yielding_storage_does_not_deadlock() {
+    const N: usize = 6;
+
+    let inner = MemoryStorage::new();
+    let mut objects = Vec::with_capacity(N);
+    for i in 0..N {
+        let addr = format!("imports/chunk_{i:04}.ttl");
+        let body = format!(
+            "{TTL_PREFIX}\n\
+            ex:user{i} a ex:User ;\n\
+                schema:name \"User{i}\" ;\n\
+                schema:age {age} .\n",
+            age = 20 + i
+        );
+        inner.write_bytes(&addr, body.as_bytes()).await.unwrap();
+        objects.push(RemoteObject {
+            address: addr,
+            size_bytes: body.len() as u64,
+        });
+    }
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let storage_dyn: Arc<dyn StorageRead> = Arc::new(HookedStorage::over(inner, YieldBeforeRead));
+    let result = fluree
+        .create("test/remote-single-inflight:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .max_inflight_chunks(1)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote import must not deadlock with single in-flight chunk");
+
+    assert_eq!(result.t, N as i64, "every chunk commits one transaction");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/remote-single-inflight:main")
+        .await
+        .expect("load ledger");
+    let q = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N, "all {N} subjects imported");
+}

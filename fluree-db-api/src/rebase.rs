@@ -1,0 +1,1060 @@
+//! Branch rebase support
+//!
+//! Provides types and orchestration for replaying a branch's commits on top
+//! of its source branch's current HEAD, bringing the branch up to date with
+//! upstream changes.
+
+use crate::commit_data::{key_of, ConfigGraphs, OwnChanges};
+use crate::error::{ApiError, Result};
+use fluree_db_core::LedgerId;
+use fluree_db_core::{BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake};
+use fluree_db_ledger::LedgerState;
+use fluree_db_nameservice::NsRecordSnapshot;
+use fluree_db_novelty::{delta_keys_of, FactKey};
+use fluree_db_transact::{
+    CommitOpts, CurrentFacts, NamespaceRegistry, Slot, StagedCommit, StoredFact,
+};
+use rustc_hash::FxHashSet;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::Instrument;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Strategy for resolving conflicts when branch and source modifications
+/// overlap on the same (subject, predicate, graph) tuple.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictStrategy {
+    /// Replay as-is, both values coexist (multi-cardinality). Default.
+    #[default]
+    TakeBoth,
+    /// Fail on first conflict, no changes applied.
+    Abort,
+    /// Drop branch's conflicting flakes from the replayed commit (source wins).
+    TakeSource,
+    /// Keep branch's flakes and add retractions for source's conflicting values (branch wins).
+    TakeBranch,
+    /// Skip the entire commit if any flakes conflict.
+    Skip,
+}
+
+impl ConflictStrategy {
+    /// Whether this strategy refuses to proceed given `conflict_count`
+    /// conflicting keys. The one shared answer for merge, revert, and merge
+    /// preview, so the preview cannot drift from what the merge does.
+    pub fn aborts_on(&self, conflict_count: usize) -> bool {
+        matches!(self, Self::Abort) && conflict_count > 0
+    }
+
+    /// Parse a canonical strategy name from a string.
+    ///
+    /// Unlike [`Self::from_str_name`], this intentionally rejects aliases such
+    /// as `ours` and `theirs` for API surfaces that require a strict wire
+    /// contract.
+    pub fn parse_canonical(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "take-both" => Ok(Self::TakeBoth),
+            "abort" => Ok(Self::Abort),
+            "take-source" => Ok(Self::TakeSource),
+            "take-branch" => Ok(Self::TakeBranch),
+            "skip" => Ok(Self::Skip),
+            _ => Err(format!("Unknown conflict strategy: {s}")),
+        }
+    }
+
+    /// Parse a strategy name from a string (case-insensitive).
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        let normalized = s.to_lowercase();
+        if let Ok(strategy) = Self::parse_canonical(&normalized) {
+            return Some(strategy);
+        }
+
+        match normalized.as_str() {
+            "takeboth" | "take_both" => Some(Self::TakeBoth),
+            "takesource" | "take_source" | "theirs" => Some(Self::TakeSource),
+            "takebranch" | "take_branch" | "ours" => Some(Self::TakeBranch),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TakeBoth => "take-both",
+            Self::Abort => "abort",
+            Self::TakeSource => "take-source",
+            Self::TakeBranch => "take-branch",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+/// Record of a conflict detected during rebase of a single commit.
+#[derive(Clone, Debug, Serialize)]
+pub struct RebaseConflict {
+    pub original_t: i64,
+    #[serde(skip)]
+    pub keys: Vec<ConflictKey>,
+    pub conflict_count: usize,
+    pub resolution: &'static str,
+}
+
+/// Record of a commit that failed validation after replay.
+#[derive(Clone, Debug, Serialize)]
+pub struct RebaseFailure {
+    pub original_t: i64,
+    pub error: String,
+}
+
+/// Summary report of a completed rebase operation.
+#[derive(Clone, Debug, Serialize)]
+pub struct RebaseReport {
+    pub replayed: usize,
+    pub conflicts: Vec<RebaseConflict>,
+    pub failures: Vec<RebaseFailure>,
+    pub source_head_t: i64,
+    pub source_head_id: ContentId,
+    pub fast_forward: bool,
+    pub total_commits: usize,
+    pub skipped: usize,
+}
+
+/// Output of [`Fluree::prepare_rebase`].
+///
+/// Bundles everything the apply phase needs — receipt metadata
+/// (counts of `replayed`/`skipped`/`conflicts`/`total_commits`,
+/// `fast_forward`, source head info), the rollback snapshot and
+/// write guard for local-mode bookkeeping, the ref endpoints the
+/// apply will advance between, and the list of built-but-unwritten
+/// commit blobs (`pending_replays`) the apply phase atomically writes
+/// before the single ref advance.
+///
+/// Callers route on `new_head_id`:
+/// - `Some(_)` → write all `pending_replays` then advance the branch
+///   HEAD from `pre_rebase_head_id` to `new_head_id` (one operation
+///   atomically; local: `publish_commit`; Raft: `AdvanceRef`).
+/// - `None` → no branch commit survived (`Skip` strategy on every
+///   conflicting commit, or every commit's flake set was empty after
+///   resolution). Nothing is written; the local apply moves the branch
+///   onto the source's head and index, and the Raft path, whose heads
+///   only advance, completes the entry with the branch unchanged.
+pub struct StagedRebase {
+    /// Branch being rebased (without ledger prefix).
+    pub branch: String,
+    /// Fully-qualified branch id (`"<ledger>:<branch>"`).
+    pub branch_id: LedgerId,
+    /// Source branch name (without ledger prefix).
+    pub source: String,
+    /// Fully-qualified source id.
+    pub source_id: LedgerId,
+    /// Source's current head ref. For fast-forward, this is also
+    /// what the branch's HEAD advances to (`new_head_*` reflects
+    /// it).
+    pub source_head_id: ContentId,
+    /// Companion to [`Self::source_head_id`].
+    pub source_head_t: i64,
+    /// `true` when the branch is already at the common ancestor —
+    /// the apply phase just fast-forwards branch HEAD to source's
+    /// HEAD. `pending_replays` is empty in this case (no new commits
+    /// to write).
+    pub fast_forward: bool,
+    /// Total number of source commits considered (replayed +
+    /// skipped + had-no-effect).
+    pub total_commits: usize,
+    /// Number of replays the build phase produced (length of
+    /// `pending_replays`).
+    pub replayed: usize,
+    /// Number of source commits the `Skip` strategy dropped due to
+    /// conflict.
+    pub skipped: usize,
+    /// Per-commit conflict records (independent of strategy).
+    pub conflicts: Vec<RebaseConflict>,
+    /// Branch's pre-rebase head snapshot. The local apply path
+    /// passes this to `RefPublisher::reset_head` to roll back a
+    /// partial publish on apply failure. The Raft apply path
+    /// ignores it (the `AdvanceRef` proposal either applies cleanly
+    /// or doesn't apply at all).
+    pub rollback_snapshot: NsRecordSnapshot,
+    /// Branch's pre-rebase head (CAS `expected_prev`). `None` if
+    /// the branch was at genesis (rare — usually rebase requires an
+    /// existing head, but the build phase produces this either
+    /// way).
+    pub pre_rebase_head_id: Option<ContentId>,
+    /// Companion to [`Self::pre_rebase_head_id`].
+    pub pre_rebase_head_t: i64,
+    /// Head ref the apply step advances the branch to. `Some` for
+    /// fast-forward (= source's head) and active general rebase (=
+    /// last replay's id); `None` when every source commit was
+    /// skipped or had no effect.
+    pub new_head_id: Option<ContentId>,
+    /// Companion to [`Self::new_head_id`].
+    pub new_head_t: i64,
+    /// Ledger write guard held across the build → apply window so
+    /// concurrent transactions on the branch are serialized. `None`
+    /// when no `LedgerManager` is configured.
+    pub write_guard: Option<crate::LedgerWriteGuard>,
+    /// Cumulative post-build state used by `finalize_commit` after
+    /// the ref advance, so the cache catches up with consensus.
+    pub final_state: LedgerState,
+    /// Built-but-unwritten replay commits. The apply step writes
+    /// them all to the content store in order, then advances the
+    /// branch HEAD from `pre_rebase_head_id` directly to the last
+    /// blob's `commit_id`. Intermediate commits exist as
+    /// content-addressed objects but aren't on the active head
+    /// chain until that single advance commits.
+    pub pending_replays: Vec<PendingReplay>,
+    /// The source's index as copied into the branch's namespace, or `None`
+    /// when the source has none or the copy failed. After a rebase that
+    /// replays commits it replaces the branch's own index, which indexes
+    /// the line the replay replaces.
+    pub source_index: Option<(ContentId, i64)>,
+    /// The source's published index, not copied. A rebase that replays
+    /// nothing makes the branch the source, and the local apply copies
+    /// this onto the branch with the source's head.
+    pub source_record_index: Option<(ContentId, i64)>,
+}
+
+/// Built-but-unwritten replay commit. Carried inside
+/// [`StagedRebase::pending_replays`]; the apply phase writes each one
+/// to the content store before the atomic ref advance.
+pub struct PendingReplay {
+    /// Commit's content id (used both as the blob key and as the
+    /// new branch HEAD when this is the last entry).
+    pub commit_id: ContentId,
+    /// Canonical serialized bytes (`ContentId::new(Commit, bytes)
+    /// == commit_id`).
+    pub commit_bytes: Vec<u8>,
+    /// Original source commit's `t`. Carried through for tracing /
+    /// telemetry; not used by the apply step.
+    pub original_t: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+impl crate::Fluree {
+    /// Rebase a branch onto its source branch's current HEAD.
+    ///
+    /// Replays the branch's unique commits on top of the source's current
+    /// state, detecting and resolving conflicts according to `strategy`.
+    pub async fn rebase_branch(
+        &self,
+        ledger_name: &str,
+        branch: &str,
+        strategy: ConflictStrategy,
+    ) -> Result<RebaseReport> {
+        let span = tracing::debug_span!(
+            "rebase_branch",
+            ledger_name,
+            branch,
+            strategy = strategy.as_str()
+        );
+        async move {
+            let staged = self.prepare_rebase(ledger_name, branch, strategy).await?;
+            let branch_id = staged.branch_id.clone();
+            let rollback_snapshot = staged.rollback_snapshot.clone();
+
+            match self.apply_rebase(staged).await {
+                Ok(report) => Ok(report),
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %branch_id,
+                        error = %e,
+                        "rebase failed, rolling back nameservice state"
+                    );
+                    if let Err(rollback_err) = self
+                        .branch_admin()?
+                        .reset_head(&branch_id, rollback_snapshot)
+                        .await
+                    {
+                        tracing::error!(
+                            branch = %branch_id,
+                            error = %rollback_err,
+                            "failed to roll back nameservice state after rebase failure"
+                        );
+                    }
+                    if let Some(ref lm) = self.ledger_manager {
+                        lm.disconnect(&branch_id).await;
+                    }
+                    Err(e)
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Validate and build the rebase up to (but not including) the
+    /// content-store blob writes + ref advance. Returns a
+    /// [`StagedRebase`] the caller can then apply via
+    /// [`Self::apply_rebase`] (local single-step apply) or by
+    /// writing the blobs + proposing a single `AdvanceRef` through
+    /// consensus (Raft path).
+    ///
+    /// Build phase semantics:
+    /// - Fast-forward (branch head is the common ancestor):
+    ///   [`StagedRebase::pending_replays`] is empty,
+    ///   [`StagedRebase::new_head_id`] is the source's head.
+    /// - General rebase: each source commit gets replayed in turn,
+    ///   each iteration's input being the previous iteration's
+    ///   post-commit state. Cumulative novelty is gated against
+    ///   [`IndexConfig::reindex_max_bytes`]; exceeding it returns
+    ///   422 with structured remediation (reindex source then
+    ///   retry, or rebase a smaller commit range). Mid-rebase
+    ///   reindex is intentionally not performed (atomicity); the
+    ///   post-apply `finalize_commit` reports
+    ///   `needs_reindex` and the background indexer rebuilds.
+    /// - All-skipped (every conflicting commit dropped by `Skip`,
+    ///   or every replay produced empty flakes):
+    ///   [`StagedRebase::new_head_id`] is `None`, and the branch becomes
+    ///   the source: the local apply moves it onto the source's head.
+    ///
+    /// Errors with [`ApiError::InvalidBranch`] when called on a
+    /// root branch, [`ApiError::NotFound`] when the source can't be
+    /// resolved, and [`ApiError::BranchConflict`] when `Abort`
+    /// meets real conflicts.
+    pub async fn prepare_rebase(
+        &self,
+        ledger_name: &str,
+        branch: &str,
+        strategy: ConflictStrategy,
+    ) -> Result<StagedRebase> {
+        let branch_id = LedgerId::from_parts(ledger_name, branch)?;
+        let branch_record = self
+            .nameservice()
+            .lookup(&branch_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
+
+        // Refuse the root structurally — there's nothing to rebase onto.
+        // "main" carries no special meaning here; a ledger whose root is
+        // named "trunk" will be refused on `trunk`, and a non-root branch
+        // named "main" can be rebased like any other.
+        let source_name = branch_record.source_branch.as_ref().ok_or_else(|| {
+            ApiError::InvalidBranch(format!(
+                "Cannot rebase '{branch}': it is the root of ledger '{ledger_name}' \
+                 (no parent to rebase onto)."
+            ))
+        })?;
+
+        let source_id = LedgerId::from_parts(ledger_name, source_name)?;
+        let source_record = self
+            .nameservice()
+            .lookup(&source_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
+
+        let source_head_id = source_record.commit_head_id.clone().ok_or_else(|| {
+            ApiError::internal(format!("Source branch {source_id} has no commit head"))
+        })?;
+        let source_head_t = source_record.commit_t;
+
+        // Branch-aware stores for reading commits across namespaces.
+        let branch_store = self.branch_store(&branch_record, &branch_id).await?;
+        let source_store = self.branch_store(&source_record, &source_id).await?;
+
+        let branch_head_id = branch_record
+            .commit_head_id
+            .clone()
+            .ok_or_else(|| ApiError::internal(format!("Branch {branch_id} has no commit head")))?;
+
+        // What each side changed since they last shared a commit, by commit
+        // identity. The branch may have merged the source in, which puts the
+        // source's head on another clock than the branch's own commits.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(branch_store.clone()) as Arc<dyn ContentStore>,
+            vec![source_store.clone()],
+        );
+        let diff =
+            fluree_db_core::diff_branches(&union_store, &branch_head_id, &source_head_id).await?;
+
+        let pre_rebase_head_t = branch_record.commit_t;
+        let pre_rebase_head_id = branch_record.commit_head_id.clone();
+        let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
+        let source_name_owned = source_name.to_string();
+
+        // Fast-forward: the branch has no commits of its own to replay.
+        let is_fast_forward = diff.source.commits.is_empty();
+        if !is_fast_forward {
+            crate::merge::refuse_merging_graph_drops(&diff)?;
+        }
+
+        if is_fast_forward {
+            // Copy the source index into the branch namespace
+            // (best-effort, matches local single-node behavior).
+            let source_index = self
+                .copy_source_index(&source_id, &branch_id, &source_record)
+                .await;
+
+            // Load the source's state under the branch's id so the
+            // post-apply cache reflects the fast-forwarded branch.
+            let mut final_state = self.ledger(&source_id).await?;
+            std::sync::Arc::make_mut(&mut final_state.snapshot).ledger_id = branch_id.clone();
+
+            let write_guard = self.lock_ledger(&branch_id).await?;
+
+            return Ok(StagedRebase {
+                branch: branch.to_string(),
+                branch_id,
+                source: source_name_owned,
+                source_id,
+                source_head_id: source_head_id.clone(),
+                source_head_t,
+                fast_forward: true,
+                total_commits: 0,
+                replayed: 0,
+                skipped: 0,
+                conflicts: Vec::new(),
+                rollback_snapshot,
+                pre_rebase_head_id,
+                pre_rebase_head_t,
+                new_head_id: Some(source_head_id),
+                new_head_t: source_head_t,
+                write_guard,
+                final_state,
+                pending_replays: Vec::new(),
+                source_index,
+                source_record_index: None,
+            });
+        }
+
+        // The replay starts from the source's queryable state, relabeled to
+        // the branch; both sides' keys and flakes name the config graph as
+        // it does.
+        let mut current_state = self.ledger(&source_id).await?;
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
+        let mut config = ConfigGraphs::for_target(&current_state);
+
+        // The keys the source changed since the two sides diverged.
+        let source_delta = config.keys(delta_keys_of(&source_store, &diff.target.own).await?);
+
+        // Pass 1: walk every commit on the branch's line to collect
+        // lightweight summaries (CID, t, conflict keys) without retaining
+        // flake payloads in memory.
+        //
+        // Merges on the line are replayed too, because a merge the branch
+        // made carries how it resolved that merge. A merge that brought the
+        // source in keeps only its resolution: the rest of its flakes are
+        // the source's own changes, which the replay base already holds.
+        let summaries = scan_branch_commits(
+            &branch_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &source_delta,
+            &mut config,
+        )
+        .await?;
+        let total_commits = summaries.len();
+
+        // Abort upfront if any commit conflicts — no commits will be written.
+        if strategy == ConflictStrategy::Abort {
+            if let Some(summary) = summaries.iter().find(|s| !s.conflict_keys.is_empty()) {
+                return Err(ApiError::BranchConflict(format!(
+                    "Rebase aborted: {} conflict(s) at t={} with abort strategy",
+                    summary.conflict_keys.len(),
+                    summary.t
+                )));
+            }
+        }
+
+        // Acquire the target branch's write lock when a manager is
+        // available, serializing the entire replay against regular
+        // transactions on the same branch.
+        let write_guard = self.lock_ledger(&branch_id).await?;
+
+        let mut conflicts: Vec<RebaseConflict> = Vec::new();
+        let mut skipped = 0;
+        let mut replayed = 0;
+        let mut pending_replays: Vec<PendingReplay> = Vec::new();
+
+        for summary in &summaries {
+            let has_conflicts = !summary.conflict_keys.is_empty();
+
+            if has_conflicts && strategy == ConflictStrategy::Skip {
+                conflicts.push(RebaseConflict {
+                    original_t: summary.t,
+                    conflict_count: summary.conflict_keys.len(),
+                    keys: summary.conflict_keys.clone(),
+                    resolution: strategy.as_str(),
+                });
+                skipped += 1;
+                continue;
+            }
+
+            let mut commit =
+                fluree_db_core::load_commit_by_id(&branch_store, &summary.commit_id).await?;
+            config.adopt(&commit.namespace_delta);
+            config.flakes(&mut commit.flakes);
+            if let Some(keys) = &summary.resolution_keys {
+                commit.flakes.retain(|flake| keys.contains(&key_of(flake)));
+            }
+
+            let flakes = self
+                .resolve_flakes(
+                    &commit.flakes,
+                    &summary.conflict_keys,
+                    &strategy,
+                    &current_state,
+                )
+                .await?;
+
+            if has_conflicts {
+                conflicts.push(RebaseConflict {
+                    original_t: summary.t,
+                    conflict_count: summary.conflict_keys.len(),
+                    keys: summary.conflict_keys.clone(),
+                    resolution: strategy.as_str(),
+                });
+            }
+
+            if flakes.is_empty() {
+                continue;
+            }
+
+            let staged = self
+                .build_replay_commit(current_state, flakes, &commit)
+                .await?;
+            let commit_id = staged
+                .commit
+                .id
+                .clone()
+                .expect("build_replay_commit guarantees commit.id is set");
+            let commit_bytes = staged.commit_bytes.clone();
+
+            let (_receipt, next_state) = staged
+                .finalize_state()
+                .map_err(|e| ApiError::internal(format!("rebase finalize_state failed: {e}")))?;
+
+            if next_state.at_max_novelty(&self.index_config) {
+                let cumulative = next_state.novelty_size();
+                let max = self.index_config.reindex_max_bytes;
+                return Err(ApiError::http(
+                    422,
+                    format!(
+                        "Rebase would accumulate {cumulative} bytes of novelty (max {max}); \
+                         reindex the source branch then retry, or rebase a smaller commit range."
+                    ),
+                ));
+            }
+
+            pending_replays.push(PendingReplay {
+                commit_id,
+                commit_bytes,
+                original_t: summary.t,
+            });
+            current_state = next_state;
+            replayed += 1;
+        }
+
+        // Copy the source index into the branch namespace, now that every
+        // replay has succeeded. This does not merely copy artifacts: it
+        // publishes the index ref onto the BRANCH. Running it before the
+        // replay left a rebase that failed mid-flight (a SHACL violation,
+        // a storage error) with the branch pointing at the source's index,
+        // and since the prepare error returns above the apply path's
+        // rollback, nothing put it back. The branch then loaded the
+        // source's index and its own commits dropped out of every read.
+        // Replay itself reads the source's state, never the copied index,
+        // so nothing above needs this to have happened. Best-effort. A
+        // rebase that replayed nothing publishes no index here: the local
+        // apply moves the branch onto the source's head and index together,
+        // and the Raft path leaves the branch where it was.
+        let source_index = if pending_replays.is_empty() {
+            None
+        } else {
+            self.copy_source_index(&source_id, &branch_id, &source_record)
+                .await
+        };
+
+        let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
+        let new_head_t = current_state.t();
+
+        Ok(StagedRebase {
+            branch: branch.to_string(),
+            branch_id,
+            source: source_name_owned,
+            source_id,
+            source_head_id,
+            source_head_t,
+            fast_forward: false,
+            total_commits,
+            replayed,
+            skipped,
+            conflicts,
+            rollback_snapshot,
+            pre_rebase_head_id,
+            pre_rebase_head_t,
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state: current_state,
+            pending_replays,
+            source_index,
+            source_record_index: source_record
+                .index_head_id
+                .clone()
+                .map(|id| (id, source_record.index_t)),
+        })
+    }
+
+    /// Apply a [`StagedRebase`] through the local commit pipeline:
+    /// write any `pending_replays` to the content store, single
+    /// fast-forward `publish_commit` to advance the branch HEAD,
+    /// then finalize the cache. The build phase already serialized
+    /// against concurrent transactions via the held write guard.
+    ///
+    /// All-or-nothing: if the blob write or publish fails, nothing
+    /// is on the active head chain. Orphan blobs in the content
+    /// store are GC fodder later.
+    async fn apply_rebase(&self, staged: StagedRebase) -> Result<RebaseReport> {
+        let StagedRebase {
+            branch: _,
+            branch_id,
+            source: _,
+            source_id,
+            source_head_id,
+            source_head_t,
+            fast_forward,
+            total_commits,
+            replayed,
+            skipped,
+            conflicts,
+            rollback_snapshot: _,
+            pre_rebase_head_id: _,
+            pre_rebase_head_t: _,
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state,
+            pending_replays,
+            source_index,
+            source_record_index,
+        } = staged;
+
+        if let Some(ref last_head_id) = new_head_id {
+            if !pending_replays.is_empty() {
+                let content_store = self.content_store(&branch_id);
+                for blob in &pending_replays {
+                    content_store
+                        .put_with_id(&blob.commit_id, &blob.commit_bytes)
+                        .await
+                        .map_err(|e| {
+                            ApiError::internal(format!("rebase commit blob write failed: {e}"))
+                        })?;
+                }
+            }
+            if fast_forward {
+                // The branch's own index is on the source's line already.
+                self.publisher()?
+                    .publish_commit(&branch_id, new_head_t, last_head_id)
+                    .await?;
+            } else {
+                // The new head and the index move in one write, so no reader
+                // sees the new head over the replaced line's index. The copy
+                // above published the source's index only if it was newer
+                // than the branch's own; the branch's own indexes the
+                // replaced line, so it goes whatever its `t`.
+                let (index_head_id, index_t) =
+                    source_index.map_or((None, 0), |(id, t)| (Some(id), t));
+                self.branch_admin()?
+                    .reset_head(
+                        &branch_id,
+                        NsRecordSnapshot {
+                            commit_head_id: Some(last_head_id.clone()),
+                            commit_t: new_head_t,
+                            index_head_id,
+                            index_t,
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        // No branch commit survived, so the branch becomes the source: its
+        // head and index move to the source's together. A reset, since the
+        // source's head can be at or below the branch's `t`.
+        let became_source = new_head_id.is_none() && !fast_forward;
+        if became_source {
+            let (index_head_id, index_t) = match source_record_index {
+                Some((index_cid, index_t)) => {
+                    match self
+                        .copy_index_to_branch(&source_id, &branch_id, &index_cid)
+                        .await
+                    {
+                        Ok(()) => (Some(index_cid), index_t),
+                        Err(e) => {
+                            tracing::warn!(
+                                %e, source = %source_id, branch = %branch_id,
+                                "failed to copy index during rebase; branch will replay from genesis"
+                            );
+                            (None, 0)
+                        }
+                    }
+                }
+                None => (None, 0),
+            };
+            self.branch_admin()?
+                .reset_head(
+                    &branch_id,
+                    NsRecordSnapshot {
+                        commit_head_id: Some(source_head_id.clone()),
+                        commit_t: source_head_t,
+                        index_head_id,
+                        index_t,
+                    },
+                )
+                .await?;
+        }
+
+        // No cache detach here (unlike merge/revert's `apply_staged_detached`):
+        // the replay base is a direct storage load (`self.ledger(&source_id)`),
+        // never a clone of the cached state, so the cache co-holds none of the
+        // dictionaries the replay's `make_mut`s extend — the state threads
+        // owned through the loop. This install performs no dictionary work.
+        // `final_state` is the replay's last state, or the source's when
+        // nothing replayed: installed wherever the branch's head moved.
+        if let Some(mut guard) = write_guard.filter(|_| new_head_id.is_some() || became_source) {
+            // The rebased state is another line than the cached one: an index
+            // install planned on that line must not land on this one.
+            guard.start_line();
+            let needs_reindex = final_state.should_reindex(&self.index_config);
+            let commit_t = final_state.t();
+            self.finalize_commit(guard, final_state, commit_t, needs_reindex)
+                .await?;
+        }
+
+        // Fast-forward keeps the cache disconnected so the next read
+        // reloads from storage (mirrors the previous behavior of
+        // `fast_forward_rebase`).
+        if fast_forward {
+            if let Some(ref lm) = self.ledger_manager {
+                lm.disconnect(&branch_id).await;
+            }
+        }
+
+        Ok(RebaseReport {
+            replayed,
+            conflicts,
+            failures: Vec::new(),
+            source_head_t,
+            source_head_id,
+            fast_forward,
+            total_commits,
+            skipped,
+        })
+    }
+
+    /// Dry-run terminal for rebase: stage `flakes` on top of `state`
+    /// and produce a [`StagedCommit`] representing the replay of
+    /// `original_commit`, without writing the commit blob or
+    /// publishing the ref. The caller finalizes each step via
+    /// `staged.finalize_state()` and publishes the batch's final
+    /// head once through `publish_commit`.
+    ///
+    /// Uses `skip_backpressure=true` (a single rebase can accumulate
+    /// novelty well past the per-commit gate). Atomic rebase is
+    /// instead bounded by a cumulative novelty check the caller
+    /// applies after `staged.finalize_state()` of each step.
+    pub(crate) async fn build_replay_commit(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        original_commit: &Commit,
+    ) -> Result<StagedCommit> {
+        // A commit written before the staging fix can hold a retraction and
+        // an assertion of one fact at one `t`. The pair means the fact holds,
+        // and a commit built here may not hold it, so the replay keeps the
+        // assertion alone.
+        let flakes = fluree_db_transact::resolve_same_t_pairs(&state, flakes);
+        // A commit that conformed on the branch can violate a shape the
+        // source installed since the fork. Each replay is validated against
+        // the state it lands on; the first violation aborts the whole rebase,
+        // which has published nothing yet, naming the commit it stopped on.
+        let (view, outcome) = self
+            .stage_validated(
+                state,
+                flakes,
+                &original_commit.namespace_delta,
+                &original_commit.graph_delta.values().cloned().collect(),
+                "rebase",
+            )
+            .await?;
+        outcome.into_result_with(|report| {
+            format!(
+                "replaying commit t={} was refused:\n{report}",
+                original_commit.t
+            )
+        })?;
+
+        let ns_registry = NamespaceRegistry::from_db(view.db());
+        let commit_opts = CommitOpts::default()
+            .with_skip_backpressure()
+            .with_namespace_delta(original_commit.namespace_delta.clone())
+            .with_graph_iris(original_commit.graph_delta.values().cloned());
+
+        // Replay commits never go through `StagedCommit::apply` — the
+        // caller publishes the batch's final head once — so
+        // `expected_head_ref` is `None` here. raw_txn has no place in
+        // a replay commit, so `txn_id` is `None` as well.
+        let staged = fluree_db_transact::build_commit(
+            view,
+            ns_registry,
+            None,
+            None,
+            &self.index_config,
+            commit_opts,
+        )
+        .await?;
+
+        Ok(staged)
+    }
+
+    /// Filter flakes based on the conflict strategy, generating retractions
+    /// for `TakeBranch`.
+    async fn resolve_flakes(
+        &self,
+        flakes: &[Flake],
+        conflicting_keys: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        source_state: &LedgerState,
+    ) -> Result<Vec<Flake>> {
+        if conflicting_keys.is_empty() {
+            return Ok(flakes.to_vec());
+        }
+
+        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
+
+        match strategy {
+            ConflictStrategy::TakeSource => {
+                // Drop branch's conflicting flakes (source wins).
+                Ok(flakes
+                    .iter()
+                    .filter(|f| {
+                        let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
+                        !conflict_set.contains(&key)
+                    })
+                    .cloned()
+                    .collect())
+            }
+            ConflictStrategy::TakeBranch => {
+                // Keep branch's flakes + retract source's conflicting values.
+                let retractions = self
+                    .build_source_retractions(conflicting_keys, source_state, flakes)
+                    .await?;
+                let mut result = flakes.to_vec();
+                result.extend(retractions);
+                Ok(result)
+            }
+            // TakeBoth: keep all branch flakes, both values coexist.
+            // Abort/Skip: handled before this function is called.
+            _ => Ok(flakes.to_vec()),
+        }
+    }
+
+    /// Apply the two-way half of [`ConflictStrategy`] to a flake set being
+    /// staged.
+    ///
+    /// "Two-way" means: `flakes` is the **winning** side under `TakeSource`
+    /// and the **losing** side under `TakeBranch`. `opposite_state` is the
+    /// ledger state whose current values get retracted when `flakes` wins.
+    /// This is the polarity used by merge (`flakes` = incoming source branch)
+    /// and revert (`flakes` = inverse flakes from the reverted commits); the
+    /// rebase replay path has the opposite polarity (`flakes` = branch
+    /// commits being replayed onto `source_state`) and uses a separate
+    /// resolver.
+    ///
+    /// Behaviour:
+    /// - empty `conflicting_keys` → return `flakes` unchanged
+    /// - `TakeSource` → keep `flakes` + retract `opposite_state`'s values for
+    ///   each conflict key (via [`Self::build_source_retractions`])
+    /// - `TakeBranch` → drop entries of `flakes` whose `(s, p, g)` is in the
+    ///   conflict set
+    /// - `TakeBoth` → keep `flakes` unchanged so both values coexist (merge
+    ///   only; revert rejects this strategy at the entry point)
+    /// - `Abort` / `Skip` → caller's responsibility to short-circuit before
+    ///   invoking this method
+    pub(crate) async fn apply_two_way_strategy(
+        &self,
+        flakes: Vec<Flake>,
+        conflicting_keys: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        opposite_state: &LedgerState,
+    ) -> Result<Vec<Flake>> {
+        if conflicting_keys.is_empty() {
+            return Ok(flakes);
+        }
+
+        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
+
+        match strategy {
+            ConflictStrategy::TakeSource => {
+                let retractions = self
+                    .build_source_retractions(conflicting_keys, opposite_state, &flakes)
+                    .await?;
+                let mut result = flakes;
+                result.extend(retractions);
+                Ok(result)
+            }
+            ConflictStrategy::TakeBranch => Ok(flakes
+                .into_iter()
+                .filter(|f| {
+                    let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
+                    !conflict_set.contains(&key)
+                })
+                .collect()),
+            // TakeBoth: keep all flakes (both values coexist).
+            // Abort/Skip: caller handles these before this function is called.
+            _ => Ok(flakes),
+        }
+    }
+
+    /// Look up `source_state`'s current flakes for the given conflict keys
+    /// and generate retraction flakes (`op: false`) for each — except values
+    /// that `winning` asserts too. Those land in the same commit at the same
+    /// `t`, where the assert is a no-op (already asserted) and a retract
+    /// would win the tie, wiping a value both sides agree on.
+    pub(crate) async fn build_source_retractions(
+        &self,
+        conflicting_keys: &[ConflictKey],
+        source_state: &LedgerState,
+        winning: &[Flake],
+    ) -> Result<Vec<Flake>> {
+        let reasserted: FxHashSet<FactKey> =
+            winning.iter().filter(|f| f.op).map(FactKey::of).collect();
+        let mut retractions = Vec::new();
+
+        for key in conflicting_keys {
+            retractions.extend(
+                current_asserted_for_key(source_state, key)
+                    .await?
+                    .into_iter()
+                    .filter(|fact| !reasserted.contains(&FactKey::of(fact.flake())))
+                    // `t` is restamped by StagedLedger::new.
+                    .map(|fact| fact.retract(0).into_flake()),
+            );
+        }
+
+        Ok(retractions)
+    }
+
+    /// Copy index artifacts from source to branch (best-effort), and
+    /// publish them on the branch where newer than its own. The index now in
+    /// the branch's namespace, if any.
+    async fn copy_source_index(
+        &self,
+        source_id: &str,
+        branch_id: &str,
+        source_record: &fluree_db_nameservice::NsRecord,
+    ) -> Option<(ContentId, i64)> {
+        let index_cid = source_record.index_head_id.as_ref()?;
+        if let Err(e) = self
+            .copy_index_to_branch(source_id, branch_id, index_cid)
+            .await
+        {
+            tracing::warn!(
+                %e, source = %source_id, branch = %branch_id,
+                "failed to copy index during rebase; branch will replay from genesis"
+            );
+            return None;
+        }
+        if let Some(publisher) = self.nameservice_mode.publisher() {
+            if let Err(e) = publisher
+                .publish_index(branch_id, source_record.index_t, index_cid)
+                .await
+            {
+                tracing::warn!(%e, "failed to publish index for rebased branch");
+            }
+        }
+        Some((index_cid.clone(), source_record.index_t))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Lightweight summary of a branch commit, collected during the scan pass.
+/// Holds only the CID, `t`, and pre-computed conflict keys — not the full
+/// flake payload, so the entire branch history fits in memory.
+struct CommitSummary {
+    commit_id: ContentId,
+    t: i64,
+    conflict_keys: Vec<ConflictKey>,
+    /// For a merge that brought the source in, the keys whose flakes are
+    /// that merge's resolution. Every other flake it carries copies a change
+    /// the replay base already holds. `None` for a commit the branch made.
+    resolution_keys: Option<FxHashSet<ConflictKey>>,
+}
+
+/// Read the branch's line, oldest first, and extract each commit's conflict
+/// keys. Full flake payloads are dropped after that, so only summaries
+/// remain in memory.
+async fn scan_branch_commits<C: fluree_db_core::ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+    own: &[ContentId],
+    source_delta: &FxHashSet<ConflictKey>,
+    config: &mut ConfigGraphs,
+) -> Result<Vec<CommitSummary>> {
+    let mut changes = OwnChanges::new(own);
+    let mut summaries = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let mut commit = fluree_db_core::load_commit_by_id(store, cid).await?;
+        config.adopt(&commit.namespace_delta);
+        config.flakes(&mut commit.flakes);
+        let is_own = changes.is_own(cid);
+        changes.retain_changes(cid, &mut commit.flakes);
+        summaries.push(CommitSummary {
+            conflict_keys: find_conflicting_keys(&commit.flakes, source_delta),
+            // Pass 2 reloads the commit, so it needs the keys this pass
+            // kept. They are few: a merge resolves what both sides changed.
+            resolution_keys: (!is_own).then(|| commit.flakes.iter().map(key_of).collect()),
+            commit_id: cid.clone(),
+            t: commit.t,
+        });
+    }
+    Ok(summaries)
+}
+
+/// Find (s, p, g) keys from flakes that overlap with the source delta.
+fn find_conflicting_keys(
+    flakes: &[Flake],
+    source_delta: &FxHashSet<ConflictKey>,
+) -> Vec<ConflictKey> {
+    let mut seen = FxHashSet::default();
+    flakes
+        .iter()
+        .filter_map(|f| {
+            let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
+            if source_delta.contains(&key) && seen.insert(key.clone()) {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The facts `state` currently holds for a conflict key's `(subject,
+/// predicate, graph)`, graph stamped.
+///
+/// Read through [`CurrentFacts`], which stamps the key's graph on index
+/// rows. A range read returns an index-resident row with `g: None` whatever
+/// graph it lives in, so filtering on `g == key.g` dropped every indexed
+/// named-graph value: a take-source merge then left the target's value in
+/// place next to the source's.
+pub(crate) async fn current_asserted_for_key(
+    state: &LedgerState,
+    key: &ConflictKey,
+) -> Result<Vec<StoredFact>> {
+    let Some(slot) = Slot::in_ledger(state, &key.g, &key.s, &key.p) else {
+        return Ok(Vec::new());
+    };
+    Ok(CurrentFacts::new(state)
+        .of_slots(std::slice::from_ref(&slot))
+        .await?
+        .pop()
+        .unwrap_or_default())
+}

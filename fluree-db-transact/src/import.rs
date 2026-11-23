@@ -1,0 +1,1809 @@
+//! Import mode: parse TTL/TriG → stream to commit-v2 blob → store.
+//!
+//! Bypasses the full staging/novelty pipeline for bulk import of clean
+//! RDF data. No WHERE evaluation, no cancellation, no policy enforcement,
+//! no novelty index merge. Duplicate facts within a chunk are written as-is;
+//! dedup happens during indexing or at query time.
+//!
+//! # Supported Formats
+//!
+//! - **Turtle**: Default graph triples only
+//! - **TriG**: Default graph + named GRAPH blocks with g_id allocation
+//! - **JSON-LD**: Expanded JSON-LD documents via GraphSink adapter, `@graph`
+//!   scoping (graph selectors and JSON-LD named graphs) included
+//!
+//! See the Phase 3 plan for full semantics documentation.
+
+mod inner {
+    use crate::commit_v2::CodecEnvelope;
+    use crate::commit_v2::StreamingCommitWriter;
+    use crate::error::{Result, TransactError};
+    use crate::generate::{infer_datatype, DT_ID, DT_LANG_STRING};
+    use crate::import_sink::ImportSink;
+    use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
+    use crate::parse::trig_meta::{parse_trig_phase1, resolve_trig_meta, RawObject, RawTerm};
+    use crate::value_convert::{convert_string_literal, LiteralCheck};
+    use fluree_db_core::ns_encoding::NsSplitMode;
+    use fluree_db_core::CommitId;
+    use fluree_db_core::{
+        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, GraphPosition,
+        Sid, TargetLedger, TxnMetaEntry,
+    };
+
+    /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
+    /// The split mode is only persisted in the genesis commit envelope.
+    fn genesis_split_mode(state: &ImportState, mode: NsSplitMode) -> Option<NsSplitMode> {
+        if state.parent.is_none() {
+            Some(mode)
+        } else {
+            None
+        }
+    }
+    use fluree_graph_turtle::splitter::TurtlePrelude;
+    use rustc_hash::FxHashSet;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// The graph a bulk import writes for the graph IRI `iri` (a TriG block's,
+    /// or a JSON-LD graph name's), read through the ledger's graph-position
+    /// table, as every graph position of a ledger reads it: the ledger's own
+    /// address is its default graph (`None`), `L#<g>` the graph `<g>`, and any
+    /// other IRI the graph of that IRI. `registered` is the import's own graph
+    /// table. `urn:default`, a name that is no graph of the ledger, and the
+    /// ledger's system graphs are refused.
+    fn import_graph_position<F>(
+        iri: &str,
+        ledger_id: &str,
+        registered: &F,
+    ) -> Result<Option<String>>
+    where
+        F: Fn(&str) -> Option<u16>,
+    {
+        crate::stage::refuse_default_graph_name(iri)?;
+        let graph = match fluree_db_core::LedgerId::parse(ledger_id) {
+            Ok(id) => match TargetLedger::new(&id, registered).graph_position(iri) {
+                GraphPosition::Default => return Ok(None),
+                // Another ledger's config graph is refused below, as any is.
+                GraphPosition::OtherLedgersSystemGraph(iri)
+                    if fluree_db_core::graph_registry::names_txn_meta_graph(&iri) =>
+                {
+                    return Err(crate::stage::other_ledgers_system_graph(&id, &iri));
+                }
+                GraphPosition::Registered { iri, .. }
+                | GraphPosition::New(iri)
+                | GraphPosition::OtherLedgersSystemGraph(iri) => iri.into_owned(),
+                GraphPosition::NotAGraph => {
+                    return Err(TransactError::Parse(format!(
+                        "<{iri}> names no graph an import can write: an address of this \
+                         ledger names its default graph, or one of its graphs through '#', \
+                         and carries no time"
+                    )))
+                }
+            },
+            Err(_) => iri.to_string(),
+        };
+        refuse_reserved_graph_iri(&graph, ledger_id)?;
+        Ok(Some(graph))
+    }
+
+    /// The named graph a bulk import into one graph of `ledger_id` writes,
+    /// for the graph name `iri` it was handed: read through the ledger's
+    /// graph-position table as a TriG block's graph is (`L#<g>` names the
+    /// graph `<g>`). `None` when the name is the ledger's default graph;
+    /// `urn:default`, a name that is no graph, and the system graphs are
+    /// refused.
+    pub fn target_graph_iri(iri: &str, ledger_id: &str) -> Result<Option<String>> {
+        import_graph_position(iri, ledger_id, &|_: &str| None)
+    }
+
+    /// Refuse a named graph a bulk import may not write, by its literal IRI:
+    /// the ledger's two system graphs, mirroring the staged-write guard's
+    /// shape. Bulk import bypasses staging, so that guard never sees its
+    /// graphs; `import_trig_commit` says why they must not be written.
+    fn refuse_reserved_graph_iri(iri: &str, ledger_id: &str) -> Result<()> {
+        if iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id) {
+            return Err(TransactError::ReservedGraphTarget {
+                graph_iri: iri.to_string(),
+            });
+        }
+        // Any ledger's config graph IRI is this ledger's config graph.
+        if fluree_db_core::graph_registry::names_config_graph(iri) {
+            return Err(TransactError::ConfigGraphImportUnsupported {
+                graph_iri: iri.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The second arm of [`refuse_reserved_graph_iri`], mirroring `stage.rs`:
+    /// refuse by what the IRI actually *routes to*, not only by how it is
+    /// spelled. The shared graph allocator is pre-seeded with the two
+    /// reserved IRIs, so this is belt-and-braces today; it is what keeps the
+    /// guard correct if the seeding ever changes. One integer compare per
+    /// graph.
+    fn refuse_reserved_g_id(iri: &str, g_id: u16) -> Result<()> {
+        if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
+            return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
+                TransactError::ConfigGraphImportUnsupported {
+                    graph_iri: iri.to_string(),
+                }
+            } else {
+                TransactError::ReservedGraphTarget {
+                    graph_iri: iri.to_string(),
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop a bare `graph` key from the top level of a JSON-LD document that
+    /// is not an envelope, as the transaction parser drops it.
+    ///
+    /// There the key is a transaction's routing key (`RESERVED_TXN_KEYS`):
+    /// a transaction strips it and writes the node where it would without it,
+    /// while the expander would read the same key as a graph selector. (An
+    /// envelope's own keys are not data on either path, and the bare key on
+    /// a node inside the document is a selector on both.) A context that
+    /// defines `graph` as a term makes it an ordinary property, kept.
+    /// `shared` is the context a newline-delimited line is read under, beneath
+    /// its own; a whole document has none.
+    fn strip_top_level_graph_key(
+        doc: &mut serde_json::Value,
+        shared: Option<&fluree_graph_json_ld::ParsedContext>,
+    ) -> Result<()> {
+        let Some(obj) = doc.as_object().filter(|obj| obj.contains_key("graph")) else {
+            return Ok(());
+        };
+        if fluree_graph_json_ld::envelope_graph_key(obj)?.is_some() {
+            return Ok(());
+        }
+        let context = match shared {
+            Some(shared) => line_context(shared, doc)?.into_owned(),
+            None => crate::parse::edge_annotations::top_level_context(doc)?,
+        };
+        if fluree_graph_json_ld::is_graph_key("graph", &context) {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove("graph");
+            }
+        }
+        Ok(())
+    }
+
+    /// How a JSON-LD chunk of a bulk import is laid out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JsonLdChunk {
+        /// One JSON-LD document: a `.jsonld` file, whole.
+        Document,
+        /// Newline-delimited JSON-LD as the ndjson reader hands it over: a
+        /// `{"@context": <shared>, "@graph": [lines]}` wrapper. Each line is a
+        /// document of its own under the shared context, as it would be
+        /// imported or inserted alone: its own `@context` resolves its graph
+        /// names, a top-level bare `graph` key is dropped, and a line that is
+        /// an envelope is unwrapped. (Blank-node labels still unify across
+        /// the lines of a context segment, as the reader documents.)
+        Lines,
+    }
+
+    /// The lines of a newline-delimited chunk: its wrapper's `@graph`.
+    fn ndjson_lines(doc: &serde_json::Value) -> Result<&[serde_json::Value]> {
+        match doc.get("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn ndjson_lines_mut(doc: &mut serde_json::Value) -> Result<&mut [serde_json::Value]> {
+        match doc.get_mut("@graph") {
+            Some(serde_json::Value::Array(lines)) => Ok(lines),
+            _ => Err(not_an_ndjson_chunk()),
+        }
+    }
+
+    fn not_an_ndjson_chunk() -> TransactError {
+        TransactError::Parse(
+            "a newline-delimited JSON-LD chunk is a {\"@graph\": [lines]} wrapper".to_string(),
+        )
+    }
+
+    /// Whether a newline-delimited `line` reads the same as a node of the
+    /// chunk's envelope as it does as a document of its own: it has no
+    /// `@context` of its own and is not itself an envelope.
+    fn reads_as_a_node(line: &serde_json::Value) -> Result<bool> {
+        Ok(match line.as_object() {
+            Some(obj) => {
+                !obj.contains_key("@context")
+                    && fluree_graph_json_ld::envelope_graph_key(obj)?.is_none()
+            }
+            None => true,
+        })
+    }
+
+    /// Refuse reserved predicates in a chunk as written, expanded as the
+    /// import expands it: the chunk, and each newline-delimited line that does
+    /// not read as a node of it (`shared` is the lines' shared context).
+    fn refuse_reserved_in_chunk(
+        doc: &serde_json::Value,
+        shared: Option<&fluree_graph_json_ld::ParsedContext>,
+    ) -> Result<()> {
+        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
+        let expanded = fluree_graph_json_ld::expand(doc).map_err(expand_error)?;
+        crate::parse::edge_annotations::refuse_reserved_iris(&expanded)?;
+        if let Some(shared) = shared {
+            for line in ndjson_lines(doc)? {
+                if !reads_as_a_node(line)? {
+                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                        .map_err(expand_error)?;
+                    crate::parse::edge_annotations::refuse_reserved_iris(&expanded)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The top-level context of a newline-delimited `line`: the shared one,
+    /// beneath the line's own `@context` if it has one.
+    fn line_context<'s>(
+        shared: &'s fluree_graph_json_ld::ParsedContext,
+        line: &serde_json::Value,
+    ) -> Result<std::borrow::Cow<'s, fluree_graph_json_ld::ParsedContext>> {
+        Ok(match line.get("@context") {
+            Some(own) => {
+                std::borrow::Cow::Owned(fluree_graph_json_ld::parse_context_with_base(shared, own)?)
+            }
+            None => std::borrow::Cow::Borrowed(shared),
+        })
+    }
+
+    /// Write one expanded JSON-LD document into `sink`. Its graph names
+    /// resolve against `context`, the document's top-level `@context`,
+    /// computed only for a document that names a graph (the adapter asks once
+    /// per name). A refusal keeps its own error.
+    fn write_jsonld_document<'c>(
+        expanded: &serde_json::Value,
+        sink: &mut ImportSink,
+        context: impl FnOnce() -> Result<std::borrow::Cow<'c, fluree_graph_json_ld::ParsedContext>>,
+        ledger_id: &str,
+    ) -> Result<()> {
+        let mut context = Some(context);
+        let mut graph_context = None;
+        let mut refusal: Option<TransactError> = None;
+        let converted =
+            fluree_graph_json_ld::adapter::to_graph_events_scoped(expanded, sink, |name| {
+                let resolved = (|| {
+                    if let Some(context) = context.take() {
+                        graph_context = Some(context()?);
+                    }
+                    let parsed = graph_context.as_deref().ok_or_else(|| {
+                        TransactError::Parse(
+                            "no @context to resolve a graph name against".to_string(),
+                        )
+                    })?;
+                    import_graph_name(name, parsed, ledger_id)
+                })();
+                resolved.map_err(|e| {
+                    let message = e.to_string();
+                    refusal = Some(e);
+                    fluree_graph_json_ld::adapter::AdapterError::Unsupported(message)
+                })
+            });
+        converted.map_err(|e| {
+            refusal.unwrap_or_else(|| TransactError::Parse(format!("JSON-LD adapter error: {e}")))
+        })
+    }
+
+    /// Where a graph name in a bulk-imported JSON-LD document writes: the
+    /// default graph (`None`), or a named graph by IRI.
+    ///
+    /// A selector resolves as a transaction's data resolves it
+    /// ([`resolve_written_graph`], against the document's top-level
+    /// `@context`), and a named graph's `@id` as a transaction's does
+    /// ([`named_graph`]). The graph then goes through the ledger's
+    /// graph-position table, as a TriG block's does ([`import_graph_position`]):
+    /// the ledger's own address is its default graph, and the system graphs
+    /// are refused, `config` included (a transaction may write the config
+    /// graph, a bulk import may not). A parallel worker has no graph table of
+    /// the import's, so this reads it as empty: a graph is named here by the
+    /// IRI the table would hold it under.
+    ///
+    /// [`resolve_written_graph`]: crate::parse::jsonld::resolve_written_graph
+    /// [`named_graph`]: crate::parse::jsonld::named_graph
+    fn import_graph_name(
+        name: fluree_graph_json_ld::adapter::GraphNameRef<'_>,
+        context: &fluree_graph_json_ld::ParsedContext,
+        ledger_id: &str,
+    ) -> Result<Option<String>> {
+        use crate::ir::GraphName;
+        use fluree_graph_json_ld::adapter::GraphNameRef;
+        let graph = match name {
+            GraphNameRef::Selector(raw) => crate::parse::jsonld::resolve_written_graph(
+                raw,
+                &HashMap::new(),
+                context,
+                true,
+                ledger_id,
+                crate::parse::jsonld::GraphRole::Data,
+                &mut fluree_db_query::VarRegistry::new(),
+            )?,
+            GraphNameRef::NamedGraph(id) => crate::parse::jsonld::named_graph(id, id, ledger_id)?,
+        };
+        let iri = match &graph {
+            GraphName::Default => return Ok(None),
+            GraphName::Iri(iri) => iri.as_str(),
+            GraphName::Address(address) => address.as_str(),
+            GraphName::Var(_) => {
+                return Err(TransactError::Parse(
+                    "a bulk import has no \"where\" to bind a variable graph".to_string(),
+                ))
+            }
+        };
+        import_graph_position(iri, ledger_id, &|_: &str| None)
+    }
+
+    /// Mutable state carried across chunks during an import session.
+    pub struct ImportState {
+        /// Current transaction number. Starts at 0; first chunk produces t=1.
+        pub t: i64,
+        /// Reference to the previous commit (address + id).
+        pub parent: Option<CommitId>,
+        /// Namespace registry (accumulates across chunks).
+        pub ns_registry: NamespaceRegistry,
+        /// Cumulative flake count across all commits (for progress reporting).
+        pub cumulative_flakes: u64,
+        /// Import start time (reused for all commits to avoid per-chunk Utc::now).
+        pub import_time: String,
+        /// Named graph IRI → g_id mapping (stable across chunks).
+        /// g_id 0 = default graph, 1 = txn-meta, 2 = config, 3+ = user-defined.
+        pub graph_ids: HashMap<String, u16>,
+        /// Next available g_id for user-defined named graphs. Only used by the
+        /// non-spooling fallback; the spooling path allocates from the shared
+        /// graph allocator instead (see `import_trig_commit`).
+        pub next_gid: u16,
+        /// Accumulated turtle @prefix short names: IRI → short prefix.
+        /// Captured from `on_prefix()` calls across all chunks.
+        pub prefix_map: HashMap<String, String>,
+        /// The owners whose list a chunk has stored compactly, for chunks
+        /// that do not spool (a spooled chunk shares
+        /// `SpoolConfig::list_owners`).
+        pub list_owners: crate::lists::ClaimedOwners,
+    }
+
+    impl ImportState {
+        /// Create a new import state for a fresh ledger.
+        ///
+        /// `NamespaceRegistry::new()` includes all predefined namespace codes
+        /// (rdf, xsd, etc). User-defined namespaces are added as chunks are parsed.
+        pub fn new() -> Self {
+            Self {
+                t: 0,
+                parent: None,
+                ns_registry: NamespaceRegistry::new(),
+                cumulative_flakes: 0,
+                import_time: chrono::Utc::now().to_rfc3339(),
+                graph_ids: HashMap::new(),
+                // 0=default, 1=txn-meta, 2=config (reserved); user graphs start
+                // at FIRST_USER_GRAPH_ID. Matches the shared graph allocator's
+                // dict_id+1 convention so spooled and fallback g_ids agree.
+                next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+                prefix_map: HashMap::new(),
+                list_owners: Default::default(),
+            }
+        }
+    }
+
+    impl ImportState {
+        /// Import state that continues an existing ledger's commit chain:
+        /// the first chunk commits at `t + 1` on top of `parent`, under the
+        /// ledger's namespace codes and named graphs (IRI → g_id).
+        pub fn continuing(
+            t: i64,
+            parent: CommitId,
+            ns_registry: NamespaceRegistry,
+            graph_ids: HashMap<String, u16>,
+        ) -> Self {
+            let next_gid = graph_ids
+                .values()
+                .map(|&g_id| g_id + 1)
+                .max()
+                .unwrap_or(0)
+                .max(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID);
+            Self {
+                t,
+                parent: Some(parent),
+                ns_registry,
+                graph_ids,
+                next_gid,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl Default for ImportState {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Result of importing a single TTL chunk.
+    pub struct ImportCommitResult {
+        /// Content identifier (CIDv1).
+        pub commit_id: ContentId,
+        /// Transaction number.
+        pub t: i64,
+        /// Number of flakes in this commit.
+        pub flake_count: u32,
+        /// Size of the committed blob in bytes.
+        pub blob_bytes: usize,
+        /// The raw commit blob (moved, not cloned — zero extra cost).
+        /// Available for downstream consumers (e.g., run generation)
+        /// without re-reading from storage.
+        pub commit_blob: Vec<u8>,
+        /// Buffered spool result from this chunk's parse (if spool was enabled).
+        /// Contains buffered RunRecords with chunk-local IDs and chunk-local
+        /// dictionaries for the post-parse sort + sorted commit write pipeline.
+        pub spool_result: Option<crate::import_sink::BufferedSpoolResult>,
+    }
+
+    /// Import a single TTL chunk as a v2 commit blob.
+    ///
+    /// Parses the Turtle input, streams flakes through the commit-v2 writer,
+    /// and stores the resulting blob. Advances `state` for the next chunk.
+    ///
+    /// # Arguments
+    /// * `state` — mutable import state (carried across chunks)
+    /// * `ttl` — Turtle input text
+    /// * `storage` — storage backend for writing commit blobs
+    /// * `ledger_id` — ledger name for storage path construction
+    /// * `skolem_base` — document-scoped blank-node key, built by the caller
+    ///   via `fluree_db_core::skolem::skolem_base`
+    /// * `compress` — whether to zstd-compress the ops stream
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_commit<S>(
+        state: &mut ImportState,
+        ttl: &str,
+        storage: &S,
+        ledger_id: &str,
+        skolem_base: &str,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+    ) -> Result<ImportCommitResult>
+    where
+        S: ContentAddressedWrite,
+    {
+        let new_t = state.t + 1;
+
+        // 1. Create ImportSink + parse TTL
+        let ns_codes_before = state.ns_registry.code_count();
+        let _parse_span = tracing::debug_span!(
+            "import_parse",
+            t = new_t,
+            ttl_bytes = ttl.len(),
+            ns_codes = ns_codes_before,
+        )
+        .entered();
+        // Allocate namespace codes through the spool's shared allocator when
+        // spooling — SpoolContext resolves code→prefix at record-push time
+        // (mid-parse), so registry-only codes would fall back to an empty
+        // prefix and write suffix-only strings into the index dicts. See the
+        // matching comment in `import_trig_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        fluree_graph_turtle::parse(ttl, &mut sink)
+            .map_err(|e| TransactError::Parse(e.to_string()))?;
+        drop(_parse_span);
+
+        // 2. Retrieve writer, get namespace delta, build envelope
+        let (writer, op_count, spool_result, envelope) = {
+            let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
+            let (writer, chunk_prefix_map, spool_ctx) = sink
+                .into_parts()
+                .map_err(crate::import_sink::encode_failure)?;
+            state.prefix_map.extend(chunk_prefix_map);
+
+            let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+            let op_count = writer.op_count();
+
+            // Adopt this commit's shared-allocator codes into the registry so
+            // take_delta() includes them in the commit's namespace_delta.
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
+            let ns_delta = state.ns_registry.take_delta();
+            let ns_codes_after = state.ns_registry.code_count();
+
+            tracing::debug!(
+                op_count,
+                ns_delta_size = ns_delta.len(),
+                ns_codes = ns_codes_after,
+                "import sink finalized"
+            );
+
+            // 3. Update cumulative flake count
+            state.cumulative_flakes += op_count as u64;
+
+            // Persist split mode in genesis commit (first chunk, no previous ref).
+            let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+            let envelope = CodecEnvelope {
+                t: new_t,
+                parents: state.parent.clone().into_iter().collect(),
+                namespace_delta: ns_delta,
+                txn: None,
+                time: Some(state.import_time.clone()),
+
+                txn_signature: None,
+                txn_meta: Vec::new(),
+                graph_delta: HashMap::new(),
+                ns_split_mode,
+                graph_drops: Vec::new(),
+            };
+
+            (writer, op_count, spool_result, envelope)
+        };
+
+        // 4. Finalize blob
+        let result = {
+            let _span = tracing::debug_span!("import_finish_blob", t = new_t, op_count).entered();
+            writer.finish(&envelope)?
+        };
+        let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+        let blob_bytes = result.bytes.len();
+
+        // 5. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
+        let write_res = {
+            use tracing::Instrument as _;
+            storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
+                .await?
+        };
+
+        tracing::debug!(
+            t = new_t,
+            flakes = op_count,
+            blob_bytes,
+            address = %write_res.address,
+            "import commit stored"
+        );
+
+        // 8. Advance state
+        state.t = new_t;
+        state.parent = Some(commit_cid.clone());
+
+        Ok(ImportCommitResult {
+            commit_id: commit_cid,
+            t: new_t,
+            flake_count: op_count,
+            blob_bytes,
+            commit_blob: result.bytes,
+            spool_result,
+        })
+    }
+
+    /// Import a single Turtle chunk using a pre-extracted header prelude (prefixes/base).
+    ///
+    /// This avoids the need to prepend the raw prefix block text onto every chunk,
+    /// which would otherwise force an extra full-chunk string copy per parse.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_commit_with_prelude<S>(
+        state: &mut ImportState,
+        ttl: &str,
+        prelude: &TurtlePrelude,
+        storage: &S,
+        ledger_id: &str,
+        skolem_base: &str,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+    ) -> Result<ImportCommitResult>
+    where
+        S: ContentAddressedWrite,
+    {
+        // Apply prelude once (equivalent to parsing the directive header).
+        if state.t == 0 {
+            for (short, ns_iri) in &prelude.prefixes {
+                state.ns_registry.get_or_allocate(ns_iri);
+                if !short.is_empty() {
+                    state.prefix_map.insert(ns_iri.clone(), short.clone());
+                }
+            }
+        }
+
+        let new_t = state.t + 1;
+
+        let ns_codes_before = state.ns_registry.code_count();
+        let _parse_span = tracing::debug_span!(
+            "import_parse",
+            t = new_t,
+            ttl_bytes = ttl.len(),
+            ns_codes = ns_codes_before,
+        )
+        .entered();
+        // Shared-allocator-backed allocation for spool prefix visibility;
+        // see the comment in `import_commit`.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        fluree_graph_turtle::parse_with_prefixes_base(
+            ttl,
+            &mut sink,
+            &prelude.prefixes,
+            prelude.base.as_deref(),
+        )
+        .map_err(|e| TransactError::Parse(e.to_string()))?;
+        drop(_parse_span);
+
+        let (writer, op_count, spool_result, envelope) = {
+            let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
+            let (writer, _chunk_prefix_map, spool_ctx) = sink
+                .into_parts()
+                .map_err(crate::import_sink::encode_failure)?;
+
+            let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+            let op_count = writer.op_count();
+
+            let new_codes = worker_cache.into_new_codes();
+            if !new_codes.is_empty() {
+                let adopted = shared_ns.lookup_codes(&new_codes);
+                state
+                    .ns_registry
+                    .adopt_delta_for_persistence(&adopted)
+                    .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+            }
+            let ns_delta = state.ns_registry.take_delta();
+            let ns_codes_after = state.ns_registry.code_count();
+
+            tracing::debug!(
+                op_count,
+                ns_delta_size = ns_delta.len(),
+                ns_codes = ns_codes_after,
+                "import sink finalized"
+            );
+
+            state.cumulative_flakes += op_count as u64;
+
+            // Persist split mode in genesis commit (first chunk, no previous ref).
+            let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+            let envelope = CodecEnvelope {
+                t: new_t,
+                parents: state.parent.clone().into_iter().collect(),
+                namespace_delta: ns_delta,
+                txn: None,
+                time: Some(state.import_time.clone()),
+
+                txn_signature: None,
+                txn_meta: Vec::new(),
+                graph_delta: HashMap::new(),
+                ns_split_mode,
+                graph_drops: Vec::new(),
+            };
+
+            (writer, op_count, spool_result, envelope)
+        };
+
+        let result = {
+            let _span = tracing::debug_span!("import_finish_blob", t = new_t, op_count).entered();
+            writer.finish(&envelope)?
+        };
+        let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+        let blob_bytes = result.bytes.len();
+
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
+        let write_res = {
+            use tracing::Instrument as _;
+            storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
+                .await?
+        };
+
+        tracing::debug!(
+            t = new_t,
+            flakes = op_count,
+            blob_bytes,
+            address = %write_res.address,
+            "import commit stored"
+        );
+
+        state.t = new_t;
+        state.parent = Some(commit_cid.clone());
+
+        Ok(ImportCommitResult {
+            commit_id: commit_cid,
+            t: new_t,
+            flake_count: op_count,
+            blob_bytes,
+            commit_blob: result.bytes,
+            spool_result,
+        })
+    }
+
+    /// Import a single TriG chunk as a v2 commit blob (with named graph support).
+    ///
+    /// Like `import_commit`, but supports TriG format with GRAPH blocks for named graphs.
+    /// If the input contains GRAPH blocks, they are processed and stored with appropriate
+    /// graph IDs, and `graph_delta` is populated in the commit envelope.
+    ///
+    /// # Named Graph ID Allocation
+    ///
+    /// - g_id 0: default graph (implicit)
+    /// - g_id 1: txn-meta graph (reserved)
+    /// - g_id 2+: user-defined named graphs
+    ///
+    /// # Arguments
+    /// * `state` — mutable import state (carried across chunks)
+    /// * `trig` — TriG input text (Turtle-compatible if no GRAPH blocks)
+    /// * `storage` — storage backend for writing commit blobs
+    /// * `ledger_id` — ledger name for storage path construction
+    /// * `skolem_base` — document-scoped blank-node key, built by the caller
+    ///   via `fluree_db_core::skolem::skolem_base`
+    /// * `compress` — whether to zstd-compress the ops stream
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_trig_commit<S>(
+        state: &mut ImportState,
+        trig: &str,
+        storage: &S,
+        ledger_id: &str,
+        skolem_base: &str,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+    ) -> Result<ImportCommitResult>
+    where
+        S: ContentAddressedWrite,
+    {
+        let new_t = state.t + 1;
+
+        // 1. Parse TriG to extract GRAPH blocks
+        let phase1 = parse_trig_phase1(trig)?;
+
+        // If no named graphs and no txn-meta, use the faster pure-Turtle path
+        if phase1.named_graphs.is_empty() && phase1.raw_meta.is_none() {
+            return import_commit(
+                state,
+                trig,
+                storage,
+                ledger_id,
+                skolem_base,
+                compress,
+                spool_dir,
+                spool_config,
+                chunk_idx,
+            )
+            .await;
+        }
+
+        let _parse_span = tracing::debug_span!(
+            "import_trig_parse",
+            t = new_t,
+            trig_bytes = trig.len(),
+            named_graph_count = phase1.named_graphs.len(),
+        )
+        .entered();
+
+        // 2. Create ImportSink and parse default graph Turtle.
+        //
+        // Namespace codes MUST be allocated through the spool's shared
+        // allocator (not `state.ns_registry` directly): SpoolContext resolves
+        // code→prefix via `ns_alloc` at record-push time — i.e. DURING the
+        // parse, right after an `@prefix` directive allocates the code. Codes
+        // that only live in the registry are invisible to it, and its
+        // empty-prefix fallback would permanently write suffix-only predicate
+        // strings into the index's predicate dict (breaking bound-predicate
+        // lookups after import). Without spooling, a throwaway allocator
+        // seeded from the registry preserves exact code assignment.
+        let shared_ns: Arc<SharedNamespaceAllocator> = match spool_config {
+            Some(cfg) => Arc::clone(&cfg.ns_alloc),
+            None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
+        };
+        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            new_t,
+            skolem_base.to_string(),
+            0,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if spool_config.is_none() {
+            sink.set_list_owners(Arc::clone(&state.list_owners));
+        }
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        fluree_graph_turtle::parse(&phase1.turtle, &mut sink)
+            .map_err(|e| TransactError::Parse(e.to_string()))?;
+
+        // 3. Retrieve writer + spool context for named graph flakes.
+        //
+        // Default-graph triples were parsed (and spooled) above. Named-graph
+        // flakes are pushed below to BOTH the commit blob (`writer`) and the
+        // spool (`spool_ctx`), so they reach the Tier-2 index and the index
+        // root's `named_graphs` routing exactly like default-graph triples.
+        // The spool is finished only after the named-graph loop completes.
+        let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
+            .into_parts()
+            .map_err(crate::import_sink::encode_failure)?;
+        state.prefix_map.extend(chunk_prefix_map);
+        let mut op_count = writer.op_count();
+
+        // 4. Process named graphs
+        // Use session-level graph ID allocation for stability across chunks.
+        // Only new mappings (introduced by this commit) go into graph_delta.
+        let mut graph_delta: HashMap<u16, String> = HashMap::new();
+
+        // Reserved system graphs are refused HERE because bulk import bypasses
+        // staging entirely: #1838's data-write guard lives in `stage()`
+        // (`stage.rs`, `ReservedGraphTarget`) and never sees these blocks. The
+        // parser assumes otherwise -- `parse/trig_meta.rs` notes "a write to the
+        // ledger's full txn-meta IRI is refused in `stage()`" -- which holds for
+        // every write surface except this one.
+        //
+        // Without the guard the flakes are encoded into the commit blob under
+        // the reserved g_id and then dropped by the graph-scoped index builder,
+        // which builds g_id 1 only from the synthetic commit-metadata chunk and
+        // has no pass for g_id 2 at all. The result is durable-but-unreadable
+        // data on an indexed ledger and, worse, *readable* forged commit
+        // provenance on a replica that has not indexed yet (issue #1846).
+        //
+        // The `<#txn-meta>` sentinel spelling is a different thing and stays
+        // supported: `parse_trig_phase1` routes it to `raw_meta`, so legitimate
+        // commit metadata never reaches this loop.
+        for block in &phase1.named_graphs {
+            let lookup = |iri: &str| state.graph_ids.get(iri).copied();
+            let block_graph = import_graph_position(&block.iri, ledger_id, &lookup)?;
+
+            let graph: Option<(u16, Sid)> = match block_graph {
+                None => None,
+                Some(iri) => {
+                    // Allocate or reuse g_id for this graph IRI.
+                    //
+                    // When spooling (index build) is active, allocate from the
+                    // shared graph allocator so the commit's `graph_delta` and
+                    // the index's `graphs.dict` / query graph registry agree on
+                    // the same g_id (allocator convention: dict_id + 1 = g_id).
+                    // Without spooling (commit-only paths), fall back to the
+                    // session counter.
+                    let g_id = if let Some(&existing) = state.graph_ids.get(&iri) {
+                        existing
+                    } else {
+                        // New graph IRI in this session — allocate and record in delta.
+                        let id = match spool_ctx.as_mut() {
+                            Some(sc) => sc.graph_g_id_for_iri(&iri),
+                            None => {
+                                let id = state.next_gid;
+                                state.next_gid += 1;
+                                id
+                            }
+                        };
+                        state.graph_ids.insert(iri.clone(), id);
+                        graph_delta.insert(id, iri.clone());
+                        id
+                    };
+
+                    refuse_reserved_g_id(&iri, g_id)?;
+
+                    // Create a graph Sid (using the graph IRI's namespace + local name)
+                    Some((g_id, worker_cache.sid_for_iri(&iri)))
+                }
+            };
+            // A block of the default graph spools under the default graph's id
+            // and encodes flakes with no graph.
+            let (g_id, graph_sid) = match graph {
+                Some((g_id, sid)) => (g_id, Some(sid)),
+                None => (fluree_db_core::graph_registry::DEFAULT_GRAPH_ID, None),
+            };
+
+            // Process each triple in this named graph
+            for triple in &block.triples {
+                let subject = triple.subject.as_ref().ok_or_else(|| {
+                    TransactError::Parse("named graph triple missing subject".to_string())
+                })?;
+
+                let s = expand_term(subject, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let p = expand_term(
+                    &triple.predicate,
+                    &block.prefixes,
+                    &mut worker_cache,
+                    skolem_base,
+                )?;
+
+                for obj in &triple.objects {
+                    let (o, dt, lang) =
+                        expand_object(obj, &block.prefixes, &mut worker_cache, skolem_base)?;
+
+                    // Spool the named-graph flake under its g_id (so it enters
+                    // the index), then encode it into the commit blob.
+                    if let Some(sc) = spool_ctx.as_mut() {
+                        sc.push_named_graph_record(
+                            g_id,
+                            &block.iri,
+                            crate::import_sink::FlakeRecord {
+                                s: &s,
+                                p: &p,
+                                o: &o,
+                                dt: &dt,
+                                lang: lang.as_deref(),
+                                list_index: None,
+                                t: new_t,
+                            },
+                        )?;
+                    }
+
+                    let meta = lang.as_deref().map(FlakeMeta::with_lang);
+                    let flake = match &graph_sid {
+                        Some(graph_sid) => Flake::new_in_graph(
+                            graph_sid.clone(),
+                            s.clone(),
+                            p.clone(),
+                            o,
+                            dt,
+                            new_t,
+                            true,
+                            meta,
+                        ),
+                        None => Flake::new(s.clone(), p.clone(), o, dt, new_t, true, meta),
+                    };
+
+                    writer.push_flake(&flake).map_err(|e| {
+                        TransactError::Parse(format!("failed to encode named graph flake: {e}"))
+                    })?;
+                    op_count += 1;
+                }
+            }
+
+            // TriG-star: `f:reifies*` bundles in the same graph as the edge
+            // they reify — the bundle the default-graph `ImportSink` emits,
+            // with `f:reifiesGraph` set.
+            for r in &block.reified {
+                let ann = expand_term(&r.reifier, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let s = expand_term(&r.subject, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let p = expand_term(
+                    &r.predicate,
+                    &block.prefixes,
+                    &mut worker_cache,
+                    skolem_base,
+                )?;
+                let (o, dt, lang) =
+                    expand_object(&r.object, &block.prefixes, &mut worker_cache, skolem_base)?;
+                let dtc = match lang {
+                    Some(lang) => fluree_db_core::DatatypeConstraint::LangTag(Arc::from(lang)),
+                    None => fluree_db_core::DatatypeConstraint::Explicit(dt),
+                };
+                let bundle = crate::generate::flakes::reified_triple_bundle(
+                    graph_sid.clone(),
+                    s,
+                    p,
+                    o,
+                    &dtc,
+                    &ann,
+                    new_t,
+                )?;
+                for flake in bundle {
+                    if let Some(sc) = spool_ctx.as_mut() {
+                        sc.push_named_graph_record(
+                            g_id,
+                            &block.iri,
+                            crate::import_sink::FlakeRecord {
+                                s: &flake.s,
+                                p: &flake.p,
+                                o: &flake.o,
+                                dt: &flake.dt,
+                                lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
+                                list_index: None,
+                                t: new_t,
+                            },
+                        )?;
+                    }
+                    writer.push_flake(&flake).map_err(|e| {
+                        TransactError::Parse(format!("failed to encode reifier bundle flake: {e}"))
+                    })?;
+                    op_count += 1;
+                }
+            }
+        }
+
+        // Named-graph flakes are now in the spool; finish it for the index.
+        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
+        drop(_parse_span);
+
+        // Adopt codes this commit allocated in the shared allocator into the
+        // registry, recording them for persistence so take_delta() below
+        // includes them in this commit's namespace_delta.
+        let new_codes = worker_cache.into_new_codes();
+        if !new_codes.is_empty() {
+            let adopted = shared_ns.lookup_codes(&new_codes);
+            state
+                .ns_registry
+                .adopt_delta_for_persistence(&adopted)
+                .map_err(|e| TransactError::Parse(format!("namespace adopt conflict: {e}")))?;
+        }
+
+        // 5. Resolve txn-meta if present
+        let txn_meta = if let Some(ref raw_meta) = phase1.raw_meta {
+            resolve_trig_meta(raw_meta, &mut state.ns_registry)?
+        } else {
+            Vec::new()
+        };
+
+        // 6. Build envelope
+        let ns_delta = state.ns_registry.take_delta();
+        let named_graph_count = graph_delta.len();
+
+        tracing::debug!(
+            op_count,
+            ns_delta_size = ns_delta.len(),
+            graph_delta_size = named_graph_count,
+            txn_meta_count = txn_meta.len(),
+            "import trig sink finalized"
+        );
+
+        state.cumulative_flakes += op_count as u64;
+
+        // Persist split mode in genesis commit (first chunk, no previous ref).
+        let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+        let envelope = CodecEnvelope {
+            t: new_t,
+            parents: state.parent.clone().into_iter().collect(),
+            namespace_delta: ns_delta,
+            txn: None,
+            time: Some(state.import_time.clone()),
+
+            txn_signature: None,
+            txn_meta,
+            graph_delta,
+            ns_split_mode,
+            graph_drops: Vec::new(),
+        };
+
+        // 7. Finalize blob
+        let result = {
+            let _span =
+                tracing::debug_span!("import_trig_finish_blob", t = new_t, op_count).entered();
+            writer.finish(&envelope)?
+        };
+        let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+        let blob_bytes = result.bytes.len();
+
+        // 8. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await — see
+        // `import_commit`'s store step.
+        let write_res = {
+            use tracing::Instrument as _;
+            storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!(
+                    "import_trig_store",
+                    t = new_t,
+                    blob_bytes
+                ))
+                .await?
+        };
+
+        tracing::debug!(
+            t = new_t,
+            flakes = op_count,
+            blob_bytes,
+            address = %write_res.address,
+            named_graphs = named_graph_count,
+            "import trig commit stored"
+        );
+
+        // 9. Advance state
+        state.t = new_t;
+        state.parent = Some(commit_cid.clone());
+
+        Ok(ImportCommitResult {
+            commit_id: commit_cid,
+            t: new_t,
+            flake_count: op_count,
+            blob_bytes,
+            commit_blob: result.bytes,
+            spool_result,
+        })
+    }
+
+    /// Expand a RawTerm to a Sid using the prefix map and worker cache.
+    ///
+    /// Allocation goes through the shared-allocator-backed [`WorkerCache`] so
+    /// the spool's prefix lookups see codes the moment they're allocated (see
+    /// the comment in `import_trig_commit`).
+    ///
+    /// Blank-node labels are skolemized with the same `{skolem_base}-{label}` key
+    /// as `ImportSink::skolemize`, so a label shared between the default graph
+    /// and a named-graph block of one TriG document resolves to one node
+    /// (TriG scopes labels to the whole document), while the same label in a
+    /// different document/commit stays distinct.
+    fn expand_term(
+        term: &RawTerm,
+        prefixes: &rustc_hash::FxHashMap<String, String>,
+        ns: &mut WorkerCache,
+        skolem_base: &str,
+    ) -> Result<Sid> {
+        match term {
+            RawTerm::Iri(iri) => {
+                if let Some(local) = iri.strip_prefix("_:") {
+                    Ok(ns.blank_node_sid(&format!("{skolem_base}-{local}")))
+                } else {
+                    Ok(ns.sid_for_iri(iri))
+                }
+            }
+            RawTerm::PrefixedName { prefix, local } => {
+                let namespace = prefixes
+                    .get(prefix.as_str())
+                    .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
+                let iri = format!("{namespace}{local}");
+                Ok(ns.sid_for_iri(&iri))
+            }
+        }
+    }
+
+    /// Expand a RawObject to FlakeValue + datatype Sid + optional language.
+    fn expand_object(
+        obj: &RawObject,
+        prefixes: &rustc_hash::FxHashMap<String, String>,
+        ns: &mut WorkerCache,
+        skolem_base: &str,
+    ) -> Result<(FlakeValue, Sid, Option<String>)> {
+        match obj {
+            RawObject::Iri(iri) => {
+                // Blank labels use the ImportSink skolem key; see expand_term.
+                let sid = if let Some(local) = iri.strip_prefix("_:") {
+                    ns.blank_node_sid(&format!("{skolem_base}-{local}"))
+                } else {
+                    ns.sid_for_iri(iri)
+                };
+                Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
+            }
+            RawObject::PrefixedName { prefix, local } => {
+                let namespace = prefixes
+                    .get(prefix.as_str())
+                    .ok_or_else(|| TransactError::Parse(format!("undefined prefix: {prefix}")))?;
+                let iri = format!("{namespace}{local}");
+                let sid = ns.sid_for_iri(&iri);
+                Ok((FlakeValue::Ref(sid), DT_ID.clone(), None))
+            }
+            RawObject::String(s) => Ok((
+                FlakeValue::String(s.clone()),
+                infer_datatype(&FlakeValue::String(s.clone())),
+                None,
+            )),
+            RawObject::Integer(n) => Ok((
+                FlakeValue::Long(*n),
+                infer_datatype(&FlakeValue::Long(*n)),
+                None,
+            )),
+            RawObject::Double(n) => Ok((
+                FlakeValue::Double(*n),
+                infer_datatype(&FlakeValue::Double(*n)),
+                None,
+            )),
+            RawObject::Boolean(b) => Ok((
+                FlakeValue::Boolean(*b),
+                infer_datatype(&FlakeValue::Boolean(*b)),
+                None,
+            )),
+            RawObject::LangString { value, lang } => Ok((
+                FlakeValue::String(value.clone()),
+                DT_LANG_STRING.clone(),
+                Some(lang.clone()),
+            )),
+            RawObject::TypedLiteral { value, datatype } => {
+                let (fv, dt) = convert_string_literal(
+                    value,
+                    datatype,
+                    &mut NsAllocator::Cached(ns),
+                    LiteralCheck::Lenient,
+                )?;
+                Ok((fv, dt, None))
+            }
+        }
+    }
+
+    // ========================================================================
+    // Parallel-friendly split: parse_chunk + finalize_parsed_chunk
+    // ========================================================================
+
+    /// Result of parsing a single TTL chunk (parallelizable step).
+    ///
+    /// Contains the `StreamingCommitWriter` (tempfile-backed, Send) and the
+    /// set of namespace codes first observed by this worker after its snapshot.
+    /// Can be sent across threads and finalized later on the commit thread.
+    pub struct ParsedChunk {
+        /// The streaming writer with all encoded ops spooled to a tempfile.
+        pub writer: StreamingCommitWriter,
+        /// Number of flakes (ops) encoded.
+        pub op_count: u32,
+        /// Namespace codes first observed after this worker's snapshot
+        /// (code >= snapshot_next_code). Includes codes allocated by this
+        /// worker AND codes allocated by other workers that this chunk uses.
+        /// The serial finalizer uses this to determine which codes need to
+        /// be "published" in this commit's namespace_delta.
+        pub new_codes: FxHashSet<u16>,
+        /// Turtle @prefix short names from this chunk: IRI → short prefix.
+        pub prefix_map: HashMap<String, String>,
+        /// Buffered spool result from parallel import (if enabled). Contains
+        /// buffered RunRecords with chunk-local IDs and chunk-local
+        /// dictionaries for the post-parse sort + sorted commit write pipeline.
+        pub spool_result: Option<crate::import_sink::BufferedSpoolResult>,
+        /// Transaction metadata for this chunk's commit envelope. EMPTY for every
+        /// text-import chunk (Turtle/TriG/JSON-LD) — those set `Vec::new()`, so the
+        /// commit is byte-identical to before this field existed. The materialize
+        /// (twin) builder sets it on ONE chunk — the FINAL commit — to carry the
+        /// completion stamp (watermark + mapping hash + builder version), so a
+        /// twin is valid iff a head-walk finds the stamp (DEC-003 §17).
+        pub txn_meta: Vec<TxnMetaEntry>,
+        /// Named graphs this chunk wrote (JSON-LD `@graph` scoping), in
+        /// first-use order. The serial finalizer puts each one no earlier
+        /// commit introduced in this commit's `graph_delta`. Empty for every
+        /// other chunk.
+        pub named_graphs: Vec<crate::import_sink::NamedGraphUse>,
+    }
+
+    /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
+    ///
+    /// Uses a [`WorkerCache`] backed by the shared allocator for lock-free
+    /// namespace lookups. New prefix allocations are tracked in the worker's
+    /// `new_codes` set for commit-order publication by the serial finalizer.
+    ///
+    /// The `t` value is pre-assigned by the caller (chunk_index + 1);
+    /// `doc_scope` identifies the source document this chunk was cut from (see
+    /// [`skolem_base`]).
+    ///
+    /// If `spool_dir` is `Some`, a spool file is written alongside the commit
+    /// blob for Phase A validation of the spool format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_chunk(
+        ttl: &str,
+        alloc: &Arc<SharedNamespaceAllocator>,
+        t: i64,
+        skolem_base: &str,
+        sub_chunk: u32,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+    ) -> Result<ParsedChunk> {
+        let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
+
+        let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        fluree_graph_turtle::parse(ttl, &mut sink)
+            .map_err(|e| TransactError::Parse(e.to_string()))?;
+        drop(_parse_span);
+
+        // Named graphs come only from a spool config's target graph: Turtle
+        // has no syntax for one.
+        let output = sink
+            .into_output()
+            .map_err(crate::import_sink::encode_failure)?;
+        let op_count = output.writer.op_count();
+        let new_codes = worker_cache.into_new_codes();
+
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
+
+        Ok(ParsedChunk {
+            writer: output.writer,
+            op_count,
+            new_codes,
+            prefix_map: output.prefix_map,
+            spool_result,
+            txn_meta: Vec::new(),
+            named_graphs: output.named_graphs,
+        })
+    }
+
+    /// Parse a TTL chunk using a pre-extracted header prelude (prefixes/base).
+    ///
+    /// Like `parse_chunk`, but does not require the prefix block text to be
+    /// prepended onto `ttl`. Uses a [`WorkerCache`] for lock-free lookups.
+    ///
+    /// `doc_scope` carries the same document-scoping contract as in
+    /// [`parse_chunk`] — see [`skolem_base`].
+    ///
+    /// If `spool_dir` is `Some`, a spool file is written alongside the commit
+    /// blob for Phase A validation of the spool format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_chunk_with_prelude(
+        ttl: &str,
+        alloc: &Arc<SharedNamespaceAllocator>,
+        prelude: &TurtlePrelude,
+        t: i64,
+        skolem_base: &str,
+        sub_chunk: u32,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+    ) -> Result<ParsedChunk> {
+        let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
+
+        let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
+
+        // Pre-register namespaces from the prelude for stable code assignment.
+        for (_short, ns_iri) in &prelude.prefixes {
+            worker_cache.get_or_allocate(ns_iri);
+        }
+
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        fluree_graph_turtle::parse_with_prefixes_base(
+            ttl,
+            &mut sink,
+            &prelude.prefixes,
+            prelude.base.as_deref(),
+        )
+        .map_err(|e| TransactError::Parse(e.to_string()))?;
+        drop(_parse_span);
+
+        // Named graphs come only from a spool config's target graph.
+        let output = sink
+            .into_output()
+            .map_err(crate::import_sink::encode_failure)?;
+        let op_count = output.writer.op_count();
+        let new_codes = worker_cache.into_new_codes();
+
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
+
+        Ok(ParsedChunk {
+            writer: output.writer,
+            op_count,
+            new_codes,
+            // Prelude prefixes are applied at session start; chunks should not
+            // need to contribute additional prefix mappings.
+            prefix_map: HashMap::new(),
+            spool_result,
+            txn_meta: Vec::new(),
+            named_graphs: output.named_graphs,
+        })
+    }
+
+    /// Extract prefix→IRI mappings from a JSON-LD `@context` and register them
+    /// in the sink's namespace allocator via `on_prefix()`.
+    ///
+    /// JSON-LD `expand()` resolves `@context` prefixes internally, producing
+    /// fully-expanded IRIs that bypass the namespace trie. Pre-registering the
+    /// declared prefixes ensures:
+    /// - The trie has entries for the declared namespaces (optimal code allocation)
+    /// - `sid_for_iri()` hits the trie instead of the split heuristic
+    /// - Namespace codes match the intended prefix boundaries
+    ///
+    /// Handles both inline `@context` objects and arrays of contexts.
+    fn register_jsonld_prefixes(
+        doc: &serde_json::Value,
+        sink: &mut crate::import_sink::ImportSink,
+    ) {
+        use fluree_graph_ir::GraphSink;
+
+        fn visit_context(ctx: &serde_json::Value, sink: &mut crate::import_sink::ImportSink) {
+            match ctx {
+                serde_json::Value::Object(obj) => {
+                    for (key, val) in obj {
+                        // Skip JSON-LD keywords (@base, @language, @vocab, etc.)
+                        if key.starts_with('@') {
+                            continue;
+                        }
+                        // Simple string values are prefix → IRI mappings
+                        if let Some(iri) = val.as_str() {
+                            sink.on_prefix(key, iri);
+                        }
+                        // Object values with @id are also prefix → IRI mappings
+                        else if let Some(obj_val) = val.as_object() {
+                            if let Some(id) = obj_val.get("@id").and_then(|v| v.as_str()) {
+                                sink.on_prefix(key, id);
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        visit_context(item, sink);
+                    }
+                }
+                _ => {} // String contexts (remote URLs) — can't extract prefixes
+            }
+        }
+
+        if let Some(ctx) = doc.get("@context") {
+            visit_context(ctx, sink);
+        }
+    }
+
+    /// Parse a JSON-LD document into a `ParsedChunk` using a shared allocator.
+    ///
+    /// Analogous to [`parse_chunk`] (Turtle) but for JSON-LD input. Uses
+    /// `SharedNamespaceAllocator` via `WorkerCache` so that namespace codes are
+    /// visible to the spool pipeline during the same parse pass.
+    ///
+    /// `@graph` scoping is written as a transaction writes it: a node's
+    /// statements go to its graph selector's graph, and a JSON-LD named
+    /// graph's content to the graph its `@id` names (see
+    /// [`fluree_graph_json_ld::adapter`]). `ledger_id` names the ledger
+    /// whose system graphs a document may not write. `shape` says whether the
+    /// chunk is one document or newline-delimited lines ([`JsonLdChunk`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_jsonld_chunk(
+        jsonld: &str,
+        alloc: &Arc<SharedNamespaceAllocator>,
+        t: i64,
+        skolem_base: &str,
+        sub_chunk: u32,
+        compress: bool,
+        spool_dir: Option<&std::path::Path>,
+        spool_config: Option<&crate::import_sink::SpoolConfig>,
+        chunk_idx: usize,
+        ledger_id: &str,
+        shape: JsonLdChunk,
+    ) -> Result<ParsedChunk> {
+        // Chunk-scoped, matching the behavior before document scoping existed.
+        // For the `Files` and remote arms that is also document-scoped, because
+        // one chunk is one whole `.jsonld` file. It is NOT for the ndjson
+        // stream, where `NdjsonReader` packs many lines into one synthetic
+        // `@graph` document: labels there merge across lines within a chunk and
+        // split across chunks. That predates document scoping and is left alone
+        // deliberately — deciding whether an ndjson line is its own RDF
+        // document is a JSON-LD question, not a Turtle-chunking one.
+
+        let _parse_span =
+            tracing::debug_span!("parse_jsonld_chunk", t, jsonld_bytes = jsonld.len(),).entered();
+
+        let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
+        let mut sink = ImportSink::new_cached(
+            &mut worker_cache,
+            t,
+            skolem_base.to_string(),
+            sub_chunk,
+            compress,
+        )
+        .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
+
+        if let Some((dir, config)) = spool_dir.zip(spool_config) {
+            let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
+            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
+                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            sink.set_spool_context(spool_ctx);
+        }
+
+        let mut doc: serde_json::Value = serde_json::from_str(jsonld)
+            .map_err(|e| TransactError::Parse(format!("JSON parse error: {e}")))?;
+        // A newline-delimited chunk's lines are read under the wrapper's
+        // shared context, each as a document of its own.
+        let shared = match shape {
+            JsonLdChunk::Document => {
+                strip_top_level_graph_key(&mut doc, None)?;
+                None
+            }
+            JsonLdChunk::Lines => {
+                let shared = crate::parse::edge_annotations::top_level_context(&doc)?;
+                for line in ndjson_lines_mut(&mut doc)? {
+                    strip_top_level_graph_key(line, Some(&shared))?;
+                }
+                Some(shared)
+            }
+        };
+
+        // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
+        // `f:reifies*` encoding before expansion, exactly as the transact path
+        // does — otherwise the JSON-LD expander silently drops them and a bulk
+        // import loses every edge property. RDF mode (lpg_mode=false): a
+        // non-empty `@annotation` lowers to a reifier bundle; the CSV/LPG
+        // loader never emits an empty `@annotation: {}`.
+        //
+        // The lowering is gated on a cheap presence check so the common
+        // (non-annotated) bulk import pays nothing. Reserved predicates are
+        // refused in what the file wrote, by the IRIs the expander resolves:
+        // an annotated chunk's here, as written, before the lowering adds
+        // statements of its own, and any other's by the sink, as each
+        // statement reaches it.
+        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
+        let needs_lowering = jsonld.contains("@annotation")
+            || jsonld.contains("@edge")
+            || jsonld.contains("@reifies");
+        if needs_lowering {
+            let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
+            let refused = refuse_reserved_in_chunk(&doc, shared.as_ref());
+            crate::parse::edge_annotations::lower_edge_annotations_unchecked(
+                &mut doc, &top_ctx, false,
+            )?;
+            refused?;
+        } else {
+            sink.refuse_reserved_predicates();
+        }
+
+        // Register @context prefix→IRI mappings in the namespace trie BEFORE
+        // expansion. JSON-LD expand() resolves prefixes internally, but the
+        // resulting fully-expanded IRIs bypass the trie. Without pre-registration,
+        // every IRI falls through to the split heuristic, potentially allocating
+        // more namespace codes than necessary and losing alignment with the
+        // declared prefixes.
+        register_jsonld_prefixes(&doc, &mut sink);
+
+        match &shared {
+            None => {
+                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                write_jsonld_document(
+                    &expanded,
+                    &mut sink,
+                    || {
+                        crate::parse::edge_annotations::top_level_context(&doc)
+                            .map(std::borrow::Cow::Owned)
+                    },
+                    ledger_id,
+                )?;
+            }
+            Some(shared) => {
+                // Most lines read the same whether the chunk expands as one
+                // envelope or line by line: those with no `@context` of their
+                // own that are not envelopes. They expand together and are
+                // written in one walk, which resolves each graph name once per
+                // chunk. Any other line expands, and resolves its graph
+                // names, as the document it is.
+                let lines = ndjson_lines(&doc)?;
+                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                let serde_json::Value::Array(expanded) = expanded else {
+                    return Err(not_an_ndjson_chunk());
+                };
+                if expanded.len() != lines.len() {
+                    return Err(not_an_ndjson_chunk());
+                }
+                let mut plain = Vec::with_capacity(expanded.len());
+                for (line, expanded) in lines.iter().zip(expanded) {
+                    if reads_as_a_node(line)? {
+                        plain.push(expanded);
+                        continue;
+                    }
+                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                        .map_err(expand_error)?;
+                    write_jsonld_document(
+                        &expanded,
+                        &mut sink,
+                        || line_context(shared, line),
+                        ledger_id,
+                    )?;
+                }
+                write_jsonld_document(
+                    &serde_json::Value::Array(plain),
+                    &mut sink,
+                    || Ok(std::borrow::Cow::Borrowed(shared)),
+                    ledger_id,
+                )?;
+            }
+        }
+        drop(_parse_span);
+
+        let output = sink
+            .into_output()
+            .map_err(crate::import_sink::encode_failure)?;
+        let op_count = output.writer.op_count();
+        let new_codes = worker_cache.into_new_codes();
+
+        let spool_result = output
+            .spool_ctx
+            .map(crate::import_sink::SpoolContext::finish_buffered);
+
+        Ok(ParsedChunk {
+            writer: output.writer,
+            op_count,
+            new_codes,
+            prefix_map: output.prefix_map,
+            spool_result,
+            txn_meta: Vec::new(),
+            named_graphs: output.named_graphs,
+        })
+    }
+
+    /// Finalize a parsed chunk: build envelope, store blob, update state.
+    ///
+    /// Must be called **serially in chunk order** because each commit
+    /// references the previous commit's address (hash chain).
+    ///
+    /// The `ns_delta` is computed by the caller via commit-order publication:
+    /// codes from `parsed.new_codes` that haven't been published by a prior
+    /// commit are looked up from the shared allocator and passed here.
+    pub async fn finalize_parsed_chunk<S>(
+        state: &mut ImportState,
+        parsed: ParsedChunk,
+        ns_delta: HashMap<u16, String>,
+        storage: &S,
+        ledger_id: &str,
+    ) -> Result<ImportCommitResult>
+    where
+        S: ContentAddressedWrite,
+    {
+        let new_t = state.t + 1;
+
+        // `.instrument` (not a held `EnteredSpan`): the body awaits the blob
+        // store, and an entered span guard is !Send across suspension points.
+        let span = tracing::debug_span!("finalize_parsed_chunk", t = new_t);
+        use tracing::Instrument as _;
+        async move {
+            // Merge published namespaces into serial registry to keep it in sync
+            // (needed for TriG serial paths and the final namespace snapshot).
+            for (code, prefix) in &ns_delta {
+                state.ns_registry.ensure_code(*code, prefix).map_err(|e| {
+                    TransactError::FlakeGeneration(format!("namespace code conflict: {e}"))
+                })?;
+            }
+            // Merge turtle prefix short names into session state
+            state.prefix_map.extend(parsed.prefix_map);
+
+            // The named graphs this chunk wrote that no earlier commit
+            // introduced: this commit's `graph_delta`, under the g_ids the
+            // spool assigned (the session counter's, without a spool).
+            let mut graph_delta: HashMap<u16, String> = HashMap::new();
+            for graph in parsed.named_graphs {
+                refuse_reserved_graph_iri(&graph.iri, ledger_id)?;
+                if let Some(&existing) = state.graph_ids.get(&graph.iri) {
+                    if graph.g_id.is_some_and(|g_id| g_id != existing) {
+                        return Err(TransactError::Parse(format!(
+                            "graph <{}> was assigned g_id {existing} and then {:?}",
+                            graph.iri, graph.g_id
+                        )));
+                    }
+                    continue;
+                }
+                let g_id = graph.g_id.unwrap_or_else(|| {
+                    let id = state.next_gid;
+                    state.next_gid += 1;
+                    id
+                });
+                refuse_reserved_g_id(&graph.iri, g_id)?;
+                state.graph_ids.insert(graph.iri.clone(), g_id);
+                graph_delta.insert(g_id, graph.iri);
+            }
+
+            state.cumulative_flakes += parsed.op_count as u64;
+
+            // Persist split mode in genesis commit (first chunk, no previous ref).
+            let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+            let envelope = CodecEnvelope {
+                t: new_t,
+                parents: state.parent.clone().into_iter().collect(),
+                namespace_delta: ns_delta,
+                txn: None,
+                time: Some(state.import_time.clone()),
+
+                txn_signature: None,
+                // Empty for every text-import chunk (unchanged behavior); the
+                // materialize builder sets it on the final commit to carry the twin's
+                // completion stamp. The predicate namespace codes were interned through
+                // this chunk's sink, so they are already in `ns_delta` above.
+                txn_meta: parsed.txn_meta,
+                graph_delta,
+                ns_split_mode,
+                graph_drops: Vec::new(),
+            };
+
+            let result = parsed.writer.finish(&envelope)?;
+            let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+            let blob_bytes = result.bytes.len();
+
+            let write_res = storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .await?;
+
+            tracing::debug!(
+                t = new_t,
+                flakes = parsed.op_count,
+                blob_bytes,
+                address = %write_res.address,
+                "parsed chunk finalized and stored"
+            );
+
+            state.t = new_t;
+            state.parent = Some(commit_cid.clone());
+
+            Ok(ImportCommitResult {
+                commit_id: commit_cid,
+                t: new_t,
+                flake_count: parsed.op_count,
+                blob_bytes,
+                commit_blob: result.bytes,
+                spool_result: parsed.spool_result,
+            })
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+pub use inner::{
+    finalize_parsed_chunk, import_commit_with_prelude, import_trig_commit, parse_chunk,
+    parse_chunk_with_prelude, parse_jsonld_chunk, target_graph_iri, ImportCommitResult,
+    ImportState, JsonLdChunk, ParsedChunk,
+};

@@ -1,0 +1,699 @@
+# Graph Sources Overview
+
+Graph sources enable querying specialized indexes and external data sources using the same query interface as regular Fluree ledgers. This document provides a comprehensive overview of graph source architecture and capabilities.
+
+## Concept
+
+A **graph source** is a non-ledger source a query can read as part of a single execution. A mapped source (Iceberg, R2RML, SQL, Delta) is a graph: you address it by its graph name/IRI, like a ledger. A search index (BM25, vector) is not a graph: a search pattern in the query names it, and the dataset is its source ledger.
+
+**Regular Ledger:**
+- Stored as RDF triples
+- Indexed with SPOT, POST, OPST, PSOT
+- Optimized for graph traversal
+
+**Non-ledger Graph Source:**
+- Stored in specialized format
+- Custom indexing for specific queries
+- Optimized for particular use cases
+
+Both are queried using the same SPARQL or JSON-LD Query syntax.
+
+## Architecture
+
+### Components
+
+```text
+┌─────────────────────────────────────────┐
+│         Fluree Query Engine             │
+└─────────────────┬───────────────────────┘
+                  │
+      ┌───────────┴──────────┐
+      │                      │
+┌─────▼──────┐      ┌───────▼────────┐
+│  Regular   │      │    Graph       │
+│  Ledgers   │      │    Sources     │
+└─────┬──────┘      └───────┬────────┘
+      │                     │
+      │             ┌───────┴────────┐
+      │             │                │
+┌─────▼──────┐ ┌───▼───┐     ┌─────▼──────┐
+│ RDF Triple │ │ BM25  │     │  usearch   │
+│   Store    │ │ Index │     │  Vector    │
+└────────────┘ └───────┘     └────────────┘
+```
+
+### Graph Source Registry (Nameservice)
+
+Non-ledger graph sources are registered in nameservice:
+
+```json
+{
+  "graph_source_id": "products-search:main",
+  "type": "graph-source",
+  "backend": "bm25",
+  "source": "products:main",
+  "config": {
+    "fields": [...]
+  },
+  "status": "ready",
+  "last_sync": "2024-01-22T10:30:00Z"
+}
+```
+
+## Graph Source Types
+
+### 1. BM25 Full-Text Search
+
+**Backend:** Inverted text index
+
+**Purpose:** Keyword search with relevance ranking
+
+**Configuration:**
+```json
+{
+  "type": "bm25",
+  "source": "products:main",
+  "fields": [
+    { "predicate": "schema:name", "weight": 2.0 },
+    { "predicate": "schema:description", "weight": 1.0 }
+  ]
+}
+```
+
+**Query:**
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 20,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?score" }
+    }
+  ],
+  "select": ["?product", "?score"]
+}
+```
+
+### 2. Vector Similarity
+
+**Backend:** HNSW index (embedded or remote)
+
+**Purpose:** Semantic search using embeddings
+
+**Configuration:**
+```json
+{
+  "type": "vector",
+  "source": "products:main",
+  "embedding_property": "ex:embedding",
+  "dimensions": 384,
+  "metric": "cosine"
+}
+```
+
+**Query:**
+```json
+{
+  "from": "mydb:main",
+  "where": [
+    {
+      "f:graphSource": "products-vector:main",
+      "f:queryVector": [0.1, 0.2, ...],
+      "f:distanceMetric": "cosine",
+      "f:searchLimit": 10,
+      "f:searchResult": {
+        "f:resultId": "?product",
+        "f:resultScore": "?score"
+      }
+    }
+  ],
+  "select": ["?product", "?score"]
+}
+```
+
+### 3. Apache Iceberg
+
+**Backend:** Iceberg tables / Parquet files via R2RML mapping
+
+**Purpose:** Analytics on data lake
+
+Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how table rows become RDF triples. Four catalog modes select how Iceberg metadata is discovered:
+
+- **REST catalog**: connects to an Iceberg REST catalog API (e.g., Polaris)
+- **Direct S3**: reads `metadata/version-hint.text` from the table’s S3 location (no catalog server required)
+- **AWS Glue Data Catalog**: looks the table up in Glue and reads the metadata file its `metadata_location` names, with the ambient AWS credentials
+- **AWS S3 Tables**: resolves the table's metadata file in an S3 Tables table bucket, with the ambient AWS credentials
+
+See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
+
+View policy is enforced on Iceberg and SQL sources for static targeting
+(`f:onProperty`, `f:onClass`, `f:onSubject`, defaults); `f:query` policies fail
+closed. Stored policies and the class hierarchy come from a model ledger named
+at registration (`--model`). See [Access policy](iceberg.md#access-policy).
+
+**Query:**
+```json
+{
+  "from": "warehouse-orders:main",
+  "select": ["?orderId", "?total"],
+  "where": [
+    { "@id": "?order", "ex:orderId": "?orderId" },
+    { "@id": "?order", "ex:total": "?total" }
+  ]
+}
+```
+
+### 4. SQL Endpoints
+
+**Backend:** Tables behind a Trino-protocol HTTP endpoint (Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar), via R2RML mapping
+
+**Purpose:** Virtual graph over a relational database or warehouse, read live
+
+SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and accept any `rr:sqlQuery` (an Iceberg source accepts only a [single-table row filter](iceberg.md#row-filters-rrsqlquery)). The engine compiles a graph block over the source into one SQL statement where the block's shape allows — joins, `OPTIONAL`, `VALUES`, `UNION`, grouping and sub-selects included — and otherwise pushes one typed single-table `SELECT` per triples map and joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
+
+See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
+
+**Query:**
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?name ?total FROM <orders-db:main>
+WHERE { ?o ex:customer ?c ; ex:total ?total . ?c ex:name ?name . FILTER(?total > 100) }
+```
+
+## Creating Graph Sources
+
+### Via Rust API
+
+Graph sources are created and registered via the `fluree-db-api` Rust API, which publishes the graph source record into the nameservice.
+
+```rust
+use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
+
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
+
+let config = R2rmlCreateConfig::new_direct(
+    "execution-log",
+    "s3://bucket/warehouse/logs/execution_log",
+    "fluree:file://mappings/execution_log.ttl",
+)
+.with_s3_region("us-east-1");
+
+fluree.create_r2rml_graph_source(config).await?;
+```
+
+## Querying Graph Sources
+
+Graph sources come in two flavors with different query models:
+
+- **Iceberg sources** — queried transparently using standard SPARQL/JSON-LD patterns (FROM, GRAPH, or as a direct query target)
+- **Search indexes** (BM25, Vector) — queried using the `f:graphSource` / `f:searchText` pattern
+
+An index source is **not a dataset member**. It has no triples, and its search pattern finds it by the `f:graphSource` id, so a dataset never needs it. Naming one where a graph is read (the query target, `FROM`, `FROM NAMED`, or `GRAPH`) answers **HTTP 400 `err:db/GraphSourceNotAGraph`**, which names the form to use: an `f:graphSource` pattern, with the index's source ledger as the dataset.
+
+### Iceberg (Transparent)
+
+Iceberg graph sources are queried just like ledgers. No special syntax is needed:
+
+**As a direct target:**
+```sparql
+# Query the graph source directly
+SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
+```
+
+**Via GRAPH pattern (joining with ledger data):**
+```json
+{
+  "from": "mydb:main",
+  "from-named": ["warehouse-orders:main"],
+  "select": ["?customer", "?orderId", "?total"],
+  "where": [
+    { "@id": "?customer", "schema:name": "?name" },
+    { "@id": "?customer", "ex:customerId": "?custId" },
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?custId",
+      "ex:orderId": "?orderId",
+      "ex:total": "?total"
+    }]
+  ]
+}
+```
+
+A graph pattern is the **array form** `["graph", <name>, <pattern>]` — an object
+with a `"graph"` key is parsed as an ordinary node pattern and fails. The graph
+source must also be part of the dataset (`"from-named"` here, `FROM NAMED` in
+SPARQL), or the block matches nothing. Address a graph source by its full id:
+dataset-local `fromNamed` aliases do not currently resolve to graph sources.
+
+Iceberg graph sources use R2RML mappings to define how table rows become RDF triples. See [Iceberg / Parquet](iceberg.md) and [R2RML](r2rml.md) for details.
+
+### Query Patterns a Graph Source Cannot Evaluate
+
+A graph source has no native RDF index. Its triples are materialized per query from the backing table or index, which is enough for triple patterns but not for the constructs that need an index to walk. Two of them are refused rather than answered:
+
+- **Property-path quantifiers** — `p+`, `p*`, `p?`, and any quantified combination such as `^p+`, `(a|b)+`, or `(a/b)+`
+- **`shortestPath` / `allShortestPaths`**
+
+A query using one against a graph source returns **HTTP 400 `err:db/InvalidQuery`**, naming the pattern kind. The refusal is deliberate: these patterns would otherwise read the graph source's empty native index and return a wrong answer as a success — nothing at all for `p+`, and the starting node alone for `p*` and `p?`. Unquantified alternation (`a|b`) and inverse (`^p`) are unaffected; they lower to ordinary triple patterns and run normally.
+
+Sub-selects are evaluated, with one exception and one cost to know about: see [Sub-selects over a Graph Source](#sub-selects-over-a-graph-source). So is an `EXISTS` in the `WHERE` clause; one in `HAVING` or `ORDER BY` is refused (see [EXISTS over a Graph Source](#exists-over-a-graph-source)).
+
+**Workaround: bounded fixed-length paths.** Sequence paths do lower to table scans, so a traversal whose maximum depth you know can be written as a union of explicit hops:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?boss FROM <warehouse-hr:main> WHERE {
+  { ex:emp1 ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager/ex:manager ?boss }
+}
+```
+
+Pick that maximum depth deliberately and state it wherever the query is documented: results are silently incomplete beyond the depth you enumerate, and nothing in the response marks the truncation.
+
+For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
+
+**JSON-LD subgraph selections.** A JSON-LD subgraph selection over a graph source (`"select": {"?s": ["*"]}`, an explicit property list, or `["@id"]`) is answered by rewriting it into a flat table scan and grouping the rows per subject. Some query keys have no place in that rewrite, so a subgraph selection that carries one is refused with **HTTP 400 `err:r2rml/UnsupportedPattern`** instead of being answered without it:
+
+- **A top-level `values`** — dropping it would return every subject the `where` matches, not the ones `values` names. Put the constraint in the `where` clause instead.
+- **`groupBy` / `having`** — dropping them would return subjects whose groups `having` rejects. Select the grouped variables with a flat `select` instead.
+- **A positive `depth`** on a selection that reads properties (`["*"]` or a property list) — on a native ledger `depth` expands each reference into the referenced node's own properties, but the rewrite renders a reference as its `@id` and expands none, so it would answer as `depth: 0`. Select each referenced subject with its own `"select": {"<iri>": ["*"]}` instead. `["@id"]` and `["@type"]` read no reference, so they take any `depth`.
+- **An `offset` past 10,000 subjects** — each page reads every subject before it again, so paging that deep is refused. Narrow the `where` clause instead.
+
+A flat `select` (`"select": ["?s", "?name"]`) is not a subgraph selection: it takes `values`, `groupBy` and `having` as usual.
+
+### Patterns Must Be Inside the GRAPH Block
+
+Patterns reach a graph source only inside a `GRAPH <gs_id> { … }` block. Fluree adds that block automatically when you address a graph source directly — but **not** to a query that already contains a `GRAPH` block of its own, since that is taken as explicit scoping. In a query that mixes the two, any triple pattern left at the top level has nothing to route it, and it returns **HTTP 400 `err:db/InvalidQuery`**:
+
+```sparql
+# Refused: `?order ex:total ?total` is outside every GRAPH block
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  ?order ex:total ?total .
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+
+# Correct: every pattern is scoped
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  GRAPH <warehouse-orders:main> { ?order ex:total ?total }
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+```
+
+Either move the pattern inside a `GRAPH` block naming the source it belongs to, or drop the explicit `GRAPH` block so the whole query is scoped automatically.
+
+One gap remains here: a top-level pattern inside `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` is **not** refused, because refusing it would reject queries that do return rows today. Such a block is evaluated against an empty index, so it matches nothing — a top-level `OPTIONAL` never binds, and a top-level `MINUS` excludes nothing. Scope those blocks with `GRAPH` as well. A sub-select outside every `GRAPH` block is the exception: one whose body reads the default view is refused (see [below](#a-sub-select-outside-every-graph-block)).
+
+### Sub-selects over a Graph Source
+
+A sub-select — a nested SPARQL `SELECT`, or a JSON-LD `["query", …]` — inside a graph source's scope is evaluated. The scope is a query addressed to the source (`FROM <source>`, `"from"`, or the source's own query endpoint) or the source's `GRAPH` block. The sub-select's body lowers to table scans like the patterns around it, and the answer is the one a native ledger holding the mapping's triples would give. Grouping and aggregates, `DISTINCT`, `ORDER BY` with `LIMIT` / `OFFSET`, and nested sub-selects all run. A pattern in the body that the source cannot evaluate (a quantified path, [above](#query-patterns-a-graph-source-cannot-evaluate)) refuses the whole query.
+
+The two query languages correlate a sub-select differently, on a graph source as on a native ledger:
+
+- **SPARQL** evaluates a sub-select once, on its own, and then joins its rows to the rest of the query (SPARQL 1.1 §18.2). An `ORDER BY ?amount LIMIT 5` inside it keeps five rows of the whole sub-select.
+- **JSON-LD** correlates a sub-select with the patterns written before it. When the sub-select has a `limit` or `offset`, and selects a variable those patterns bind and its own body binds in every row, it runs once per outer row, seeded with that row's value. A `limit` inside it is then a top-k per outer row: the two largest orders of each customer, say. Without a `limit` or `offset` it is evaluated once and joined on the shared variable (under an outer result known to hold fewer than eight rows it may run once per row instead). A sub-select that shares no variable it binds in every row is evaluated once, with or without a slice.
+
+#### Cost: a sliced JSON-LD sub-select reads per outer row
+
+Each per-row run of a sliced, correlated JSON-LD sub-select reads the tables its body scans, and reads each one whole. The outer row's value is not yet pushed into the scan to skip files ([#2310](https://github.com/fluree/db/issues/2310)). A `limit` sub-select over an `orders` table under 50 outer rows reads `orders` 50 times; under 10,000 outer rows, 10,000 times. Before running one over a large outer result:
+
+- If you want the top rows of the whole sub-select rather than per outer row, write it in SPARQL, or leave the shared variable out of the JSON-LD sub-select's `select`. Either way it is evaluated once.
+- If you do want a top-k per outer row, narrow the outer rows first, or query a [native twin](iceberg.md#materializing-a-native-twin), where each seeded run is an index lookup.
+
+#### Annotation and list patterns
+
+An R2RML mapping produces no edge annotations: it has no term map for one. An annotation pattern (SPARQL `{| … |}` or `rdf:reifies`, JSON-LD `@annotation` or `@reifies`) therefore matches nothing over a graph source, in a sub-select or not. A native ledger holding the same triples gives the same answer. Nor does a mapping produce RDF lists stored as list values; `rdf:first` / `rdf:rest` triples a mapping does produce are ordinary triples and query as such.
+
+#### A sub-select outside every GRAPH block
+
+A query addressed to a graph source that has a `GRAPH` block of its own is not wrapped in the source's scope (see [Patterns Must Be Inside the GRAPH Block](#patterns-must-be-inside-the-graph-block)). A sub-select outside every `GRAPH` block in such a query is still evaluated when its body reads the source through a `GRAPH` block of its own, or reads no index at all (only `VALUES` or `BIND`). One whose body reads the default view directly — a triple pattern outside any `GRAPH` block — is refused with **HTTP 400 `err:db/InvalidQuery`**, because that body would read the source's empty native index (an ungrouped `COUNT` would answer 0):
+
+> A sub-select reads a graph source only from inside that source's graph block; move it there, or drop the explicit graph block so the whole query is scoped to the graph source.
+
+```sparql
+# Refused: the sub-select's body reads the default view
+SELECT ?name ?orders WHERE {
+  GRAPH <warehouse-orders:main> { ?c ex:name ?name }
+  { SELECT ?c (COUNT(?o) AS ?orders) WHERE { ?o ex:customer ?c } GROUP BY ?c }
+}
+
+# Correct: the body reads the source through its own GRAPH block
+SELECT ?name ?orders WHERE {
+  GRAPH <warehouse-orders:main> { ?c ex:name ?name }
+  { SELECT ?c (COUNT(?o) AS ?orders) WHERE {
+      GRAPH <warehouse-orders:main> { ?o ex:customer ?c }
+    } GROUP BY ?c }
+}
+```
+
+Dropping the explicit `GRAPH` block works as well: the whole query, sub-select included, is then scoped to the source.
+
+### EXISTS over a Graph Source
+
+An `EXISTS` or `NOT EXISTS` in the `WHERE` clause reads the graph source wherever it sits: as a pattern (`FILTER EXISTS { … }`, JSON-LD `["exists", …]`), inside an expression (`BIND(EXISTS { … } AS ?b)`, `FILTER(EXISTS { … } || …)`, a JSON-LD compound `filter` such as `["or", ["exists", …], …]`), or in a sub-select's `HAVING` or `ORDER BY`. Its body lowers to table scans like the rest of the scope.
+
+A query's own `HAVING` and `ORDER BY` run after the `WHERE` clause, outside the graph source's scope. So do the expressions a query evaluates after a trailing `VALUES` block: its `GROUP BY` expressions, aggregate inputs and `SELECT` expressions. An `EXISTS` there would read the source's empty native index, where every `EXISTS` is false. A query with one is refused with **HTTP 400 `err:db/InvalidQuery`** naming `EXISTS outside the WHERE clause`, with or without a `GRAPH` block of its own. Move the condition into the `WHERE` clause:
+
+```sparql
+# Refused: the EXISTS is in HAVING
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+} GROUP BY ?c HAVING (EXISTS { ?c ex:name ?name })
+
+# Correct: the same condition as a FILTER in WHERE
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+  FILTER EXISTS { ?c ex:name ?name }
+} GROUP BY ?c
+```
+
+To order by an `EXISTS`, `BIND` it to a variable in the `WHERE` clause and order by that variable.
+
+### Search Indexes (BM25, Vector)
+
+Search indexes use the `f:graphSource` pattern:
+
+### Single Graph Source
+
+Query one graph source:
+
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "select": ["?product", "?score"],
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 20,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?score" }
+    }
+  ]
+}
+```
+
+### Multiple Graph Sources
+
+Combine multiple graph sources:
+
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "select": ["?product", "?textScore", "?vecScore"],
+  "values": [
+    ["?queryVec"],
+    [{"@value": [0.1, 0.2, 0.3], "@type": "https://ns.flur.ee/db#embeddingVector"}]
+  ],
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 100,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?textScore" }
+    },
+    {
+      "f:graphSource": "products-vector:main",
+      "f:queryVector": "?queryVec",
+      "f:searchLimit": 100,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?vecScore" }
+    }
+  ]
+}
+```
+
+### Graph Sources + Regular Graphs
+
+Combine graph sources and regular ledgers:
+
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "select": ["?product", "?name", "?price", "?score"],
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 20,
+      "f:searchResult": { "f:resultId": "?product", "f:resultScore": "?score" }
+    },
+    { "@id": "?product", "schema:name": "?name" },
+    { "@id": "?product", "schema:price": "?price" }
+  ]
+}
+```
+
+## Synchronization
+
+### Source Tracking
+
+Graph sources track their source ledger:
+
+```text
+Source: products:main @ t=150
+Graph Source: products-search:main @ source_t=150
+```
+
+### Update Modes
+
+**Real-Time:**
+- Updates immediately as source changes
+- Low latency
+- Higher overhead
+
+**Batch:**
+- Updates periodically
+- Higher latency
+- Lower overhead
+
+**Manual:**
+- Updates on demand
+- Full control
+- Requires manual triggering
+
+### Checking Sync Status
+
+```bash
+curl http://localhost:8090/graph-source/products-search:main/status
+```
+
+Response:
+```json
+{
+  "name": "products-search:main",
+  "source": "products:main",
+  "source_t": 150,
+  "index_t": 148,
+  "lag": 2,
+  "last_sync": "2024-01-22T10:30:00Z",
+  "status": "syncing"
+}
+```
+
+## Query Execution
+
+### Query Planning
+
+Query planner handles graph sources:
+
+1. **Parse Query:** Extract graph patterns
+2. **Route Subqueries:** Identify which graphs handle which patterns
+3. **Execute Subqueries:** Run against appropriate backends
+4. **Join Results:** Combine results from multiple graphs
+5. **Apply Filters:** Final filtering and sorting
+
+### Example Execution
+
+Query:
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 50,
+      "f:searchResult": { "f:resultId": "?p" }
+    },
+    { "@id": "?p", "schema:price": "?price" }
+  ],
+  "filter": "?price < 1000"
+}
+```
+
+Execution Plan:
+```text
+1. Execute BM25 search on products-search:main:
+   f:searchText "laptop", f:searchLimit 50
+   → Result: ?p = [ex:p1, ex:p2, ex:p3, ...]
+
+2. Execute on products:main:
+   SELECT ?p ?price WHERE {
+     VALUES ?p { ex:p1 ex:p2 ex:p3 ... }
+     ?p schema:price ?price
+   }
+   → Result: [(ex:p1, 899), (ex:p2, 1200), ...]
+
+3. Join and filter:
+   ?price < 1000
+   → Result: [(ex:p1, 899)]
+```
+
+## Performance Characteristics
+
+### BM25 Graph Sources
+
+- **Index Build:** O(n × avg_doc_length)
+- **Query:** O(log n) with inverted index
+- **Space:** 2-3× source data
+- **Update:** Incremental, O(doc_size)
+
+### Vector Graph Sources
+
+- **Index Build:** O(n log n) for HNSW
+- **Query:** O(log n) approximate
+- **Space:** 1.5× embedding size
+- **Update:** Incremental, O(1)
+
+### Iceberg Graph Sources
+
+- **Index Build:** No index (direct file access)
+- **Query:** O(partitions scanned)
+- **Space:** Zero overhead (uses Parquet files)
+- **Update:** Batch-oriented
+
+## Best Practices
+
+### 1. Choose Appropriate Type
+
+Match graph source type to use case:
+- **Keyword search** → BM25
+- **Semantic search** → Vector
+- **Analytics / data lake** → Iceberg (with R2RML mapping)
+
+### 2. Monitor Synchronization
+
+Check sync lag regularly:
+
+```javascript
+setInterval(async () => {
+  const status = await getGraphSourceStatus('products-search:main');
+  if (status.lag > 10) {
+    console.warn(`Graph source lag: ${status.lag} transactions`);
+  }
+}, 60000);
+```
+
+### 3. Filter in Graph Sources
+
+Push filters to graph sources when possible:
+
+Good (graph source pattern first narrows results before graph traversal):
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "where": [
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 20,
+      "f:searchResult": { "f:resultId": "?p" }
+    },
+    { "@id": "?p", "schema:name": "?name" }
+  ]
+}
+```
+
+Bad (graph traversal before graph source means scanning all products first):
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "from": "products:main",
+  "where": [
+    { "@id": "?p", "schema:name": "?name" },
+    {
+      "f:graphSource": "products-search:main",
+      "f:searchText": "laptop",
+      "f:searchLimit": 20,
+      "f:searchResult": { "f:resultId": "?p" }
+    }
+  ]
+}
+```
+
+### 4. Use Explain Plans
+
+Understand query execution:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/explain \
+  -d '{...}'
+```
+
+### 5. Limit Results
+
+Always use LIMIT with graph sources:
+
+```json
+{
+  "where": [...],
+  "limit": 100
+}
+```
+
+## Troubleshooting
+
+### High Sync Lag
+
+**Symptom:** `lag` increasing
+
+**Causes:**
+- Source ledger write rate too high
+- Graph source indexing too slow
+- Resource constraints
+
+**Solutions:**
+- Increase indexing resources
+- Batch updates
+- Use manual sync mode
+
+### Query Performance Issues
+
+**Symptom:** Slow queries combining graph sources
+
+**Solutions:**
+1. Check explain plan
+2. Add filters to reduce intermediate results
+3. Ensure graph source is synced
+4. Consider query rewrite
+
+### Missing Results
+
+**Symptom:** Expected results not returned
+
+**Causes:**
+- Graph source not synced
+- Mapping misconfiguration
+- Filter too restrictive
+
+**Solutions:**
+- Check sync status
+- Verify mapping configuration
+- Test subqueries independently
+
+## Related Documentation
+
+- [BM25 Graph Source](bm25.md) - Full-text search
+- [Iceberg](iceberg.md) - Data lake integration
+- [R2RML](r2rml.md) - R2RML mapping reference
+- [BM25 Indexing](../indexing-and-search/bm25.md) - BM25 details
+- [Vector Search](../indexing-and-search/vector-search.md) - Vector details
+- [Query Datasets](../query/datasets.md) - Multi-graph queries

@@ -1,0 +1,2226 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+
+use crate::{ContentId, ContentStore};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use tokio::sync::broadcast;
+
+const CACHE_BUDGET_NUMERATOR: u64 = 9;
+const CACHE_BUDGET_DENOMINATOR: u64 = 10;
+const CACHE_EVICT_NUMERATOR: u64 = 8;
+const CACHE_EVICT_DENOMINATOR: u64 = 10;
+const DEFAULT_LAMBDA_TMP_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_LAMBDA_TMP_WARN_SLACK_BYTES: u64 = 64 * 1024 * 1024;
+
+static CACHE_REGISTRY: Lazy<Mutex<HashMap<PathBuf, Weak<DiskArtifactCache>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Single-flight for stores that forbid a plaintext cache: coalesces
+/// concurrent fetches of one artifact like the cached path does, but never
+/// reads or writes a cache directory — it is not registered and never
+/// creates one. Flights are keyed by the path the cache would have used, so
+/// they are exactly as narrow as the cached ones.
+static UNCACHED_FLIGHTS: Lazy<Arc<DiskArtifactCache>> =
+    Lazy::new(|| Arc::new(DiskArtifactCache::detached()));
+
+/// Sentinel for "no configured budget" — fall back to auto-detect.
+const BUDGET_UNSET: u64 = u64::MAX;
+
+/// Process-global default disk-cache budget in bytes, set from configuration
+/// (e.g. the server's `disk_cache_max_mb`). `BUDGET_UNSET` means auto-detect.
+static CONFIGURED_BUDGET_BYTES: AtomicU64 = AtomicU64::new(BUDGET_UNSET);
+
+/// Set the process-global default disk-cache budget (bytes), shared across every
+/// on-disk cache (Fluree object storage + Iceberg). Applies to caches created
+/// after this call whose `FLUREE_DISK_CACHE_BUDGET_BYTES` env override is unset;
+/// `0` disables disk caching. Call before the first cache is created (e.g. at
+/// server/builder startup). Mirrors the `disk_cache_max_mb` config knob.
+pub fn set_configured_budget_bytes(bytes: u64) {
+    CONFIGURED_BUDGET_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The configured budget if set, otherwise a fraction of available disk space.
+fn configured_or_auto(available: u64) -> u64 {
+    match CONFIGURED_BUDGET_BYTES.load(Ordering::Relaxed) {
+        BUDGET_UNSET => available
+            .saturating_mul(CACHE_BUDGET_NUMERATOR)
+            .saturating_div(CACHE_BUDGET_DENOMINATOR),
+        bytes => bytes,
+    }
+}
+
+/// Shared outcome of one in-flight remote fetch. Bytes are shared via `Arc` so
+/// coalesced waiters neither re-fetch nor re-allocate the payload; the per-caller
+/// `Vec` copy happens only at the API boundary. Errors are shared but never
+/// cached — the in-flight entry is removed on completion so the next caller
+/// retries (see [`DiskArtifactCache::coalesced_fetch`]).
+type FlightResult = std::result::Result<Arc<[u8]>, Arc<io::Error>>;
+
+/// A single in-flight fetch that concurrent callers for the same cache target
+/// can wait on instead of issuing their own remote read.
+#[derive(Debug)]
+struct Flight {
+    /// Generation token guarding removal against ABA: a stale guard (from a
+    /// cancelled leader) must not evict a newer flight started for the same
+    /// target by a different leader.
+    generation: u64,
+    /// Broadcast handle waiters `subscribe()` to; the leader sends exactly once.
+    tx: broadcast::Sender<FlightResult>,
+}
+
+/// Whether this caller leads the flight (does the fetch) or waits on a leader.
+enum FlightRole {
+    Leader {
+        generation: u64,
+        tx: broadcast::Sender<FlightResult>,
+    },
+    Waiter(broadcast::Receiver<FlightResult>),
+}
+
+/// RAII guard that clears a leader's in-flight slot on completion or on drop,
+/// so a cancelled or panicked leader cannot orphan the slot (which would wedge
+/// every later waiter on it). Removal is generation-checked, so it never evicts
+/// a newer flight for the same target.
+struct FlightGuard {
+    cache: Arc<DiskArtifactCache>,
+    target: PathBuf,
+    generation: u64,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.cache.finish_flight(&self.target, self.generation);
+    }
+}
+
+#[derive(Debug)]
+pub struct DiskArtifactCache {
+    root: PathBuf,
+    budget_bytes: u64,
+    /// Shared with the background scan that sizes the directory.
+    state: Arc<Mutex<DiskArtifactCacheState>>,
+    /// Per-target single-flight coordination: coalesces concurrent remote
+    /// fetches for the same cache target into one `cs.get` + one tmp-file write.
+    /// Keyed by the resolved cache-target path (narrow: same content + same
+    /// destination). Never held across `.await`.
+    inflight: Mutex<HashMap<PathBuf, Flight>>,
+    next_flight_generation: AtomicU64,
+}
+
+/// The byte accounting a cache keeps for its directory.
+///
+/// The directory changes while a scan walks it, so a scan's total is only
+/// right once every write and eviction that landed around it is counted
+/// exactly once. Each registers here before its file operation and accounts
+/// after it ([`Self::begin`], [`Self::end`]), at most one per path at a time,
+/// and every scan lands through [`Self::land_scan`], which reconciles them.
+#[derive(Debug, Default)]
+struct DiskArtifactCacheState {
+    /// The directory's size, once a scan has measured it.
+    tracked_bytes: Option<u64>,
+    /// A background scan is sizing the directory; see
+    /// [`DiskArtifactCache::spawn_sizing`].
+    sizing: bool,
+    /// Scans walking the directory now: the background sizing and
+    /// [`DiskArtifactCache::evict_until`]'s rescan.
+    scans: usize,
+    /// While a scan runs, each write and eviction that lands, with the bytes
+    /// it added (positive) or removed (negative).
+    landed: Vec<(PathBuf, i64)>,
+    /// Writes and evictions registered and not yet accounted.
+    in_flight: Vec<InFlight>,
+    next_op: u64,
+    /// Test hook: named points where an operation waits; see `pause_at`.
+    #[cfg(test)]
+    pauses: HashMap<&'static str, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<bool>)>,
+}
+
+/// A write or eviction between its registration and its accounting.
+#[derive(Debug)]
+struct InFlight {
+    id: u64,
+    path: PathBuf,
+    /// What a scan that landed meanwhile counted for `path`. The walk can't
+    /// say whether it read the path before or after this operation, so the
+    /// operation corrects the total by what it actually left there.
+    counted: Option<u64>,
+}
+
+/// The bytes a path holds after an operation that changed it by `delta`: a
+/// write leaves its file, an eviction nothing.
+fn size_after(delta: i64) -> u64 {
+    u64::try_from(delta).unwrap_or(0)
+}
+
+fn add_signed(total: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        total.saturating_add(delta.unsigned_abs())
+    } else {
+        total.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+impl DiskArtifactCacheState {
+    /// Register a write or eviction of `path` before its file operation, or
+    /// `None` when one of `path` is under way already. One at a time per path
+    /// is what lets a scan say what each path holds.
+    fn begin(&mut self, path: &Path) -> Option<u64> {
+        if self.in_flight.iter().any(|op| op.path == path) {
+            return None;
+        }
+        let id = self.next_op;
+        self.next_op += 1;
+        self.in_flight.push(InFlight {
+            id,
+            path: path.to_path_buf(),
+            counted: None,
+        });
+        Some(id)
+    }
+
+    /// Account operation `id`, whose file operation changed its path by
+    /// `delta` bytes (`+n` a write created it, `-n` an eviction removed it).
+    fn end(&mut self, id: u64, delta: i64) {
+        let Some(at) = self.in_flight.iter().position(|op| op.id == id) else {
+            return;
+        };
+        let InFlight { path, counted, .. } = self.in_flight.swap_remove(at);
+        if delta == 0 {
+            return;
+        }
+        if let Some(tracked) = self.tracked_bytes {
+            let change = match counted {
+                Some(counted) => size_after(delta) as i64 - counted as i64,
+                None => delta,
+            };
+            self.tracked_bytes = Some(add_signed(tracked, change));
+        }
+        if self.scans > 0 {
+            self.landed.push((path, delta));
+        }
+    }
+
+    /// Open a scan; returns where its window starts in [`Self::landed`].
+    fn begin_scan(&mut self) -> usize {
+        self.scans += 1;
+        self.landed.len()
+    }
+
+    /// Close a scan without installing its total.
+    fn end_scan(&mut self) {
+        self.scans -= 1;
+        if self.scans == 0 {
+            self.landed.clear();
+        }
+    }
+
+    /// Install the size a scan measured: `walked_total` over the entries in
+    /// `walked`. The walk read the directory while operations kept landing,
+    /// so a path one changed meanwhile holds what its last operation left,
+    /// whatever the walk saw; a path one is changing now is counted as found,
+    /// for that operation to correct when it lands.
+    fn land_scan(&mut self, start: usize, walked_total: u64, walked: &HashMap<&Path, u64>) {
+        let mut last: HashMap<&Path, i64> = HashMap::new();
+        for (path, delta) in &self.landed[start..] {
+            last.insert(path.as_path(), *delta);
+        }
+        let found = |path: &Path| walked.get(path).copied().unwrap_or(0);
+        let mut total = walked_total as i64;
+        for (path, delta) in &last {
+            total += size_after(*delta) as i64 - found(path) as i64;
+        }
+        let counted: Vec<u64> = self
+            .in_flight
+            .iter()
+            .map(|op| match last.get(op.path.as_path()) {
+                Some(delta) => size_after(*delta),
+                None => found(&op.path),
+            })
+            .collect();
+        for (op, counted) in self.in_flight.iter_mut().zip(counted) {
+            op.counted = Some(counted);
+        }
+        self.tracked_bytes = Some(u64::try_from(total).unwrap_or(0));
+    }
+
+    /// The directory's size if known. If not, and no background scan is
+    /// sizing it yet, `true`: the caller starts one
+    /// ([`DiskArtifactCache::spawn_sizing`]).
+    fn known_bytes(&mut self) -> (Option<u64>, bool) {
+        if self.tracked_bytes.is_some() || self.sizing {
+            return (self.tracked_bytes, false);
+        }
+        self.sizing = true;
+        (None, true)
+    }
+}
+
+/// A scan walking the directory. Writes and evictions that land meanwhile
+/// are recorded for it until it lands ([`Self::land`]) or is dropped, which
+/// closes it without a total, so an error or a panic mid-walk can't leave
+/// it open.
+#[must_use]
+struct Scan<'a> {
+    state: &'a Mutex<DiskArtifactCacheState>,
+    /// Where its window starts in [`DiskArtifactCacheState::landed`].
+    start: usize,
+    /// The background sizing, which closing it ends.
+    sizing: bool,
+}
+
+impl<'a> Scan<'a> {
+    fn begin(state: &'a Mutex<DiskArtifactCacheState>, sizing: bool) -> Self {
+        let start = state.lock().begin_scan();
+        Self {
+            state,
+            start,
+            sizing,
+        }
+    }
+
+    /// Install the size the walk found; see
+    /// [`DiskArtifactCacheState::land_scan`].
+    fn land(self, walked_total: u64, walked: &HashMap<&Path, u64>) {
+        self.state
+            .lock()
+            .land_scan(self.start, walked_total, walked);
+    }
+}
+
+impl Drop for Scan<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.end_scan();
+        if self.sizing {
+            state.sizing = false;
+        }
+    }
+}
+
+/// Accounts a registered write or eviction when dropped, so neither an early
+/// return nor a panic leaves its path registered for good.
+struct Landing<'a> {
+    state: &'a Mutex<DiskArtifactCacheState>,
+    id: u64,
+    delta: i64,
+}
+
+impl Drop for Landing<'_> {
+    fn drop(&mut self) {
+        self.state.lock().end(self.id, self.delta);
+    }
+}
+
+/// Walk `root` and land `scan` on what it found.
+fn walk_and_land(scan: Scan<'_>, root: &Path) -> io::Result<()> {
+    let entries = scan_cache_entries(root)?;
+    scan.land(walked_bytes(&entries), &walked_paths(&entries));
+    Ok(())
+}
+
+/// The bytes a walk found.
+fn walked_bytes(entries: &[CacheEntry]) -> u64 {
+    entries
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes))
+}
+
+/// Each entry a walk found, with its size, by path.
+fn walked_paths(entries: &[CacheEntry]) -> HashMap<&Path, u64> {
+    entries
+        .iter()
+        .map(|entry| (entry.path.as_path(), entry.bytes))
+        .collect()
+}
+
+/// How long a test pause waits on either side before failing the test.
+#[cfg(test)]
+const PAUSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Test hook: wait at `point` if a test armed it, after telling the test.
+/// The test lets the operation go on, or makes it panic here. A test that
+/// fails first does neither, and the operation panics rather than wait for
+/// good, so the test reports its failure instead of hanging on the join.
+#[cfg(test)]
+fn pause_at(state: &Mutex<DiskArtifactCacheState>, point: &'static str) {
+    let armed = state.lock().pauses.remove(point);
+    if let Some((reached, go)) = armed {
+        let _ = reached.send(());
+        match go.recv_timeout(PAUSE_LIMIT) {
+            Ok(true) => {}
+            Ok(false) => panic!("the test panicked `{point}`"),
+            Err(_) => panic!("the test never released `{point}`"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+fn storage_to_io_error(e: crate::error::Error) -> io::Error {
+    let kind = match &e {
+        crate::error::Error::NotFound(_) => io::ErrorKind::NotFound,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, e.to_string())
+}
+
+fn is_cache_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".cas_") && name.ends_with(".tmp"))
+}
+
+fn is_disk_full(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::StorageFull || err.raw_os_error() == Some(28)
+}
+
+pub fn try_read_cached_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_result_as_cache_outcome(fs::read(path))
+}
+
+/// `NotFound` — and `Unsupported`, which is what every `std::fs` call returns
+/// on wasm32-unknown-unknown — are cache MISSES that must fall through to the
+/// authoritative CAS fetch, not errors. `fetch_cached_bytes*` apply `?` to
+/// this result before attempting the fetch, so anything mapped to `Err` here
+/// aborts the read outright.
+fn read_result_as_cache_outcome(res: io::Result<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
+    match res {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Create the disk-cache directory, treating "this platform has no
+/// filesystem" as success.
+///
+/// Loaders call this once before reading through the cache. On
+/// wasm32-unknown-unknown `create_dir_all` returns `Unsupported`, and failing
+/// there would abort the whole load before a single CAS fetch was attempted —
+/// even though every subsequent cache read already degrades to a miss
+/// ([`try_read_cached_bytes`]) and every cache write is already suppressed
+/// (`available_space` reports 0). Real filesystem failures — permissions, a
+/// full disk, a path that is a file — still surface.
+pub fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    create_dir_result_as_cache_outcome(fs::create_dir_all(dir))
+}
+
+fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
+    match res {
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+fn directory_bytes(root: &Path) -> io::Result<u64> {
+    Ok(walked_bytes(&scan_cache_entries(root)?))
+}
+
+/// Test hook: runs on each file a walk on this thread lists, before the
+/// walk reads its size.
+#[cfg(test)]
+type ListedHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static ON_LISTED: std::cell::RefCell<Option<ListedHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+
+        // An entry removed after the listing is gone, not a failed walk: the
+        // cache's own evictions and writes run while it walks.
+        for child in read_dir {
+            let child = child?;
+            let path = child.path();
+            let file_type = match child.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || is_cache_temp_file(&path) {
+                continue;
+            }
+
+            #[cfg(test)]
+            ON_LISTED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(&path);
+                }
+            });
+            let meta = match child.metadata() {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            entries.push(CacheEntry {
+                path,
+                bytes: meta.len(),
+                modified: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+impl DiskArtifactCache {
+    pub fn for_dir(cache_dir: &Path) -> Arc<Self> {
+        let root = cache_dir.to_path_buf();
+        let mut registry = CACHE_REGISTRY.lock();
+        if let Some(existing) = registry.get(&root).and_then(Weak::upgrade) {
+            return existing;
+        }
+
+        let cache = Arc::new(Self::new(root.clone()));
+        registry.insert(root, Arc::downgrade(&cache));
+        cache
+    }
+
+    /// A cache with no directory and no budget, used only for its flights.
+    fn detached() -> Self {
+        Self {
+            root: PathBuf::new(),
+            budget_bytes: 0,
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
+            inflight: Mutex::new(HashMap::new()),
+            next_flight_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn new(root: PathBuf) -> Self {
+        if let Err(err) = fs::create_dir_all(&root) {
+            tracing::warn!(
+                cache_dir = %root.display(),
+                error = %err,
+                "failed to create disk artifact cache directory; cache writes disabled"
+            );
+            return Self {
+                root,
+                budget_bytes: 0,
+                state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
+                inflight: Mutex::new(HashMap::new()),
+                next_flight_generation: AtomicU64::new(0),
+            };
+        }
+
+        // No filesystem on wasm32: budget 0 disables cache writes, reads miss.
+        #[cfg(target_arch = "wasm32")]
+        let available: u64 = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let available = fs2::available_space(&root).unwrap_or_else(|err| {
+            tracing::warn!(
+                cache_dir = %root.display(),
+                error = %err,
+                "failed to inspect available disk space; disk cache writes disabled"
+            );
+            0
+        });
+        let budget_bytes = match std::env::var("FLUREE_DISK_CACHE_BUDGET_BYTES") {
+            Ok(val) => match val.parse::<u64>() {
+                Ok(0) => {
+                    tracing::debug!(
+                        cache_dir = %root.display(),
+                        "FLUREE_DISK_CACHE_BUDGET_BYTES=0; disk cache writes disabled"
+                    );
+                    0
+                }
+                Ok(bytes) => {
+                    tracing::trace!(
+                        cache_dir = %root.display(),
+                        budget_bytes = bytes,
+                        "using FLUREE_DISK_CACHE_BUDGET_BYTES override"
+                    );
+                    bytes
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        cache_dir = %root.display(),
+                        value = %val,
+                        error = %err,
+                        "invalid FLUREE_DISK_CACHE_BUDGET_BYTES; falling back to configured/auto"
+                    );
+                    configured_or_auto(available)
+                }
+            },
+            Err(_) => configured_or_auto(available),
+        };
+
+        if available > 0
+            && available
+                <= DEFAULT_LAMBDA_TMP_BYTES.saturating_add(DEFAULT_LAMBDA_TMP_WARN_SLACK_BYTES)
+        {
+            tracing::warn!(
+                cache_dir = %root.display(),
+                available_tmp_bytes = available,
+                cache_budget_bytes = budget_bytes,
+                "disk cache is using near-default ephemeral storage; consider increasing Lambda /tmp"
+            );
+        }
+
+        Self {
+            root,
+            budget_bytes,
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
+            inflight: Mutex::new(HashMap::new()),
+            next_flight_generation: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_budget(root: PathBuf, budget_bytes: u64) -> Self {
+        fs::create_dir_all(&root).expect("create test cache dir");
+        Self {
+            root,
+            budget_bytes,
+            state: Arc::new(Mutex::new(DiskArtifactCacheState::default())),
+            inflight: Mutex::new(HashMap::new()),
+            next_flight_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The disk byte budget. `0` means disk caching is disabled (writes are
+    /// skipped), so callers can avoid pointless remote fetches into a dead cache.
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    fn low_water_mark(&self) -> u64 {
+        self.budget_bytes
+            .saturating_mul(CACHE_EVICT_NUMERATOR)
+            .saturating_div(CACHE_EVICT_DENOMINATOR)
+    }
+
+    /// The directory's size, scanning it now if it is not yet known.
+    #[cfg(test)]
+    fn current_bytes(&self) -> io::Result<u64> {
+        if let Some(bytes) = self.state.lock().tracked_bytes {
+            return Ok(bytes);
+        }
+        walk_and_land(Scan::begin(&self.state, false), &self.root)?;
+        Ok(self.state.lock().tracked_bytes.unwrap_or(0))
+    }
+
+    /// Size the directory on a background thread.
+    ///
+    /// Walking a large shared cache takes seconds; done inline, under the
+    /// state lock, it stalls the async worker that writes first and every
+    /// writer queued on the lock. Writes made meanwhile skip the budget check,
+    /// and the scan reconciles everything that lands while it walks. The
+    /// scan opens before the walk starts, so anything that lands before it
+    /// opens is on disk for the walk to see.
+    fn spawn_sizing(&self) {
+        let root = self.root.clone();
+        let shared = Arc::clone(&self.state);
+        let size = move || {
+            let scan = Scan::begin(&shared, true);
+            #[cfg(test)]
+            pause_at(&shared, "size-scan");
+            if let Err(err) = walk_and_land(scan, &root) {
+                tracing::debug!(
+                    cache_dir = %root.display(),
+                    error = %err,
+                    "failed to size the disk cache; the next write retries"
+                );
+            }
+        };
+        // No threads on wasm32, where the cache never writes (budget 0).
+        #[cfg(target_arch = "wasm32")]
+        size();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(err) = std::thread::Builder::new()
+            .name("fluree-cache-size".into())
+            .spawn(size)
+        {
+            tracing::debug!(error = %err, "failed to start the disk cache size scan");
+            self.state.lock().sizing = false;
+        }
+    }
+
+    /// Drop one entry, keeping the byte accounting in step.
+    ///
+    /// An absent entry is the common case — most released CIDs were never
+    /// cached — and is not an error. Untracked totals stay untracked so the
+    /// next capacity check rescans rather than trusting a partial figure. An
+    /// entry another write or eviction is changing is left to it.
+    fn evict_entry(&self, path: &Path) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let Some(id) = self.state.lock().begin(path) else {
+            return;
+        };
+        let mut landing = Landing {
+            state: &self.state,
+            id,
+            delta: 0,
+        };
+        match fs::remove_file(path) {
+            Ok(()) => landing.delta = -(metadata.len() as i64),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::debug!(
+                cache_dir = %self.root.display(),
+                path = %path.display(),
+                error = %err,
+                "failed to evict cache entry for a released object"
+            ),
+        }
+        #[cfg(test)]
+        pause_at(&self.state, "evicted");
+    }
+
+    /// Remove entries, oldest first by mtime, until the directory holds no
+    /// more than `target_bytes`.
+    ///
+    /// Reads never touch mtime ([`try_read_cached_bytes`] is a plain
+    /// `fs::read`), so this is write order, not access order: the entries
+    /// that go first are the ones resident longest, however often they are
+    /// read. A bulk writer sharing the directory with the read path — the
+    /// index sweep walks and caches every root in a chain — can push out hot
+    /// leaves once the budget is reached.
+    ///
+    /// It rescans the directory, so it lands as a scan, and each removal is
+    /// a registered eviction: entries another write or eviction is changing
+    /// are passed over.
+    fn evict_until(&self, target_bytes: u64) -> io::Result<()> {
+        let scan = Scan::begin(&self.state, false);
+        let mut entries = scan_cache_entries(&self.root)?;
+        #[cfg(test)]
+        pause_at(&self.state, "rescan");
+        let walked_total = walked_bytes(&entries);
+        let mut current = walked_total;
+        if current > target_bytes {
+            entries.sort_by_key(|entry| entry.modified);
+            for entry in &entries {
+                if current <= target_bytes {
+                    break;
+                }
+                let Some(id) = self.state.lock().begin(&entry.path) else {
+                    continue;
+                };
+                let mut landing = Landing {
+                    state: &self.state,
+                    id,
+                    delta: 0,
+                };
+                match fs::remove_file(&entry.path) {
+                    Ok(()) => {
+                        landing.delta = -(entry.bytes as i64);
+                        current = current.saturating_sub(entry.bytes);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        // Gone since the walk, through this cache or around
+                        // it: the landing counts it as gone either way.
+                        landing.delta = -(entry.bytes as i64);
+                        current = current.saturating_sub(entry.bytes);
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            cache_dir = %self.root.display(),
+                            path = %entry.path.display(),
+                            error = %err,
+                            "failed to evict cache file"
+                        );
+                    }
+                }
+            }
+        }
+        scan.land(walked_total, &walked_paths(&entries));
+        Ok(())
+    }
+
+    /// Make room for `incoming_bytes` when the directory's size is `known`
+    /// and the write would pass the budget.
+    fn ensure_capacity(&self, known: Option<u64>, incoming_bytes: u64) -> io::Result<()> {
+        let Some(current) = known else {
+            return Ok(());
+        };
+        if current.saturating_add(incoming_bytes) <= self.budget_bytes {
+            return Ok(());
+        }
+
+        let target = self
+            .low_water_mark()
+            .min(self.budget_bytes.saturating_sub(incoming_bytes));
+        self.evict_until(target)
+    }
+
+    fn write_atomic(&self, target: &Path, bytes: &[u8]) -> io::Result<bool> {
+        if target.exists() {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        pause_at(&self.state, "checked");
+
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::other("cache target has no parent dir"))?;
+        fs::create_dir_all(parent)?;
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = parent.join(format!(".cas_{}_{}.tmp", std::process::id(), seq));
+        if let Err(err) = fs::write(&tmp, bytes) {
+            // Scans skip temporary files, so a partial one left here would
+            // hold disk space no accounting sees and no eviction removes.
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        if let Err(_rename_err) = fs::rename(&tmp, target) {
+            let _ = fs::remove_file(&tmp);
+            if !target.exists() {
+                return Err(io::Error::other(format!(
+                    "failed to cache bytes to {target:?}"
+                )));
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub fn best_effort_write(&self, target: &Path, bytes: &[u8]) {
+        // Only a write that creates the entry registers: a registered write
+        // keeps an eviction of its path away for its whole run. One that
+        // races another to create it is still caught by `write_atomic`.
+        if self.budget_bytes == 0 || target.exists() {
+            return;
+        }
+
+        // One lock registers the write and reads the directory's size.
+        let (id, known, size) = {
+            let mut state = self.state.lock();
+            // Another write or an eviction of this entry is under way.
+            let Some(id) = state.begin(target) else {
+                return;
+            };
+            let (known, size) = state.known_bytes();
+            (id, known, size)
+        };
+        #[cfg(test)]
+        pause_at(&self.state, "registered");
+        if size {
+            self.spawn_sizing();
+        }
+        let mut landing = Landing {
+            state: &self.state,
+            id,
+            delta: 0,
+        };
+
+        if let Err(err) = self.ensure_capacity(known, bytes.len() as u64) {
+            tracing::warn!(
+                cache_dir = %self.root.display(),
+                error = %err,
+                "failed to enforce disk cache budget; skipping cache write"
+            );
+            return;
+        }
+
+        let written = match self.write_atomic(target, bytes) {
+            Err(err) if is_disk_full(&err) => {
+                if let Err(evict_err) = self.evict_until(self.low_water_mark()) {
+                    tracing::warn!(
+                        cache_dir = %self.root.display(),
+                        error = %evict_err,
+                        "failed to evict cache files after disk-full error"
+                    );
+                    return;
+                }
+                self.write_atomic(target, bytes).inspect_err(|retry_err| {
+                    tracing::warn!(
+                        cache_dir = %self.root.display(),
+                        target = %target.display(),
+                        error = %retry_err,
+                        "disk cache write failed after eviction; continuing without cache"
+                    );
+                })
+            }
+            Err(err) => {
+                tracing::warn!(
+                    cache_dir = %self.root.display(),
+                    target = %target.display(),
+                    error = %err,
+                    "disk cache write failed; continuing without cache"
+                );
+                Err(err)
+            }
+            written => written,
+        };
+        if let Ok(true) = written {
+            landing.delta = bytes.len() as i64;
+        }
+        #[cfg(test)]
+        pause_at(&self.state, "written");
+    }
+
+    /// Remove the in-flight entry for `target` iff it is still the flight with
+    /// `generation`. The generation check keeps removal ABA-safe: a stale guard
+    /// from a cancelled leader must not evict a newer flight a different leader
+    /// started for the same target.
+    fn finish_flight(&self, target: &Path, generation: u64) {
+        let mut map = self.inflight.lock();
+        if map.get(target).is_some_and(|f| f.generation == generation) {
+            map.remove(target);
+        }
+    }
+
+    /// Coalesce concurrent remote fetches that target the same cache path so
+    /// only ONE `fetch` runs per `target` at a time; other callers await the
+    /// shared result instead of each issuing their own S3 GET and tmp-file
+    /// write. This is process-local (it does not coordinate across containers).
+    ///
+    /// `fetch` is the leader's remote read (e.g. `cs.get(id)` mapped to io).
+    /// Only the leader runs it. After winning the flight the leader double-
+    /// checks disk (a just-finished prior flight may have written the file),
+    /// then on a miss fetches once, writes the cache atomically, and wakes
+    /// waiters with the shared bytes.
+    ///
+    /// Safety properties:
+    /// - the in-flight map lock is never held across `.await`;
+    /// - the slot is cleared on completion *and* on drop, so a cancelled or
+    ///   panicked leader cannot orphan it (waiters then observe a closed channel
+    ///   and retry rather than hang);
+    /// - errors are propagated to current waiters but never cached — the slot is
+    ///   gone by then, so the next caller retries.
+    pub async fn coalesced_fetch<F, Fut>(
+        self: &Arc<Self>,
+        target: PathBuf,
+        fetch: F,
+    ) -> io::Result<Vec<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Vec<u8>>>,
+    {
+        self.coalesce(target, true, fetch).await
+    }
+
+    /// [`Self::coalesced_fetch`], with `persist == false` touching no disk:
+    /// the leader neither re-checks nor writes `target`, only fetches.
+    async fn coalesce<F, Fut>(
+        self: &Arc<Self>,
+        target: PathBuf,
+        persist: bool,
+        fetch: F,
+    ) -> io::Result<Vec<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Vec<u8>>>,
+    {
+        loop {
+            // Decide leader vs waiter under the lock; release it before awaiting.
+            let role = {
+                let mut map = self.inflight.lock();
+                match map.get(&target) {
+                    Some(flight) => FlightRole::Waiter(flight.tx.subscribe()),
+                    None => {
+                        let (tx, _rx) = broadcast::channel(1);
+                        let generation =
+                            self.next_flight_generation.fetch_add(1, Ordering::Relaxed);
+                        map.insert(
+                            target.clone(),
+                            Flight {
+                                generation,
+                                tx: tx.clone(),
+                            },
+                        );
+                        FlightRole::Leader { generation, tx }
+                    }
+                }
+            };
+
+            match role {
+                FlightRole::Waiter(mut rx) => match rx.recv().await {
+                    Ok(Ok(bytes)) => return Ok(bytes.to_vec()),
+                    Ok(Err(err)) => return Err(io::Error::new(err.kind(), err.to_string())),
+                    // Leader finished without publishing (cancelled/panicked).
+                    // Its guard has cleared the slot, so retry as a fresh caller
+                    // rather than wait on a result that will never arrive.
+                    Err(_) => continue,
+                },
+                FlightRole::Leader { generation, tx } => {
+                    // Clears the slot on completion or on early return /
+                    // cancellation (drop). Generation-checked, so it never
+                    // evicts a newer flight for the same target.
+                    let guard = FlightGuard {
+                        cache: Arc::clone(self),
+                        target: target.clone(),
+                        generation,
+                    };
+
+                    // Double-check disk after winning: a prior flight for the
+                    // same target may have just completed its atomic write.
+                    //
+                    // The disk re-check is an OPTIMIZATION only. A cache miss
+                    // (`Ok(None)`) OR a transient read error (`Err`, e.g. EIO /
+                    // fd exhaustion on the local file) both fall through to the
+                    // authoritative remote fetch — we must not let one caller's
+                    // disk hiccup broadcast a failure to the whole coalesced
+                    // batch, since the fetch path can satisfy everyone.
+                    let cached = if persist {
+                        try_read_cached_bytes(&target).ok().flatten()
+                    } else {
+                        None
+                    };
+                    let outcome: io::Result<Vec<u8>> = match cached {
+                        Some(bytes) => Ok(bytes),
+                        None => match fetch().await {
+                            Ok(bytes) => {
+                                if persist {
+                                    self.best_effort_write(&target, &bytes);
+                                }
+                                Ok(bytes)
+                            }
+                            Err(err) => Err(err),
+                        },
+                    };
+
+                    // Clear the slot before waking waiters so callers arriving
+                    // after this point start a fresh flight (and hit the now-
+                    // written cache) instead of subscribing to a finished one.
+                    drop(guard);
+
+                    // Wake waiters that subscribed before removal. Skip the
+                    // shared allocation entirely when nobody is waiting.
+                    if tx.receiver_count() > 0 {
+                        let payload: FlightResult = match &outcome {
+                            Ok(bytes) => Ok(Arc::from(bytes.as_slice())),
+                            Err(err) => Err(Arc::new(io::Error::new(err.kind(), err.to_string()))),
+                        };
+                        let _ = tx.send(payload);
+                    }
+                    return outcome;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `cs`'s artifacts belong in the disk cache at all.
+///
+/// The rule every reader and writer of the cache follows. A local copy pays
+/// off only when the store's reads leave the machine — a store on local disk
+/// or in memory is already as fast as the cache would be — and is allowed
+/// only when the store's bytes may sit outside it in plaintext.
+pub fn uses_disk_cache(cs: &dyn ContentStore) -> bool {
+    cs.is_remote() && cs.permits_plaintext_cache()
+}
+
+/// Whether a copy of `id` belongs in the disk cache: [`uses_disk_cache`],
+/// and the store does not already hold it as a local file (a remote store's
+/// local tier).
+pub fn needs_disk_copy(cs: &dyn ContentStore, id: &ContentId) -> bool {
+    uses_disk_cache(cs) && cs.resolve_local_path(id).is_none()
+}
+
+/// Copy `bytes`, which `cs` holds as `id`, into the cache at `cache_dir` when
+/// [`needs_disk_copy`] says a copy is worth having, returning whether it
+/// tried. Best effort: a failed write only costs a later fetch.
+pub fn seed_disk_cache(
+    cs: &dyn ContentStore,
+    id: &ContentId,
+    cache_dir: &Path,
+    bytes: &[u8],
+) -> bool {
+    if !needs_disk_copy(cs, id) {
+        return false;
+    }
+    DiskArtifactCache::for_dir(cache_dir).best_effort_write(&cache_dir.join(id.to_string()), bytes);
+    true
+}
+
+/// Drop `id` from every disk cache this process holds open.
+///
+/// Callers delete an object from storage and then call this. A cache entry
+/// that outlives its blob still reads back, so anything deciding what storage
+/// holds from a cached read sees a deleted object as present — the index-chain
+/// walk ends at a root storage no longer holds, and a stale entry hides that
+/// ending.
+///
+/// Best effort, and narrower than "no entry outlives its blob":
+///
+/// - it reaches this process's caches, so a delete by another process leaves
+///   that process's entry behind,
+/// - a crash between the delete and this call leaves the entry behind, where
+///   it survives restarts and goes only when the cache exceeds its budget,
+/// - it is reached through [`ContentStore::release`], and not every delete
+///   goes that way: the index sweep reclaims orphans by address, through
+///   [`crate::storage::Storage::delete`], because its plan comes from a
+///   storage listing and has no CID to evict by. Those entries stay behind
+///   the same way a crash leaves them. The sweep can afford that because an
+///   orphan is, by construction, a blob no index chain reaches, so no walk
+///   reads its entry afterwards,
+/// - a fetch already in flight for `id` writes its result when it completes,
+///   which can be after this call, and an entry it is writing right now is
+///   left to it. Eviction removes an entry; it cannot cancel the read that
+///   is about to replace it.
+/// - it drops entries keyed by CID ([`fetch_cached_bytes_cid`]). Entries
+///   [`fetch_cached_bytes`] keys by digest and extension would need a
+///   directory scan per call to find, which a release loop cannot afford, so
+///   they are left to budget eviction.
+///
+/// Consumers that must not act on a released object therefore still need to
+/// tolerate one, rather than treating this as a guarantee.
+pub fn evict_cached_cid(id: &ContentId) {
+    // Snapshot before touching the filesystem: a release loop runs many of
+    // these concurrently and the registry lock is process-global.
+    //
+    // Registered directories outlive the cache instances that opened them —
+    // callers build a `DiskArtifactCache` per fetch and drop it — so the entry
+    // to remove is found by directory, and the instance is used only when one
+    // still happens to be open.
+    let caches: Vec<(PathBuf, Option<Arc<DiskArtifactCache>>)> = CACHE_REGISTRY
+        .lock()
+        .iter()
+        .map(|(dir, cache)| (dir.clone(), cache.upgrade()))
+        .collect();
+
+    for (dir, cache) in caches {
+        let path = dir.join(id.to_string());
+        match cache {
+            // A live instance tracks its own byte total, so go through it and
+            // keep the budget accounting in step.
+            Some(cache) => cache.evict_entry(&path),
+            // Nothing holds this directory open, so no total needs adjusting;
+            // whichever instance opens it next rescans from disk.
+            None => match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => tracing::debug!(
+                    cache_dir = %dir.display(),
+                    error = %err,
+                    "failed to evict cache entry for a released object"
+                ),
+            },
+        }
+    }
+}
+
+/// Read `id` straight from the store, touching no cache path: the read path
+/// for every store [`uses_disk_cache`] keeps out of the cache. For one that
+/// decrypts on read, its bytes must not land in the cache directory, and a
+/// stale plaintext entry from an earlier unencrypted run must not be
+/// consulted either. Concurrent readers of one artifact still share a single
+/// fetch, keyed by `target` — the path the cache would have used.
+async fn fetch_uncached(
+    cs: &dyn ContentStore,
+    id: &ContentId,
+    target: PathBuf,
+) -> io::Result<Vec<u8>> {
+    UNCACHED_FLIGHTS
+        .coalesce(target, false, || async {
+            cs.get(id).await.map_err(storage_to_io_error)
+        })
+        .await
+}
+
+// Both return `fetch_through_cache`'s future rather than awaiting it: an
+// extra `async fn` layer here pushes some callers' future types past the
+// compiler's layout depth limit.
+pub fn fetch_cached_bytes<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
+    ext: &str,
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
+    let cached = cache_dir.join(format!("{}.{}", id.digest_hex(), ext));
+    fetch_through_cache(cs, id, cache_dir, cached)
+}
+
+pub fn fetch_cached_bytes_cid<'a>(
+    cs: &'a dyn ContentStore,
+    id: &'a ContentId,
+    cache_dir: &'a Path,
+) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + 'a {
+    let cached = cache_dir.join(id.to_string());
+    fetch_through_cache(cs, id, cache_dir, cached)
+}
+
+/// Read `id` from the store's own local file when it has one, else through
+/// the disk cache entry `cached` when [`uses_disk_cache`] allows, else
+/// straight from the store.
+async fn fetch_through_cache(
+    cs: &dyn ContentStore,
+    id: &ContentId,
+    cache_dir: &Path,
+    cached: PathBuf,
+) -> io::Result<Vec<u8>> {
+    if let Some(local_path) = cs.resolve_local_path(id) {
+        if let Some(bytes) = try_read_cached_bytes(&local_path)? {
+            return Ok(bytes);
+        }
+        tracing::debug!(
+            path = %local_path.display(),
+            "local artifact path disappeared during read; fetching from the store"
+        );
+    }
+    if !uses_disk_cache(cs) {
+        return fetch_uncached(cs, id, cached).await;
+    }
+    if let Some(bytes) = try_read_cached_bytes(&cached)? {
+        return Ok(bytes);
+    }
+    DiskArtifactCache::for_dir(cache_dir)
+        .coalesced_fetch(cached, || async {
+            cs.get(id).await.map_err(storage_to_io_error)
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// wasm32-unknown-unknown returns `Unsupported` from every `std::fs`
+    /// call. That MUST read as a cache miss (fall through to CAS fetch), not
+    /// an error — `fetch_cached_bytes*` apply `?` to this result before ever
+    /// reaching the fetch.
+    #[test]
+    fn unsupported_read_is_a_miss_not_an_error() {
+        let miss = read_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation not supported on this platform",
+        )));
+        assert!(matches!(miss, Ok(None)));
+
+        let not_found =
+            read_result_as_cache_outcome(Err(io::Error::new(io::ErrorKind::NotFound, "enoent")));
+        assert!(matches!(not_found, Ok(None)));
+
+        let hit = read_result_as_cache_outcome(Ok(vec![1, 2, 3]));
+        assert!(matches!(hit, Ok(Some(ref b)) if b == &vec![1, 2, 3]));
+
+        // Real I/O failures (EIO, permissions) still surface as errors.
+        let denied = read_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "eacces",
+        )));
+        assert!(denied.is_err());
+    }
+
+    /// The same rule for the loaders' one-time `create_dir_all`: on a
+    /// filesystem-less platform there is simply no cache directory to make,
+    /// and aborting there kills the load before any CAS fetch is attempted.
+    #[test]
+    fn unsupported_create_dir_is_not_an_error() {
+        let unsupported = create_dir_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation not supported on this platform",
+        )));
+        assert!(unsupported.is_ok());
+
+        assert!(create_dir_result_as_cache_outcome(Ok(())).is_ok());
+
+        // A real filesystem failure still aborts the load.
+        let denied = create_dir_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "eacces",
+        )));
+        assert!(denied.is_err());
+    }
+
+    fn temp_cache_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "fluree-artifact-cache-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            n
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn write_and_read_back() {
+        let dir = temp_cache_dir("write-read");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let target = dir.join("abc123.leaf");
+        let data = b"hello world";
+
+        cache.best_effort_write(&target, data);
+        assert!(target.exists());
+        assert_eq!(fs::read(&target).unwrap(), data);
+    }
+
+    #[test]
+    fn write_skipped_when_budget_is_zero() {
+        let dir = temp_cache_dir("zero-budget");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 0);
+        let target = dir.join("should-not-exist.leaf");
+
+        cache.best_effort_write(&target, b"data");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn duplicate_write_is_idempotent() {
+        let dir = temp_cache_dir("dup-write");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let target = dir.join("dup.leaf");
+        let data = b"first write";
+
+        cache.best_effort_write(&target, data);
+        cache.best_effort_write(&target, b"second write attempt");
+        // First write wins — content unchanged.
+        assert_eq!(fs::read(&target).unwrap(), data);
+    }
+
+    #[test]
+    fn tracked_bytes_updated_on_write() {
+        let dir = temp_cache_dir("tracked");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+
+        cache.best_effort_write(&dir.join("a.leaf"), &[0u8; 100]);
+        cache.best_effort_write(&dir.join("b.leaf"), &[0u8; 200]);
+
+        assert_eq!(cache.current_bytes().unwrap(), 300);
+    }
+
+    /// The first write sizes the directory off the writer's thread: a large
+    /// shared cache took seconds to walk inline, under the state lock, which
+    /// stalled the async worker writing first and every writer behind it.
+    #[test]
+    fn first_write_does_not_wait_for_the_size_scan() {
+        let dir = temp_cache_dir("background-scan");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        fs::write(dir.join("existing.leaf"), [0u8; 300]).unwrap();
+        let scan = arm(&cache, "size-scan");
+
+        // Returns with the scan still held: the size is not known yet.
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        assert!(dir.join("new.leaf").exists());
+        assert_eq!(cache.state.lock().tracked_bytes, None);
+
+        scan.release();
+        wait_for_sizing(&cache);
+        // The walk saw the new entry too; it is counted once.
+        assert_eq!(cache.state.lock().tracked_bytes, Some(400));
+    }
+
+    /// A pause armed at a named point; see `pause_at`. Arm it inside the
+    /// `thread::scope` whose thread it parks: if the test fails, dropping it
+    /// fails that thread too, and the scope reports the failure.
+    struct Pause {
+        reached: std::sync::mpsc::Receiver<()>,
+        go: std::sync::mpsc::Sender<bool>,
+    }
+
+    impl Pause {
+        /// Wait for an operation to park here.
+        fn reached(&self) {
+            self.reached
+                .recv_timeout(PAUSE_LIMIT)
+                .expect("no operation reached the pause");
+        }
+
+        /// Let the parked operation go on.
+        fn release(&self) {
+            let _ = self.go.send(true);
+        }
+
+        /// Whether an operation has parked here.
+        fn is_reached(&self) -> bool {
+            self.reached.try_recv().is_ok()
+        }
+
+        /// Make the parked operation panic where it is.
+        fn panic(&self) {
+            let _ = self.go.send(false);
+        }
+    }
+
+    /// Arm the pause at `point`: the operation that reaches it parks there.
+    fn arm(cache: &DiskArtifactCache, point: &'static str) -> Pause {
+        let (reached, at) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel();
+        cache.state.lock().pauses.insert(point, (reached, wait));
+        Pause { reached: at, go }
+    }
+
+    fn wait_for_sizing(cache: &DiskArtifactCache) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cache.state.lock().sizing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "size scan never landed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Start the background size scan without a write.
+    fn start_sizing(cache: &DiskArtifactCache) {
+        let (_, size) = cache.state.lock().known_bytes();
+        assert!(size, "the size is not known yet");
+        cache.spawn_sizing();
+    }
+
+    /// The accounting matches the directory.
+    fn assert_exact(cache: &DiskArtifactCache, dir: &Path, bytes: u64) {
+        assert_eq!(directory_bytes(dir).unwrap(), bytes, "the directory");
+        assert_eq!(
+            cache.state.lock().tracked_bytes,
+            Some(bytes),
+            "the accounting"
+        );
+    }
+
+    /// A size scan that walks after a write's file lands, and lands before
+    /// the write is accounted, counts the file once.
+    #[test]
+    fn a_size_scan_landing_inside_a_write_counts_it_once() {
+        let dir = temp_cache_dir("size-scan-in-write");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        std::thread::scope(|scope| {
+            let scan = arm(&cache, "size-scan");
+            let written = arm(&cache, "written");
+            scope.spawn(|| cache.best_effort_write(&dir.join("a.leaf"), &[0u8; 100]));
+            scan.reached();
+            written.reached();
+            scan.release();
+            wait_for_sizing(&cache);
+            written.release();
+        });
+        assert_exact(&cache, &dir, 100);
+    }
+
+    /// A size scan that walks after an eviction's file is gone, and lands
+    /// before the eviction is accounted, counts it gone once.
+    #[test]
+    fn a_size_scan_landing_inside_an_eviction_counts_it_once() {
+        let dir = temp_cache_dir("size-scan-in-evict");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gone.leaf"), [0u8; 300]).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        std::thread::scope(|scope| {
+            let scan = arm(&cache, "size-scan");
+            let evicted = arm(&cache, "evicted");
+            start_sizing(&cache);
+            scope.spawn(|| cache.evict_entry(&dir.join("gone.leaf")));
+            scan.reached();
+            evicted.reached();
+            scan.release();
+            wait_for_sizing(&cache);
+            evicted.release();
+        });
+        assert_exact(&cache, &dir, 500);
+    }
+
+    /// A write that lands while `evict_until` rescans is kept: the rescan's
+    /// total doesn't overwrite it.
+    #[test]
+    fn a_write_landing_inside_a_rescan_is_kept() {
+        let dir = temp_cache_dir("write-in-rescan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 500);
+        std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
+            scope.spawn(|| cache.evict_until(10_000).unwrap());
+            rescan.reached();
+            cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+            rescan.release();
+        });
+        assert_exact(&cache, &dir, 600);
+    }
+
+    /// A rescan that walks after a write's file lands, and lands before the
+    /// write is accounted, counts the file once.
+    #[test]
+    fn a_rescan_landing_inside_a_write_counts_it_once() {
+        let dir = temp_cache_dir("rescan-in-write");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 500);
+        std::thread::scope(|scope| {
+            let written = arm(&cache, "written");
+            scope.spawn(|| cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]));
+            written.reached();
+            cache.evict_until(10_000).unwrap();
+            written.release();
+        });
+        assert_exact(&cache, &dir, 600);
+    }
+
+    /// An eviction that lands while `evict_until` rescans is kept: the
+    /// rescan's total doesn't count the entry back.
+    #[test]
+    fn an_eviction_landing_inside_a_rescan_is_kept() {
+        let dir = temp_cache_dir("evict-in-rescan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gone.leaf"), [0u8; 300]).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 800);
+        std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
+            scope.spawn(|| cache.evict_until(10_000).unwrap());
+            rescan.reached();
+            cache.evict_entry(&dir.join("gone.leaf"));
+            rescan.release();
+        });
+        assert_exact(&cache, &dir, 500);
+    }
+
+    /// An entry removed around the cache after `evict_until`'s walk, which
+    /// then finds it gone, isn't counted.
+    #[test]
+    fn an_entry_gone_before_a_rescan_removes_it_is_not_counted() {
+        let dir = temp_cache_dir("gone-in-rescan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("old.leaf"), [0u8; 300]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(dir.join("new.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 800);
+        std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
+            scope.spawn(|| cache.evict_until(600).unwrap());
+            rescan.reached();
+            fs::remove_file(dir.join("old.leaf")).unwrap();
+            rescan.release();
+        });
+        assert!(dir.join("new.leaf").exists());
+        assert_exact(&cache, &dir, 500);
+    }
+
+    /// A rescan that panics mid-walk closes: operations stop being recorded
+    /// for it.
+    #[test]
+    fn a_rescan_that_panics_is_closed() {
+        let dir = temp_cache_dir("rescan-panics");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 500);
+        let rescanned = std::thread::scope(|scope| {
+            let rescan = arm(&cache, "rescan");
+            let evict = scope.spawn(|| cache.evict_until(0));
+            rescan.reached();
+            rescan.panic();
+            evict.join()
+        });
+        assert!(rescanned.is_err(), "the rescan should have panicked");
+        assert_eq!(cache.state.lock().scans, 0, "the rescan is still open");
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        assert!(cache.state.lock().landed.is_empty());
+    }
+
+    /// A size scan that panics ends the sizing: the next write sizes the
+    /// directory again, so the budget is enforced.
+    #[test]
+    fn a_size_scan_that_panics_is_closed() {
+        let dir = temp_cache_dir("size-scan-panics");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 300]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let scan = arm(&cache, "size-scan");
+        start_sizing(&cache);
+        scan.reached();
+        scan.panic();
+        wait_for_sizing(&cache);
+        assert_eq!(cache.state.lock().scans, 0, "the size scan is still open");
+        assert_eq!(cache.state.lock().tracked_bytes, None);
+
+        cache.best_effort_write(&dir.join("new.leaf"), &[0u8; 100]);
+        wait_for_sizing(&cache);
+        assert_exact(&cache, &dir, 400);
+    }
+
+    /// Two writes of one entry at once: the second finds the first under way
+    /// and leaves the entry to it, so it is written and counted once.
+    #[test]
+    fn a_second_write_of_an_entry_under_way_is_left_to_the_first() {
+        let dir = temp_cache_dir("write-twice");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 0);
+        let target = dir.join("same.leaf");
+        std::thread::scope(|scope| {
+            let checked = arm(&cache, "checked");
+            scope.spawn(|| cache.best_effort_write(&target, &[0u8; 100]));
+            checked.reached();
+            cache.best_effort_write(&target, &[0u8; 100]);
+            checked.release();
+        });
+        assert_exact(&cache, &dir, 100);
+    }
+
+    /// A write of an entry already on disk changes nothing, so it doesn't
+    /// hold the entry: an eviction meanwhile removes it.
+    #[test]
+    fn a_write_of_an_entry_on_disk_leaves_it_to_an_eviction() {
+        let dir = temp_cache_dir("write-cached");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cached.leaf");
+        fs::write(&target, [0u8; 100]).unwrap();
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 100);
+        std::thread::scope(|scope| {
+            let registered = arm(&cache, "registered");
+            let write = scope.spawn(|| cache.best_effort_write(&target, &[0u8; 100]));
+            // A write that holds the entry parks once it does; one that
+            // doesn't returns.
+            let deadline = std::time::Instant::now() + PAUSE_LIMIT;
+            while !write.is_finished() && !registered.is_reached() {
+                assert!(std::time::Instant::now() < deadline, "the write hung");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cache.evict_entry(&target);
+            registered.release();
+        });
+        assert!(
+            !target.exists(),
+            "the write kept the entry from the eviction"
+        );
+        assert_exact(&cache, &dir, 0);
+    }
+
+    /// A released object's entry must go, or a later read sees a blob storage
+    /// no longer holds.
+    #[tokio::test]
+    async fn evicting_a_cid_removes_its_cached_entry() {
+        let dir = temp_cache_dir("evict-cid");
+        let data = vec![7u8; 128];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let store = CountingStore {
+            data: data.clone(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
+        };
+
+        fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
+        let cached = dir.join(id.to_string());
+        assert!(cached.exists(), "fetch should have populated the cache");
+
+        evict_cached_cid(&id);
+
+        assert!(
+            !cached.exists(),
+            "released CID still readable from the cache"
+        );
+    }
+
+    /// Most released CIDs were never cached, so an absent entry is the common
+    /// path, not an error.
+    #[test]
+    fn evicting_an_uncached_cid_is_silent() {
+        let dir = temp_cache_dir("evict-absent");
+        // Registers the cache so the eviction has somewhere to look.
+        let _cache = DiskArtifactCache::for_dir(&dir);
+        let id = ContentId::new(crate::ContentKind::IndexRoot, b"never-cached");
+
+        evict_cached_cid(&id);
+    }
+
+    /// Eviction and writes share the byte accounting, so a released entry does
+    /// not leave the budget overstated.
+    #[test]
+    fn tracked_bytes_updated_on_eviction() {
+        let dir = temp_cache_dir("evict-tracked");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let target = dir.join("tracked.leaf");
+
+        cache.best_effort_write(&target, &[0u8; 100]);
+        assert_eq!(cache.current_bytes().unwrap(), 100);
+
+        cache.evict_entry(&target);
+
+        assert_eq!(cache.current_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn eviction_removes_oldest_files() {
+        let dir = temp_cache_dir("eviction");
+        // Budget: 500 bytes, low water mark = 500 * 8/10 = 400.
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 500);
+
+        // Write three 150-byte files (total 450, under budget).
+        for name in &["old.leaf", "mid.leaf", "new.leaf"] {
+            let target = dir.join(name);
+            cache.best_effort_write(&target, &[0u8; 150]);
+            // Ensure distinct modification times for deterministic eviction order.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(cache.current_bytes().unwrap(), 450);
+
+        // Writing another 150 bytes pushes total to 600 > 500 budget.
+        // ensure_capacity should evict oldest files down to low water mark (400)
+        // or budget - incoming (350), whichever is lower → 350.
+        cache.best_effort_write(&dir.join("trigger.leaf"), &[0u8; 150]);
+
+        // The oldest file(s) should have been evicted.
+        assert!(
+            !dir.join("old.leaf").exists(),
+            "oldest file should be evicted"
+        );
+        // The newest files + trigger should survive.
+        assert!(dir.join("trigger.leaf").exists());
+    }
+
+    #[test]
+    fn scan_ignores_temp_files() {
+        let dir = temp_cache_dir("scan-temp");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("real.leaf"), [0u8; 10]).unwrap();
+        fs::write(dir.join(".cas_123_0.tmp"), [0u8; 20]).unwrap();
+
+        let entries = scan_cache_entries(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.ends_with("real.leaf"));
+    }
+
+    /// An entry removed between the walk listing it and reading its size is
+    /// gone, not a failed walk.
+    #[test]
+    fn scan_skips_an_entry_removed_mid_walk() {
+        let dir = temp_cache_dir("scan-vanished");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gone.leaf"), [0u8; 300]).unwrap();
+        fs::write(dir.join("kept.leaf"), [0u8; 500]).unwrap();
+        ON_LISTED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|path: &Path| {
+                if path.ends_with("gone.leaf") {
+                    fs::remove_file(path).unwrap();
+                }
+            }));
+        });
+        let walked = scan_cache_entries(&dir);
+        ON_LISTED.with(|hook| hook.borrow_mut().take());
+        let entries = walked.expect("the walk failed on the removed entry");
+        assert_eq!(walked_bytes(&entries), 500);
+    }
+
+    #[test]
+    fn scan_walks_subdirectories() {
+        let dir = temp_cache_dir("scan-subdir");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("a.leaf"), [0u8; 10]).unwrap();
+        fs::write(sub.join("b.leaf"), [0u8; 20]).unwrap();
+
+        let entries = scan_cache_entries(&dir).unwrap();
+        assert_eq!(entries.len(), 2);
+        let total: u64 = entries.iter().map(|e| e.bytes).sum();
+        assert_eq!(total, 30);
+    }
+
+    #[test]
+    fn for_dir_returns_singleton() {
+        let dir = temp_cache_dir("singleton");
+        let a = DiskArtifactCache::for_dir(&dir);
+        let b = DiskArtifactCache::for_dir(&dir);
+        assert!(Arc::ptr_eq(&a, &b), "same dir should return same Arc");
+    }
+
+    #[test]
+    fn singleton_dropped_when_no_strong_refs() {
+        let dir = temp_cache_dir("singleton-drop");
+        let a = DiskArtifactCache::for_dir(&dir);
+        let ptr1 = Arc::as_ptr(&a);
+        drop(a);
+
+        // After dropping the only strong ref, a new call should create a fresh instance.
+        let b = DiskArtifactCache::for_dir(&dir);
+        let ptr2 = Arc::as_ptr(&b);
+        assert_ne!(ptr1, ptr2, "should be a new instance after drop");
+    }
+
+    #[test]
+    fn current_bytes_scans_on_first_call() {
+        let dir = temp_cache_dir("initial-scan");
+        fs::create_dir_all(&dir).unwrap();
+        // Pre-populate some files before creating the cache.
+        fs::write(dir.join("pre1.leaf"), [0u8; 100]).unwrap();
+        fs::write(dir.join("pre2.leaf"), [0u8; 200]).unwrap();
+
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        assert_eq!(cache.current_bytes().unwrap(), 300);
+    }
+
+    #[test]
+    fn write_creates_parent_dirs() {
+        let dir = temp_cache_dir("nested-write");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let target = dir.join("deep").join("nested").join("file.leaf");
+
+        cache.best_effort_write(&target, b"nested data");
+        assert_eq!(fs::read(&target).unwrap(), b"nested data");
+    }
+
+    // ---- Single-flight coalescing ----
+
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalesced_fetch_runs_leader_once_under_concurrency() {
+        let dir = temp_cache_dir("coalesce-once");
+        let cache = Arc::new(DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024));
+        let target = dir.join("obj.bin");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let target = target.clone();
+            let calls = Arc::clone(&calls);
+            handles.push(tokio::spawn(async move {
+                cache
+                    .coalesced_fetch(target, move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Hold the flight open long enough for the others to join.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok(b"shared-bytes".to_vec())
+                    })
+                    .await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap().unwrap(), b"shared-bytes");
+        }
+        // Only the leader fetched; the other 7 awaited the shared result.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // And it was written to disk exactly once.
+        assert_eq!(fs::read(&target).unwrap(), b"shared-bytes");
+    }
+
+    #[tokio::test]
+    async fn coalesced_fetch_does_not_cache_errors() {
+        let dir = temp_cache_dir("coalesce-err");
+        let cache = Arc::new(DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024));
+        let target = dir.join("obj.bin");
+
+        let first = cache
+            .coalesced_fetch(target.clone(), || async { Err(io::Error::other("boom")) })
+            .await;
+        assert!(first.is_err());
+
+        // The errored entry must have been removed, not cached: a fresh call
+        // runs its own fetch and succeeds.
+        let second = cache
+            .coalesced_fetch(target.clone(), || async { Ok(b"recovered".to_vec()) })
+            .await;
+        assert_eq!(second.unwrap(), b"recovered");
+    }
+
+    #[tokio::test]
+    async fn coalesced_fetch_double_checks_disk_before_fetching() {
+        let dir = temp_cache_dir("coalesce-disk");
+        let cache = Arc::new(DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024));
+        let target = dir.join("obj.bin");
+        fs::write(&target, b"already-here").unwrap();
+
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fetched);
+        let bytes = cache
+            .coalesced_fetch(target.clone(), move || async move {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(b"from-fetch".to_vec())
+            })
+            .await
+            .unwrap();
+
+        // Leader saw the file on the post-win disk re-check and skipped fetch.
+        assert_eq!(bytes, b"already-here");
+        assert_eq!(fetched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_fetch_disk_read_error_falls_through_to_fetch() {
+        // A transient/non-NotFound error on the optimization-only disk
+        // double-check must NOT fail the flight: fall through to the
+        // authoritative fetch. We force a non-NotFound read error by placing a
+        // *directory* where the cache file would be (`fs::read` on a dir errors).
+        let dir = temp_cache_dir("coalesce-diskerr");
+        let cache = Arc::new(DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024));
+        let target = dir.join("obj.bin");
+        fs::create_dir_all(&target).unwrap();
+
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fetched);
+        let bytes = cache
+            .coalesced_fetch(target.clone(), move || async move {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(b"from-fetch".to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"from-fetch");
+        assert_eq!(
+            fetched.load(Ordering::SeqCst),
+            1,
+            "a disk-read error on the double-check must fall through to fetch, not fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_fetch_cancelled_leader_does_not_orphan_slot() {
+        let dir = temp_cache_dir("coalesce-cancel");
+        let cache = Arc::new(DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024));
+        let target = dir.join("obj.bin");
+
+        // Leader registers the flight then hangs in fetch; we cancel it.
+        let leader = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let target = target.clone();
+            async move {
+                cache
+                    .coalesced_fetch(target, || async {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        Ok(b"never".to_vec())
+                    })
+                    .await
+            }
+        });
+        // Let it register the slot and park in the sleep.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader.abort();
+        let _ = leader.await;
+
+        // The guard must have cleared the slot on drop. A new fetch must proceed
+        // (not hang waiting on a result the cancelled leader will never send).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.coalesced_fetch(target.clone(), move || async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(b"after-cancel".to_vec())
+            }),
+        )
+        .await
+        .expect("must not hang on an orphaned in-flight slot")
+        .unwrap();
+
+        assert_eq!(bytes, b"after-cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Counting content store: records `get` calls and can delay to widen the
+    /// concurrency window.
+    #[derive(Debug)]
+    struct CountingStore {
+        data: Vec<u8>,
+        gets: Arc<AtomicUsize>,
+        delay: Duration,
+        permits_plaintext_cache: bool,
+        remote: bool,
+        local_path: Option<PathBuf>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for CountingStore {
+        async fn has(&self, _id: &ContentId) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn get(&self, _id: &ContentId) -> crate::error::Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.data.clone())
+        }
+        async fn put(
+            &self,
+            _kind: crate::ContentKind,
+            _bytes: &[u8],
+        ) -> crate::error::Result<ContentId> {
+            unimplemented!("put not needed for cache tests")
+        }
+        async fn put_with_id(&self, _id: &ContentId, _bytes: &[u8]) -> crate::error::Result<()> {
+            unimplemented!("put_with_id not needed for cache tests")
+        }
+        async fn release(&self, _id: &ContentId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn permits_plaintext_cache(&self) -> bool {
+            self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            self.remote
+        }
+
+        fn resolve_local_path(&self, _id: &ContentId) -> Option<PathBuf> {
+            self.local_path.clone()
+        }
+    }
+
+    fn regular_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    fn store(
+        remote: bool,
+        permits_plaintext_cache: bool,
+        local_path: Option<PathBuf>,
+    ) -> CountingStore {
+        CountingStore {
+            data: b"bytes".to_vec(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache,
+            remote,
+            local_path,
+        }
+    }
+
+    #[test]
+    fn only_remote_plaintext_artifacts_without_a_local_file_need_a_disk_copy() {
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+        assert!(needs_disk_copy(&store(true, true, None), &id));
+        assert!(
+            !needs_disk_copy(&store(false, true, None), &id),
+            "local store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, false, None), &id),
+            "decrypting store"
+        );
+        assert!(
+            !needs_disk_copy(&store(true, true, Some(PathBuf::from("/tier/leaf"))), &id),
+            "a remote store's local tier"
+        );
+    }
+
+    #[test]
+    fn seeding_writes_only_what_needs_a_disk_copy() {
+        let dir = temp_cache_dir("seed");
+        let id = ContentId::new(crate::ContentKind::IndexLeaf, b"leaf");
+
+        assert!(!seed_disk_cache(
+            &store(false, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert!(regular_files_under(&dir).is_empty());
+
+        assert!(seed_disk_cache(
+            &store(true, true, None),
+            &id,
+            &dir,
+            b"bytes"
+        ));
+        assert_eq!(fs::read(dir.join(id.to_string())).unwrap(), b"bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A store in memory is read directly: fetching through the cache helpers
+    /// writes nothing to the cache directory.
+    #[tokio::test]
+    async fn fetch_from_a_local_store_writes_nothing_to_the_cache() {
+        let dir = temp_cache_dir("local-store");
+        let store = crate::storage::MemoryContentStore::new();
+        let id = store
+            .put(crate::ContentKind::IndexLeaf, b"bytes")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap(),
+                b"bytes"
+            );
+            assert_eq!(
+                fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap(),
+                b"bytes"
+            );
+        }
+        assert!(regular_files_under(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A store that decrypts on read must leave nothing in the cache
+    /// directory: neither the CID-keyed nor the extension-keyed fetch may
+    /// spill its plaintext, and a second fetch goes back to the store.
+    #[tokio::test]
+    async fn fetch_bypasses_disk_cache_when_store_forbids_plaintext() {
+        let dir = temp_cache_dir("e2e-no-plaintext-spill");
+        let data = vec![7u8; 128];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store = CountingStore {
+            data: data.clone(),
+            gets: Arc::clone(&gets),
+            delay: Duration::ZERO,
+            permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
+        };
+
+        for _ in 0..2 {
+            let bytes = fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
+            assert_eq!(bytes, data);
+            let bytes = fetch_cached_bytes(&store, &id, &dir, "nba").await.unwrap();
+            assert_eq!(bytes, data);
+        }
+
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            4,
+            "every read must hit the store"
+        );
+        assert!(
+            regular_files_under(&dir).is_empty(),
+            "no artifact may be written to the cache directory"
+        );
+
+        // Non-vacuity: the same flow with a permitting store does populate the cache.
+        let permitting = CountingStore {
+            data: data.clone(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+            permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
+        };
+        fetch_cached_bytes_cid(&permitting, &id, &dir)
+            .await
+            .unwrap();
+        assert_eq!(regular_files_under(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_cached_bytes_cid_coalesces_concurrent_callers() {
+        let dir = temp_cache_dir("e2e-coalesce");
+        let data = vec![42u8; 256];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(CountingStore {
+            data: data.clone(),
+            gets: Arc::clone(&gets),
+            delay: Duration::from_millis(100),
+            permits_plaintext_cache: true,
+            remote: true,
+            local_path: None,
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let dir = dir.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                fetch_cached_bytes_cid(store.as_ref(), &id, &dir).await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap().unwrap(), data);
+        }
+        // End to end: eight concurrent callers, one underlying S3 GET.
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "concurrent callers for the same CID should coalesce into one get"
+        );
+        // Subsequent calls hit the disk cache (still one get total).
+        assert_eq!(
+            fetch_cached_bytes_cid(store.as_ref(), &id, &dir)
+                .await
+                .unwrap(),
+            data
+        );
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+    }
+
+    /// A store that forbids a plaintext cache keeps the single-flight: eight
+    /// concurrent readers of one cold artifact share one `get`, and the cache
+    /// directory is never created. Once the flight ends, the next read goes
+    /// back to the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uncached_fetch_coalesces_concurrent_callers_without_touching_disk() {
+        let dir = temp_cache_dir("uncached-coalesce");
+        let data = vec![9u8; 256];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(CountingStore {
+            data: data.clone(),
+            gets: Arc::clone(&gets),
+            delay: Duration::from_millis(100),
+            permits_plaintext_cache: false,
+            remote: true,
+            local_path: None,
+        });
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = Arc::clone(&store);
+            let dir = dir.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    fetch_cached_bytes_cid(store.as_ref(), &id, &dir).await
+                } else {
+                    fetch_cached_bytes(store.as_ref(), &id, &dir, "nba").await
+                }
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap().unwrap(), data);
+        }
+        // One flight per cache key: the CID-keyed and extension-keyed reads
+        // are separate targets, as they are on the cached path.
+        assert_eq!(gets.load(Ordering::SeqCst), 2);
+        assert!(!dir.exists(), "no cache directory may be created");
+
+        fetch_cached_bytes_cid(store.as_ref(), &id, &dir)
+            .await
+            .unwrap();
+        assert_eq!(gets.load(Ordering::SeqCst), 3, "nothing is retained");
+    }
+}

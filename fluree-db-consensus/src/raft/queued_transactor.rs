@@ -1,0 +1,1489 @@
+//! Thin [`Committer`](crate::Committer) impl that routes `transact`
+//! through the Raft command queue.
+//!
+//! On submission, the transactor:
+//! 1. Builds the [`QueuedRequest`](crate::QueuedRequest) envelope
+//!    around the request body + per-request context.
+//! 2. Writes the envelope to shared CAS — the resulting CID is
+//!    `request_cid`.
+//! 3. Proposes [`Command::EnqueueCommand`](super::state_machine::Command::EnqueueCommand)
+//!    through Raft; the state machine appends a `QueueEntry` and
+//!    returns the assigned `queue_id`.
+//! 4. Registers a waiter on `queue_id` against the shared
+//!    [`WaiterMap`](super::waiter::WaiterMap) and awaits the outcome.
+//! 5. Translates [`WaiterOutcome::Applied`](super::waiter::WaiterOutcome)
+//!    into a [`TransactionReceipt`], or `Aborted` into a
+//!    [`SubmissionError`].
+//!
+//! Non-`transact` methods (`revert`, `merge`, `rebase`, `push`)
+//! delegate to a fallback `Committer` during the migration — the
+//! legacy `RaftCommitter` while we move call sites onto the queue.
+
+use crate::raft::staged_receipt::AppliedReceipt;
+use crate::raft::state_machine::{
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonReason,
+    PoisonRecord, QueueSubmission, RefKey, Response as SmResponse,
+};
+use crate::raft::state_machine_adapter::SharedState;
+use crate::raft::waiter::{AbortReason, WaitError, WaiterMap, WaiterOutcome};
+use crate::raft::TypeConfig;
+use crate::{
+    CommittedSubmission, Committer, IdempotencyCacheKey, IdempotencyKey, MergeReceipt,
+    MergeRequest, PushReceipt, PushRequest, QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest,
+    QueuedRevert, QueuedTransact, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest,
+    SubmissionError, SubmissionLookup, SubmissionState, TransactionReceipt, TransactionRequest,
+};
+use async_trait::async_trait;
+use fluree_db_api::{CommitReceipt, Fluree};
+use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
+use fluree_db_core::ContentId;
+use fluree_db_core::ContentKind;
+use fluree_db_transact::CommitOptsRequest;
+use openraft::error::{ClientWriteError, RaftError};
+use openraft::Raft;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// How long a single waiter `await` blocks before the transactor
+/// checks on the submission. A timeout is a *probe*, not a verdict:
+/// while the entry is still in the replicated queue and the cluster
+/// has a leader, the submission is alive — a slow stage, a deep
+/// per-branch queue — and the wait simply continues. Only a timeout
+/// that finds the entry gone (or the cluster leaderless) spends one of
+/// the retry attempts, which is the leader-transition case this budget
+/// was always meant for.
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Number of (propose → register waiter → await) attempts before the
+/// transactor gives up on an idempotent submission. Each attempt
+/// re-proposes the same `EnqueueCommand`; the state machine's
+/// idempotency cache makes repeats safe.
+const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Ceiling on the total time a submission may stay parked on a live
+/// queue entry before the transactor reports its outcome unknown. This
+/// is the backstop for a worker that never finishes — a wedged stage,
+/// a former leader partitioned away from the cluster with a stale copy
+/// of the queue. The number is deliberately generous: a submission
+/// that hits it has already survived every probe, so the only thing it
+/// costs is a still-progressing commit reported as a 504.
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// How long a probe that found its entry gone waits for the outcome
+/// before spending an attempt. The entry leaves the replicated queue
+/// under the state lock, but its terminal apply resolves the waiter in
+/// the observer's effects, after that lock drops — so a probe can read
+/// the queue in between and see the entry gone while the receipt is
+/// moments from landing. A genuinely stranded entry just times out
+/// again; the cost is paid only on that path.
+const GONE_ENTRY_GRACE: Duration = Duration::from_millis(250);
+
+/// Committer that routes transactions through the per-branch Raft
+/// queue.
+///
+/// Cloning is cheap (`Arc` clones). Hand to a
+/// [`CachingCommitter`](crate::CachingCommitter) wrap if you want
+/// in-process idempotency dedup before proposing.
+pub struct QueuedTransactor {
+    raft: Arc<Raft<TypeConfig>>,
+    fluree: Arc<Fluree>,
+    waiter_map: Arc<WaiterMap>,
+    /// Read-only view of the replicated state machine. Used by
+    /// `merge` to resolve a missing `target_branch` to the source's
+    /// parent before deciding which per-branch queue the entry rides
+    /// on.
+    shared_state: SharedState,
+    wait_timeout: Duration,
+    max_retries: usize,
+    max_wait: Duration,
+}
+
+impl QueuedTransactor {
+    pub fn new(
+        raft: Arc<Raft<TypeConfig>>,
+        fluree: Arc<Fluree>,
+        waiter_map: Arc<WaiterMap>,
+        shared_state: SharedState,
+    ) -> Self {
+        Self {
+            raft,
+            fluree,
+            waiter_map,
+            shared_state,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
+            max_wait: DEFAULT_MAX_WAIT,
+        }
+    }
+
+    /// Override the waiter probe interval (default 8s) — how often a
+    /// parked submission checks that its queue entry is still alive.
+    pub fn with_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.wait_timeout = timeout;
+        self
+    }
+
+    /// Override the ceiling on total time parked on a live queue entry
+    /// (default 10 minutes). See [`DEFAULT_MAX_WAIT`].
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
+    }
+
+    /// Override the retry budget for idempotency-keyed submissions
+    /// (default 3 attempts total). Floored at 1 — a budget of zero
+    /// would skip the propose loop entirely and surface every
+    /// submission as `stranded` without ever talking to Raft, which
+    /// is never what callers want.
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries.max(1);
+        self
+    }
+
+    /// Submit an `EnqueueCommand`, register a waiter on
+    /// `Enqueued`/`InFlight` responses, and await the outcome with a
+    /// bounded timeout. On timeout — or on a stale waiter whose
+    /// channel got overridden — re-propose the same command iff
+    /// `retry_eligible` is true; the state machine's idempotency
+    /// cache short-circuits to `IdempotencyHit` once the original
+    /// processing completes.
+    ///
+    /// `retry_eligible` should mirror whether the command carries
+    /// an idempotency key: without one, re-proposing would create a
+    /// duplicate queue entry rather than hitting the cache.
+    ///
+    /// The envelope is released here when nothing will read it: when
+    /// every propose of this submission was turned away (a state-machine
+    /// rejection or idempotency answer, or a Raft error before the log)
+    /// or it only joined another submission's in-flight entry under the
+    /// same key, which reads its own envelope. Every submission stamps
+    /// its envelope, so none shares an address with another's. Once this
+    /// submission's own entry is queued the queue owns the envelope, and
+    /// releases it at apply (no key) or at idempotency eviction; a later
+    /// propose that fails must not release it from under that entry. A
+    /// Raft `Fatal` leaves it too: the entry may have committed before
+    /// this node's loop crashed, and a worker on the new leader would
+    /// read it.
+    async fn submit_and_await(
+        &self,
+        args: QueueSubmission,
+        ref_key: RefKey,
+        retry_eligible: bool,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let request_cid = args.request_cid.clone();
+        let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
+        let mut envelope = EnvelopeFate::Unanswered;
+        let result = self
+            .propose_and_park(args, ref_key, retry_eligible, &mut envelope)
+            .await;
+        if envelope.is_unread() {
+            self.release_envelope(&full_ledger_id, &request_cid).await;
+        }
+        result
+    }
+
+    async fn propose_and_park(
+        &self,
+        args: QueueSubmission,
+        ref_key: RefKey,
+        retry_eligible: bool,
+        envelope: &mut EnvelopeFate,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let request_cid = args.request_cid.clone();
+        let cmd = SmCommand::EnqueueCommand(args);
+        let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
+        // Arm interest *before* proposing. The queue_id does not exist
+        // yet, so the waiter is keyed by request_cid until this node
+        // applies the enqueue and binds it — which is what lets a fast
+        // worker's ApplyHead find a waiter, and what keeps followers
+        // from tracking anything at all. Dropped on every return path.
+        let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key.clone());
+        let parked_since = std::time::Instant::now();
+        for attempt in 0..attempts_allowed {
+            let response = match self.raft.client_write(cmd.clone()).await {
+                Ok(response) => response,
+                // `ForwardToLeader` and `ChangeMembershipError` reject
+                // the propose before it enters the replicated log.
+                // `Fatal` is ambiguous: the entry may have committed to
+                // a majority before this node's local raft loop crashed.
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
+                    envelope.turned_away();
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: "raft node is not the leader; retry against the current leader"
+                            .into(),
+                    });
+                }
+                Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+                    envelope.turned_away();
+                    return Err(SubmissionError::Execution {
+                        status: 500,
+                        message: format!("unexpected ChangeMembershipError on EnqueueCommand: {e}"),
+                    });
+                }
+                Err(RaftError::Fatal(f)) => {
+                    *envelope = EnvelopeFate::Unknown;
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: format!(
+                            "raft fatal during EnqueueCommand: {f}; submission outcome \
+                             is unknown, retry with an idempotency key"
+                        ),
+                    });
+                }
+            };
+            envelope.answered(&response.data);
+            match response.data {
+                SmResponse::Enqueued { .. } | SmResponse::InFlight { .. } => {
+                    // The adapter bound the ticket while applying this
+                    // enqueue, so there is nothing to register here.
+                    // On a retry the response is `InFlight` for the same
+                    // entry and the ticket is already bound to it.
+                    // Park until the outcome lands. A probe timeout that
+                    // finds the entry still queued keeps waiting without
+                    // spending an attempt — the entry is alive, and the
+                    // former-leader case is covered too: `ApplyHead`
+                    // replicates to every node, so a waiter bound here
+                    // resolves when the new leader's worker finishes it.
+                    // Displaced (a duplicate submission took the slot)
+                    // and a timeout that finds the entry gone are handled
+                    // the same: retry if eligible, error otherwise. A gone
+                    // entry first gets `GONE_ENTRY_GRACE` for its outcome
+                    // to land.
+                    loop {
+                        // The ceiling must wake a live waiter even when it
+                        // falls before the next probe. Keep polling the ticket
+                        // at zero remaining time so an already-ready outcome
+                        // still wins over the ceiling.
+                        let remaining = self.max_wait.saturating_sub(parked_since.elapsed());
+                        match ticket.wait(self.wait_timeout.min(remaining)).await {
+                            Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
+                            Err(WaitError::Displaced) => break,
+                            Err(WaitError::TimedOut) => {
+                                let alive = self.entry_alive(&ref_key, ticket.queue_id()).await;
+                                match probe_verdict(alive, parked_since.elapsed(), self.max_wait) {
+                                    ProbeVerdict::KeepWaiting => continue,
+                                    ProbeVerdict::SpendAttempt => {
+                                        if let Ok(outcome) = ticket.wait(GONE_ENTRY_GRACE).await {
+                                            return Ok(SubmissionOutcome::Waiter(outcome));
+                                        }
+                                        break;
+                                    }
+                                    ProbeVerdict::CeilingReached => {
+                                        return Err(self.ceiling_error(retry_eligible));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if attempt + 1 >= attempts_allowed {
+                        return Err(self.stranded_error(retry_eligible));
+                    }
+                }
+                SmResponse::IdempotencyHit { record } => {
+                    return Ok(SubmissionOutcome::Cached(record));
+                }
+                SmResponse::IdempotencyFailed { record } => {
+                    return Ok(SubmissionOutcome::CachedFailure(record));
+                }
+                SmResponse::BodyHashMismatch => {
+                    return Err(SubmissionError::KeyCollision);
+                }
+                SmResponse::QueueFull { .. } => {
+                    return Err(SubmissionError::Overloaded);
+                }
+                SmResponse::LedgerNotFound { ledger_id } => {
+                    return Err(SubmissionError::Execution {
+                        status: 404,
+                        message: format!("ledger not found: {ledger_id}"),
+                    });
+                }
+                SmResponse::LedgerRetracted { ledger_id } => {
+                    // Retracted branches are tombstoned at the state
+                    // machine; the alias can't be reused without a
+                    // purge + re-create. 410 Gone matches the
+                    // semantics — the resource existed, the client
+                    // shouldn't retry with the same alias.
+                    return Err(SubmissionError::Execution {
+                        status: 410,
+                        message: format!("ledger retracted: {ledger_id}"),
+                    });
+                }
+                other => {
+                    return Err(SubmissionError::Execution {
+                        status: 500,
+                        message: format!(
+                            "unexpected Response variant for EnqueueCommand: {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        Err(self.stranded_error(retry_eligible))
+    }
+
+    /// Whether the submission bound to `queue_id` is still alive: its
+    /// entry is present in the replicated per-branch queue and the
+    /// cluster has a leader to drive it. An unbound ticket (this node
+    /// never applied the enqueue) and a leaderless view — which is also
+    /// what a partitioned former leader sees — both read as not alive,
+    /// so the retry path gets to surface the real condition.
+    async fn entry_alive(&self, ref_key: &RefKey, queue_id: Option<u64>) -> bool {
+        let Some(queue_id) = queue_id else {
+            return false;
+        };
+        if self.raft.current_leader().await.is_none() {
+            return false;
+        }
+        let state = self.shared_state.read().await;
+        entry_queued(&state, ref_key, queue_id)
+    }
+
+    fn ceiling_error(&self, retry_eligible: bool) -> SubmissionError {
+        let recourse = if retry_eligible {
+            "poll with the idempotency key"
+        } else {
+            "it carried no idempotency key, so check the ledger head before retrying"
+        };
+        SubmissionError::Execution {
+            status: 504,
+            message: format!(
+                "submission still queued after {:?}; its outcome is unknown and it may \
+                 still commit — {recourse}",
+                self.max_wait
+            ),
+        }
+    }
+
+    fn stranded_error(&self, retry_eligible: bool) -> SubmissionError {
+        SubmissionError::Execution {
+            status: 504,
+            message: if retry_eligible {
+                "submission retry budget exhausted while waiting for queue resolution".into()
+            } else {
+                "submission stranded by leader transition; retry with an idempotency key".into()
+            },
+        }
+    }
+
+    /// Hash the envelope's canonical body bytes into a comparison-only
+    /// `ContentId`. Distinct from the `request_cid` returned by the
+    /// CAS put: the envelope as-stored includes its submission and
+    /// per-request transient fields (timestamps, tracking) whereas the
+    /// body CID covers only what defines the request semantically.
+    fn canonical_body_cid(envelope: &QueuedRequest) -> Result<ContentId, SubmissionError> {
+        let bytes = envelope
+            .canonical_body_bytes()
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("canonical body encode failed: {e}"),
+            })?;
+        Ok(ContentId::new(ContentKind::Txn, &bytes))
+    }
+
+    /// Decrement (or remove) an orphaned envelope's CAS entry. The
+    /// content store's `release` is idempotent, so a double-release
+    /// on the same CID is harmless — log on failure but don't escalate
+    /// to the caller, since the submission has already returned its
+    /// terminal status.
+    async fn release_envelope(&self, ledger_id: &str, request_cid: &ContentId) {
+        if let Err(err) = self
+            .fluree
+            .content_store(ledger_id)
+            .release(request_cid)
+            .await
+        {
+            tracing::warn!(
+                %ledger_id,
+                cid = %request_cid,
+                error = %err,
+                "failed to release orphaned QueuedRequest envelope"
+            );
+        }
+    }
+
+    /// Encode `envelope`, write it to the per-ledger content store,
+    /// derive the body-CID from the same envelope bytes, and submit
+    /// `EnqueueCommand` through [`Self::submit_and_await`].
+    ///
+    /// Consolidates the invariants that are otherwise re-derived at
+    /// every per-op `Committer` call site:
+    ///
+    /// - `body_cid` is computed from the same [`QueuedRequest`] whose
+    ///   bytes produced `request_cid`, so the state machine's
+    ///   body-hash dedup stays honest.
+    /// - `applied_at_millis` is sampled once per submission, not once
+    ///   per derived field.
+    /// - `idempotency_cache_key` uses the canonical `name:branch`
+    ///   form via [`format_ledger_id`].
+    /// - `retry_eligible` mirrors `idempotency_key.is_some()`.
+    ///
+    /// Per-op preprocessing (raw-txn upload resolution, per-commit
+    /// CAS uploads, merge target resolution) stays at the call site —
+    /// only the envelope-to-outcome plumbing is shared.
+    async fn enqueue_and_await(
+        &self,
+        ledger_name: String,
+        branch: String,
+        mut envelope: QueuedRequest,
+        body_kind: BodyKind,
+        idempotency_key: Option<&IdempotencyKey>,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let full_ledger_id = format_ledger_id(&ledger_name, &branch);
+        let ref_key = RefKey::new(&ledger_name, &branch);
+        let idempotency_cache_key =
+            idempotency_key.map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
+
+        envelope.stamp_submission(ulid::Ulid::new().to_string());
+        let bytes = envelope
+            .to_bytes()
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest encode failed: {e}"),
+            })?;
+        let request_cid = self
+            .fluree
+            .content_store(&full_ledger_id)
+            .put(ContentKind::Txn, &bytes)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest CAS write failed: {e}"),
+            })?;
+
+        let body_cid = Self::canonical_body_cid(&envelope)?;
+        let retry_eligible = idempotency_cache_key.is_some();
+        let args = QueueSubmission {
+            ledger_id: ledger_name,
+            branch,
+            idempotency: idempotency_cache_key,
+            request_cid,
+            body_cid,
+            body_kind,
+            applied_at_millis: crate::raft::current_millis(),
+        };
+
+        self.submit_and_await(args, ref_key, retry_eligible).await
+    }
+}
+
+/// What became of a submission's envelope over its proposes, which decides
+/// whether [`QueuedTransactor::submit_and_await`] releases it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvelopeFate {
+    Unanswered,
+    /// Every propose was turned away, before the log or by the state
+    /// machine.
+    TurnedAway,
+    /// It joined another submission's in-flight entry under the same key.
+    Joined,
+    /// Its own entry was queued, which owns the envelope from then on.
+    Queued,
+    /// A Raft `Fatal` left the last propose's fate unknown.
+    Unknown,
+}
+
+impl EnvelopeFate {
+    fn answered(&mut self, response: &SmResponse) {
+        if *self == Self::Queued {
+            return;
+        }
+        *self = match response {
+            SmResponse::Enqueued { .. } => Self::Queued,
+            SmResponse::InFlight { .. } => Self::Joined,
+            _ => Self::TurnedAway,
+        };
+    }
+
+    fn turned_away(&mut self) {
+        if *self != Self::Queued {
+            *self = Self::TurnedAway;
+        }
+    }
+
+    fn is_unread(self) -> bool {
+        matches!(self, Self::TurnedAway | Self::Joined)
+    }
+}
+
+/// Internal result shape `submit_and_await` returns to each
+/// `Committer` method. The method matches on the variants to build
+/// its operation-specific receipt or error.
+enum SubmissionOutcome {
+    /// Waiter resolved with an outcome (success or abort).
+    Waiter(WaiterOutcome),
+    /// Idempotency cache had a recorded success for the key.
+    Cached(ApplyRecord),
+    /// Idempotency cache had a recorded poison for the key.
+    CachedFailure(PoisonRecord),
+}
+
+#[async_trait]
+impl Committer for QueuedTransactor {
+    async fn transact(
+        &self,
+        request: TransactionRequest,
+    ) -> Result<TransactionReceipt, SubmissionError> {
+        let TransactionRequest {
+            idempotency_key,
+            ledger_id,
+            body,
+            txn_opts,
+            mut commit_opts,
+            tracking,
+            governance,
+        } = request;
+
+        // Resolve any pending raw-txn upload on the leader and carry
+        // the CID through the queue envelope. The worker only sees
+        // the parsed body, which is insufficient when the original
+        // payload is a signed credential envelope (the canonical
+        // body and the raw payload differ). Resolving here also
+        // means the upload happens once per submission rather than
+        // re-running on each worker retry.
+        let raw_txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
+            Some(
+                pending
+                    .finish()
+                    .await
+                    .map_err(|e| SubmissionError::Execution {
+                        status: 500,
+                        message: format!("raw_txn upload failed: {e}"),
+                    })?,
+            )
+        } else {
+            commit_opts.raw_txn_id.take()
+        };
+
+        // Canonical `name:branch` form drives both the
+        // [`IdempotencyCacheKey`] (so retries that elide the
+        // default branch dedup correctly against the replicated
+        // map) and the per-ledger `content_store` namespace (so
+        // CAS writes the worker reads back resolve from the same
+        // store). The wrapping [`CachingCommitter`] normalizes too,
+        // but doing it here keeps this layer self-correct
+        // independent of caller behavior.
+        let ledger_id =
+            normalize_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+        let (ledger_name, branch) =
+            split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+
+        let body_kind = BodyKind::from(&body);
+        let mut commit_opts_request = CommitOptsRequest::from(&commit_opts);
+        commit_opts_request.raw_txn_id = raw_txn_id;
+        let envelope = QueuedRequest::Transact(Box::new(QueuedTransact {
+            body,
+            txn_opts,
+            commit_opts: commit_opts_request,
+            tracking,
+            governance,
+            submission: None,
+        }));
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch,
+                envelope,
+                body_kind,
+                idempotency_key.as_ref(),
+            )
+            .await?;
+
+        match outcome {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                transaction_receipt_from(idempotency_key, *receipt)
+            }
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(TransactionReceipt {
+                idempotency_key,
+                commit: CommitReceipt {
+                    commit_id: record.head,
+                    t: record.t,
+                    flake_count: record.flake_count as usize,
+                    // The raft idempotency record carries only the total —
+                    // the assert/retract split is not persisted in raft
+                    // state (wire-format stability), so a replayed receipt
+                    // reports 0/0.
+                    assert_count: 0,
+                    retract_count: 0,
+                },
+                tally: record.tally.map(Into::into),
+                cypher_return: None,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
+        }
+    }
+
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+        let RevertRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            selection,
+            strategy,
+        } = request;
+
+        let envelope = QueuedRequest::Revert(QueuedRevert {
+            selection,
+            strategy,
+            submission: None,
+        });
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch.clone(),
+                envelope,
+                BodyKind::Revert,
+                idempotency_key.as_ref(),
+            )
+            .await?;
+
+        match outcome {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                revert_receipt_from(idempotency_key, branch, strategy, *receipt)
+            }
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(RevertReceipt {
+                idempotency_key,
+                branch,
+                reverted_commits: Vec::new(),
+                conflict_count: 0,
+                strategy,
+                new_head_t: record.t,
+                new_head_id: record.head,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
+        }
+    }
+
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        let MergeRequest {
+            idempotency_key,
+            ledger_name,
+            source_branch,
+            target_branch,
+            strategy,
+        } = request;
+
+        // The queue is per-branch, so the entry must be routed to a
+        // concrete target up front. When the caller omits
+        // `target_branch`, fall back to the source's recorded
+        // parent — same semantic the legacy committer's
+        // `prepare_merge` used to default to.
+        let target_for_queue = match target_branch.clone() {
+            Some(t) => t,
+            None => {
+                let state = self.shared_state.read().await;
+                let source_ref = state.refs.get(&RefKey::new(&ledger_name, &source_branch));
+                match source_ref.and_then(|r| r.source_branch.clone()) {
+                    Some(parent) => parent,
+                    None => {
+                        return Err(SubmissionError::Execution {
+                            status: 400,
+                            message: format!(
+                                "merge target unresolved: source branch '{source_branch}' has \
+                                 no recorded parent; specify target_branch explicitly"
+                            ),
+                        });
+                    }
+                }
+            }
+        };
+
+        let envelope = QueuedRequest::Merge(QueuedMerge {
+            source_branch: source_branch.clone(),
+            target_branch,
+            strategy,
+            submission: None,
+        });
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                target_for_queue.clone(),
+                envelope,
+                BodyKind::Merge,
+                idempotency_key.as_ref(),
+            )
+            .await?;
+
+        match outcome {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => merge_receipt_from(
+                idempotency_key,
+                source_branch,
+                target_for_queue,
+                strategy,
+                *receipt,
+            ),
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(MergeReceipt {
+                idempotency_key,
+                source: source_branch,
+                target: target_for_queue,
+                fast_forward: false,
+                new_head_t: record.t,
+                new_head_id: record.head,
+                commits_copied: 0,
+                conflict_count: 0,
+                strategy,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
+        }
+    }
+
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+        let RebaseRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            strategy,
+        } = request;
+
+        let envelope = QueuedRequest::Rebase(QueuedRebase {
+            strategy,
+            submission: None,
+        });
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch.clone(),
+                envelope,
+                BodyKind::Rebase,
+                idempotency_key.as_ref(),
+            )
+            .await?;
+
+        match outcome {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                rebase_receipt_from(idempotency_key, branch, strategy, *receipt)
+            }
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(RebaseReceipt {
+                idempotency_key,
+                branch,
+                fast_forward: false,
+                replayed: 0,
+                skipped: 0,
+                conflicts: 0,
+                failures: 0,
+                total_commits: 0,
+                source_head_t: record.t,
+                source_head_id: record.head,
+                strategy,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
+        }
+    }
+
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            merged_commits,
+            governance,
+        } = request;
+
+        // See the same comment in `transact` — normalize once so
+        // the idempotency map and the per-ledger content store
+        // both key off the canonical `name:branch` form.
+        let ledger_id =
+            normalize_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+        let (ledger_name, branch) =
+            split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+
+        // Upload each commit's bytes to the per-ledger content store
+        // and record its CID. The envelope carries only the CIDs;
+        // the worker reads the bytes back when staging.
+        let content_store = self.fluree.content_store(&ledger_id);
+        let upload = |blobs: Vec<Vec<u8>>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut cids = Vec::with_capacity(blobs.len());
+                for bytes in &blobs {
+                    let cid = content_store
+                        .put(ContentKind::Commit, bytes)
+                        .await
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("push commit CAS write failed: {e}"),
+                        })?;
+                    cids.push(cid);
+                }
+                Ok::<_, SubmissionError>(cids)
+            }
+        };
+        let commit_cids = upload(commits).await?;
+        let merged_commit_cids = upload(merged_commits).await?;
+
+        let envelope = QueuedRequest::for_push(
+            QueuedPush {
+                commit_cids,
+                blobs,
+                governance,
+                submission: None,
+            },
+            merged_commit_cids,
+        );
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch,
+                envelope,
+                BodyKind::Pushed,
+                idempotency_key.as_ref(),
+            )
+            .await?;
+
+        match outcome {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                push_receipt_from(idempotency_key, ledger_id, *receipt)
+            }
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => {
+                // Push idempotency hit: the original push produced
+                // this head. The cache record doesn't carry
+                // `accepted` or a fresh `IndexingStatus`, so surface
+                // conservative defaults — clients that need an
+                // exact `accepted` count on retry can resubmit with
+                // a fresh key.
+                Ok(PushReceipt {
+                    idempotency_key,
+                    ledger: ledger_id,
+                    accepted: 0,
+                    head_t: record.t,
+                    head_id: record.head,
+                    indexing: idle_indexing_status(record.t),
+                })
+            }
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
+        }
+    }
+}
+
+/// Status lookup backed by the replicated idempotency state.
+///
+/// The wrapping [`CachingCommitter`](crate::CachingCommitter) checks
+/// its in-process moka cache first — that has the full typed
+/// [`OperationReceipt`] the originating node produced and returns
+/// [`SubmissionState::Committed`] with `receipt: Some(...)`. Only on
+/// a cache miss does the call land here, and that's the path that
+/// closes the post-leader-transition gap: the new leader's moka
+/// won't carry entries the old leader served, but
+/// `state.idempotency` is replicated, so this lookup still returns
+/// `Committed` for any submission that completed before the
+/// transition.
+///
+/// `receipt` is `None` on this path — the per-op detail (conflict
+/// counts, merge target branch, etc.) isn't replicated. The
+/// canonical kit (`commit_id`, `t`, `kind`, `tally`) is enough for
+/// clients verifying "did my submission land?"; richer detail can
+/// be chased through the commit-log endpoint.
+#[async_trait]
+impl SubmissionLookup for QueuedTransactor {
+    async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
+        // Same canonicalization as the write side — a bad
+        // ledger_id falls through to `Unknown` (the route boundary
+        // surfaces 400s).
+        let Ok(ledger_id) = normalize_ledger_id(ledger_id) else {
+            return SubmissionState::Unknown;
+        };
+        let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
+        let state = self.shared_state.read().await;
+        match state.idempotency.get(&cache_key) {
+            Some(ApplyOutcome::Applied(record)) => committed_from_applied(key.clone(), record),
+            Some(ApplyOutcome::Failed(record)) => {
+                SubmissionState::Failed(failure_from_poison(record))
+            }
+            None => SubmissionState::Unknown,
+        }
+    }
+}
+
+fn committed_from_applied(key: IdempotencyKey, record: &ApplyRecord) -> SubmissionState {
+    SubmissionState::Committed(Box::new(CommittedSubmission {
+        idempotency_key: Some(key),
+        kind: record.body_kind,
+        commit_id: record.head.clone(),
+        t: record.t,
+        tally: record.tally.clone().map(Into::into),
+        receipt: None,
+    }))
+}
+
+fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
+    // Same status and phrasing the fresh path surfaces through
+    // `submission_error_from_abort`'s `Poisoned` arm — a poison
+    // replayed from the replicated map must read identically to one
+    // observed live. The replicated `PoisonRecord` only carries the
+    // poison reason (e.g. `BodyMalformed`, `StagingFailed`); clients
+    // that need richer typing can use the body via the commit log;
+    // the status route only promises pass/fail + identity.
+    SubmissionError::Execution {
+        status: poison_status(&record.reason),
+        message: format!("submission poisoned: {:?}", record.reason),
+    }
+}
+
+fn poison_status(reason: &PoisonReason) -> u16 {
+    match reason {
+        PoisonReason::PolicyViolation { .. } => 403,
+        _ => 422,
+    }
+}
+
+/// Conservative `IndexingStatus` for paths that don't observe the
+/// worker's post-stage novelty / index-t snapshot — used by the
+/// idempotency-hit branch and by the queued push receipt until the
+/// worker surfaces those fields through the waiter map.
+fn idle_indexing_status(commit_t: i64) -> fluree_db_api::IndexingStatus {
+    fluree_db_api::IndexingStatus {
+        enabled: false,
+        needed: false,
+        novelty_size: 0,
+        index_t: commit_t,
+        commit_t,
+    }
+}
+
+/// Error surfaced when the adapter delivers a receipt variant whose
+/// operation type doesn't match the one the transactor submitted.
+/// Should never happen — same queue_id can't belong to two
+/// operations — so it's a state machine / wiring bug.
+fn variant_mismatch(expected: &'static str, got: &AppliedReceipt) -> SubmissionError {
+    SubmissionError::Execution {
+        status: 500,
+        message: format!("applied receipt mismatch: expected {expected}, got {got:?}"),
+    }
+}
+
+fn transaction_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    receipt: AppliedReceipt,
+) -> Result<TransactionReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::TransactApplied;
+    let (commit_id, commit_t, flake_count, tally) = match receipt {
+        AppliedReceipt::Transact(TransactApplied {
+            commit_id,
+            commit_t,
+            flake_count,
+            tally,
+        }) => (commit_id, commit_t, flake_count, tally),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, 0, None),
+        other => return Err(variant_mismatch("Transact", &other)),
+    };
+    Ok(TransactionReceipt {
+        idempotency_key,
+        commit: CommitReceipt {
+            commit_id,
+            t: commit_t,
+            flake_count,
+            // `AppliedReceipt` does not carry the assert/retract split
+            // (raft wire-format stability), so raft-applied receipts
+            // report 0/0.
+            assert_count: 0,
+            retract_count: 0,
+        },
+        tally,
+        cypher_return: None,
+    })
+}
+
+fn push_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    ledger_id: String,
+    receipt: AppliedReceipt,
+) -> Result<PushReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::PushApplied;
+    let (commit_id, commit_t, accepted, indexing) = match receipt {
+        AppliedReceipt::Push(PushApplied {
+            commit_id,
+            commit_t,
+            accepted,
+            indexing,
+        }) => (commit_id, commit_t, accepted, indexing),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, 0, idle_indexing_status(commit_t)),
+        other => return Err(variant_mismatch("Push", &other)),
+    };
+    Ok(PushReceipt {
+        idempotency_key,
+        ledger: ledger_id,
+        accepted,
+        head_t: commit_t,
+        head_id: commit_id,
+        indexing,
+    })
+}
+
+fn revert_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    branch: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<RevertReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::RevertApplied;
+    let (commit_id, commit_t, reverted_commits, conflict_count, strategy_out) = match receipt {
+        AppliedReceipt::Revert(RevertApplied {
+            commit_id,
+            commit_t,
+            reverted_commits,
+            conflict_count,
+            strategy,
+        }) => (
+            commit_id,
+            commit_t,
+            reverted_commits,
+            conflict_count,
+            strategy,
+        ),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, Vec::new(), 0, strategy),
+        other => return Err(variant_mismatch("Revert", &other)),
+    };
+    Ok(RevertReceipt {
+        idempotency_key,
+        branch,
+        reverted_commits,
+        conflict_count,
+        strategy: strategy_out,
+        new_head_t: commit_t,
+        new_head_id: commit_id,
+    })
+}
+
+fn merge_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    source: String,
+    target: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<MergeReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::MergeApplied;
+    let (commit_id, commit_t, fast_forward, commits_copied, conflict_count, strategy_out) =
+        match receipt {
+            AppliedReceipt::Merge(MergeApplied {
+                commit_id,
+                commit_t,
+                fast_forward,
+                commits_copied,
+                conflict_count,
+                strategy,
+            }) => (
+                commit_id,
+                commit_t,
+                fast_forward,
+                commits_copied,
+                conflict_count,
+                strategy,
+            ),
+            AppliedReceipt::Minimal {
+                commit_id,
+                commit_t,
+            } => (commit_id, commit_t, false, 0, 0, strategy),
+            other => return Err(variant_mismatch("Merge", &other)),
+        };
+    Ok(MergeReceipt {
+        idempotency_key,
+        source,
+        target,
+        fast_forward,
+        new_head_t: commit_t,
+        new_head_id: commit_id,
+        commits_copied,
+        conflict_count,
+        strategy: strategy_out,
+    })
+}
+
+fn rebase_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    branch: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<RebaseReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::RebaseApplied;
+    match receipt {
+        AppliedReceipt::Rebase(RebaseApplied {
+            commit_id: _,
+            commit_t: _,
+            fast_forward,
+            replayed,
+            skipped,
+            conflicts,
+            failures,
+            total_commits,
+            source_head_t,
+            source_head_id,
+            strategy,
+        }) => Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward,
+            replayed,
+            skipped,
+            conflicts,
+            failures,
+            total_commits,
+            source_head_t,
+            source_head_id,
+            strategy,
+        }),
+        // Fallback for stranded staged-receipts (former-leader path):
+        // we only know the resulting head, not whether this was a
+        // fast-forward or an actual replay. Reporting `fast_forward:
+        // true` keeps the receipt internally consistent — in a true
+        // fast-forward `source_head_id` equals the branch's new head,
+        // which is what `commit_id` carries here. The counters at
+        // their defaults (0 replayed / skipped / conflicts) line up
+        // with that interpretation; the alternative would mislabel
+        // the result head as the source head under a non-fast-forward
+        // rebase.
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward: true,
+            replayed: 0,
+            skipped: 0,
+            conflicts: 0,
+            failures: 0,
+            total_commits: 0,
+            source_head_t: commit_t,
+            source_head_id: commit_id,
+            strategy,
+        }),
+        other => Err(variant_mismatch("Rebase", &other)),
+    }
+}
+
+/// What a probe timeout means for the parked submission.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// The entry is alive; park again without spending an attempt.
+    KeepWaiting,
+    /// The entry is gone or the cluster is leaderless; spend an attempt
+    /// on a re-propose (idempotent) or report stranded (anonymous).
+    SpendAttempt,
+    /// Alive, but parked longer than the ceiling allows.
+    CeilingReached,
+}
+
+fn probe_verdict(alive: bool, parked_for: Duration, max_wait: Duration) -> ProbeVerdict {
+    if !alive {
+        ProbeVerdict::SpendAttempt
+    } else if parked_for >= max_wait {
+        ProbeVerdict::CeilingReached
+    } else {
+        ProbeVerdict::KeepWaiting
+    }
+}
+
+/// Whether `queue_id` is still an entry of `ref_key`'s replicated queue.
+fn entry_queued(state: &NameServiceState, ref_key: &RefKey, queue_id: u64) -> bool {
+    state
+        .queues
+        .get(ref_key)
+        .is_some_and(|queue| queue.iter().any(|entry| entry.queue_id == queue_id))
+}
+
+fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
+    match reason {
+        AbortReason::BranchDropped => SubmissionError::Execution {
+            status: 410,
+            message: "branch dropped while submission was queued".into(),
+        },
+        AbortReason::BranchPurged => SubmissionError::Execution {
+            status: 410,
+            message: "ledger purged while submission was queued".into(),
+        },
+        AbortReason::BranchHeadReset => SubmissionError::Execution {
+            status: 409,
+            message: "branch head reset while submission was queued; retry".into(),
+        },
+        AbortReason::BranchRetracted => SubmissionError::Execution {
+            status: 410,
+            message: "branch retracted while submission was queued".into(),
+        },
+        AbortReason::SnapshotInstalled => SubmissionError::Execution {
+            status: 503,
+            message: "leader transitioned and the local state was rebuilt from a snapshot; \
+                      the submission's outcome is unknown, retry"
+                .into(),
+        },
+        AbortReason::Poisoned(reason) => SubmissionError::Execution {
+            status: poison_status(&reason),
+            message: format!("submission poisoned: {reason:?}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raft::state_machine::{PoisonReason, QueueEntry};
+
+    /// A submission's own queued entry owns its envelope through any later
+    /// propose; one that never queued an entry leaves its envelope unread.
+    #[test]
+    fn an_envelope_is_released_only_when_no_entry_of_its_own_was_queued() {
+        let enqueued = SmResponse::Enqueued {
+            ledger_id: "db:main".into(),
+            queue_id: 1,
+        };
+        let in_flight = SmResponse::InFlight {
+            ledger_id: "db:main".into(),
+            queue_id: 1,
+        };
+        let not_found = SmResponse::LedgerNotFound {
+            ledger_id: "db:main".into(),
+        };
+
+        let mut queued = EnvelopeFate::Unanswered;
+        queued.answered(&enqueued);
+        queued.answered(&in_flight);
+        queued.turned_away();
+        queued.answered(&not_found);
+        assert!(!queued.is_unread());
+
+        let mut joined = EnvelopeFate::Unanswered;
+        joined.answered(&in_flight);
+        assert!(joined.is_unread());
+        joined.answered(&enqueued);
+        assert!(!joined.is_unread(), "a later propose queued its own entry");
+
+        let mut refused = EnvelopeFate::Unanswered;
+        refused.turned_away();
+        assert!(refused.is_unread());
+        refused.answered(&not_found);
+        assert!(refused.is_unread());
+
+        assert!(!EnvelopeFate::Unknown.is_unread());
+        assert!(!EnvelopeFate::Unanswered.is_unread());
+    }
+
+    #[test]
+    fn a_probe_timeout_on_a_live_entry_keeps_waiting() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(30), ceiling),
+            ProbeVerdict::KeepWaiting,
+            "a slow stage on a queued entry must not spend an attempt"
+        );
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(599), ceiling),
+            ProbeVerdict::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn a_probe_timeout_on_a_missing_entry_spends_an_attempt() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(false, Duration::from_millis(1), ceiling),
+            ProbeVerdict::SpendAttempt
+        );
+        // Gone beats the ceiling: the retry path gets to surface why.
+        assert_eq!(
+            probe_verdict(false, Duration::from_secs(601), ceiling),
+            ProbeVerdict::SpendAttempt
+        );
+    }
+
+    #[test]
+    fn the_ceiling_only_applies_to_a_live_entry() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(true, ceiling, ceiling),
+            ProbeVerdict::CeilingReached
+        );
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(601), ceiling),
+            ProbeVerdict::CeilingReached
+        );
+    }
+
+    #[test]
+    fn entry_queued_finds_the_entry_only_on_its_own_branch() {
+        fn cid(seed: u8) -> ContentId {
+            ContentId::new(ContentKind::Commit, &[seed])
+        }
+        let entry = |queue_id: u64| QueueEntry {
+            queue_id,
+            enqueued_index: 1,
+            enqueued_at_millis: 0,
+            idempotency: None,
+            request_cid: cid(queue_id as u8),
+            body_cid: cid(queue_id as u8),
+            body_kind: BodyKind::JsonLdInsert,
+        };
+        let main = RefKey::new("db", "main");
+        let dev = RefKey::new("db", "dev");
+        let mut state = NameServiceState::default();
+        state
+            .queues
+            .entry(main.clone())
+            .or_default()
+            .extend([entry(1), entry(2)]);
+        state
+            .queues
+            .entry(dev.clone())
+            .or_default()
+            .push_back(entry(3));
+
+        assert!(entry_queued(&state, &main, 1));
+        assert!(
+            entry_queued(&state, &main, 2),
+            "a second entry is still queued behind the front"
+        );
+        assert!(
+            !entry_queued(&state, &main, 3),
+            "another branch's entry does not count"
+        );
+        assert!(!entry_queued(&state, &dev, 1));
+        assert!(
+            !entry_queued(&state, &RefKey::new("other", "main"), 1),
+            "an absent queue reads as gone"
+        );
+        state.queues.get_mut(&main).unwrap().pop_front();
+        assert!(!entry_queued(&state, &main, 1), "a popped entry is gone");
+    }
+
+    fn status(err: &SubmissionError) -> u16 {
+        match err {
+            SubmissionError::Execution { status, .. } => *status,
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_dropped_maps_to_410() {
+        assert_eq!(
+            status(&submission_error_from_abort(AbortReason::BranchDropped)),
+            410
+        );
+    }
+
+    #[test]
+    fn branch_purged_maps_to_410() {
+        assert_eq!(
+            status(&submission_error_from_abort(AbortReason::BranchPurged)),
+            410
+        );
+    }
+
+    #[test]
+    fn branch_head_reset_maps_to_409() {
+        assert_eq!(
+            status(&submission_error_from_abort(AbortReason::BranchHeadReset)),
+            409
+        );
+    }
+
+    #[test]
+    fn snapshot_installed_maps_to_503_with_retry_hint() {
+        let err = submission_error_from_abort(AbortReason::SnapshotInstalled);
+        assert_eq!(status(&err), 503);
+        match err {
+            SubmissionError::Execution { message, .. } => {
+                assert!(message.contains("snapshot"), "got: {message}");
+                assert!(message.contains("retry"), "got: {message}");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn poisoned_maps_to_422_with_reason_in_message() {
+        let err = submission_error_from_abort(AbortReason::Poisoned(PoisonReason::BodyMalformed {
+            error: "bad turtle".into(),
+        }));
+        assert_eq!(status(&err), 422);
+        match err {
+            SubmissionError::Execution { message, .. } => {
+                assert!(message.contains("BodyMalformed"), "got: {message}");
+                assert!(message.contains("bad turtle"), "got: {message}");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn policy_poison_maps_to_403_for_fresh_and_replayed_submissions() {
+        use crate::raft::state_machine::PoisonRecord;
+        use fluree_db_core::ContentKind;
+
+        let reason = PoisonReason::PolicyViolation {
+            error: "write refused".into(),
+        };
+        let fresh = submission_error_from_abort(AbortReason::Poisoned(reason.clone()));
+        let replayed = failure_from_poison(&PoisonRecord {
+            request_cid: ContentId::new(ContentKind::Commit, &[1]),
+            body_cid: ContentId::new(ContentKind::Commit, &[2]),
+            reason,
+            recorded_index: 1,
+            recorded_at_millis: 0,
+        });
+        assert_eq!(status(&fresh), 403);
+        assert_eq!(status(&replayed), 403);
+        assert_eq!(fresh.to_string(), replayed.to_string());
+    }
+
+    /// A poison replayed from the replicated idempotency map must
+    /// surface with the same status and phrasing as one observed
+    /// live through the waiter — previously the replay said 500
+    /// "cached failure" where the fresh path said 422 "submission
+    /// poisoned", so a client's error handling depended on which
+    /// node answered.
+    #[test]
+    fn replayed_poison_surfaces_identically_to_fresh_poison() {
+        use crate::raft::state_machine::PoisonRecord;
+        use fluree_db_core::ContentKind;
+
+        let reason = PoisonReason::BodyMalformed {
+            error: "bad turtle".into(),
+        };
+        let fresh = submission_error_from_abort(AbortReason::Poisoned(reason.clone()));
+        let replayed = failure_from_poison(&PoisonRecord {
+            request_cid: ContentId::new(ContentKind::Commit, &[1]),
+            body_cid: ContentId::new(ContentKind::Commit, &[2]),
+            reason,
+            recorded_index: 1,
+            recorded_at_millis: 0,
+        });
+
+        assert_eq!(status(&fresh), status(&replayed));
+        assert_eq!(fresh.to_string(), replayed.to_string());
+    }
+}

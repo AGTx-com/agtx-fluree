@@ -1,0 +1,769 @@
+//! Filter predicate expressions for scan planning.
+//!
+//! This module defines the expression language for filter predicates that can
+//! be used for:
+//! - Partition pruning at the manifest level
+//! - File pruning using column statistics
+//! - Residual filtering on actual row data
+//!
+//! # Design
+//!
+//! - `field_id` is the CANONICAL identifier for columns (matches Iceberg's schema)
+//! - `column` name is stored for debug/error messages only - never use it for lookup
+//! - Expressions form a tree with boolean combinators (And, Or, Not)
+
+use crate::manifest::TypedValue;
+
+/// Comparison operators for filter expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOp {
+    /// Equal to (=)
+    Eq,
+    /// Not equal to (!=)
+    NotEq,
+    /// Less than (<)
+    Lt,
+    /// Less than or equal (<=)
+    LtEq,
+    /// Greater than (>)
+    Gt,
+    /// Greater than or equal (>=)
+    GtEq,
+}
+
+impl ComparisonOp {
+    /// Get the negation of this operator.
+    pub fn negate(&self) -> Self {
+        match self {
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::GtEq => Self::Lt,
+        }
+    }
+
+    /// Check if this is an equality operator.
+    pub fn is_equality(&self) -> bool {
+        matches!(self, Self::Eq | Self::NotEq)
+    }
+}
+
+impl std::fmt::Display for ComparisonOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eq => write!(f, "="),
+            Self::NotEq => write!(f, "!="),
+            Self::Lt => write!(f, "<"),
+            Self::LtEq => write!(f, "<="),
+            Self::Gt => write!(f, ">"),
+            Self::GtEq => write!(f, ">="),
+        }
+    }
+}
+
+/// Literal values for comparisons.
+///
+/// These match Iceberg's type system and can be compared against decoded bounds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiteralValue {
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    /// Date: days since 1970-01-01
+    Date(i32),
+    /// Timestamp WITHOUT zone (`timestamp`): microseconds since epoch, wall-clock
+    /// frame. Only ever compared against a physically-`timestamp` column (item 10).
+    Timestamp(i64),
+    /// Timestamp WITH zone (`timestamptz`): microseconds since epoch, UTC frame.
+    /// Only ever compared against a physically-`timestamptz` column (item 10) — the
+    /// frame (naive vs UTC) is matched at emit time so the micros are comparable.
+    TimestampTz(i64),
+    /// Decimal: `unscaled × 10^-scale`. A literal has no precision of its own;
+    /// a comparison is evaluated against the COLUMN's `decimal(p, s)`.
+    Decimal {
+        unscaled: i128,
+        scale: i8,
+    },
+}
+
+impl LiteralValue {
+    /// Convert to TypedValue for comparison with decoded bounds.
+    pub fn to_typed_value(&self) -> TypedValue {
+        match self {
+            Self::Boolean(v) => TypedValue::Boolean(*v),
+            Self::Int32(v) => TypedValue::Int32(*v),
+            Self::Int64(v) => TypedValue::Int64(*v),
+            Self::Float32(v) => TypedValue::Float32(*v),
+            Self::Float64(v) => TypedValue::Float64(*v),
+            Self::String(v) => TypedValue::String(v.clone()),
+            Self::Bytes(v) => TypedValue::Bytes(v.clone()),
+            Self::Date(v) => TypedValue::Date(*v),
+            Self::Timestamp(v) => TypedValue::Timestamp(*v),
+            Self::TimestampTz(v) => TypedValue::TimestampTz(*v),
+            Self::Decimal { unscaled, scale } => TypedValue::Decimal {
+                unscaled: *unscaled,
+                scale: *scale,
+            },
+        }
+    }
+
+    /// Create from TypedValue.
+    pub fn from_typed_value(value: &TypedValue) -> Self {
+        match value {
+            TypedValue::Boolean(v) => Self::Boolean(*v),
+            TypedValue::Int32(v) => Self::Int32(*v),
+            TypedValue::Int64(v) => Self::Int64(*v),
+            TypedValue::Float32(v) => Self::Float32(*v),
+            TypedValue::Float64(v) => Self::Float64(*v),
+            TypedValue::String(v) => Self::String(v.clone()),
+            TypedValue::Bytes(v) => Self::Bytes(v.clone()),
+            TypedValue::Date(v) => Self::Date(*v),
+            TypedValue::Timestamp(v) => Self::Timestamp(*v),
+            TypedValue::TimestampTz(v) => Self::TimestampTz(*v),
+            TypedValue::Uuid(v) => Self::Bytes(v.to_vec()),
+            TypedValue::Decimal { unscaled, scale } => Self::Decimal {
+                unscaled: *unscaled,
+                scale: *scale,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for LiteralValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Boolean(v) => write!(f, "{v}"),
+            Self::Int32(v) => write!(f, "{v}"),
+            Self::Int64(v) => write!(f, "{v}L"),
+            Self::Float32(v) => write!(f, "{v}f"),
+            Self::Float64(v) => write!(f, "{v}"),
+            Self::String(v) => write!(f, "'{v}'"),
+            Self::Bytes(v) => write!(f, "bytes[{}]", v.len()),
+            Self::Date(v) => write!(f, "date({v})"),
+            Self::Timestamp(v) => write!(f, "ts({v})"),
+            Self::TimestampTz(v) => write!(f, "tstz({v})"),
+            Self::Decimal { unscaled, scale } => {
+                write!(f, "decimal({unscaled}, {scale})")
+            }
+        }
+    }
+}
+
+/// The members of an `IN`, with the ordered view file and row-group pruning
+/// searches built once from them (see
+/// [`OrderedMembers`](crate::scan::pruning::OrderedMembers)), so the two can
+/// never disagree. Both are shared: a scan plan clones its filter into every
+/// file's task, and a clone of a set copies a pointer, not its members.
+/// Derefs to the members.
+#[derive(Debug, Clone)]
+pub struct InSet {
+    values: std::sync::Arc<[LiteralValue]>,
+    ordered: std::sync::Arc<crate::scan::pruning::OrderedMembers>,
+}
+
+impl InSet {
+    /// The set of `values`.
+    pub fn new(values: Vec<LiteralValue>) -> Self {
+        let ordered = std::sync::Arc::new(crate::scan::pruning::OrderedMembers::of(&values));
+        Self {
+            values: values.into(),
+            ordered,
+        }
+    }
+
+    /// The members, as given.
+    pub fn values(&self) -> &[LiteralValue] {
+        &self.values
+    }
+
+    pub(crate) fn ordered(&self) -> &crate::scan::pruning::OrderedMembers {
+        &self.ordered
+    }
+}
+
+impl std::ops::Deref for InSet {
+    type Target = [LiteralValue];
+
+    fn deref(&self) -> &[LiteralValue] {
+        &self.values
+    }
+}
+
+/// Sets are equal when their members are, in order.
+impl PartialEq for InSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl PartialEq<Vec<LiteralValue>> for InSet {
+    fn eq(&self, other: &Vec<LiteralValue>) -> bool {
+        *self.values == **other
+    }
+}
+
+/// Filter expression for predicate pushdown.
+///
+/// # Design
+///
+/// - `field_id` is the CANONICAL identifier (matches Iceberg schema field IDs)
+/// - `column` name is for debug/error messages ONLY - never use for lookup
+/// - Expressions are immutable trees, combined via boolean operators
+#[derive(Debug, Clone)]
+pub enum Expression {
+    /// Always true (no filtering)
+    AlwaysTrue,
+    /// Always false (no results)
+    AlwaysFalse,
+    /// Logical NOT
+    Not(Box<Expression>),
+    /// Logical AND of multiple expressions
+    And(Vec<Expression>),
+    /// Logical OR of multiple expressions
+    Or(Vec<Expression>),
+    /// IS NULL check
+    IsNull {
+        /// Iceberg field ID (canonical)
+        field_id: i32,
+        /// Column name (debug/UX only)
+        column: String,
+    },
+    /// IS NOT NULL check
+    IsNotNull {
+        /// Iceberg field ID (canonical)
+        field_id: i32,
+        /// Column name (debug/UX only)
+        column: String,
+    },
+    /// Comparison (=, !=, <, <=, >, >=)
+    Comparison {
+        /// Iceberg field ID (canonical)
+        field_id: i32,
+        /// Column name (debug/UX only)
+        column: String,
+        /// Comparison operator
+        op: ComparisonOp,
+        /// Literal value to compare against
+        value: LiteralValue,
+    },
+    /// IN list check
+    In {
+        /// Iceberg field ID (canonical)
+        field_id: i32,
+        /// Column name (debug/UX only)
+        column: String,
+        /// Values to check membership in
+        values: InSet,
+    },
+    /// NOT IN list check
+    NotIn {
+        /// Iceberg field ID (canonical)
+        field_id: i32,
+        /// Column name (debug/UX only)
+        column: String,
+        /// Values to check non-membership in
+        values: Vec<LiteralValue>,
+    },
+}
+
+impl Expression {
+    /// Create an equality comparison.
+    pub fn eq(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::Eq,
+            value,
+        }
+    }
+
+    /// Create a not-equal comparison.
+    pub fn not_eq(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::NotEq,
+            value,
+        }
+    }
+
+    /// Create a less-than comparison.
+    pub fn lt(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::Lt,
+            value,
+        }
+    }
+
+    /// Create a less-than-or-equal comparison.
+    pub fn lt_eq(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::LtEq,
+            value,
+        }
+    }
+
+    /// Create a greater-than comparison.
+    pub fn gt(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::Gt,
+            value,
+        }
+    }
+
+    /// Create a greater-than-or-equal comparison.
+    pub fn gt_eq(field_id: i32, column: impl Into<String>, value: LiteralValue) -> Self {
+        Self::Comparison {
+            field_id,
+            column: column.into(),
+            op: ComparisonOp::GtEq,
+            value,
+        }
+    }
+
+    /// Create an IS NULL check.
+    pub fn is_null(field_id: i32, column: impl Into<String>) -> Self {
+        Self::IsNull {
+            field_id,
+            column: column.into(),
+        }
+    }
+
+    /// Create an IS NOT NULL check.
+    pub fn is_not_null(field_id: i32, column: impl Into<String>) -> Self {
+        Self::IsNotNull {
+            field_id,
+            column: column.into(),
+        }
+    }
+
+    /// Create an IN list check.
+    pub fn in_list(field_id: i32, column: impl Into<String>, values: Vec<LiteralValue>) -> Self {
+        Self::In {
+            field_id,
+            column: column.into(),
+            values: InSet::new(values),
+        }
+    }
+
+    /// Create a NOT IN list check.
+    pub fn not_in_list(
+        field_id: i32,
+        column: impl Into<String>,
+        values: Vec<LiteralValue>,
+    ) -> Self {
+        Self::NotIn {
+            field_id,
+            column: column.into(),
+            values,
+        }
+    }
+
+    /// Create a logical AND of expressions.
+    pub fn and(exprs: Vec<Expression>) -> Self {
+        // Flatten nested ANDs and filter out AlwaysTrue
+        let mut flattened = Vec::new();
+        for expr in exprs {
+            match expr {
+                Expression::AlwaysTrue => continue,
+                Expression::AlwaysFalse => return Expression::AlwaysFalse,
+                Expression::And(inner) => flattened.extend(inner),
+                other => flattened.push(other),
+            }
+        }
+
+        match flattened.len() {
+            0 => Expression::AlwaysTrue,
+            1 => flattened.into_iter().next().unwrap(),
+            _ => Expression::And(flattened),
+        }
+    }
+
+    /// Create a logical OR of expressions.
+    pub fn or(exprs: Vec<Expression>) -> Self {
+        // Flatten nested ORs and filter out AlwaysFalse
+        let mut flattened = Vec::new();
+        for expr in exprs {
+            match expr {
+                Expression::AlwaysFalse => continue,
+                Expression::AlwaysTrue => return Expression::AlwaysTrue,
+                Expression::Or(inner) => flattened.extend(inner),
+                other => flattened.push(other),
+            }
+        }
+
+        match flattened.len() {
+            0 => Expression::AlwaysFalse,
+            1 => flattened.into_iter().next().unwrap(),
+            _ => Expression::Or(flattened),
+        }
+    }
+
+    /// Create a logical NOT.
+    pub fn negate(expr: Expression) -> Self {
+        match expr {
+            Expression::AlwaysTrue => Expression::AlwaysFalse,
+            Expression::AlwaysFalse => Expression::AlwaysTrue,
+            Expression::Not(inner) => *inner,
+            other => Expression::Not(Box::new(other)),
+        }
+    }
+
+    /// Check if this expression is always true.
+    pub fn is_always_true(&self) -> bool {
+        matches!(self, Expression::AlwaysTrue)
+    }
+
+    /// Check if this expression is always false.
+    pub fn is_always_false(&self) -> bool {
+        matches!(self, Expression::AlwaysFalse)
+    }
+
+    /// Get all field IDs referenced by this expression.
+    pub fn referenced_field_ids(&self) -> Vec<i32> {
+        let mut ids = Vec::new();
+        self.collect_field_ids(&mut ids);
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn collect_field_ids(&self, ids: &mut Vec<i32>) {
+        match self {
+            Expression::AlwaysTrue | Expression::AlwaysFalse => {}
+            Expression::Not(inner) => inner.collect_field_ids(ids),
+            Expression::And(exprs) | Expression::Or(exprs) => {
+                for expr in exprs {
+                    expr.collect_field_ids(ids);
+                }
+            }
+            Expression::IsNull { field_id, .. }
+            | Expression::IsNotNull { field_id, .. }
+            | Expression::Comparison { field_id, .. }
+            | Expression::In { field_id, .. }
+            | Expression::NotIn { field_id, .. } => {
+                ids.push(*field_id);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Expression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expression::AlwaysTrue => write!(f, "TRUE"),
+            Expression::AlwaysFalse => write!(f, "FALSE"),
+            Expression::Not(inner) => write!(f, "NOT ({inner})"),
+            Expression::And(exprs) => {
+                let parts: Vec<String> =
+                    exprs.iter().map(std::string::ToString::to_string).collect();
+                write!(f, "({})", parts.join(" AND "))
+            }
+            Expression::Or(exprs) => {
+                let parts: Vec<String> =
+                    exprs.iter().map(std::string::ToString::to_string).collect();
+                write!(f, "({})", parts.join(" OR "))
+            }
+            Expression::IsNull { column, .. } => write!(f, "{column} IS NULL"),
+            Expression::IsNotNull { column, .. } => write!(f, "{column} IS NOT NULL"),
+            Expression::Comparison {
+                column, op, value, ..
+            } => {
+                write!(f, "{column} {op} {value}")
+            }
+            Expression::In { column, values, .. } => {
+                let vals: Vec<String> = values
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                write!(f, "{} IN ({})", column, vals.join(", "))
+            }
+            Expression::NotIn { column, values, .. } => {
+                let vals: Vec<String> = values
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                write!(f, "{} NOT IN ({})", column, vals.join(", "))
+            }
+        }
+    }
+}
+
+/// A row filter that is part of what the scanned rows MEAN, not a hint.
+///
+/// A pushed query predicate ([`FileScanTask::residual_filter`](super::FileScanTask))
+/// is advisory: the engine re-checks every row it keeps, so the reader may
+/// skip a comparison it cannot state exactly, a column it did not project, or
+/// the whole filter when pushdown is switched off. A mapping's row filter (an
+/// `rr:sqlQuery` `WHERE` over an Iceberg table) has nothing behind it: a row
+/// it keeps is a row the mapping emits. So the reader enforces this filter on
+/// every row, whatever the pushdown switch says, and fails the read rather than
+/// keep a row it cannot decide.
+///
+/// SQL semantics: a comparison with a null cell is unknown and drops the row;
+/// only `IS NULL` keeps it. A column absent from a data file (added by schema
+/// evolution after the file was written) reads as null in every row.
+///
+/// Built by a caller that has already typed each literal against its column
+/// (see `fluree-db-api`'s mapping filter resolution); an empty filter is
+/// unrepresentable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactRowFilter {
+    predicates: std::sync::Arc<[ExactPredicate]>,
+}
+
+/// One conjunct of an [`ExactRowFilter`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExactPredicate {
+    /// `<column> <op> <value>`, the value typed for the column.
+    Compare {
+        field_id: i32,
+        column: String,
+        op: ComparisonOp,
+        value: LiteralValue,
+    },
+    /// `<column> IS NULL`.
+    IsNull { field_id: i32, column: String },
+    /// `<column> IS NOT NULL`.
+    IsNotNull { field_id: i32, column: String },
+}
+
+impl ExactPredicate {
+    /// The Iceberg field the predicate tests.
+    pub fn field_id(&self) -> i32 {
+        match self {
+            Self::Compare { field_id, .. }
+            | Self::IsNull { field_id, .. }
+            | Self::IsNotNull { field_id, .. } => *field_id,
+        }
+    }
+
+    /// The same test as an [`Expression`], for file and row-group pruning.
+    pub fn to_expression(&self) -> Expression {
+        match self {
+            Self::Compare {
+                field_id,
+                column,
+                op,
+                value,
+            } => Expression::Comparison {
+                field_id: *field_id,
+                column: column.clone(),
+                op: *op,
+                value: value.clone(),
+            },
+            Self::IsNull { field_id, column } => Expression::IsNull {
+                field_id: *field_id,
+                column: column.clone(),
+            },
+            Self::IsNotNull { field_id, column } => Expression::IsNotNull {
+                field_id: *field_id,
+                column: column.clone(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ExactPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compare {
+                column, op, value, ..
+            } => write!(f, "{column} {op} {value}"),
+            Self::IsNull { column, .. } => write!(f, "{column} IS NULL"),
+            Self::IsNotNull { column, .. } => write!(f, "{column} IS NOT NULL"),
+        }
+    }
+}
+
+impl ExactRowFilter {
+    /// The conjunction of `predicates`; `None` when there are none.
+    pub fn new(predicates: Vec<ExactPredicate>) -> Option<Self> {
+        (!predicates.is_empty()).then(|| Self {
+            predicates: predicates.into(),
+        })
+    }
+
+    /// The conjuncts.
+    pub fn predicates(&self) -> &[ExactPredicate] {
+        &self.predicates
+    }
+
+    /// Every field the filter reads; a scan must project them all.
+    pub fn field_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.predicates.iter().map(ExactPredicate::field_id)
+    }
+
+    /// The filter as an [`Expression`] for file and row-group pruning, or
+    /// `None` when no conjunct can prune.
+    ///
+    /// A floating-point comparison is left out: the filter compares floats as
+    /// IEEE numbers (a NaN cell satisfies only `<>`), while column bounds omit
+    /// NaN, so a file whose bounds are both `5.0` may still hold a NaN row that
+    /// `<> 5` keeps. Leaving a conjunct out only prunes less; the reader still
+    /// enforces it on every row.
+    pub fn pruning_expression(&self) -> Option<Expression> {
+        let mut prunable: Vec<Expression> = self
+            .predicates
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    p,
+                    ExactPredicate::Compare {
+                        value: LiteralValue::Float32(_) | LiteralValue::Float64(_),
+                        ..
+                    }
+                )
+            })
+            .map(ExactPredicate::to_expression)
+            .collect();
+        match prunable.len() {
+            0 => None,
+            1 => prunable.pop(),
+            _ => Some(Expression::And(prunable)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_comparison_op_negate() {
+        assert_eq!(ComparisonOp::Eq.negate(), ComparisonOp::NotEq);
+        assert_eq!(ComparisonOp::Lt.negate(), ComparisonOp::GtEq);
+        assert_eq!(ComparisonOp::LtEq.negate(), ComparisonOp::Gt);
+        assert_eq!(ComparisonOp::Gt.negate(), ComparisonOp::LtEq);
+        assert_eq!(ComparisonOp::GtEq.negate(), ComparisonOp::Lt);
+    }
+
+    #[test]
+    fn test_expression_builders() {
+        let expr = Expression::eq(1, "id", LiteralValue::Int64(42));
+        assert!(matches!(
+            expr,
+            Expression::Comparison {
+                field_id: 1,
+                op: ComparisonOp::Eq,
+                ..
+            }
+        ));
+
+        let expr = Expression::gt(2, "value", LiteralValue::Float64(3.13));
+        assert!(matches!(
+            expr,
+            Expression::Comparison {
+                field_id: 2,
+                op: ComparisonOp::Gt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_expression_and_simplification() {
+        // AND with AlwaysTrue is simplified
+        let expr = Expression::and(vec![
+            Expression::AlwaysTrue,
+            Expression::eq(1, "id", LiteralValue::Int32(1)),
+        ]);
+        assert!(matches!(expr, Expression::Comparison { .. }));
+
+        // AND with AlwaysFalse becomes AlwaysFalse
+        let expr = Expression::and(vec![
+            Expression::AlwaysFalse,
+            Expression::eq(1, "id", LiteralValue::Int32(1)),
+        ]);
+        assert!(matches!(expr, Expression::AlwaysFalse));
+
+        // Empty AND becomes AlwaysTrue
+        let expr = Expression::and(vec![]);
+        assert!(matches!(expr, Expression::AlwaysTrue));
+    }
+
+    #[test]
+    fn test_expression_or_simplification() {
+        // OR with AlwaysFalse is simplified
+        let expr = Expression::or(vec![
+            Expression::AlwaysFalse,
+            Expression::eq(1, "id", LiteralValue::Int32(1)),
+        ]);
+        assert!(matches!(expr, Expression::Comparison { .. }));
+
+        // OR with AlwaysTrue becomes AlwaysTrue
+        let expr = Expression::or(vec![
+            Expression::AlwaysTrue,
+            Expression::eq(1, "id", LiteralValue::Int32(1)),
+        ]);
+        assert!(matches!(expr, Expression::AlwaysTrue));
+
+        // Empty OR becomes AlwaysFalse
+        let expr = Expression::or(vec![]);
+        assert!(matches!(expr, Expression::AlwaysFalse));
+    }
+
+    #[test]
+    fn test_expression_not_simplification() {
+        // NOT TRUE = FALSE
+        let expr = Expression::negate(Expression::AlwaysTrue);
+        assert!(matches!(expr, Expression::AlwaysFalse));
+
+        // NOT FALSE = TRUE
+        let expr = Expression::negate(Expression::AlwaysFalse);
+        assert!(matches!(expr, Expression::AlwaysTrue));
+
+        // NOT NOT expr = expr
+        let inner = Expression::eq(1, "id", LiteralValue::Int32(1));
+        let expr = Expression::negate(Expression::negate(inner.clone()));
+        // Should be the same comparison
+        assert!(matches!(expr, Expression::Comparison { .. }));
+    }
+
+    #[test]
+    fn test_referenced_field_ids() {
+        let expr = Expression::and(vec![
+            Expression::eq(1, "id", LiteralValue::Int32(1)),
+            Expression::gt(2, "value", LiteralValue::Float64(3.13)),
+            Expression::is_not_null(3, "name"),
+        ]);
+
+        let ids = expr.referenced_field_ids();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expression_display() {
+        let expr = Expression::and(vec![
+            Expression::eq(1, "id", LiteralValue::Int64(42)),
+            Expression::gt(2, "value", LiteralValue::Float64(3.13)),
+        ]);
+
+        let s = expr.to_string();
+        assert!(s.contains("id = 42L"));
+        assert!(s.contains("value > 3.13"));
+        assert!(s.contains("AND"));
+    }
+
+    #[test]
+    fn test_literal_value_typed_conversion() {
+        let lit = LiteralValue::Int64(42);
+        let typed = lit.to_typed_value();
+        assert_eq!(typed, TypedValue::Int64(42));
+
+        let back = LiteralValue::from_typed_value(&typed);
+        assert_eq!(back, lit);
+    }
+}

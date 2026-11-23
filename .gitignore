@@ -1,0 +1,55 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# fluree-db-wasm npm package build output (wasm-bindgen glue, tsc output)
+/fluree-db-wasm/js/pkg/
+/fluree-db-wasm/js/dist/
+/fluree-db-wasm/js/node_modules/
+
+# mdBook build output
+/docs/book/
+
+# llms.txt artifacts staged by docs/scripts/llms_preproc.py
+/docs/.llms-staging/
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Claude Code — track commands/ (team skills) and CLAUDE.md (shared conventions),
+# but not local settings or personal notes
+.claude/settings.local.json
+.claude/dev-docs/
+CLAUDE.local.md
+
+# Fluree data (storage, indexes, etc.)
+.fluree/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Test database (generated data)
+/test-database/
+
+# Benchmark inputs/outputs — never tracked
+/benchmarks/
+
+# Internal analysis scratch — not part of the published docs
+BI_QUERY_ANALYSIS.md
+SEPARATION_PLAN.md
+
+# Cursor editor config — local only
+/.cursor/
+
+# Per-test staged copies of Iceberg fixtures (it_iceberg_local_fs.rs); TempDir cleans up, this catches a killed run.
+fluree-db-api/tests/fixtures/iceberg/.tmp*

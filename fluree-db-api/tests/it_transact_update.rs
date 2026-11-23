@@ -1,0 +1,4461 @@
+//! Transact update integration tests
+//!
+//! Note: The `transaction-functions` section (hash/datetime) is covered with bind support.
+
+use crate::support;
+use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
+use fluree_db_core::{load_commit_by_id, FlakeValue, LedgerSnapshot};
+use fluree_db_transact::{CommitOpts, TxnOpts};
+use serde_json::{json, Value as JsonValue};
+
+fn ctx_ex_schema() -> JsonValue {
+    json!({
+        "ex": "http://example.org/ns/",
+        "schema": "http://schema.org/"
+    })
+}
+
+fn ctx_ex() -> JsonValue {
+    json!({
+        "id": "@id",
+        "type": "@type",
+        "ex": "http://example.com/",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    })
+}
+
+async fn seed_users(ledger_id: &str) -> (fluree_db_api::Fluree, LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let db0 = LedgerSnapshot::genesis(ledger_id);
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "insert": {
+                    "@graph": [
+                        {"@id":"ex:alice","@type":"ex:User","schema:name":"Alice","schema:email":"alice@flur.ee","schema:age":42},
+                        {"@id":"ex:bob","@type":"ex:User","schema:name":"Bob","schema:age":22},
+                        {"@id":"ex:jane","@type":"ex:User","schema:name":"Jane","schema:email":"jane@flur.ee","schema:age":30}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed update insert");
+
+    (fluree, seeded.ledger)
+}
+
+async fn query_names(fluree: &fluree_db_api::Fluree, ledger: &LedgerState) -> Vec<String> {
+    let q = json!({
+        "@context": ctx_ex_schema(),
+        "select": "?name",
+        "where": {"schema:name": "?name"}
+    });
+    let result = support::query_jsonld(fluree, ledger, &q)
+        .await
+        .expect("query names");
+    let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|x| x.as_str().expect("name string").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn update_delete_subject_ex_alice_removes_only_alice() {
+    let (fluree, db) = seed_users("it/transact-update:delete-subject").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where":  { "@id": "ex:alice", "?p": "?o" },
+                "delete": { "@id": "ex:alice", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("delete subject");
+
+    assert_eq!(query_names(&fluree, &out.ledger).await, vec!["Bob", "Jane"]);
+}
+
+#[tokio::test]
+async fn update_delete_bob_age_only() {
+    let (fluree, db) = seed_users("it/transact-update:delete-bob-age").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "ex:bob", "schema:age": "?o" },
+                "where":  { "@id": "ex:bob", "schema:age": "?o" }
+            }),
+        )
+        .await
+        .expect("delete bob age");
+
+    let q_bob = json!({ "@context": ctx_ex_schema(), "selectOne": { "ex:bob": ["*"] }});
+    let bob = support::query_jsonld(&fluree, &out.ledger, &q_bob)
+        .await
+        .expect("query bob")
+        .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+    assert_eq!(
+        bob,
+        json!({"@id":"ex:bob","@type":"ex:User","schema:name":"Bob"})
+    );
+}
+
+#[tokio::test]
+async fn update_delete_all_subjects_with_email_predicate() {
+    let (fluree, db) = seed_users("it/transact-update:delete-has-email").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "?s", "?p": "?o" },
+                "where":  { "@id": "?s", "schema:email": "?x", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("delete all with email");
+
+    assert_eq!(query_names(&fluree, &out.ledger).await, vec!["Bob"]);
+}
+
+#[tokio::test]
+async fn update_delete_all_subjects_where_age_equals_30() {
+    let (fluree, db) = seed_users("it/transact-update:delete-age-30").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "?s", "?p": "?o" },
+                "where":  { "@id": "?s", "schema:age": 30, "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("delete by age=30");
+
+    assert_eq!(
+        query_names(&fluree, &out.ledger).await,
+        vec!["Alice", "Bob"]
+    );
+}
+
+#[tokio::test]
+async fn update_bob_age_when_match() {
+    let (fluree, db) = seed_users("it/transact-update:update-bob-when-match").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "ex:bob", "schema:age": 22 },
+                "insert": { "@id": "ex:bob", "schema:age": 23 },
+                "where":  { "@id": "ex:bob", "schema:age": 22 }
+            }),
+        )
+        .await
+        .expect("update bob age when match");
+
+    let bob = support::query_jsonld(
+        &fluree,
+        &out.ledger,
+        &json!({"@context": ctx_ex_schema(), "selectOne": {"ex:bob": ["*"]}}),
+    )
+    .await
+    .expect("query bob")
+    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+    assert_eq!(
+        bob,
+        json!({"@id":"ex:bob","@type":"ex:User","schema:name":"Bob","schema:age":23})
+    );
+}
+
+#[tokio::test]
+async fn update_where_bound_typed_string_delete_and_insert_use_same_datatype_sid() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tx/update-typed-string-datatype-sid:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    let initial_txn = json!({
+        "@context": {"xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {
+                "@id": "http://example.org/s",
+                "http://example.org/p": {
+                    "@value": "before",
+                    "@type": "xsd:string"
+                }
+            }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &initial_txn).await.unwrap().ledger;
+
+    let update_txn = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "where": [{
+            "@id": "?s",
+            "ex:p": "?old"
+        }],
+        "delete": [{
+            "@id": "?s",
+            "ex:p": "?old"
+        }],
+        "insert": [{
+            "@id": "?s",
+            "ex:p": {
+                "@value": "after",
+                "@type": "xsd:string"
+            }
+        }]
+    });
+    let txn_opts = TxnOpts {
+        object_var_parsing: Some(true),
+        ..Default::default()
+    };
+    let result = fluree
+        .update_with_opts(
+            ledger1,
+            &update_txn,
+            txn_opts,
+            Default::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    let content_store = fluree.content_store(ledger_id);
+    let commit = load_commit_by_id(&content_store, &result.receipt.commit_id)
+        .await
+        .expect("load update commit");
+
+    let retract = commit
+        .flakes
+        .iter()
+        .find(|f| {
+            !f.op
+                && matches!(&f.o, FlakeValue::String(s) if s == "before")
+                && f.p.name.as_ref() == "p"
+        })
+        .expect("retract flake for previous typed string");
+    let assert = commit
+        .flakes
+        .iter()
+        .find(|f| {
+            f.op && matches!(&f.o, FlakeValue::String(s) if s == "after")
+                && f.p.name.as_ref() == "p"
+        })
+        .expect("assert flake for replacement typed string");
+
+    assert_eq!(
+        retract.dt, assert.dt,
+        "update where/delete/insert should keep the same datatype SID on retract and assert for xsd:string literals"
+    );
+}
+
+#[tokio::test]
+async fn update_delete_blank_node_rejected() {
+    // JSON-LD parity for SPARQL 1.1 Update §19.8 note 8 (W3C syntax-update-1
+    // test_50/51/52, delete-insert-03..09): blank nodes are not allowed in
+    // delete templates. A blank node denotes a fresh node — the retraction
+    // would skolemize a brand-new SID and silently match nothing.
+    let (fluree, db) = seed_users("it/transact-update:delete-bnode").await;
+
+    // Explicit blank-node @id.
+    let err = fluree
+        .update(
+            db.clone(),
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where":  { "@id": "ex:alice", "schema:name": "?name" },
+                "delete": { "@id": "_:b0", "schema:name": "?name" }
+            }),
+        )
+        .await
+        .expect_err("blank-node @id in delete must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not allowed in delete"),
+        "error should explain the bnode-in-delete rule, got: {msg}"
+    );
+
+    // Nested object without @id mints a blank node — same rejection.
+    let err = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where":  { "@id": "ex:alice", "schema:name": "?name" },
+                "delete": { "@id": "ex:alice", "schema:knows": { "schema:name": "?name" } }
+            }),
+        )
+        .await
+        .expect_err("nested blank node in delete must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not allowed in delete"),
+        "error should explain the bnode-in-delete rule, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_no_match_is_noop_success_and_does_not_bump_t() {
+    let (fluree, db) = seed_users("it/transact-update:no-match-noop").await;
+    let t_before = db.t();
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "?s", "schema:age": 99 },
+                "insert": { "@id": "?s", "schema:age": 23 },
+                "where":  { "@id": "?s", "schema:age": 99 }
+            }),
+        )
+        .await
+        .expect("no-op update should succeed");
+
+    assert_eq!(out.ledger.t(), t_before);
+
+    let bob = support::query_jsonld(
+        &fluree,
+        &out.ledger,
+        &json!({"@context": ctx_ex_schema(), "selectOne": {"ex:bob": ["*"]}}),
+    )
+    .await
+    .expect("query bob")
+    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+    assert_eq!(
+        bob,
+        json!({"@id":"ex:bob","@type":"ex:User","schema:name":"Bob","schema:age":22})
+    );
+}
+
+#[tokio::test]
+async fn update_replace_jane_age() {
+    let (fluree, db) = seed_users("it/transact-update:update-jane").await;
+
+    let out = fluree
+        .update(
+            db,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "delete": { "@id": "ex:jane", "schema:age": "?current_age" },
+                "insert": { "@id": "ex:jane", "schema:age": 31 },
+                "where":  { "@id": "ex:jane", "schema:age": "?current_age" }
+            }),
+        )
+        .await
+        .expect("update jane age");
+
+    let jane = support::query_jsonld(
+        &fluree,
+        &out.ledger,
+        &json!({"@context": ctx_ex_schema(), "selectOne": {"ex:jane": ["*"]}}),
+    )
+    .await
+    .expect("query jane")
+    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+    assert_eq!(
+        jane,
+        json!({"@id":"ex:jane","@type":"ex:User","schema:name":"Jane","schema:email":"jane@flur.ee","schema:age":31})
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_hash_functions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:hash-functions");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:md5":0,"ex:sha1":0,"ex:sha256":0,"ex:sha384":0,"ex:sha512":0},
+                        {"id":"ex:hash-fns","ex:message":"abc"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed hash fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "delete": [],
+                "where": [
+                    {"id":"ex:hash-fns","ex:message":"?message"},
+                    ["bind", "?sha256", "(sha256 ?message)", "?sha512", "(sha512 ?message)"]
+                ],
+                "insert": {"id":"ex:hash-fns","ex:sha256":"?sha256","ex:sha512":"?sha512"}
+            }),
+        )
+        .await
+        .expect("update hash fns");
+
+    let result = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:hash-fns": ["ex:sha512","ex:sha256"]}
+        }),
+    )
+    .await
+    .expect("query hash fns")
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+
+    assert_eq!(
+        result,
+        json!({
+            "ex:sha512": "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            "ex:sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        })
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_datetime_functions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:datetime-functions");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:now":0,"ex:year":0,"ex:month":0,"ex:day":0,"ex:hours":0,"ex:minutes":0,"ex:seconds":0,"ex:timezone":0,"ex:tz":0},
+                        {"id":"ex:datetime-fns",
+                         "ex:localdatetime":{"@value":"2023-06-13T14:17:22.435","@type":"xsd:dateTime"},
+                         "ex:offsetdatetime":{"@value":"2023-06-13T14:17:22.435-05:00","@type":"xsd:dateTime"},
+                         "ex:utcdatetime":{"@value":"2023-06-13T14:17:22.435Z","@type":"xsd:dateTime"}}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed datetime fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:datetime-fns","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:localdatetime":"?localdatetime","ex:offsetdatetime":"?offsetdatetime","ex:utcdatetime":"?utcdatetime"},
+                    ["bind",
+                     "?now", "(now)",
+                     "?year", "(year ?localdatetime)",
+                     "?month", "(month ?localdatetime)",
+                     "?day", "(day ?localdatetime)",
+                     "?hours", "(hours ?localdatetime)",
+                     "?minutes", "(minutes ?localdatetime)",
+                     "?seconds", "(seconds ?localdatetime)",
+                     "?tz1", "(tz ?utcdatetime)",
+                     "?tz2", "(tz ?offsetdatetime)",
+                     "?comp=", "(= ?localdatetime (now))",
+                     "?comp<", "(< ?localdatetime (now))",
+                     "?comp<=", "(<= ?localdatetime (now))",
+                     "?comp>", "(> ?localdatetime (now))",
+                     "?comp>=", "(>= ?localdatetime (now))"]
+                ],
+                "insert": {"id":"?s",
+                           "ex:now":"?now",
+                           "ex:year":"?year",
+                           "ex:month":"?month",
+                           "ex:day":"?day",
+                           "ex:hours":"?hours",
+                           "ex:minutes":"?minutes",
+                           "ex:seconds":"?seconds",
+                           "ex:tz":["?tz1","?tz2"],
+                           "ex:comp=":"?comp=",
+                           "ex:comp<":"?comp<",
+                           "ex:comp<=":"?comp<=",
+                           "ex:comp>":"?comp>",
+                           "ex:comp>=":"?comp>="}
+            }),
+        )
+        .await
+        .expect("update datetime fns");
+
+    let result = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:datetime-fns": ["ex:now","ex:year","ex:month","ex:day","ex:hours","ex:minutes","ex:seconds","ex:tz","ex:comp=","ex:comp<","ex:comp<=","ex:comp>","ex:comp>="]}
+        }),
+    )
+    .await
+    .expect("query datetime fns")
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    let now_val = result.get("ex:now").expect("now");
+    assert!(now_val.is_string() || now_val.get("@value").is_some());
+    assert_eq!(
+        result.get("ex:year").and_then(serde_json::Value::as_i64),
+        Some(2023)
+    );
+    assert_eq!(
+        result.get("ex:month").and_then(serde_json::Value::as_i64),
+        Some(6)
+    );
+    assert_eq!(
+        result.get("ex:day").and_then(serde_json::Value::as_i64),
+        Some(13)
+    );
+    assert_eq!(
+        result.get("ex:hours").and_then(serde_json::Value::as_i64),
+        Some(14)
+    );
+    assert_eq!(
+        result.get("ex:minutes").and_then(serde_json::Value::as_i64),
+        Some(17)
+    );
+    // SECONDS returns xsd:decimal per W3C spec. The JSON-LD output may
+    // serialize it as a plain string ("22.435000000"), a JSON number, or a
+    // typed value object.
+    let seconds_val = result.get("ex:seconds").expect("seconds");
+    let seconds = seconds_val
+        .as_f64()
+        .or_else(|| seconds_val.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| {
+            seconds_val
+                .get("@value")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .or_else(|| {
+            seconds_val
+                .get("@value")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .expect("seconds should be numeric");
+    assert!(
+        (seconds - 22.435).abs() < 0.001,
+        "expected ~22.435, got {seconds}"
+    );
+    // `?tz1` and `?tz2` are TZ() over a "...Z" value and a "...-05:00" value.
+    // This asserted ["-05:00", "Z"] until 2026-08-29; TZ now reports UTC for
+    // every temporal rather than the source offset (see it_timezone_accessors
+    // for why), so both arms produce "Z" and the two writes collapse to the one
+    // distinct object value. Deduplication to a scalar is the ordinary
+    // multi-value JSON-LD rendering, not a quirk of this change.
+    let tz = result.get("ex:tz").expect("tz");
+    let tz_values: Vec<&str> = match tz {
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        other => other.as_str().into_iter().collect(),
+    };
+    assert_eq!(tz_values, vec!["Z"], "TZ reports UTC for every temporal");
+    assert_eq!(result.get("ex:comp="), Some(&json!(false)));
+    assert_eq!(result.get("ex:comp<"), Some(&json!(true)));
+    assert_eq!(result.get("ex:comp<="), Some(&json!(true)));
+    assert_eq!(result.get("ex:comp>"), Some(&json!(false)));
+    assert_eq!(result.get("ex:comp>="), Some(&json!(false)));
+}
+
+#[tokio::test]
+async fn update_where_bind_numeric_and_math_functions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:numeric-functions");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:abs":0,"ex:round":0,"ex:ceil":0,"ex:floor":0,"ex:rand":0,"ex:result":0},
+                        {"id":"ex:numeric-fns","ex:pos-int":2,"ex:neg-int":-2,"ex:decimal":1.4},
+                        {"id":"ex:math","ex:num":0}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed numeric fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:numeric-fns","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:pos-int":"?pos-int","ex:neg-int":"?neg-int","ex:decimal":"?decimal"},
+                    ["bind",
+                     "?abs", "(abs ?neg-int)",
+                     "?round", "(round ?decimal)",
+                     "?ceil", "(ceil ?decimal)",
+                     "?floor", "(floor ?decimal)",
+                     "?rand", "(rand)"]
+                ],
+                "insert": {"id":"?s",
+                           "ex:abs":"?abs",
+                           "ex:round":"?round",
+                           "ex:ceil":"?ceil",
+                           "ex:floor":"?floor",
+                           "ex:rand":"?rand"}
+            }),
+        )
+        .await
+        .expect("update numeric fns");
+
+    let updated = fluree
+        .update(
+            updated.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:math","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:num":"?num"},
+                    ["bind", "?result", "(* (* (* (- (/ (+ ?num 10) 2) 3) (- (/ (+ ?num 10) 2) 3)) (- (/ (+ ?num 10) 2) 3)) 10)"]
+                ],
+                "insert": {"id":"?s","ex:result":"?result"}
+            }),
+        )
+        .await
+        .expect("update math fns");
+
+    let numeric = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:numeric-fns": ["ex:abs","ex:round","ex:ceil","ex:floor","ex:rand"]}
+        }),
+    )
+    .await
+    .expect("query numeric fns")
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+
+    // xsd:decimal results render as a JSON string (to preserve exactness), so
+    // also accept a numeric string here.
+    let num_val = |v: &serde_json::Value| {
+        v.as_i64()
+            .map(|n| n as f64)
+            .or_else(|| v.as_f64())
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+    assert_eq!(numeric.get("ex:abs").and_then(num_val), Some(2.0));
+    assert_eq!(numeric.get("ex:round").and_then(num_val), Some(1.0));
+    assert_eq!(numeric.get("ex:ceil").and_then(num_val), Some(2.0));
+    assert_eq!(numeric.get("ex:floor").and_then(num_val), Some(1.0));
+    assert!(numeric.get("ex:rand").is_some());
+
+    let math = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:math": ["ex:result"]}
+        }),
+    )
+    .await
+    .expect("query math fns")
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .await
+    .expect("to_jsonld_async");
+
+    assert_eq!(math.get("ex:result").and_then(num_val), Some(80.0));
+}
+
+#[tokio::test]
+async fn update_where_bind_string_functions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:string-functions");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:strLen":0,"ex:subStr":0,"ex:ucase":0,"ex:lcase":0,"ex:strStarts":0,"ex:strEnds":0,"ex:contains":0,"ex:strBefore":0,"ex:strAfter":0,"ex:concat":0,"ex:regex":0},
+                        {"id":"ex:string-fns","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed string fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:string-fns","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind",
+                     "?strlen", "(strLen ?text)",
+                     "?sub1", "(subStr ?text 5)",
+                     "?sub2", "(subStr ?text 1 4)",
+                     "?upcased", "(ucase ?text)",
+                     "?downcased", "(lcase ?text)",
+                     "?a-start", "(strStarts ?text \"x\")",
+                     "?a-end", "(strEnds ?text \"x\")",
+                     "?contains", "(contains ?text \"x\")",
+                     "?strBefore", "(strBefore ?text \"bcd\")",
+                     "?strAfter", "(strAfter ?text \"bcd\")",
+                     "?concatted", ["concat", "?text", " ", "STR1 ", "STR2"],
+                     "?matched", "(regex ?text \"^Abc\")"]
+                ],
+                "insert": {"id":"?s",
+                           "ex:strStarts":"?a-start",
+                           "ex:strEnds":"?a-end",
+                           "ex:subStr":["?sub1","?sub2"],
+                           "ex:strLen":"?strlen",
+                           "ex:ucase":"?upcased",
+                           "ex:lcase":"?downcased",
+                           "ex:contains":"?contains",
+                           "ex:strBefore":"?strBefore",
+                           "ex:strAfter":"?strAfter",
+                           "ex:concat":"?concatted",
+                           "ex:regex":"?matched"}
+            }),
+        )
+        .await
+        .expect("update string fns");
+
+    let result = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:string-fns": ["ex:strLen","ex:subStr","ex:ucase","ex:lcase","ex:strStarts","ex:strEnds","ex:contains","ex:strBefore","ex:strAfter","ex:concat","ex:regex"]}
+        }),
+    )
+    .await
+    .expect("query string fns")
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    assert_eq!(
+        result,
+        json!({
+            "ex:strEnds": false,
+            "ex:strStarts": false,
+            "ex:contains": false,
+            "ex:regex": true,
+            "ex:subStr": ["Abcd", "efg"],
+            "ex:strLen": 7,
+            "ex:ucase": "ABCDEFG",
+            "ex:lcase": "abcdefg",
+            "ex:strBefore": "A",
+            "ex:strAfter": "efg",
+            "ex:concat": "Abcdefg STR1 STR2"
+        })
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_functional_forms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:functional-forms");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:bound":0,"ex:if":0,"ex:coalesce":0,"ex:logical-or":0,"ex:logical-and":0},
+                        {"id":"ex:functional-fns","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed functional fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:functional-fns","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind",
+                     "?bound", "(bound ?text)",
+                     "?if", "(if true 1 2)",
+                     "?coalesce", "(coalesce ?missing ?text)",
+                     // Keep IN list literals simple (no nested expressions) to avoid
+                     // depending on unsupported parsing of expression forms inside vectors.
+                     "?in", "(in (strLen ?text) [7 8 9])",
+                     "?not-in", "(not (in (strLen ?text) [7 8 9]))",
+                     "?or", "(or false false false (= 0 (- (- 10 3) 7)))",
+                     // Ensure boolean output (avoid truthy non-bool semantics).
+                     "?and", "(and true true true (= (+ (- 10 3) 7) 14))"]
+                ],
+                "insert": {"id":"?s",
+                           "ex:bound":"?bound",
+                           "ex:if":"?if",
+                           "ex:coalesce":"?coalesce",
+                           "ex:in":"?in",
+                           "ex:not-in":"?not-in",
+                           "ex:logical-or":"?or",
+                           "ex:logical-and":"?and"}
+            }),
+        )
+        .await
+        .expect("update functional fns");
+
+    let result = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:functional-fns": ["ex:bound","ex:if","ex:coalesce","ex:in","ex:not-in","ex:logical-or","ex:logical-and"]}
+        }),
+    )
+    .await
+    .expect("query functional fns")
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    assert_eq!(
+        result,
+        json!({
+            "ex:bound": true,
+            "ex:if": 1,
+            "ex:coalesce": "Abcdefg",
+            "ex:in": true,
+            "ex:not-in": false,
+            "ex:logical-or": true,
+            "ex:logical-and": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_rdf_term_functions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:rdf-term-functions");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:isBlank":0,"ex:isNumeric":0,"ex:str":0,"ex:IRI":0,"ex:isIRI":0,"ex:isLiteral":0,"ex:strdt":0,"ex:strLang":0,"ex:bnode":0,"ex:lang":0,"ex:datatype":0},
+                        {"id":"ex:rdf-term-fns",
+                         "ex:text":"Abcdefg",
+                         "ex:langText":{"@value":"hola","@language":"es"},
+                         "ex:number":1}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed rdf term fns");
+
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "values": ["?s", [{"@value":"ex:rdf-term-fns","@type":"@id"}]],
+                "where": [
+                    {"id":"?s","ex:text":"?text","ex:langText":"?langtext","ex:number":"?num"},
+                    ["bind",
+                     "?str", "(str ?num)",
+                     "?str2", "(str ?text)",
+                     "?lang", "(lang ?langtext)",
+                     "?datatype", "(datatype ?langtext)",
+                     "?IRI", "(iri (concat \"http://example.com/\" ?text))",
+                     "?isIRI", "(is-iri ?IRI)",
+                     "?isLiteral", "(is-literal ?num)",
+                     "?strdt", "(str-dt ?text \"http://example.com/mystring\")",
+                     "?strLang", "(str-lang ?text \"foo\")",
+                     "?bnode", "(bnode)"]
+                ],
+                "insert": {"id":"?s",
+                           "ex:str":["?str","?str2"],
+                           "ex:isNumeric":"?isLiteral",
+                           "ex:lang":"?lang",
+                           "ex:datatype":"?datatype",
+                           "ex:IRI":"?IRI",
+                           "ex:isIRI":"?isIRI",
+                           "ex:isLiteral":"?isLiteral",
+                           "ex:strdt":"?strdt",
+                           "ex:strLang":"?strLang",
+                           "ex:bnode":"?bnode"}
+            }),
+        )
+        .await
+        .expect("update rdf term fns");
+
+    let result = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "selectOne": {"ex:rdf-term-fns": ["ex:isIRI","ex:isLiteral","ex:lang","ex:datatype","ex:IRI","ex:bnode","ex:strdt","ex:strLang","ex:str"]}
+        }),
+    )
+    .await
+    .expect("query rdf term fns")
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    let bnode = result.get("ex:bnode").expect("bnode");
+    let bnode_id = bnode.get("@id").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(bnode_id.starts_with("_:"));
+
+    assert_eq!(result.get("ex:IRI"), Some(&json!({"@id": "ex:Abcdefg"})));
+    assert_eq!(result.get("ex:isIRI"), Some(&json!(true)));
+    assert_eq!(result.get("ex:isLiteral"), Some(&json!(true)));
+    assert_eq!(result.get("ex:lang"), Some(&json!("es")));
+    // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so binding it
+    // and inserting stores an IRI reference, not a plain string.
+    assert_eq!(
+        result.get("ex:datatype"),
+        Some(&json!({"@id": "rdf:langString"}))
+    );
+    assert_eq!(
+        result.get("ex:strdt"),
+        Some(&json!({"@value": "Abcdefg", "@type": "ex:mystring"}))
+    );
+    assert_eq!(
+        result.get("ex:strLang"),
+        Some(&json!({"@value": "Abcdefg", "@language": "foo"}))
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_unknown_function() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-handling-parse");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger_for_update = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns")
+        .ledger;
+    let parse_err = fluree
+        .update(
+            ledger_for_update,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(foo ?text)"]
+                ],
+                "insert": {"id":"?s","ex:text":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        parse_err.is_err(),
+        "expected parse error for unknown function"
+    );
+    if let Err(err) = parse_err {
+        assert!(
+            err.to_string().contains("Unknown function: foo"),
+            "unexpected error: {err}"
+        );
+    }
+
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-handling-query");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+    let ledger_for_query = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns")
+        .ledger;
+    let query_err = support::query_jsonld(
+        &fluree,
+        &ledger_for_query,
+        &json!({
+            "@context": ctx_ex(),
+            "where": [
+                {"id":"ex:error","ex:text":"?text"},
+                ["bind", "?err", "(foo ?text)"]
+            ],
+            "select": "?err"
+        }),
+    )
+    .await;
+
+    assert!(
+        query_err.is_err(),
+        "expected query parse error for unknown function"
+    );
+    if let Err(err) = query_err {
+        assert!(
+            err.to_string().contains("Unknown function: foo"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_runtime_type_mismatch() {
+    // W3C §17: type mismatch in ABS() produces unbound, not an error.
+    // (abs ?text) where ?text is a string returns Ok(None) → ?err is unbound,
+    // and the insert simply omits the ex:error predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-runtime");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(abs ?text)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "type mismatch should produce unbound, not error: {:?}",
+        result.err()
+    );
+}
+
+/// `(iri ..)` of an absolute IRI in a namespace the ledger has never
+/// registered writes that IRI, as a direct insert of it does (#1765): the
+/// update stores the same term, and only the write registers the namespace.
+/// A string that is not an absolute IRI names nothing to write and is still
+/// refused.
+#[tokio::test]
+async fn update_where_bind_iri_in_an_unseen_namespace() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:unseen-iri");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
+            }),
+        )
+        .await
+        .expect("seed");
+    let bind_iri = |iri: &str| {
+        json!({
+            "@context": ctx_ex(),
+            "where": [
+                {"id": "?s", "ex:text": "?text"},
+                ["bind", "?o", format!("(iri \"{iri}\")")]
+            ],
+            "insert": {"id": "?s", "ex:ref": "?o"}
+        })
+    };
+
+    let refused = fluree
+        .update(seeded.ledger.clone(), &bind_iri("not an iri"))
+        .await
+        .expect_err("a string that is not an absolute IRI");
+    assert!(
+        refused.to_string().contains("cannot be used as object"),
+        "unexpected error: {refused}"
+    );
+
+    let updated = fluree
+        .update(seeded.ledger, &bind_iri("http://unseen.example/o"))
+        .await
+        .expect("(iri ..) in an unseen namespace");
+    let direct = fluree
+        .insert(
+            updated.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "@id": "ex:direct",
+                "ex:ref": {"@id": "http://unseen.example/o"}
+            }),
+        )
+        .await
+        .expect("direct insert of the same IRI");
+
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:ref": {"@id": "http://unseen.example/o"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
+}
+
+/// A constant `(iri ..)` is expanded as an insert's `@id` is (#1765):
+/// `"ex:thing"` with `ex` in the `@context` writes the expanded IRI, the term
+/// `{"@id": "ex:thing"}` stores, and `"bad:thing"` with no `bad` prefix is
+/// refused with the insert's "Unresolved compact IRI" error rather than
+/// written as the IRI `bad:thing`.
+#[tokio::test]
+async fn update_where_bind_iri_expands_through_the_context() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:iri-context");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
+            }),
+        )
+        .await
+        .expect("seed");
+    let bind_iri = |iri: &str| {
+        json!({
+            "@context": ctx_ex(),
+            "where": [
+                {"id": "?s", "ex:text": "?text"},
+                ["bind", "?o", format!("(iri \"{iri}\")")]
+            ],
+            "insert": {"id": "?s", "ex:ref": "?o"}
+        })
+    };
+
+    for (what, refused) in [
+        (
+            "(iri \"bad:thing\")",
+            fluree
+                .update(seeded.ledger.clone(), &bind_iri("bad:thing"))
+                .await
+                .err(),
+        ),
+        (
+            "{\"@id\": \"bad:thing\"}",
+            fluree
+                .insert(
+                    seeded.ledger.clone(),
+                    &json!({"@context": ctx_ex(), "@id": "ex:direct", "ex:ref": {"@id": "bad:thing"}}),
+                )
+                .await
+                .err(),
+        ),
+    ] {
+        let err = refused.unwrap_or_else(|| panic!("{what} is refused"));
+        assert!(
+            err.to_string().contains("Unresolved compact IRI 'bad:thing'"),
+            "{what}: {err}"
+        );
+    }
+
+    let updated = fluree
+        .update(seeded.ledger, &bind_iri("ex:thing"))
+        .await
+        .expect("(iri \"ex:thing\")");
+    let direct = fluree
+        .insert(
+            updated.ledger,
+            &json!({"@context": ctx_ex(), "@id": "ex:direct", "ex:ref": {"@id": "ex:thing"}}),
+        )
+        .await
+        .expect("direct insert of the same IRI");
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:ref": {"@id": "http://example.com/thing"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
+
+    // With `strictCompactIri: false` the update takes the string verbatim,
+    // as the insert does, and both store the IRI `bad:thing`.
+    let mut lax = bind_iri("bad:thing");
+    lax["opts"] = json!({"strictCompactIri": false});
+    lax["insert"] = json!({"id": "?s", "ex:lax": "?o"});
+    let lax_update = fluree
+        .update(direct.ledger, &lax)
+        .await
+        .expect("strictCompactIri: false");
+    let lax_insert = fluree
+        .insert(
+            lax_update.ledger,
+            &json!({"@context": ctx_ex(), "@id": "ex:lax-direct", "ex:lax": {"@id": "bad:thing"},
+                    "opts": {"strictCompactIri": false}}),
+        )
+        .await
+        .expect("insert with strictCompactIri: false");
+    let lax_both = support::query_jsonld(
+        &fluree,
+        &lax_insert.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:lax": {"@id": "bad:thing"}},
+            "orderBy": "?s",
+            "opts": {"strictCompactIri": false}
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&lax_insert.ledger.snapshot)
+    .expect("format");
+    assert_eq!(
+        lax_both,
+        json!(["ex:error", "ex:lax-direct"]),
+        "strictCompactIri: false"
+    );
+}
+
+/// SPARQL's twin: `IRI()` and `UUID()` in a namespace the ledger has never
+/// registered write as subject, predicate and object, each the term an
+/// `INSERT DATA` of the IRI stores (#1765). A DELETE of such an IRI matches
+/// nothing stored, and registers no namespace.
+#[tokio::test]
+async fn sparql_update_writes_an_iri_in_an_unseen_namespace() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/transact-update:sparql-unseen-iri";
+    fluree.create_ledger(id).await.expect("create ledger");
+    let update = |body: &str| {
+        let fluree = &fluree;
+        let body = format!("PREFIX ex: <http://example.org/ns/> {body}");
+        async move {
+            fluree
+                .graph(id)
+                .transact()
+                .sparql_update(&body)
+                .commit()
+                .await
+                .map(|r| r.receipt.t)
+        }
+    };
+    update(r#"INSERT DATA { ex:s ex:p "a" }"#)
+        .await
+        .expect("seed");
+    for (name, body) in [
+        (
+            "object",
+            r#"INSERT { ex:s ex:ref ?o } WHERE { ex:s ex:p ?m BIND(IRI("http://unseen.example/o") AS ?o) }"#,
+        ),
+        (
+            "subject",
+            r#"INSERT { ?s ex:p "b" } WHERE { ex:s ex:p ?m BIND(IRI("urn:unseen:s") AS ?s) }"#,
+        ),
+        (
+            "predicate",
+            r#"INSERT { ex:s ?p "c" } WHERE { ex:s ex:p "a" BIND(IRI("http://unseen.example/p") AS ?p) }"#,
+        ),
+        (
+            "UUID()",
+            r#"INSERT { ex:s ex:id ?u } WHERE { ex:s ex:p "a" BIND(UUID() AS ?u) }"#,
+        ),
+    ] {
+        update(body).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    update(
+        r#"INSERT DATA { ex:direct ex:ref <http://unseen.example/o> . <urn:unseen:s> ex:q "d" }"#,
+    )
+    .await
+    .expect("direct insert");
+    // The update also inserts a fact, so it commits: a namespace its
+    // retraction registered would land with that commit.
+    let t_before_delete = fluree.ledger(id).await.expect("ledger").t();
+    let deleted = update(
+        r#"DELETE { ex:s ex:ref ?o } INSERT { ex:s ex:p "e" }
+           WHERE { ex:s ex:p "a" BIND(IRI("http://never.example/o") AS ?o) }"#,
+    )
+    .await
+    .expect("delete of an IRI nothing holds");
+    assert_eq!(
+        deleted,
+        t_before_delete + 1,
+        "the update commits its insert"
+    );
+
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:ref <http://unseen.example/o> } ORDER BY ?s",
+    )
+    .await
+    .expect("object query");
+    assert_eq!(
+        rows,
+        json!([["ex:direct"], ["ex:s"]]),
+        "the IRI() object and the INSERT DATA object are one term"
+    );
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?p ?o WHERE { <urn:unseen:s> ?p ?o } ORDER BY ?p",
+    )
+    .await
+    .expect("subject query");
+    assert_eq!(
+        rows,
+        json!([["ex:p", "b"], ["ex:q", "d"]]),
+        "the IRI() subject and the INSERT DATA subject are one term"
+    );
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:s <http://unseen.example/p> ?o }",
+    )
+    .await
+    .expect("predicate query");
+    assert_eq!(rows, json!([["c"]]), "the IRI() predicate");
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+           SELECT (isIRI(?u) AS ?iri) (STRSTARTS(STR(?u), "urn:uuid:") AS ?uuid)
+           WHERE { ex:s ex:id ?u }"#,
+    )
+    .await
+    .expect("UUID query");
+    assert_eq!(rows, json!([[true, true]]), "the UUID() object");
+    assert!(
+        !ledger
+            .snapshot
+            .namespaces()
+            .values()
+            .any(|prefix| prefix.contains("never.example")),
+        "the delete registers no namespace"
+    );
+}
+
+/// A `str-dt` datatype string that looks like a compact IRI with an undefined
+/// prefix refuses the update with the error a JSON-LD insert of the same
+/// `@type` gives.
+#[tokio::test]
+async fn update_where_bind_error_handling_invalid_datatype_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-invalid-dt-iri");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let run_err = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(str-dt ?text \"bad:datatype\")"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(run_err.is_err(), "expected the compact-IRI guard's error");
+    if let Err(err) = run_err {
+        assert!(
+            err.to_string()
+                .contains("Unresolved compact IRI 'bad:datatype'"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+/// An update that binds `str-dt` with a datatype in a namespace the ledger
+/// has never registered stores the literal as the same term a direct insert
+/// of it stores; the bind used to fail the update with "Unknown datatype IRI"
+/// (#1765).
+#[tokio::test]
+async fn update_where_bind_str_dt_with_an_unseen_datatype_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:unseen-dt-iri");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {"id": "ex:error", "ex:text": "Abcdefg"}
+            }),
+        )
+        .await
+        .expect("seed");
+    let updated = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "?s", "ex:text": "?text"},
+                    ["bind", "?lit", "(str-dt ?text \"urn:example:dt\")"]
+                ],
+                "insert": {"id": "?s", "ex:typed": "?lit"}
+            }),
+        )
+        .await
+        .expect("str-dt with an unseen datatype IRI");
+    let direct = fluree
+        .insert(
+            updated.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "@id": "ex:direct",
+                "ex:typed": {"@value": "Abcdefg", "@type": "urn:example:dt"}
+            }),
+        )
+        .await
+        .expect("direct insert of the same literal");
+
+    let both = support::query_jsonld(
+        &fluree,
+        &direct.ledger,
+        &json!({
+            "@context": ctx_ex(),
+            "select": "?s",
+            "where": {"id": "?s", "ex:typed": {"@value": "Abcdefg", "@type": "urn:example:dt"}},
+            "orderBy": "?s"
+        }),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&direct.ledger.snapshot)
+    .expect("format");
+    assert_eq!(both, json!(["ex:direct", "ex:error"]));
+}
+
+/// `str-dt` takes any IRI as its datatype, and nothing else: a datatype that
+/// cannot be an IRI (a number, a string with spaces) is a type error, which
+/// leaves the value unbound in a query and fails an update, on both surfaces.
+/// It used to build a literal whose datatype was the string, and an update
+/// stored it.
+#[tokio::test]
+async fn str_dt_refuses_a_datatype_that_is_not_an_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/transact-update:str-dt-not-an-iri";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(r#"PREFIX ex: <http://example.com/> INSERT DATA { ex:s ex:text "a" }"#)
+        .commit()
+        .await
+        .expect("seed");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+
+    for (datatype, bound) in [
+        (r#""not an iri""#, false),
+        ("5", false),
+        (r#""urn:example:dt""#, true),
+        (r#"IRI("urn:example:dt")"#, true),
+        ("<urn:example:dt>", true),
+    ] {
+        let query = format!(
+            r"PREFIX ex: <http://example.com/>
+               SELECT ?b WHERE {{ ex:s ex:text ?t BIND(STRDT(?t, {datatype}) AS ?v) BIND(BOUND(?v) AS ?b) }}"
+        );
+        let json = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{datatype}: {e}"))
+            .to_sparql_json(&ledger.snapshot)
+            .expect("sparql json");
+        assert_eq!(
+            json["results"]["bindings"][0]["b"]["value"],
+            bound.to_string(),
+            "SPARQL STRDT with {datatype}: {json}"
+        );
+    }
+    for (datatype, bound) in [("\"not an iri\"", false), ("\"urn:example:dt\"", true)] {
+        let rows = support::query_jsonld(
+            &fluree,
+            &ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "ex:s", "ex:text": "?t"},
+                    ["bind", "?v", format!("(str-dt ?t {datatype})"), "?b", "(bound ?v)"]
+                ],
+                "select": "?b"
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{datatype}: {e}"))
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+        assert_eq!(rows, json!([bound]), "JSON-LD str-dt with {datatype}");
+    }
+
+    let sparql = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.com/>
+               INSERT { ex:s ex:typed ?v } WHERE { ex:s ex:text ?t BIND(STRDT(?t, "not an iri") AS ?v) }"#,
+        )
+        .commit()
+        .await;
+    assert!(
+        sparql.is_err(),
+        "SPARQL update stored it: {:?}",
+        sparql.ok().map(|r| r.receipt.t)
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id": "ex:s", "ex:text": "?t"},
+                    ["bind", "?v", "(str-dt ?t \"not an iri\")"]
+                ],
+                "insert": {"id": "ex:s", "ex:typed": "?v"}
+            }),
+        )
+        .await;
+    assert!(jsonld.is_err(), "JSON-LD update stored it");
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_invalid_iri_type() {
+    // W3C §17: type mismatch in IRI() produces unbound, not an error.
+    // (iri 42) with a numeric arg returns Ok(None) → ?err is unbound,
+    // and the insert simply omits the ex:error predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-iri-type");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(iri 42)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "type mismatch should produce unbound, not error: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_strdt_non_string() {
+    // W3C §17: type mismatch in STRDT() produces unbound, not an error.
+    // (str-dt 42 "xsd:string") with a numeric first arg returns Ok(None) → ?err is unbound,
+    // and the insert simply omits the ex:error predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strdt-non-string");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(str-dt 42 \"xsd:string\")"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "type mismatch should produce unbound, not error: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_bnode_arity() {
+    // Per W3C spec, BNODE accepts 0 or 1 arguments. (bnode ?text) with a
+    // string label now produces a deterministic blank node rather than an error.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-bnode-arity");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(bnode ?text)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "BNODE with 1 arg should succeed, not error: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_strlang_non_string() {
+    // W3C §17: type mismatch in STRLANG() produces unbound, not an error.
+    // (str-lang 42 "en") with a numeric first arg returns Ok(None) → ?err is unbound,
+    // and the insert simply omits the ex:error predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strlang-non-string");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(str-lang 42 \"en\")"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "type mismatch should produce unbound, not error: {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_iri_arity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-iri-arity");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let run_err = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(iri ?text ?text)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(run_err.is_err(), "expected runtime bind error");
+    if let Err(err) = run_err {
+        assert!(
+            err.to_string().contains("IRI requires exactly 1 argument"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_strdt_arity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strdt-arity");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let run_err = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(str-dt ?text)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(run_err.is_err(), "expected runtime bind error");
+    if let Err(err) = run_err {
+        assert!(
+            err.to_string()
+                .contains("STRDT requires exactly 2 arguments"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_strlang_arity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-strlang-arity");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let run_err = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(str-lang ?text)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(run_err.is_err(), "expected runtime bind error");
+    if let Err(err) = run_err {
+        assert!(
+            err.to_string()
+                .contains("STRLANG requires exactly 2 arguments"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_where_bind_error_handling_in_requires_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:error-in-list");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex(),
+                "insert": {
+                    "@graph": [
+                        {"id":"ex:create-predicates","ex:text":0,"ex:error":0},
+                        {"id":"ex:error","ex:text":"Abcdefg"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .expect("seed error fns");
+
+    let parse_err = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex(),
+                "where": [
+                    {"id":"?s","ex:text":"?text"},
+                    ["bind", "?err", "(in ?text 1)"]
+                ],
+                "insert": {"id":"?s","ex:error":"?err"},
+                "values": ["?s", [{"@value":"ex:error","@type":"@id"}]]
+            }),
+        )
+        .await;
+
+    assert!(parse_err.is_err(), "expected parse error for in list");
+    if let Err(err) = parse_err {
+        assert!(
+            err.to_string().contains("in requires a list literal"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression: wildcard delete via values should retract ALL triples
+// ---------------------------------------------------------------------------
+
+/// The "full" context matching the bug report — declaring many prefixes
+/// that happen to overlap with property namespaces used in the data.
+fn ctx_full() -> JsonValue {
+    json!({
+        "fsys": "https://ns.flur.ee/system#",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#",
+        "schema": "http://schema.org/",
+        "f": "https://ns.flur.ee/db#"
+    })
+}
+
+/// Reproduce reported bug: `values` + `"?p": "?o"` wildcard delete with
+/// a rich @context only retracts a subset of triples.
+///
+/// With a minimal context (just "fsys") all triples are retracted.
+/// With the full context (rdf, rdfs, xsd, schema, f), only some are.
+#[tokio::test]
+async fn update_values_wildcard_delete_retracts_all_triples() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    // Seed entity using urn: IRI format and fsys properties (matching production).
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": {
+                    "fsys": "https://ns.flur.ee/system#",
+                    "schema": "http://schema.org/"
+                },
+                "insert": {
+                    "@id": "urn:fsys:space:space-001",
+                    "@type": "fsys:Space",
+                    "fsys:name": "My Space",
+                    "fsys:spaceId": "space-001",
+                    "fsys:status": "active",
+                    "fsys:owner": {"@id": "urn:fsys:user:user1"},
+                    "fsys:createdBy": {"@id": "urn:fsys:user:user1"},
+                    "fsys:dateCreated": "2026-03-25",
+                    "fsys:dateModified": "2026-03-25",
+                    "fsys:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                    "fsys:knowledgeBases": [{"@id": "urn:fsys:kb:kb1"}, {"@id": "urn:fsys:kb:kb2"}],
+                    "fsys:spaceLedger": {"@id": "urn:fsys:ledger:ledger1"}
+                }
+            }),
+        )
+        .await
+        .expect("seed space entity");
+
+    // Delete with the FULL context (6 prefixes) — this is the failing case.
+    let deleted = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_full(),
+                "values": ["?s", [{"@type": "@id", "@value": "urn:fsys:space:space-001"}]],
+                "where": {
+                    "@id": "?s",
+                    "?p": "?o"
+                },
+                "delete": {
+                    "@id": "?s",
+                    "?p": "?o"
+                }
+            }),
+        )
+        .await
+        .expect("wildcard delete via values (full context)");
+
+    // Use minimal context for the verification query to avoid the same bug.
+    let remaining = support::query_jsonld(
+        &fluree,
+        &deleted.ledger,
+        &json!({
+            "@context": {"fsys": "https://ns.flur.ee/system#"},
+            "select": ["?p", "?o"],
+            "where": { "@id": "urn:fsys:space:space-001", "?p": "?o" }
+        }),
+    )
+    .await
+    .expect("query remaining triples")
+    .to_jsonld(&deleted.ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        remaining,
+        json!([]),
+        "Expected zero remaining triples with full context delete, but found: {remaining}"
+    );
+}
+
+/// Control test: same entity, same delete pattern, but minimal context.
+/// Per the bug report, this succeeds.
+#[tokio::test]
+async fn update_values_wildcard_delete_minimal_context_works() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete-minimal");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": {
+                    "fsys": "https://ns.flur.ee/system#",
+                    "schema": "http://schema.org/"
+                },
+                "insert": {
+                    "@id": "fsys:space1",
+                    "@type": "fsys:Space",
+                    "schema:name": "My Space",
+                    "fsys:spaceId": "space-001",
+                    "fsys:status": "active",
+                    "fsys:owner": {"@id": "fsys:user1"},
+                    "fsys:createdBy": {"@id": "fsys:user1"},
+                    "schema:dateCreated": "2026-03-25",
+                    "schema:dateModified": "2026-03-25",
+                    "fsys:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                    "fsys:knowledgeBases": [{"@id": "fsys:kb1"}, {"@id": "fsys:kb2"}],
+                    "fsys:spaceLedger": {"@id": "fsys:ledger1"}
+                }
+            }),
+        )
+        .await
+        .expect("seed space entity");
+
+    // Delete with MINIMAL context (just fsys) — this is the working case.
+    let deleted = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": {"fsys": "https://ns.flur.ee/system#"},
+                "values": ["?s", [{"@type": "@id", "@value": "fsys:space1"}]],
+                "where": {
+                    "@id": "?s",
+                    "?p": "?o"
+                },
+                "delete": {
+                    "@id": "?s",
+                    "?p": "?o"
+                }
+            }),
+        )
+        .await
+        .expect("wildcard delete via values (minimal context)");
+
+    let remaining = support::query_jsonld(
+        &fluree,
+        &deleted.ledger,
+        &json!({
+            "@context": {"fsys": "https://ns.flur.ee/system#"},
+            "select": ["?p", "?o"],
+            "where": { "@id": "fsys:space1", "?p": "?o" }
+        }),
+    )
+    .await
+    .expect("query remaining triples")
+    .to_jsonld(&deleted.ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        remaining,
+        json!([]),
+        "Expected zero remaining triples for fsys:space1 with minimal context delete, but found: {remaining}"
+    );
+}
+
+/// Same as above but with a hardcoded @id (no values clause) to isolate
+/// whether `values` is the problem or the wildcard pattern itself.
+#[tokio::test]
+async fn update_hardcoded_id_wildcard_delete_retracts_all_triples() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:hardcoded-wildcard-delete");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    let seeded = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "insert": {
+                    "@id": "ex:space1",
+                    "@type": "ex:Space",
+                    "schema:name": "My Space",
+                    "ex:spaceId": "space-001",
+                    "ex:status": "active",
+                    "ex:owner": {"@id": "ex:user1"},
+                    "ex:createdBy": {"@id": "ex:user1"},
+                    "schema:dateCreated": "2026-03-25",
+                    "schema:dateModified": "2026-03-25",
+                    "ex:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                    "ex:knowledgeBases": [{"@id": "ex:kb1"}, {"@id": "ex:kb2"}],
+                    "ex:spaceLedger": {"@id": "ex:ledger1"}
+                }
+            }),
+        )
+        .await
+        .expect("seed space entity");
+
+    // Delete using hardcoded @id (no values clause)
+    let deleted = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "where": {
+                    "@id": "ex:space1",
+                    "?p": "?o"
+                },
+                "delete": {
+                    "@id": "ex:space1",
+                    "?p": "?o"
+                }
+            }),
+        )
+        .await
+        .expect("hardcoded wildcard delete");
+
+    let remaining = support::query_jsonld(
+        &fluree,
+        &deleted.ledger,
+        &json!({
+            "@context": ctx_ex_schema(),
+            "select": ["?p", "?o"],
+            "where": { "@id": "ex:space1", "?p": "?o" }
+        }),
+    )
+    .await
+    .expect("query remaining triples")
+    .to_jsonld(&deleted.ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        remaining,
+        json!([]),
+        "Expected zero remaining triples for ex:space1 (hardcoded), but found: {remaining}"
+    );
+}
+
+/// Test wildcard delete when data is split across two transactions
+/// (simulating index/novelty split in production).
+#[tokio::test]
+async fn update_values_wildcard_delete_across_two_transactions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let db0 = LedgerSnapshot::genesis("it/transact-update:values-wildcard-delete-2txn");
+    let ledger0 = LedgerState::new(db0, Novelty::new(0));
+
+    // First transaction: core properties
+    let txn1 = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "insert": {
+                    "@id": "ex:space1",
+                    "@type": "ex:Space",
+                    "schema:name": "My Space",
+                    "ex:spaceId": "space-001",
+                    "ex:status": "active",
+                    "ex:owner": {"@id": "ex:user1"},
+                    "ex:createdBy": {"@id": "ex:user1"}
+                }
+            }),
+        )
+        .await
+        .expect("txn1");
+
+    // Second transaction: add more properties (these will be in a different
+    // novelty segment from the first batch).
+    let txn2 = fluree
+        .update(
+            txn1.ledger,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "insert": {
+                    "@id": "ex:space1",
+                    "schema:dateCreated": "2026-03-25",
+                    "schema:dateModified": "2026-03-25",
+                    "ex:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                    "ex:knowledgeBases": [{"@id": "ex:kb1"}, {"@id": "ex:kb2"}],
+                    "ex:spaceLedger": {"@id": "ex:ledger1"}
+                }
+            }),
+        )
+        .await
+        .expect("txn2");
+
+    // Now delete all triples via values + wildcard
+    let deleted = fluree
+        .update(
+            txn2.ledger,
+            &json!({
+                "@context": ctx_ex_schema(),
+                "values": ["?s", [{"@type": "@id", "@value": "ex:space1"}]],
+                "where": {
+                    "@id": "?s",
+                    "?p": "?o"
+                },
+                "delete": {
+                    "@id": "?s",
+                    "?p": "?o"
+                }
+            }),
+        )
+        .await
+        .expect("wildcard delete via values (2 txn)");
+
+    let remaining = support::query_jsonld(
+        &fluree,
+        &deleted.ledger,
+        &json!({
+            "@context": ctx_ex_schema(),
+            "select": ["?p", "?o"],
+            "where": { "@id": "ex:space1", "?p": "?o" }
+        }),
+    )
+    .await
+    .expect("query remaining triples")
+    .to_jsonld(&deleted.ledger.snapshot)
+    .expect("to_jsonld");
+
+    assert_eq!(
+        remaining,
+        json!([]),
+        "Expected zero remaining triples for ex:space1 after 2-txn split, but found: {remaining}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: wildcard delete with data split across index + novelty
+// ---------------------------------------------------------------------------
+
+/// Test wildcard delete when some data has been indexed and newer data
+/// is still in novelty. This is the most likely production scenario for
+/// the reported partial-deletion bug.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn update_values_wildcard_delete_index_plus_novelty() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/transact-update:wildcard-delete-indexed";
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let ledger0 = LedgerSnapshot::genesis(ledger_id);
+    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        Default::default(),
+    );
+
+    local
+        .run_until(async {
+            // Transaction 1: core properties
+            let txn1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "@graph": [{
+                            "@id": "ex:space1",
+                            "@type": "ex:Space",
+                            "schema:name": "My Space",
+                            "ex:spaceId": "space-001",
+                            "ex:status": "active",
+                            "ex:owner": {"@id": "ex:user1"},
+                            "ex:createdBy": {"@id": "ex:user1"}
+                        }]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("txn1");
+
+            // Index transaction 1 — moves flakes from novelty to index
+            trigger_index_and_wait(&handle, ledger_id, txn1.receipt.t).await;
+
+            // Reload ledger after indexing
+            let indexed_ledger = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("load after index");
+
+            // Transaction 2: add more properties (these stay in novelty)
+            let txn2 = fluree
+                .insert_with_opts(
+                    indexed_ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "@graph": [{
+                            "@id": "ex:space1",
+                            "schema:dateCreated": "2026-03-25",
+                            "schema:dateModified": "2026-03-25",
+                            "ex:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                            "ex:knowledgeBases": [{"@id": "ex:kb1"}, {"@id": "ex:kb2"}],
+                            "ex:spaceLedger": {"@id": "ex:ledger1"}
+                        }]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("txn2");
+
+            // Now delete all triples via values + wildcard.
+            // Data is split: txn1 flakes in index, txn2 flakes in novelty.
+            let deleted = fluree
+                .update(
+                    txn2.ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "values": ["?s", [{"@type": "@id", "@value": "ex:space1"}]],
+                        "where": {
+                            "@id": "?s",
+                            "?p": "?o"
+                        },
+                        "delete": {
+                            "@id": "?s",
+                            "?p": "?o"
+                        }
+                    }),
+                )
+                .await
+                .expect("wildcard delete via values (indexed)");
+
+            let remaining = support::query_jsonld(
+                &fluree,
+                &deleted.ledger,
+                &json!({
+                    "@context": ctx_ex_schema(),
+                    "select": ["?p", "?o"],
+                    "where": { "@id": "ex:space1", "?p": "?o" }
+                }),
+            )
+            .await
+            .expect("query remaining triples")
+            .to_jsonld(&deleted.ledger.snapshot)
+            .expect("to_jsonld");
+
+            assert_eq!(
+                remaining,
+                json!([]),
+                "Expected zero remaining triples for ex:space1 after index+novelty delete, but found: {remaining}"
+            );
+        })
+        .await;
+}
+
+/// Regression: duplicate facts across index + novelty cause incomplete retraction.
+///
+/// Scenario:
+///   1. Commit 1: insert entity with properties
+///   2. Index runs → flakes move from novelty to index
+///   3. Commit 2: re-insert the SAME triples (upsert/idempotent pattern)
+///      - Novelty dedup only checks novelty, not the index
+///      - So the duplicate is accepted → same fact now lives in BOTH index AND novelty
+///   4. Query sees each fact once (collapsed at query time)
+///   5. Wildcard delete generates one retraction per collapsed fact
+///   6. BUG: only one copy is retracted; the other survives
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/transact-update:wildcard-delete-dup-index-novelty";
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let ledger0 = LedgerSnapshot::genesis(ledger_id);
+    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        Default::default(),
+    );
+
+    local
+        .run_until(async {
+            let entity_data = json!({
+                "@context": ctx_ex_schema(),
+                "@graph": [{
+                    "@id": "ex:space1",
+                    "@type": "ex:Space",
+                    "schema:name": "My Space",
+                    "ex:spaceId": "space-001",
+                    "ex:status": "active",
+                    "ex:owner": {"@id": "ex:user1"},
+                    "ex:createdBy": {"@id": "ex:user1"},
+                    "schema:dateCreated": "2026-03-25",
+                    "schema:dateModified": "2026-03-25",
+                    "ex:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                    "ex:knowledgeBases": [{"@id": "ex:kb1"}, {"@id": "ex:kb2"}],
+                    "ex:spaceLedger": {"@id": "ex:ledger1"}
+                }]
+            });
+
+            // Commit 1: insert the entity
+            let txn1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &entity_data,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("txn1 insert");
+
+            // Index → flakes move from novelty to persistent index
+            trigger_index_and_wait(&handle, ledger_id, txn1.receipt.t).await;
+            let ledger_after_index = fluree.ledger(ledger_id).await.expect("load after index");
+
+            // Commit 2: re-insert the SAME entity data (idempotent upsert).
+            // Novelty dedup only checks novelty (now empty after indexing),
+            // so these duplicate assertions should be accepted.
+            let txn2 = fluree
+                .insert_with_opts(
+                    ledger_after_index,
+                    &entity_data,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("txn2 re-insert (duplicate)");
+
+            // Sanity: query should still show one entity (collapsed)
+            let before_delete = support::query_jsonld(
+                &fluree,
+                &txn2.ledger,
+                &json!({
+                    "@context": ctx_ex_schema(),
+                    "select": "?name",
+                    "where": { "@id": "ex:space1", "schema:name": "?name" }
+                }),
+            )
+            .await
+            .expect("query before delete")
+            .to_jsonld(&txn2.ledger.snapshot)
+            .expect("to_jsonld");
+            assert_eq!(
+                before_delete,
+                json!(["My Space"]),
+                "should see one name before delete"
+            );
+
+            // Now wildcard delete
+            let deleted = fluree
+                .update(
+                    txn2.ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "values": ["?s", [{"@type": "@id", "@value": "ex:space1"}]],
+                        "where": {"@id": "?s", "?p": "?o"},
+                        "delete": {"@id": "?s", "?p": "?o"}
+                    }),
+                )
+                .await
+                .expect("wildcard delete");
+
+            let remaining = support::query_jsonld(
+                &fluree,
+                &deleted.ledger,
+                &json!({
+                    "@context": ctx_ex_schema(),
+                    "select": ["?p", "?o"],
+                    "where": { "@id": "ex:space1", "?p": "?o" }
+                }),
+            )
+            .await
+            .expect("query remaining triples")
+            .to_jsonld(&deleted.ledger.snapshot)
+            .expect("to_jsonld");
+
+            assert_eq!(
+                remaining,
+                json!([]),
+                "Expected zero remaining triples after wildcard delete of entity with \
+                 duplicate facts across index+novelty, but found: {remaining}"
+            );
+        })
+        .await;
+}
+
+/// Test wildcard delete on an entity that was built up over many transactions
+/// with updates (not just inserts) — closer to the real production lifecycle.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn update_values_wildcard_delete_after_updates_and_indexing() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/transact-update:wildcard-delete-updates-indexed";
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let ledger0 = LedgerSnapshot::genesis(ledger_id);
+    let ledger0 = LedgerState::new(ledger0, Novelty::new(0));
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        Default::default(),
+    );
+
+    local
+        .run_until(async {
+            // Txn 1: initial entity
+            let txn1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "@graph": [{
+                            "@id": "ex:space1",
+                            "@type": "ex:Space",
+                            "schema:name": "Draft Space",
+                            "ex:spaceId": "space-001",
+                            "ex:status": "draft",
+                            "ex:owner": {"@id": "ex:user1"},
+                            "ex:createdBy": {"@id": "ex:user1"},
+                            "schema:dateCreated": "2026-03-20"
+                        }]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("txn1");
+
+            // Index txn1
+            trigger_index_and_wait(&handle, ledger_id, txn1.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load after index1");
+
+            // Txn 2: update name, status; add multi-valued properties
+            let txn2 = fluree
+                .update(
+                    ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "where": {"@id": "ex:space1", "schema:name": "?oldName", "ex:status": "?oldStatus"},
+                        "delete": {"@id": "ex:space1", "schema:name": "?oldName", "ex:status": "?oldStatus"},
+                        "insert": {
+                            "@id": "ex:space1",
+                            "schema:name": "My Space",
+                            "ex:status": "active",
+                            "schema:dateModified": "2026-03-25",
+                            "ex:mcpTools": ["tool-a", "tool-b", "tool-c", "tool-d"],
+                            "ex:knowledgeBases": [{"@id": "ex:kb1"}, {"@id": "ex:kb2"}],
+                            "ex:spaceLedger": {"@id": "ex:ledger1"}
+                        }
+                    }),
+                )
+                .await
+                .expect("txn2");
+
+            // Index txn2
+            trigger_index_and_wait(&handle, ledger_id, txn2.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load after index2");
+
+            // Txn 3: one more small update (stays in novelty)
+            let txn3 = fluree
+                .update(
+                    ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "where": {"@id": "ex:space1", "schema:dateModified": "?old"},
+                        "delete": {"@id": "ex:space1", "schema:dateModified": "?old"},
+                        "insert": {"@id": "ex:space1", "schema:dateModified": "2026-03-25T17:12:33Z"}
+                    }),
+                )
+                .await
+                .expect("txn3");
+
+            // Now delete everything via values + wildcard
+            let deleted = fluree
+                .update(
+                    txn3.ledger,
+                    &json!({
+                        "@context": ctx_ex_schema(),
+                        "values": ["?s", [{"@type": "@id", "@value": "ex:space1"}]],
+                        "where": {"@id": "?s", "?p": "?o"},
+                        "delete": {"@id": "?s", "?p": "?o"}
+                    }),
+                )
+                .await
+                .expect("wildcard delete");
+
+            let remaining = support::query_jsonld(
+                &fluree,
+                &deleted.ledger,
+                &json!({
+                    "@context": ctx_ex_schema(),
+                    "select": ["?p", "?o"],
+                    "where": {"@id": "ex:space1", "?p": "?o"}
+                }),
+            )
+            .await
+            .expect("query remaining")
+            .to_jsonld(&deleted.ledger.snapshot)
+            .expect("to_jsonld");
+
+            assert_eq!(
+                remaining,
+                json!([]),
+                "Expected zero remaining triples after multi-txn+index wildcard delete, but found: {remaining}"
+            );
+        })
+        .await;
+}
+
+/// Issue #1438 (resolved): a multi-operation SPARQL UPDATE request
+/// (`INSERT ...; DELETE ...`) used to execute ONLY the first operation,
+/// silently discarding everything after the first ';' — silent data loss
+/// through the public transact path. PR-3's interim guard made that fail
+/// loudly; the request-level `;` loop + sequential staging now execute the
+/// full sequence in ONE atomic commit, each operation observing the state
+/// its predecessors produced (SPARQL 1.1 Update §3.1 / roadmap D-10).
+#[tokio::test]
+async fn multi_operation_sparql_update_executes_sequentially() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:main")
+        .await
+        .expect("create ledger");
+
+    // Op 2's WHERE must observe op 1's insert within the same request —
+    // the truncation bug's core scenario, now the sequential-staging one.
+    let two_ops = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:p "first" } ;
+        INSERT { ?s ex:q "second" } WHERE { ?s ex:p "first" }
+    "#;
+    let result = fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(two_ops)
+        .commit()
+        .await
+        .expect("two-op request executes as one atomic commit");
+    assert_eq!(result.receipt.t, 1, "one request = one commit");
+
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?p ?o WHERE { ex:s ?p ?o } ORDER BY ?o",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let bindings = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both operations' effects must be visible: {json}"
+    );
+    assert_eq!(bindings[0]["o"]["value"], "first");
+    assert_eq!(bindings[1]["o"]["value"], "second");
+
+    // Insert-then-delete of the same fact in one request nets to absence
+    // (ordered application), while a fact asserted before the request and
+    // deleted-then-reasserted inside it survives.
+    let insert_delete = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:tmp ex:p "transient" } ;
+        DELETE DATA { ex:tmp ex:p "transient" }
+    "#;
+    fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(insert_delete)
+        .commit()
+        .await
+        .expect("insert-then-delete request commits");
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:tmp ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "insert-then-delete within one request must net to absence: {json}"
+    );
+
+    let delete_insert = r#"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE DATA { ex:s ex:p "first" } ;
+        INSERT DATA { ex:s ex:p "first" }
+    "#;
+    fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(delete_insert)
+        .commit()
+        .await
+        .expect("delete-then-reinsert request commits");
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:s ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "delete-then-reinsert within one request must net to presence: {json}"
+    );
+}
+
+/// Every operation of a request is lowered before the first one stages. An
+/// operation can register a namespace while it stages (an IRI it binds in
+/// WHERE and then writes), so the codes the lowering gave later operations'
+/// namespaces must already be taken by then: otherwise the two namespaces
+/// get one code, and the request fails with a namespace conflict however
+/// often it is retried.
+#[tokio::test]
+async fn multi_operation_namespaces_registered_while_staging_follow_the_lowered_ones() {
+    async fn run(fluree: &fluree_db_api::Fluree, ledger_id: &str, update: &str) -> JsonValue {
+        fluree.create_ledger(ledger_id).await.expect("create");
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(r#"PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:s ex:p "a" }"#)
+            .commit()
+            .await
+            .expect("seed");
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(update)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{ledger_id}: the request commits: {e}"));
+        let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+        let rows = support::query_sparql(
+            fluree,
+            &ledger,
+            r"PREFIX ex: <http://example.org/ns/>
+               SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER(?p != ex:p || ?o = 'b') }
+               ORDER BY ?s ?p ?o",
+        )
+        .await
+        .expect("query");
+        rows.to_sparql_json(&ledger.snapshot).expect("sparql json")["results"]["bindings"].clone()
+    }
+    fn triples(bindings: &JsonValue) -> Vec<(String, String, String)> {
+        bindings
+            .as_array()
+            .expect("bindings")
+            .iter()
+            .map(|row| {
+                let term = |var: &str| {
+                    let cell = &row[var];
+                    match cell["datatype"].as_str() {
+                        Some(dt) => format!("{}^^{dt}", cell["value"].as_str().unwrap()),
+                        None => cell["value"].as_str().unwrap().to_string(),
+                    }
+                };
+                (term("s"), term("p"), term("o"))
+            })
+            .collect()
+    }
+    let t = |s: &str, p: &str, o: &str| (s.to_string(), p.to_string(), o.to_string());
+    let ex = |local: &str| format!("http://example.org/ns/{local}");
+    let then_b = r#"INSERT DATA { <http://unseen-b.example/y> ex:p "b" }"#;
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    for (n, bind) in [
+        r#"BIND(IRI("http://unseen-a.example/o") AS ?o)"#,
+        r"BIND(<http://unseen-a.example/o> AS ?o)",
+        r"VALUES ?o { <http://unseen-a.example/o> }",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let update = format!(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT {{ ex:s ex:ref ?o }} WHERE {{ ex:s ex:p "a" {bind} }} ;
+               {then_b}"#
+        );
+        let rows = run(&fluree, &format!("ns-order-{n}:main"), &update).await;
+        assert_eq!(
+            triples(&rows),
+            vec![
+                t(&ex("s"), &ex("ref"), "http://unseen-a.example/o"),
+                t("http://unseen-b.example/y", &ex("p"), "b"),
+            ],
+            "{bind}"
+        );
+    }
+
+    let update = format!(
+        r#"PREFIX ex: <http://example.org/ns/>
+           INSERT {{ ex:s ex:val ?v }}
+           WHERE {{ ex:s ex:p "a" BIND(STRDT("x", <http://unseen-a.example/T>) AS ?v) }} ;
+           {then_b}"#
+    );
+    let rows = run(&fluree, "ns-order-strdt:main", &update).await;
+    assert_eq!(
+        triples(&rows),
+        vec![
+            t(&ex("s"), &ex("val"), "x^^http://unseen-a.example/T"),
+            t("http://unseen-b.example/y", &ex("p"), "b"),
+        ]
+    );
+
+    // Both operations name one unseen IRI, the first by binding it: they
+    // must write it under one code, or the ledger holds two subjects for it.
+    let update = r#"PREFIX ex: <http://example.org/ns/>
+        INSERT { ex:s ex:ref ?o } WHERE { ex:s ex:p "a" BIND(IRI("http://unseen-a.example/o") AS ?o) } ;
+        INSERT DATA { <http://unseen-b.example/y> ex:ref <http://unseen-a.example/o> }"#;
+    let fluree_shared = FlureeBuilder::memory().build_memory();
+    run(&fluree_shared, "ns-order-shared:main", update).await;
+    let ledger = fluree_shared
+        .ledger("ns-order-shared:main")
+        .await
+        .expect("ledger");
+    let rows = support::query_sparql(
+        &fluree_shared,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s (COUNT(*) AS ?n) WHERE { ?s ex:ref <http://unseen-a.example/o> }
+           GROUP BY ?s ORDER BY ?s",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let subjects: Vec<&str> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| row["s"]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        subjects,
+        vec![ex("s").as_str(), "http://unseen-b.example/y"],
+        "one IRI, one code: {json}"
+    );
+}
+
+/// A fact an operation reverses back to how the request found it is not in
+/// the commit: last-wins netting alone committed `INSERT x ; DELETE x` as a
+/// retraction of a fact the ledger never held, visible in its history.
+#[tokio::test]
+async fn multi_operation_reversed_facts_leave_no_commit() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "multiop-net:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let update = |sparql: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(sparql)
+                .commit()
+                .await
+                .expect("commit")
+                .receipt
+        }
+    };
+
+    let seeded =
+        update(r#"PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:s ex:p "kept" }"#).await;
+    assert_eq!(seeded.t, 1);
+
+    for (sparql, what) in [
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:tmp ex:p "transient" } ;
+               DELETE DATA { ex:tmp ex:p "transient" }"#,
+            "insert-then-delete of a new fact",
+        ),
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               DELETE DATA { ex:s ex:p "kept" } ;
+               INSERT DATA { ex:s ex:p "kept" }"#,
+            "delete-then-reinsert of an existing fact",
+        ),
+        (
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { GRAPH ex:new { ex:tmp ex:p "transient" } } ;
+               DELETE DATA { GRAPH ex:new { ex:tmp ex:p "transient" } }"#,
+            "insert-then-delete in a graph the ledger has never seen",
+        ),
+    ] {
+        let receipt = update(sparql).await;
+        assert_eq!(
+            (receipt.t, receipt.flake_count),
+            (1, 0),
+            "{what} must commit nothing"
+        );
+    }
+
+    // A reversal is netted only against what the base held: a fact the
+    // base has, asserted again and then deleted, is still deleted.
+    let receipt = update(
+        r#"PREFIX ex: <http://example.org/ns/>
+           INSERT DATA { ex:s ex:p "kept" } ;
+           DELETE DATA { ex:s ex:p "kept" }"#,
+    )
+    .await;
+    assert_eq!((receipt.t, receipt.retract_count), (2, 1));
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/ns/> SELECT ?o WHERE { ex:s ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(json["results"]["bindings"].as_array().unwrap().is_empty());
+}
+
+/// A graph a request introduces and then empties again is left out of its
+/// registrations, while a graph it keeps, introduced alongside, is
+/// registered and read back.
+#[tokio::test]
+async fn multi_operation_registers_only_the_graphs_it_keeps() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "multiop-graphs:main";
+    fluree.create_ledger(ledger_id).await.expect("create");
+    let receipt = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { GRAPH ex:a { ex:s ex:p "gone" } GRAPH ex:b { ex:s ex:p "kept" } } ;
+               DELETE DATA { GRAPH ex:a { ex:s ex:p "gone" } }"#,
+        )
+        .commit()
+        .await
+        .expect("commit")
+        .receipt;
+    assert_eq!((receipt.t, receipt.flake_count), (1, 1));
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/ns/> SELECT ?g ?o WHERE { GRAPH ?g { ex:s ex:p ?o } }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let found: Vec<(&str, &str)> = json["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b["g"]["value"].as_str().unwrap(),
+                b["o"]["value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(found, vec![("http://example.org/ns/b", "kept")], "{json}");
+}
+
+/// PR-1454 review: atomicity on mid-request failure. Op 1 stages
+/// successfully; op 2 — evaluating over op 1's data, proving it actually
+/// ran against the sequential state — writes a value the ledger refuses.
+/// The request must fail as a unit: an error response, `t` unchanged, and
+/// no trace of op 1's insert.
+#[tokio::test]
+async fn multi_operation_request_failing_mid_request_leaves_no_trace() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:atomicity")
+        .await
+        .expect("create ledger");
+
+    let seeded = fluree
+        .graph("multiop:atomicity")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/> PREFIX f: <https://ns.flur.ee/db#>
+               INSERT DATA { ex:pre ex:p "pre-existing" ; ex:emb "[1.0, 2.0]"^^f:embeddingVector }"#,
+        )
+        .commit()
+        .await
+        .expect("seed commit");
+    let t_before = seeded.receipt.t;
+
+    // Op 2 matches op 1's staged fact and gives it a 3-element vector on a
+    // property that holds 2-element vectors. The ledger refuses that by
+    // contract (one vector length per property, a 422), so no later fix
+    // can turn the trigger into a write that succeeds, as fixes to STRDT
+    // and IRI() in an unseen namespace (#1765) did to the earlier ones. With
+    // no row from op 1, op 2 writes nothing and the request succeeds.
+    let failing = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX f: <https://ns.flur.ee/db#>
+        INSERT DATA { ex:mid ex:p "landed" } ;
+        INSERT { ?s ex:emb "[1.0, 2.0, 3.0]"^^f:embeddingVector }
+        WHERE { ?s ex:p ?m . FILTER(?m = "landed") }
+    "#;
+    let result = fluree
+        .graph("multiop:atomicity")
+        .transact()
+        .sparql_update(failing)
+        .commit()
+        .await;
+    let err = result.expect_err("a mid-request failure must fail the whole request");
+    assert!(
+        matches!(
+            &err,
+            fluree_db_api::ApiError::Transact(fluree_db_api::TransactError::InvalidVector(msg))
+                if msg.contains("<http://example.org/ns/emb>") && msg.contains("expected 2, got 3")
+        ),
+        "op 2's vector is refused for its length: {err}"
+    );
+
+    let ledger = fluree.ledger("multiop:atomicity").await.expect("ledger");
+    assert_eq!(
+        ledger.t(),
+        t_before,
+        "a failed request must not advance `t`"
+    );
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:mid ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "op 1's insert must leave no trace after the request fails: {json}"
+    );
+}
+
+/// PR-1454 review: constant IRIs in UPDATE operations must resolve against
+/// the request `BASE` exactly as the query surface resolves them — one
+/// document, one set of IRIs. The update path used to store the literal
+/// relative forms (`s1`, `g1`), which BASE-carrying queries could never
+/// find.
+#[tokio::test]
+async fn sparql_update_constant_iris_resolve_against_base_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("base:main")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("base:main")
+        .transact()
+        .sparql_update(
+            r#"BASE <http://x.example/>
+               INSERT DATA { <s1> <p1> "v" . GRAPH <g1> { <s2> <p1> "w" } }"#,
+        )
+        .commit()
+        .await
+        .expect("BASE-relative INSERT DATA commits");
+
+    let ledger = fluree.ledger("base:main").await.expect("ledger");
+
+    // The same document shape on the query surface resolves to the same
+    // absolute IRIs and finds the data …
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"BASE <http://x.example/> SELECT ?o WHERE { <s1> <p1> ?o }",
+    )
+    .await
+    .expect("BASE query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the BASE-resolved subject must be found by a BASE-resolved query: {json}"
+    );
+    assert_eq!(bindings[0]["o"]["value"], "v");
+
+    // … because the stored terms ARE the absolute IRIs.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"SELECT ?o WHERE { <http://x.example/s1> <http://x.example/p1> ?o }",
+    )
+    .await
+    .expect("absolute query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "absolute-IRI lookup must find the BASE-resolved fact: {json}"
+    );
+
+    // GRAPH names route through the same expansion.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"SELECT ?o WHERE { GRAPH <http://x.example/g1> { <http://x.example/s2> <http://x.example/p1> ?o } }",
+    )
+    .await
+    .expect("named-graph query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "the BASE-resolved graph name must address the named graph: {json}"
+    );
+}
+
+/// PR-1454 review: the per-operation validation semantics, pinned.
+/// Constraint checks (uniqueness here; policy and SHACL ride the same
+/// per-op pipeline) run against the SEQUENTIAL state after each operation
+/// — a transiently-invalid-but-finally-valid request aborts at the
+/// offending operation. Required for ordered uniqueness; deliberate for
+/// SHACL (no deferred constraints). Documented in docs/query/sparql.md.
+#[tokio::test]
+async fn multi_operation_validation_is_per_operation_not_final_state() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:per-op-validation")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    // The final state would be valid (op 2 frees the value), but op 1
+    // transiently duplicates the unique value → the request aborts there.
+    let opts = TxnOpts {
+        unique_properties: Some(vec!["http://example.org/ns/email".to_string()]),
+        ..TxnOpts::default()
+    };
+    let err = fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .txn_opts(opts)
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:new ex:email "shared@example.org" } ;
+               DELETE DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect_err("a transiently-duplicated unique value must abort the request");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a uniqueness violation, got: {err}"
+    );
+
+    let ledger = fluree
+        .ledger("multiop:per-op-validation")
+        .await
+        .expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:email ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "only the seeded holder survives the aborted request: {json}"
+    );
+}
+
+/// PR-1454 review (bplatz): a blank-node label reused across DELETE WHERE
+/// operations is two independently-scoped existential matches — the
+/// request must execute (it used to be rejected as a duplicate label), and
+/// each operation deletes its own matches.
+#[tokio::test]
+async fn multi_operation_delete_where_reusing_bnode_labels_executes_independently() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:dw-bnode")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:dw-bnode")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA {
+                   ex:x ex:flag "a" .
+                   ex:y ex:flag "b" .
+                   ex:z ex:keep "c"
+               }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    fluree
+        .graph("multiop:dw-bnode")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               DELETE WHERE { _:b1 ex:flag "a" } ;
+               DELETE WHERE { _:b1 ex:flag "b" }"#,
+        )
+        .commit()
+        .await
+        .expect("label reuse across DELETE WHERE operations must be accepted");
+
+    let ledger = fluree.ledger("multiop:dw-bnode").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s ?o WHERE { ?s ex:flag ?o }",
+    )
+    .await
+    .expect("query flags");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "each DELETE WHERE must delete its own matches: {json}"
+    );
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:z ex:keep ?o }",
+    )
+    .await
+    .expect("query keep");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "unmatched data must survive: {json}"
+    );
+}
+
+/// The W3C `dawg-delete-insert-01c` shape end-to-end: `INSERT ... WHERE ;
+/// DELETE ... WHERE`, where op 1 makes a relation bidirectional and op 2 —
+/// evaluating over op 1's output — deletes every edge. Under first-op-only
+/// truncation this left 2 edges; under op-isolated (non-sequential)
+/// staging it would leave 1.
+#[tokio::test]
+async fn multi_operation_modify_sequence_matches_w3c_semantics() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:w3c")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:w3c")
+        .transact()
+        .sparql_update(
+            r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+               PREFIX ex: <http://example.org/>
+               INSERT DATA { ex:alice foaf:knows ex:bob }",
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    fluree
+        .graph("multiop:w3c")
+        .transact()
+        .sparql_update(
+            r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+               INSERT { ?b foaf:knows ?a } WHERE { ?a foaf:knows ?b } ;
+               DELETE { ?a foaf:knows ?b } WHERE { ?a foaf:knows ?b }",
+        )
+        .commit()
+        .await
+        .expect("01c-shaped request commits");
+
+    let ledger = fluree.ledger("multiop:w3c").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+           SELECT ?a ?b WHERE { ?a foaf:knows ?b }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "op 2 must delete every knows edge, including op 1's insertions: {json}"
+    );
+}
+
+/// Grammar edge cases at the transact seam: one trailing ';' is legal; an
+/// empty request is a valid no-op (reported as an empty transaction, the
+/// same outcome as an update whose WHERE matched nothing); a blank-node
+/// label reused across operations is a loud parse error.
+#[tokio::test]
+async fn sparql_update_request_grammar_edges_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:edges")
+        .await
+        .expect("create ledger");
+
+    // One operation with the grammar's optional trailing ';'.
+    let one_op = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:p "only" } ;
+    "#;
+    let result = fluree
+        .graph("multiop:edges")
+        .transact()
+        .sparql_update(one_op)
+        .commit()
+        .await
+        .expect("single-op update with a trailing ';' is valid SPARQL and should commit");
+    assert_eq!(result.receipt.t, 1);
+
+    // Prologue-only request: valid no-op — succeeds through the existing
+    // zero-staged-flakes no-op path without creating a commit (t unchanged,
+    // zero flakes), rather than erroring as a parse failure.
+    let result = fluree
+        .graph("multiop:edges")
+        .transact()
+        .sparql_update("PREFIX ex: <http://example.org/ns/>")
+        .commit()
+        .await
+        .expect("prologue-only request is a valid no-op");
+    assert_eq!(result.receipt.flake_count, 0, "no-op stages nothing");
+    assert_eq!(result.receipt.t, 1, "no-op creates no new commit");
+
+    // Cross-operation blank-node label reuse: loud parse error (W3C
+    // syntax-update-54 semantics), nothing staged.
+    let err = fluree
+        .graph("multiop:edges")
+        .transact()
+        .sparql_update(
+            r"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { _:b1 ex:p ex:o } ;
+               INSERT DATA { _:b1 ex:p ex:o }",
+        )
+        .commit()
+        .await
+        .expect_err("cross-op bnode label reuse must be rejected");
+    assert!(
+        err.to_string().contains("blank node label"),
+        "error should name the bnode scope violation, got: {err}"
+    );
+}
+
+/// bplatz review feedback on #1453: validator-side UPDATE rules must apply
+/// on the production seam (`parse_and_lower_sparql_update`), not only inside
+/// the W3C harness's own `validate()` call. The message shapes asserted here
+/// are the VALIDATOR's ("Blank node _:b0 is not allowed…", "Variable ?s not
+/// allowed…") — the lowering mirror's blank-node message reads "blank nodes
+/// are not allowed in…", and lowering has no variable guard at all — so
+/// these assertions prove `validate()` ran at the seam.
+#[tokio::test]
+async fn sparql_update_validation_runs_at_the_production_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("updval:main")
+        .await
+        .expect("create ledger");
+
+    // Validator rule with a lowering mirror: the error text is now the
+    // validator's, produced before lowering runs.
+    let err = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("DELETE DATA { _:b0 <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect_err("blank node in DELETE DATA must be rejected");
+    assert!(
+        err.to_string()
+            .contains("Blank node _:b0 is not allowed in DELETE DATA"),
+        "expected the validator's message shape, got: {err}"
+    );
+
+    // Validator-only rule (no lowering mirror): variables in ground DATA
+    // previously lowered to never-bindable template variables whose flakes
+    // were silently skipped at staging — a silent no-op. Now loud (D-4).
+    let err = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("INSERT DATA { ?s <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect_err("variables in INSERT DATA must be rejected, not silently no-op");
+    assert!(
+        err.to_string()
+            .contains("Variable ?s not allowed in INSERT DATA"),
+        "expected the validator's VariableInGroundData message, got: {err}"
+    );
+
+    // Control (the #1438-test idiom): a valid insert afterwards lands at
+    // t=1, proving the rejected requests staged nothing.
+    let result = fluree
+        .graph("updval:main")
+        .transact()
+        .sparql_update("INSERT DATA { <urn:s> <http://example.org/p> <urn:o> }")
+        .commit()
+        .await
+        .expect("valid insert commits");
+    assert_eq!(result.receipt.t, 1);
+}
+
+/// The seam's `validate()` call applies the query surface's WHERE rules to
+/// update WHERE clauses. Sub-SELECT shapes that SPARQL forbids — `SELECT *`
+/// combined with GROUP BY, and projecting an ungrouped variable — were
+/// previously accepted AND executed by the staged lowering of an update
+/// WHERE; they now reject up front exactly like the query surface
+/// (helpers::parse_and_validate_sparql) has since PR-2. Migration-noted in
+/// the PR body as part of the reject-more wave.
+#[tokio::test]
+async fn sparql_update_where_now_validated_like_query_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("updwhere:main")
+        .await
+        .expect("create ledger");
+
+    let star_group_by = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE { ?s ex:p ?o }
+        WHERE { { SELECT * WHERE { ?s ex:p ?o } GROUP BY ?s } }
+    ";
+    let err = fluree
+        .graph("updwhere:main")
+        .transact()
+        .sparql_update(star_group_by)
+        .commit()
+        .await
+        .expect_err("SELECT * with GROUP BY in an update WHERE must reject");
+    assert!(
+        err.to_string()
+            .contains("SELECT * is not allowed with GROUP BY"),
+        "expected the V4 projection-scope message, got: {err}"
+    );
+
+    let ungrouped = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE { ?s ex:p ?o }
+        WHERE { { SELECT ?o WHERE { ?s ex:p ?o } GROUP BY ?s } }
+    ";
+    let err = fluree
+        .graph("updwhere:main")
+        .transact()
+        .sparql_update(ungrouped)
+        .commit()
+        .await
+        .expect_err("ungrouped projection in an update WHERE sub-SELECT must reject");
+    assert!(
+        err.to_string()
+            .contains("is projected but is neither a GROUP BY key nor aggregated"),
+        "expected the V4 ungrouped-projection message, got: {err}"
+    );
+}
+
+/// The seam's `validate()` call runs with
+/// `Capabilities::with_delete_where_extensions()`: Fluree's documented
+/// DELETE WHERE surface — non-stable blank nodes as existential variables
+/// and anonymous annotation tails — keeps working end-to-end through the
+/// PRODUCTION path. The W3C suite cannot guard this wiring (its
+/// negative-syntax tests require the strict default to reject these very
+/// shapes), and the pre-existing existential-semantics tests drive
+/// `lower_sparql_update_ast` directly, bypassing the seam — so this test is
+/// the production pin for the capability.
+#[tokio::test]
+async fn sparql_delete_where_extensions_still_work_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("delwhere:main")
+        .await
+        .expect("create ledger");
+
+    let seed = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:a ex:p "one" . ex:b ex:p "two" . ex:b ex:q "keep" }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed)
+        .commit()
+        .await
+        .expect("seed");
+
+    // _:x is an existential variable: every subject with ex:p matches, so
+    // both ex:a's and ex:b's ex:p triples are retracted; ex:b's ex:q stays.
+    let del = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { _:x ex:p ?o }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del)
+        .commit()
+        .await
+        .expect("existential DELETE WHERE stays supported on the transact surface");
+
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let p_rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx.clone(), "select": "?o", "where": {"ex:p": "?o"}}),
+    )
+    .await
+    .expect("query ex:p")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        p_rows,
+        json!([]),
+        "existential match must retract ex:p from every subject"
+    );
+    let q_rows = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx.clone(), "select": "?o", "where": {"ex:q": "?o"}}),
+    )
+    .await
+    .expect("query ex:q")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(q_rows, json!(["keep"]), "unmatched triples survive");
+
+    // Anonymous annotation tails in DELETE WHERE — the capability's second
+    // waiver — also survive the seam.
+    let seed_ann = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:s ex:r ex:o {| ex:note "n" |} }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_ann)
+        .commit()
+        .await
+        .expect("seed annotated edge");
+    let del_ann = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { ex:s ex:r ex:o {| ex:note ?v |} . }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_ann)
+        .commit()
+        .await
+        .expect("anonymous annotation tail in DELETE WHERE stays supported");
+
+    // GRAPH-bearing DELETE WHERE with an existential blank node: exercises
+    // the rewrite-to-reserved-variables path (`rewrite_blank_nodes_to_vars`)
+    // plus the staged SPARQL-WHERE lowering end-to-end — the reserved `_:`
+    // names must round-trip the stored WHERE pattern, bind, and instantiate
+    // the graph-scoped delete templates.
+    let seed_graph = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { GRAPH <urn:g1> { ex:a ex:p "g-one" . ex:b ex:p "g-two" } }
+    "#;
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_graph)
+        .commit()
+        .await
+        .expect("seed named graph");
+    let del_graph = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { GRAPH <urn:g1> { _:s ex:p ?o } }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_graph)
+        .commit()
+        .await
+        .expect("existential blank node in a GRAPH block stays supported");
+    let g1_rows = fluree
+        .query_connection(&json!({
+            "@context": ctx.clone(),
+            "from": "delwhere:main#urn:g1",
+            "select": "?o",
+            "where": {"ex:p": "?o"}
+        }))
+        .await
+        .expect("query named graph");
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let g1_rows = g1_rows.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        g1_rows,
+        json!([]),
+        "the existential must match every subject in the named graph"
+    );
+
+    // Anonymous `[]` existentials take the same rewrite path with the
+    // reserved `_:[]{N}` names — prove the anonymous arm end-to-end too.
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(seed_graph)
+        .commit()
+        .await
+        .expect("re-seed named graph");
+    let del_graph_anon = r"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE WHERE { GRAPH <urn:g1> { [] ex:p ?o } }
+    ";
+    fluree
+        .graph("delwhere:main")
+        .transact()
+        .sparql_update(del_graph_anon)
+        .commit()
+        .await
+        .expect("anonymous existential in a GRAPH block stays supported");
+    let ledger = fluree.ledger("delwhere:main").await.expect("ledger");
+    let g1_rows = fluree
+        .query_connection(&json!({
+            "@context": ctx.clone(),
+            "from": "delwhere:main#urn:g1",
+            "select": "?o",
+            "where": {"ex:p": "?o"}
+        }))
+        .await
+        .expect("query named graph")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        g1_rows,
+        json!([]),
+        "the anonymous existential must match every subject in the named graph"
+    );
+}
+
+/// Each anonymous `[]` in a `DELETE WHERE` with no GRAPH block is one
+/// existential, which its template deletes by: as subject, as object, and
+/// with several in one pattern.
+#[tokio::test]
+async fn sparql_delete_where_anonymous_blank_nodes_without_a_graph_block() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "delwhere-anon:main";
+    fluree.create_ledger(id).await.expect("create ledger");
+    let update = |body: &str| {
+        let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+        let fluree = &fluree;
+        async move {
+            fluree
+                .graph(id)
+                .transact()
+                .sparql_update(&text)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .receipt
+                .retract_count
+        }
+    };
+    update(
+        r#"INSERT DATA { ex:a ex:p "one" . ex:b ex:p "two" . ex:c ex:q ex:d .
+                         ex:e ex:r ex:f ; ex:mark "m" . ex:g ex:keep "kept" }"#,
+    )
+    .await;
+    assert_eq!(update("DELETE WHERE { [] ex:p ?o }").await, 2, "as subject");
+    assert_eq!(
+        update("DELETE WHERE { ex:c ex:q [] }").await,
+        1,
+        "as object"
+    );
+    assert_eq!(
+        update(r#"DELETE WHERE { [] ex:r [] . [] ex:mark "m" }"#).await,
+        2,
+        "several in one pattern"
+    );
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let left = support::query_sparql_formatted(&fluree, &ledger, "SELECT ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("query");
+    assert_eq!(left, json!([["http://example.org/ns/keep", "kept"]]));
+}
+
+/// A `;` or `,` list copies its `[]` subject into each triple, and every copy
+/// is the one node: `DELETE WHERE` deletes only from a subject that matches
+/// the whole list, with and without a GRAPH block.
+#[tokio::test]
+async fn sparql_delete_where_anonymous_subject_is_one_node_across_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let cases = [
+        // (data, pattern, retracted)
+        (
+            r#"ex:a ex:p "one" . ex:b ex:q "two""#,
+            "[] ex:p ?o ; ex:q ?z",
+            0,
+        ),
+        (r#"ex:a ex:p "one" ; ex:q "two""#, "[] ex:p ?o ; ex:q ?z", 2),
+        ("ex:a ex:p ex:x . ex:b ex:p ex:y", "[] ex:p ex:x , ex:y", 0),
+        ("ex:a ex:p ex:x , ex:y", "[] ex:p ex:x , ex:y", 2),
+    ];
+    let mut n = 0;
+    for (data, pattern, expected) in cases {
+        for in_graph in [false, true] {
+            n += 1;
+            let id = format!("delwhere-anon-list-{n}:main");
+            fluree.create_ledger(&id).await.expect("create ledger");
+            let wrap = |body: &str| {
+                if in_graph {
+                    format!("GRAPH <urn:g1> {{ {body} }}")
+                } else {
+                    body.to_string()
+                }
+            };
+            let update = |body: String| {
+                let fluree = &fluree;
+                let id = id.clone();
+                async move {
+                    let text = format!("PREFIX ex: <http://example.org/ns/>\n{body}");
+                    fluree
+                        .graph(&id)
+                        .transact()
+                        .sparql_update(&text)
+                        .commit()
+                        .await
+                        .unwrap_or_else(|e| panic!("{text}: {e}"))
+                        .receipt
+                        .retract_count
+                }
+            };
+            update(format!("INSERT DATA {{ {} }}", wrap(data))).await;
+            let op = format!("DELETE WHERE {{ {} }}", wrap(pattern));
+            assert_eq!(update(op.clone()).await, expected, "{op} over {data}");
+        }
+    }
+}
+
+/// `INSERT DATA { [] ex:p 1 ; ex:q 2 }` creates one node with both
+/// properties, not one node per triple.
+#[tokio::test]
+async fn sparql_insert_data_anonymous_subject_is_one_node_across_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "insert-anon-list:main";
+    fluree.create_ledger(id).await.expect("create ledger");
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { [] ex:p 1 ; ex:q 2 . [] ex:r ex:x , ex:y }",
+        )
+        .commit()
+        .await
+        .expect("insert");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let subjects = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "SELECT ?s (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY ?n",
+    )
+    .await
+    .expect("query");
+    let counts: Vec<_> = subjects
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[1].clone())
+        .collect();
+    assert_eq!(counts, vec![json!(2), json!(2)], "{subjects}");
+}
+
+/// An update whose WHERE matches nothing succeeds without a commit on the
+/// tracked path, as it does on the plain one. The tracked path (also the
+/// path every policy-carrying builder write takes) used to commit the empty
+/// stage and fail with "Empty transaction" as a 500.
+#[tokio::test]
+async fn tracked_update_matching_nothing_is_a_noop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/tracked-noop-update:main";
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let seeded = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:p": "x"}),
+        )
+        .await
+        .expect("seed");
+    let seeded_t = seeded.receipt.t;
+
+    let update = json!({
+        "ledger": ledger_id,
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?s", "ex:absent": "?o"},
+        "delete": {"@id": "?s", "ex:absent": "?o"}
+    });
+    let (result, _tally) = fluree
+        .update_with_ledger_tracked(&update)
+        .await
+        .expect("a no-match update must succeed on the tracked path");
+    assert_eq!(result.receipt.t, seeded_t, "no commit may be written");
+    assert_eq!(result.receipt.flake_count, 0);
+}
+
+/// A no-match update whose INSERT template names a graph the ledger has not
+/// registered still commits, with zero flakes, so the registration persists.
+/// This is the rule the transaction builder always applied; `transact()` now
+/// shares it, where it used to skip the commit.
+#[tokio::test]
+async fn no_match_update_naming_a_new_graph_commits_its_registration() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/noop-update-new-graph:main";
+    let ledger = support::genesis_ledger(&fluree, ledger_id);
+    let seeded = fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:p": "x"}),
+        )
+        .await
+        .expect("seed");
+    let seeded_t = seeded.receipt.t;
+
+    let new_graph = "http://example.org/graphs/brandnew";
+    let result = fluree
+        .update(
+            seeded.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": {"@id": "?s", "ex:absent": "?o"},
+                "insert": {"@id": "?s", "@graph": new_graph, "ex:q": "y"}
+            }),
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(
+        result.receipt.t,
+        seeded_t + 1,
+        "a registration commit is written"
+    );
+    assert_eq!(result.receipt.flake_count, 0);
+    assert!(
+        result
+            .ledger
+            .snapshot
+            .graph_registry
+            .assigned_graph_id(new_graph)
+            .is_some(),
+        "the named graph is registered"
+    );
+}
+
+/// #1978, UPDATE surface: an INSERT template reads a grouped sub-SELECT's
+/// SELECT expression. The sub-SELECT's expression is one scalar per group, so
+/// every matched entity gets its group's label and size. It used to reach the
+/// template as a per-group list, and the transaction failed ("Object cannot be
+/// a grouped value").
+#[tokio::test]
+async fn sparql_update_template_reads_grouped_sub_select_expression() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/update-grouped-subselect:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/>
+               INSERT DATA {
+                 ex:e1 ex:area "Net" . ex:e2 ex:area "Net" . ex:e3 ex:area "Net" .
+                 ex:e4 ex:area "Local" . ex:e5 ex:area "Local" . ex:e6 ex:area "Remote" .
+               }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    let seg = r#"(IF(?a = "Net", "network", "other") AS ?seg)"#;
+    // With an aggregate, and dedup-only (no aggregation stage).
+    for (template, sub_select) in [
+        (
+            "?e ex:segment ?seg ; ex:groupSize ?n",
+            format!("SELECT ?a {seg} (COUNT(?x) AS ?n) WHERE {{ ?x ex:area ?a }} GROUP BY ?a"),
+        ),
+        (
+            "?e ex:label ?seg",
+            format!("SELECT ?a {seg} WHERE {{ ?x ex:area ?a }} GROUP BY ?a"),
+        ),
+    ] {
+        let update = format!(
+            "PREFIX ex: <http://example.org/>
+             INSERT {{ {template} }} WHERE {{ {{ {sub_select} }} ?e ex:area ?a }}"
+        );
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&update)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("update over {sub_select}: {e}"));
+    }
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?e ?seg ?n ?label WHERE { ?e ex:segment ?seg ; ex:groupSize ?n ; ex:label ?label }",
+    )
+    .await
+    .expect("query");
+    let jsonld = rows.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        support::normalize_rows(&jsonld),
+        support::normalize_rows(&json!([
+            ["ex:e1", "network", 3, "network"],
+            ["ex:e2", "network", 3, "network"],
+            ["ex:e3", "network", 3, "network"],
+            ["ex:e4", "other", 2, "other"],
+            ["ex:e5", "other", 2, "other"],
+            ["ex:e6", "other", 1, "other"]
+        ])),
+        "one value per entity, from its group: {jsonld}"
+    );
+}
+
+/// The JSON-LD twin: an update template reads a grouped subquery's key-only
+/// select expression, which J3 evaluates once per group. It used to reach the
+/// template as a per-group list, like the SPARQL form.
+#[tokio::test]
+async fn jsonld_update_template_reads_grouped_subquery_expression() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = fluree
+        .create_ledger("it/update-grouped-subquery-jsonld:main")
+        .await
+        .expect("create ledger");
+    let ctx = json!({"ex": "http://example.org/"});
+    let seed = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:e1", "ex:area": "Net"}, {"@id": "ex:e2", "ex:area": "Net"},
+            {"@id": "ex:e3", "ex:area": "Net"}, {"@id": "ex:e4", "ex:area": "Local"},
+            {"@id": "ex:e5", "ex:area": "Local"}, {"@id": "ex:e6", "ex:area": "Remote"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.expect("seed").ledger;
+    let update = json!({
+        "@context": ctx,
+        "where": [
+            ["query", {
+                "@context": ctx,
+                "select": [
+                    "?a",
+                    "(as (if (= ?a \"Net\") \"network\" \"other\") ?seg)",
+                    "(as (count ?x) ?n)"
+                ],
+                "where": {"@id": "?x", "ex:area": "?a"},
+                "groupBy": ["?a"]
+            }],
+            {"@id": "?e", "ex:area": "?a"}
+        ],
+        "insert": {"@id": "?e", "ex:segment": "?seg", "ex:groupSize": "?n"}
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("update over a grouped subquery")
+        .ledger;
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?e ?seg ?n WHERE { ?e ex:segment ?seg ; ex:groupSize ?n }",
+    )
+    .await
+    .expect("query");
+    let jsonld = rows.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        support::normalize_rows(&jsonld),
+        support::normalize_rows(&json!([
+            ["ex:e1", "network", 3],
+            ["ex:e2", "network", 3],
+            ["ex:e3", "network", 3],
+            ["ex:e4", "other", 2],
+            ["ex:e5", "other", 2],
+            ["ex:e6", "other", 1]
+        ])),
+        "one value per entity, from its group: {jsonld}"
+    );
+}
+
+/// An IRI a `where` binds, in a namespace the ledger has not seen, is stored
+/// under the same Sid a direct write of it gets, as a subject and as an
+/// object: after the namespace is registered, a lookup by the IRI finds what
+/// both writes stored. It used to be stored under the encoder's fallback
+/// (`Sid(EMPTY, iri)`), which a lookup by the IRI no longer matches once
+/// the namespace has its code, so the bound write was lost to it. The JSON-LD
+/// update and the SPARQL UPDATE share the path, and an update's top-level
+/// `values` reaches it in the same form. Two IRIs in the namespace, each
+/// written twice, are each stored as themselves.
+#[tokio::test]
+async fn where_bound_iri_in_a_new_namespace_is_stored_canonically() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": [["values", ["?x", [{"@id": "urn:new:thing"}, {"@id": "urn:new:other"}]]]],
+        "insert": [
+            {"@id": "?x", "ex:p": "via-values"},
+            {"@id": "ex:holder", "ex:points": "?x"}
+        ]
+    });
+    let top_level = json!({
+        "@context": {"ex": "http://example.org/"},
+        "values": ["?x", [{"@id": "urn:new:thing"}, {"@id": "urn:new:other"}]],
+        "insert": [
+            {"@id": "?x", "ex:p": "via-values"},
+            {"@id": "ex:holder", "ex:points": "?x"}
+        ]
+    });
+    let sparql = r#"PREFIX ex: <http://example.org/>
+        INSERT { ?x ex:p "via-values" . ex:holder ex:points ?x }
+        WHERE { VALUES ?x { <urn:new:thing> <urn:new:other> } }"#;
+    let mut missed = Vec::new();
+    for (i, surface) in ["JSON-LD", "SPARQL", "JSON-LD top-level values"]
+        .into_iter()
+        .enumerate()
+    {
+        let ledger_id = format!("it/where-bound-canonical-{i}:main");
+        fluree
+            .create_ledger(&ledger_id)
+            .await
+            .expect("create ledger");
+        let graph = fluree.graph(&ledger_id);
+        let transact = match surface {
+            "JSON-LD" => graph.transact().update(&jsonld),
+            "SPARQL" => graph.transact().sparql_update(sparql),
+            _ => graph.transact().update(&top_level),
+        };
+        transact
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("{surface}: the bound write: {e}"));
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "urn:new:thing",
+                "ex:q": "direct"
+            }))
+            .commit()
+            .await
+            .expect("the direct write");
+        let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+
+        let as_subject = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?p ?o WHERE { <urn:new:thing> ?p ?o } ORDER BY ?p",
+        )
+        .await
+        .expect("as subject");
+        if as_subject
+            != json!([
+                ["http://example.org/p", "via-values"],
+                ["http://example.org/q", "direct"]
+            ])
+        {
+            missed.push(format!("{surface}, as a subject: {as_subject}"));
+        }
+        let as_object = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?s WHERE { ?s <http://example.org/points> <urn:new:thing> }",
+        )
+        .await
+        .expect("as object");
+        if as_object != json!([["http://example.org/holder"]]) {
+            missed.push(format!("{surface}, as an object: {as_object}"));
+        }
+        let other = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?p ?o WHERE { <urn:new:other> ?p ?o }",
+        )
+        .await
+        .expect("the other IRI");
+        if other != json!([["http://example.org/p", "via-values"]]) {
+            missed.push(format!("{surface}, the other IRI as a subject: {other}"));
+        }
+        let pointed = support::query_sparql_formatted(
+            &fluree,
+            &ledger,
+            "SELECT ?o WHERE { <http://example.org/holder> <http://example.org/points> ?o } ORDER BY ?o",
+        )
+        .await
+        .expect("what the holder points to");
+        if pointed != json!([["urn:new:other"], ["urn:new:thing"]]) {
+            missed.push(format!("{surface}, both IRIs as objects: {pointed}"));
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
+
+/// Reads back what an update bound: `ex:out ex:saw ?v`.
+const SAW: &str = "SELECT ?v WHERE { <http://example.org/out> <http://example.org/saw> ?v }";
+
+/// An IRI bound by an update's top-level `values` reads in the `where` as it
+/// was written, whether or not the ledger has seen its namespace: `STR` gives
+/// the IRI, and the insert stores it. The where reads it in the ledger's
+/// encoding, as a where VALUES does (it used to receive the code the
+/// transaction gave the new namespace, which it could not decode, so `STR`
+/// gave the encoded form, `15:thing`, and the insert stored that).
+#[tokio::test]
+async fn top_level_values_iri_reads_as_written_through_str() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/"});
+    // A namespace the ledger knows, then one it has not seen.
+    for (i, iri) in ["http://example.org/known", "urn:new:thing"]
+        .into_iter()
+        .enumerate()
+    {
+        let ledger = support::genesis_ledger(&fluree, &format!("it/values-str-{i}:main"));
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@id": "ex:a", "ex:p": "seed"}),
+            )
+            .await
+            .expect("seed")
+            .ledger;
+        let ledger = fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "values": ["?x", [{"@id": iri}]],
+                    "where": [["bind", "?s", "(str ?x)"]],
+                    "insert": {"@id": "ex:out", "ex:saw": "?s"}
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{iri}: {e}"))
+            .ledger;
+        let stored = support::query_sparql_formatted(&fluree, &ledger, SAW)
+            .await
+            .expect("read back");
+        assert_eq!(stored, json!([[iri]]), "STR of a top-level values {iri}");
+    }
+}
+
+/// A graph name bound by an update's top-level `values` reads that graph: a
+/// named graph, and `urn:default` (a name no write registers, so the ledger
+/// has not seen its namespace) the default graph.
+#[tokio::test]
+async fn top_level_values_graph_name_reads_its_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/"});
+    for (i, (graph, expected)) in [
+        ("http://example.org/g2", "in-g2"),
+        ("urn:default", "in-default"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger = support::genesis_ledger(&fluree, &format!("it/values-graph-{i}:main"));
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx, "@id": "ex:a", "ex:p": "in-default"}),
+            )
+            .await
+            .expect("seed the default graph")
+            .ledger;
+        let ledger = fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "graph": "ex:g2",
+                    "insert": {"@id": "ex:b", "ex:p": "in-g2"}
+                }),
+            )
+            .await
+            .expect("seed ex:g2")
+            .ledger;
+        let ledger = fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "values": ["?g", [{"@id": graph}]],
+                    "where": [["graph", "?g", {"@id": "?s", "ex:p": "?o"}]],
+                    "insert": {"@id": "ex:out", "ex:saw": "?o"}
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{graph}: {e}"))
+            .ledger;
+        let read = support::query_sparql_formatted(&fluree, &ledger, SAW)
+            .await
+            .expect("read back");
+        assert_eq!(read, json!([[expected]]), "GRAPH ?g bound to {graph}");
+    }
+}
+
+/// The control: in a namespace the ledger has registered, an IRI bound by an
+/// update's top-level `values` is the stored subject's Sid, as before. The
+/// where matches the stored fact through the bound variable and through a
+/// constant naming the same IRI, and the delete retracts it.
+#[tokio::test]
+async fn top_level_values_iri_in_a_registered_namespace_matches_as_stored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/"});
+    let ledger = support::genesis_ledger(&fluree, "it/values-registered:main");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:known", "ex:p": "stored"}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "values": ["?x", [{"@id": "ex:known"}]],
+                "where": [
+                    {"@id": "?x", "ex:p": "?o"},
+                    {"@id": "ex:known", "ex:p": "?o"}
+                ],
+                "delete": {"@id": "?x", "ex:p": "?o"},
+                "insert": {"@id": "ex:out", "ex:saw": "?o"}
+            }),
+        )
+        .await
+        .expect("the update")
+        .ledger;
+    let saw = support::query_sparql_formatted(&fluree, &ledger, SAW)
+        .await
+        .expect("read back");
+    assert_eq!(
+        saw,
+        json!([["stored"]]),
+        "the where matched the stored fact"
+    );
+    let left = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "SELECT ?o WHERE { <http://example.org/known> <http://example.org/p> ?o }",
+    )
+    .await
+    .expect("read the subject");
+    assert_eq!(left, json!([]), "the delete retracted it");
+}

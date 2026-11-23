@@ -1,0 +1,364 @@
+use crate::cli::PolicyArgs;
+use crate::commands::insert::{
+    build_policy_ctx, print_txn_result, resolve_inputs, warn_novelty_if_needed,
+};
+use crate::context::{self, LedgerMode};
+use crate::error::{CliError, CliResult};
+use crate::input;
+use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::CommitOpts;
+use std::path::Path;
+
+/// Format detected for the update body.
+///
+/// `update` accepts JSON-LD (with where/delete/insert), SPARQL UPDATE, and
+/// openCypher writes (CREATE / MATCH…SET / REMOVE). Turtle is not valid
+/// here—use `insert` or `upsert` for Turtle data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateFormat {
+    JsonLd,
+    SparqlUpdate,
+    Cypher,
+}
+
+/// Detect whether the input is JSON-LD, SPARQL UPDATE, or Cypher.
+fn detect_update_format(
+    path: Option<&Path>,
+    content: &str,
+    explicit: Option<&str>,
+) -> CliResult<UpdateFormat> {
+    // Explicit flag
+    if let Some(fmt) = explicit {
+        return match fmt.to_lowercase().as_str() {
+            "jsonld" | "json-ld" | "json" => Ok(UpdateFormat::JsonLd),
+            "sparql" | "sparql-update" => Ok(UpdateFormat::SparqlUpdate),
+            "cypher" | "opencypher" => Ok(UpdateFormat::Cypher),
+            other => Err(CliError::Usage(format!(
+                "unknown update format '{other}'\n  {} valid formats: jsonld (json-ld, json), sparql (sparql-update), cypher (opencypher)",
+                colored::Colorize::bold(colored::Colorize::cyan("help:"))
+            ))),
+        };
+    }
+
+    // File extension
+    if let Some(p) = path {
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            match ext.to_lowercase().as_str() {
+                "json" | "jsonld" => return Ok(UpdateFormat::JsonLd),
+                "rq" | "ru" | "sparql" => return Ok(UpdateFormat::SparqlUpdate),
+                "cypher" | "cyp" | "cql" => return Ok(UpdateFormat::Cypher),
+                _ => {}
+            }
+        }
+    }
+
+    // Content sniffing
+    sniff_update_format(content)
+}
+
+fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
+    // A `{"cypher": "...", "params": {...}}` envelope is Cypher even though it
+    // is valid JSON — check it before the generic JSON → JSON-LD fallthrough,
+    // which would otherwise route it to the JSON-LD pipeline and fail.
+    if crate::detect::looks_like_cypher_envelope(content) {
+        return Ok(UpdateFormat::Cypher);
+    }
+
+    // Try JSON parse first
+    if serde_json::from_str::<serde_json::Value>(content).is_ok() {
+        return Ok(UpdateFormat::JsonLd);
+    }
+
+    let upper = content.trim().to_uppercase();
+
+    // Cypher write leads. `CREATE (` disambiguates Cypher node/edge creation
+    // from SPARQL UPDATE `CREATE GRAPH`.
+    if upper.starts_with("MATCH ")
+        || upper.starts_with("MERGE ")
+        || upper.starts_with("DETACH ")
+        || upper.starts_with("CREATE (")
+    {
+        return Ok(UpdateFormat::Cypher);
+    }
+
+    // Check for SPARQL UPDATE keywords
+    if upper.starts_with("INSERT")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("PREFIX")
+        || upper.starts_with("BASE")
+    {
+        return Ok(UpdateFormat::SparqlUpdate);
+    }
+
+    Err(CliError::Usage(format!(
+        "could not detect update format\n  {} use --format jsonld, sparql, or cypher to specify",
+        colored::Colorize::bold(colored::Colorize::cyan("help:"))
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    args: &[String],
+    ledger_flag: Option<&str>,
+    expr: Option<&str>,
+    file_flag: Option<&Path>,
+    format_flag: Option<&str>,
+    dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
+    policy: &PolicyArgs,
+) -> CliResult<()> {
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
+
+    // Resolve input: -e > positional inline > -f > positional file > stdin
+    let source = input::resolve_input(
+        expr,
+        positional_inline,
+        file_flag,
+        positional_file.as_deref(),
+    )?;
+    let content = input::read_input(&source)?;
+
+    // For format detection, prefer the -f path, then positional file
+    let detect_path = file_flag.or(positional_file.as_deref());
+    let txn_format = detect_update_format(detect_path, &content, format_flag)?;
+
+    // Resolve ledger mode: --remote flag, local, tracked, or auto-route to local server
+    let mode = if let Some(remote_name) = remote_flag {
+        let alias = context::resolve_ledger(explicit_ledger, dirs)?;
+        context::build_remote_mode(remote_name, &alias, dirs).await?
+    } else {
+        let mode = context::resolve_ledger_mode(explicit_ledger, dirs).await?;
+        if direct {
+            mode
+        } else {
+            context::try_server_route(mode, dirs)
+        }
+    };
+
+    match mode {
+        LedgerMode::Tracked {
+            client,
+            remote_alias,
+            remote_name,
+            ..
+        } => {
+            // Policy enforcement on Cypher writes isn't wired on either transport
+            // (the local arm rejects it too); fail rather than silently ignore it.
+            if txn_format == UpdateFormat::Cypher && policy.is_set() {
+                return Err(CliError::Usage(
+                    "policy enforcement is not yet supported for Cypher writes".into(),
+                ));
+            }
+            let client = client.with_policy(policy.clone());
+            let result = match txn_format {
+                UpdateFormat::SparqlUpdate => client.update_sparql(&remote_alias, &content).await?,
+                UpdateFormat::JsonLd => {
+                    let json: serde_json::Value = serde_json::from_str(&content)?;
+                    client.update_jsonld(&remote_alias, &json).await?
+                }
+                // Send the body verbatim (raw Cypher or a `{cypher, params}`
+                // envelope); the server extracts the envelope itself, exactly
+                // like the read path and `fluree load --cypher --remote`.
+                UpdateFormat::Cypher => client.update_cypher_body(&remote_alias, &content).await?,
+            };
+
+            context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+
+            print_txn_result(&result);
+        }
+        LedgerMode::Local { fluree, alias } => match txn_format {
+            UpdateFormat::Cypher => {
+                if policy.is_set() {
+                    return Err(CliError::Usage(
+                        "policy enforcement is not yet supported for Cypher writes".into(),
+                    ));
+                }
+                let ledger = fluree.ledger(&alias).await?;
+                let (cypher, params) = fluree_db_api::extract_cypher_envelope(&content);
+                let result = fluree
+                    .transact_cypher_with_params(ledger, &cypher, params.as_ref())
+                    .await?;
+                println!(
+                    "Committed t={}, {} flakes",
+                    result.receipt.t, result.receipt.flake_count
+                );
+                warn_novelty_if_needed(&result.indexing);
+            }
+            UpdateFormat::SparqlUpdate | UpdateFormat::JsonLd => {
+                // Parse JSON-LD up front so the body outlives the borrowed builder.
+                let json = if txn_format == UpdateFormat::JsonLd {
+                    Some(serde_json::from_str::<serde_json::Value>(&content)?)
+                } else {
+                    None
+                };
+                let policy_ctx = build_policy_ctx(&fluree, &alias, policy).await?;
+                let graph = fluree.graph(&alias);
+                let txn = graph.transact().commit_opts(CommitOpts::default());
+                let txn = match &json {
+                    Some(j) => txn.update(j),
+                    None => txn.sparql_update(&content),
+                };
+                let txn = match policy_ctx {
+                    Some(ctx) => txn.policy(ctx),
+                    None => txn,
+                };
+                let result = txn.commit().await?;
+
+                println!(
+                    "Committed t={}, {} flakes",
+                    result.receipt.t, result.receipt.flake_count
+                );
+                warn_novelty_if_needed(&result.indexing);
+            }
+        },
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn detect_explicit_jsonld() {
+        let fmt = detect_update_format(None, "", Some("jsonld")).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+
+        let fmt = detect_update_format(None, "", Some("json-ld")).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+
+        let fmt = detect_update_format(None, "", Some("json")).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+    }
+
+    #[test]
+    fn detect_explicit_sparql() {
+        let fmt = detect_update_format(None, "", Some("sparql")).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+
+        let fmt = detect_update_format(None, "", Some("sparql-update")).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+    }
+
+    #[test]
+    fn detect_explicit_unknown_errors() {
+        let result = detect_update_format(None, "", Some("turtle"));
+        assert!(result.is_err());
+    }
+
+    /// Every spelling the match arms accept is named by the error that lists
+    /// them.
+    ///
+    /// Twin of `detect::tests::the_usage_error_names_every_format_the_flag_accepts`.
+    /// Both messages advertised the canonical spelling of each format and
+    /// silently omitted its aliases, so `--format json-ld` and
+    /// `--format opencypher` worked while the only text telling a user what to
+    /// type said they did not exist.
+    #[test]
+    fn the_usage_error_names_every_update_format_the_flag_accepts() {
+        let accepted = [
+            "jsonld",
+            "json-ld",
+            "json",
+            "sparql",
+            "sparql-update",
+            "cypher",
+            "opencypher",
+        ];
+        for fmt in accepted {
+            assert!(
+                detect_update_format(None, "", Some(fmt)).is_ok(),
+                "--format {fmt} must be accepted"
+            );
+        }
+        let err = detect_update_format(None, "", Some("turtle"))
+            .expect_err("turtle is not an update format")
+            .to_string();
+        for fmt in accepted {
+            assert!(
+                err.contains(fmt),
+                "the usage error must name '{fmt}'; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_json_cypher_envelope_as_cypher() {
+        // A `{"cypher": ..., "params": ...}` envelope must sniff as Cypher, not
+        // JSON-LD (it is valid JSON but is the Cypher transport form).
+        let body = r#"{"cypher": "CREATE (n:Person {name: $n})", "params": {"n": "A"}}"#;
+        assert_eq!(
+            detect_update_format(None, body, None).unwrap(),
+            UpdateFormat::Cypher
+        );
+        // A plain JSON-LD update object still sniffs as JSON-LD.
+        let jsonld = r#"{"insert": {"@id": "ex:a", "ex:p": 1}}"#;
+        assert_eq!(
+            detect_update_format(None, jsonld, None).unwrap(),
+            UpdateFormat::JsonLd
+        );
+    }
+
+    #[test]
+    fn detect_by_file_extension() {
+        let fmt = detect_update_format(Some(Path::new("update.json")), "anything", None).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+
+        let fmt = detect_update_format(Some(Path::new("update.jsonld")), "anything", None).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+
+        let fmt = detect_update_format(Some(Path::new("update.ru")), "anything", None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+
+        let fmt = detect_update_format(Some(Path::new("update.rq")), "anything", None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+
+        let fmt = detect_update_format(Some(Path::new("update.sparql")), "anything", None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+    }
+
+    #[test]
+    fn sniff_json_ld_body() {
+        let content = r#"{"where": [], "delete": [], "insert": []}"#;
+        let fmt = detect_update_format(None, content, None).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+    }
+
+    #[test]
+    fn sniff_sparql_insert_data() {
+        let content = "INSERT DATA { <http://example.org/x> <http://example.org/val> \"hello\" }";
+        let fmt = detect_update_format(None, content, None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+    }
+
+    #[test]
+    fn sniff_sparql_delete_where() {
+        let content =
+            "DELETE { ?s <http://example.org/val> ?o } WHERE { ?s <http://example.org/val> ?o }";
+        let fmt = detect_update_format(None, content, None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+    }
+
+    #[test]
+    fn sniff_sparql_with_prefix() {
+        let content = "PREFIX ex: <http://example.org/>\nINSERT DATA { ex:x ex:val \"hello\" }";
+        let fmt = detect_update_format(None, content, None).unwrap();
+        assert_eq!(fmt, UpdateFormat::SparqlUpdate);
+    }
+
+    #[test]
+    fn sniff_unrecognized_errors() {
+        let result = detect_update_format(None, "not json and not sparql", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_overrides_extension() {
+        // Even with .ru extension, explicit "jsonld" wins
+        let fmt = detect_update_format(Some(Path::new("update.ru")), "{}", Some("jsonld")).unwrap();
+        assert_eq!(fmt, UpdateFormat::JsonLd);
+    }
+}

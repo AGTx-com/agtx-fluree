@@ -1,0 +1,1411 @@
+use crate::error::{MemoryError, Result};
+use crate::schema::{memory_schema_jsonld, memory_to_jsonld};
+use crate::types::{
+    Memory, MemoryFilter, MemoryInput, MemoryKind, MemoryPreview, MemoryStatus, MemoryUpdate, Scope,
+};
+use chrono::Utc;
+use fluree_db_api::Fluree;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
+
+const MEM_PREFIX: &str = "mem:";
+const MEM_NAMESPACE: &str = "https://ns.flur.ee/memory#";
+
+/// Expand compact `mem:` prefix IDs to full IRIs for SPARQL queries.
+/// Passes through already-expanded IRIs unchanged.
+fn expand_id(id: &str) -> String {
+    if id.starts_with(MEM_NAMESPACE) {
+        id.to_string()
+    } else if let Some(local) = id.strip_prefix(MEM_PREFIX) {
+        format!("{MEM_NAMESPACE}{local}")
+    } else {
+        id.to_string()
+    }
+}
+
+/// Compact a full IRI back to `mem:` prefix form (canonical for Memory.id).
+fn compact_id(id: &str) -> String {
+    if let Some(local) = id.strip_prefix(MEM_NAMESPACE) {
+        format!("{MEM_PREFIX}{local}")
+    } else {
+        id.to_string()
+    }
+}
+
+fn escape_sparql_string(s: &str) -> String {
+    let normalized = crate::turtle_io::normalize_unicode_quotes(s);
+    let mut out = String::with_capacity(normalized.len());
+    for c in normalized.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn preview_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        return "...".to_string();
+    }
+    format!("{}...", &s[..end])
+}
+
+fn optional_memory_clauses() -> String {
+    crate::vocab::OPTIONAL_PROPS
+        .iter()
+        .map(|(iri, var)| format!("OPTIONAL {{ ?id <{iri}> ?{var} }}"))
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+fn optional_memory_clauses_for_subject(subject_iri: &str) -> String {
+    crate::vocab::OPTIONAL_PROPS
+        .iter()
+        .map(|(iri, var)| format!("OPTIONAL {{ <{subject_iri}> <{iri}> ?{var} }}"))
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+/// Name of the internal memory ledger.
+pub const MEMORY_LEDGER: &str = "__memory";
+
+/// Normalized ledger ID (with branch suffix).
+const MEMORY_LEDGER_ID: &str = "__memory:main";
+
+/// The memory store: CRUD operations backed by a Fluree ledger.
+///
+/// When `memory_dir` is set, mutations are also written to `.ttl` files
+/// for git-based sharing. The ledger serves as a derived query cache.
+pub struct MemoryStore {
+    fluree: Fluree,
+    memory_dir: Option<PathBuf>,
+    /// Serializes file-backed memory mutations inside one MCP/CLI process.
+    ///
+    /// The `.ttl` files and the `__memory` ledger cache are updated as one
+    /// logical unit. Letting overlapping MCP tool calls perform that
+    /// read-modify-write sequence concurrently can leave the file watermark and
+    /// cache diverged, causing rebuild storms.
+    mutation_lock: Mutex<()>,
+    /// Hash of the `.ttl` file content that **this process's** ledger cache
+    /// currently reflects (`None` until the first sync).
+    ///
+    /// The on-disk `.local/build-hash` is shared by every process, so it only
+    /// records who wrote the files *last* — it cannot tell a long-lived process
+    /// that another process changed the files out from under its in-memory
+    /// ledger. This per-process watermark closes that gap: it is advanced only
+    /// by our own rebuilds and mutations, so when the live file hash diverges
+    /// from it we know our ledger is stale and must rebuild before reading.
+    synced_hash: std::sync::Mutex<Option<String>>,
+    /// Whether the first sync may seed [`Self::synced_hash`] from the on-disk
+    /// `build-hash` instead of forcing a rebuild.
+    ///
+    /// True for a **persistent** (file-backed) ledger: at startup the loaded
+    /// ledger is consistent with the on-disk hash, so seeding avoids a needless
+    /// rebuild on every short-lived CLI invocation. False for an **ephemeral**
+    /// (in-memory) ledger: a fresh process starts empty and must rebuild from
+    /// the files before it can answer queries, so it must not trust the shared
+    /// on-disk hash.
+    seed_watermark_from_disk: bool,
+}
+
+impl MemoryStore {
+    /// Create a memory store backed by a **persistent** (file-backed) ledger.
+    ///
+    /// Pass `memory_dir` to enable file-based sync (e.g., `.fluree-memory/`).
+    /// Pass `None` for legacy behavior (ledger-only, no file sharing).
+    pub fn new(fluree: Fluree, memory_dir: Option<PathBuf>) -> Self {
+        Self::build(fluree, memory_dir, true)
+    }
+
+    /// Create a memory store backed by an **ephemeral** (in-memory) ledger.
+    ///
+    /// Use this when the ledger is a process-private cache that does not persist
+    /// across restarts (e.g. `mcp serve`, where many processes share one
+    /// `.fluree-memory` directory). The ledger is rebuilt from the `.ttl` files
+    /// on first use, so the watermark must not be seeded from the shared
+    /// on-disk hash.
+    pub fn new_ephemeral_ledger(fluree: Fluree, memory_dir: Option<PathBuf>) -> Self {
+        Self::build(fluree, memory_dir, false)
+    }
+
+    fn build(fluree: Fluree, memory_dir: Option<PathBuf>, seed_watermark_from_disk: bool) -> Self {
+        Self {
+            fluree,
+            memory_dir,
+            mutation_lock: Mutex::new(()),
+            synced_hash: std::sync::Mutex::new(None),
+            seed_watermark_from_disk,
+        }
+    }
+
+    /// Whether the first sync may seed the watermark from the on-disk hash.
+    pub(crate) fn seed_watermark_from_disk(&self) -> bool {
+        self.seed_watermark_from_disk
+    }
+
+    /// The memory directory path, if file-based sync is enabled.
+    pub fn memory_dir(&self) -> Option<&Path> {
+        self.memory_dir.as_deref()
+    }
+
+    /// The project root that repo-relative `artifactRef` paths resolve against.
+    ///
+    /// The memory directory always sits directly under it (`<root>/.fluree-memory`),
+    /// so `None` here means the store is ledger-only and refs cannot be resolved.
+    pub fn repo_root(&self) -> Option<&Path> {
+        self.memory_dir.as_deref().and_then(Path::parent)
+    }
+
+    /// The file-content hash this process's ledger currently reflects.
+    pub(crate) fn synced_hash(&self) -> Option<String> {
+        self.synced_hash
+            .lock()
+            .expect("synced_hash poisoned")
+            .clone()
+    }
+
+    /// Record the file-content hash this process's ledger now reflects.
+    pub(crate) fn set_synced_hash(&self, hash: Option<String>) {
+        *self.synced_hash.lock().expect("synced_hash poisoned") = hash;
+    }
+
+    /// Acquire the in-process mutation lock, bounded by [`crate::file_sync::lock_timeout`].
+    ///
+    /// Using a timeout instead of an unbounded `.lock().await` means that if a
+    /// prior memory operation is stuck holding the lock (e.g. a wedged task
+    /// spinning under it), later calls fail with a recoverable error rather than
+    /// freezing the session forever.
+    async fn lock_mutation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let timeout = crate::file_sync::lock_timeout();
+        match tokio::time::timeout(timeout, self.mutation_lock.lock()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(MemoryError::FileSync(format!(
+                "timed out after {timeout:?} waiting for the in-process memory lock; \
+                 a prior memory operation may be stuck"
+            ))),
+        }
+    }
+
+    /// Check if the memory ledger has been initialized.
+    pub async fn is_initialized(&self) -> Result<bool> {
+        Ok(self.fluree.ledger_exists(MEMORY_LEDGER_ID).await?)
+    }
+
+    /// Initialize the memory ledger and file structure.
+    ///
+    /// Idempotent — safe to call on every operation. Creates the ledger,
+    /// transacts the schema, and (when `memory_dir` is set) creates the
+    /// directory structure, `.gitignore`, and empty `.ttl` files.
+    pub async fn initialize(&self) -> Result<()> {
+        if self.is_initialized().await? {
+            // Ledger exists — but ensure file structure exists too
+            self.ensure_file_structure()?;
+            return Ok(());
+        }
+
+        debug!("Creating memory ledger");
+        match self.fluree.create_ledger(MEMORY_LEDGER).await {
+            Ok(_) => {}
+            Err(fluree_db_api::ApiError::LedgerExists(_)) => {
+                // Concurrent tool calls race through `is_initialized() ==
+                // false` together (initialize takes no lock — mutation paths
+                // already hold the mutation lock when they call it, so it
+                // must not re-acquire). Losing the create race means another
+                // task is initializing; let it transact the schema.
+                debug!("Memory ledger created concurrently — skipping init");
+                self.ensure_file_structure()?;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        debug!("Transacting memory schema");
+        let schema = memory_schema_jsonld();
+        match self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .insert(&schema)
+            .commit()
+            .await
+        {
+            Ok(_) => {}
+            Err(fluree_db_api::ApiError::Transact(
+                fluree_db_api::TransactError::CommitConflict { .. },
+            )) => {
+                // A concurrent process (e.g. an old MCP server) may have
+                // modified the ledger between create_ledger and the schema
+                // transact. This commonly happens after `fluree init` when
+                // an old process is still running. Fall back to a full
+                // drop-and-reinit to recover cleanly.
+                warn!("Commit conflict during init — falling back to drop_and_reinit");
+                self.drop_and_reinit_unlocked().await?;
+                self.ensure_file_structure()?;
+                debug!("Memory ledger initialized (via drop_and_reinit fallback)");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        self.ensure_file_structure()?;
+
+        debug!("Memory ledger initialized");
+        Ok(())
+    }
+
+    /// Create the file-based memory directory structure if `memory_dir` is set.
+    ///
+    /// Idempotent — skips anything that already exists.
+    fn ensure_file_structure(&self) -> Result<()> {
+        let Some(dir) = &self.memory_dir else {
+            return Ok(());
+        };
+
+        // Create .local/ subdirectory
+        let local_dir = dir.join(".local");
+        std::fs::create_dir_all(&local_dir)?;
+
+        // .gitignore for .local/
+        let gitignore_path = dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            std::fs::write(&gitignore_path, ".local/\n")?;
+        }
+
+        // Empty .ttl files with prefix headers
+        let repo_ttl = crate::turtle_io::repo_ttl_path(dir);
+        if !repo_ttl.exists() {
+            crate::turtle_io::create_empty_memory_file(&repo_ttl, crate::turtle_io::REPO_HEADER)?;
+        }
+
+        let user_ttl = crate::turtle_io::user_ttl_path(dir);
+        if !user_ttl.exists() {
+            crate::turtle_io::create_empty_memory_file(&user_ttl, crate::turtle_io::USER_HEADER)?;
+        }
+
+        Ok(())
+    }
+
+    /// Drop and reinitialize the `__memory` ledger.
+    ///
+    /// Used by the rebuild pipeline to recreate the ledger from `.ttl` files.
+    pub async fn drop_and_reinit(&self) -> Result<()> {
+        let _guard = self.lock_mutation().await?;
+        let file_lock = self.acquire_file_lock().await?;
+        let result = self.drop_and_reinit_unlocked().await;
+        drop(file_lock);
+        result
+    }
+
+    /// Drop and reinitialize the `__memory` ledger while the caller already
+    /// holds the store mutation lock.
+    pub(crate) async fn drop_and_reinit_unlocked(&self) -> Result<()> {
+        // The ledger is about to be emptied, so it no longer reflects any file
+        // content. Clear the watermark so the next sync rebuilds from the files.
+        self.set_synced_hash(None);
+
+        // Delete the ledger if it exists
+        if self.is_initialized().await? {
+            debug!("Dropping __memory ledger for rebuild");
+            self.fluree
+                .drop_ledger(MEMORY_LEDGER, fluree_db_api::DropMode::Hard)
+                .await?;
+        }
+
+        // Recreate
+        debug!("Recreating __memory ledger");
+        self.fluree.create_ledger(MEMORY_LEDGER).await?;
+
+        let schema = memory_schema_jsonld();
+        self.fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .insert(&schema)
+            .commit()
+            .await?;
+
+        debug!("__memory ledger reinitialized");
+        Ok(())
+    }
+
+    /// Ensure the ledger is in sync with `.ttl` files.
+    ///
+    /// No-op if `memory_dir` is `None`.
+    pub async fn ensure_synced(&self) -> Result<()> {
+        if let Some(dir) = &self.memory_dir {
+            let _guard = self.lock_mutation().await?;
+            crate::file_sync::ensure_synced(self, dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the ledger from files if this process's ledger is stale,
+    /// assuming the caller **already holds** the mutation lock and the
+    /// cross-process file lock.
+    ///
+    /// Mutations call this after taking both locks and before reading the
+    /// current memory set, so the sync-from-file and the subsequent file
+    /// rewrite happen in one uninterrupted critical section. That closes the
+    /// window where another process could write the files in between, which
+    /// would otherwise be silently overwritten by the stale-ledger rewrite.
+    async fn sync_under_lock(&self) -> Result<()> {
+        if let Some(dir) = &self.memory_dir {
+            crate::file_sync::rebuild_if_stale_unlocked(self, dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Insert a JSON-LD document into the memory ledger (used by rebuild).
+    pub async fn transact_insert(&self, doc: &Value) -> Result<()> {
+        self.fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .insert(doc)
+            .commit()
+            .await?;
+        Ok(())
+    }
+
+    /// Add a new memory to the store.
+    ///
+    /// Returns the generated memory ID.
+    ///
+    /// In file-based mode, the `.ttl` file is written first (authoritative),
+    /// then the ledger cache is updated. The build hash is only updated after
+    /// the ledger cache commit succeeds so that any cache failure leaves a hash
+    /// mismatch and triggers a rebuild on the next `ensure_synced()`.
+    pub async fn add(&self, input: MemoryInput) -> Result<String> {
+        let _guard = self.lock_mutation().await?;
+        let file_lock = self.acquire_file_lock().await?;
+        self.initialize().await?;
+        self.sync_under_lock().await?;
+
+        let id = crate::id::generate_memory_id(input.kind);
+        let created_at = Utc::now().to_rfc3339();
+
+        let mem = Memory {
+            id: id.clone(),
+            kind: input.kind,
+            content: input.content,
+            tags: input.tags,
+            scope: input.scope,
+            severity: input.severity,
+            artifact_refs: input.artifact_refs,
+            branch: input.branch,
+            created_at,
+            updated_at: None,
+            rationale: input.rationale,
+            alternatives: input.alternatives,
+        };
+
+        // File is truth — splice the new block into its sorted (branch, id)
+        // position by reading only the `.ttl` text, never re-querying the
+        // ledger. Untouched blocks stay byte-identical, so concurrent adds on
+        // different branches land in different regions and merge cleanly under
+        // a default git merge, while same-memory edits still conflict.
+        if let Some(dir) = &self.memory_dir {
+            let (path, header) = match mem.scope {
+                Scope::Repo => (
+                    crate::turtle_io::repo_ttl_path(dir),
+                    crate::turtle_io::REPO_HEADER,
+                ),
+                Scope::User => (
+                    crate::turtle_io::user_ttl_path(dir),
+                    crate::turtle_io::USER_HEADER,
+                ),
+            };
+            crate::turtle_io::insert_memory_into_file(&path, &mem, header)?;
+        }
+
+        // Then update the ledger cache
+        let doc = memory_to_jsonld(&mem);
+        self.fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .insert(&doc)
+            .commit()
+            .await?;
+
+        // Update the file watermark only after cache commit succeeds.
+        if let Some(dir) = &self.memory_dir {
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
+        }
+
+        debug!(id = %id, kind = %mem.kind, "Memory added");
+        drop(file_lock);
+        Ok(id)
+    }
+
+    /// Get a single memory by ID.
+    pub async fn get(&self, id: &str) -> Result<Option<Memory>> {
+        self.initialize().await?;
+
+        let expanded = expand_id(id);
+        // Compact form is canonical for Memory.id
+        let compact = compact_id(&expanded);
+        let id = &expanded;
+        let optional = optional_memory_clauses_for_subject(id);
+        let sparql = format!(
+            "SELECT ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\n\
+WHERE {{\n\
+  <{id}> a ?type .\n\
+  <{id}> <https://ns.flur.ee/memory#content> ?content .\n\
+  <{id}> <https://ns.flur.ee/memory#createdAt> ?createdAt .\n\
+  {optional}\n\
+}}"
+        );
+
+        let result = self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .query()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await?;
+
+        parse_memory_from_sparql_results(&compact, &result)
+    }
+
+    /// Update a memory in place.
+    ///
+    /// Merges the provided fields over the existing memory, keeping the same ID.
+    /// Returns the memory's (unchanged) ID.
+    ///
+    /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
+    /// then the ledger is updated via retract-all + re-insert.
+    pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
+        let _guard = self.lock_mutation().await?;
+        let file_lock = self.acquire_file_lock().await?;
+        self.initialize().await?;
+        self.sync_under_lock().await?;
+
+        let expanded = expand_id(id);
+        let compact = compact_id(&expanded);
+
+        // Load the existing memory
+        let existing = self
+            .get(&expanded)
+            .await?
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+
+        // Merge updates over existing values, keeping the same ID. The stamp is
+        // unconditional: an update that changes no field is how a caller records
+        // "I re-verified this memory against HEAD".
+        let merged = Memory {
+            id: compact.clone(),
+            kind: existing.kind,
+            content: update.content.unwrap_or(existing.content),
+            tags: update.tags.unwrap_or(existing.tags),
+            scope: existing.scope,
+            severity: update.severity.or(existing.severity),
+            artifact_refs: update.artifact_refs.unwrap_or(existing.artifact_refs),
+            branch: existing.branch,
+            created_at: existing.created_at,
+            updated_at: Some(Utc::now().to_rfc3339()),
+            rationale: update.rationale.or(existing.rationale),
+            alternatives: update.alternatives.or(existing.alternatives),
+        };
+
+        // File is truth — rewrite with the modified memory in place
+        if let Some(dir) = &self.memory_dir {
+            let (path, header, scope_filter) = match merged.scope {
+                Scope::Repo => (
+                    crate::turtle_io::repo_ttl_path(dir),
+                    crate::turtle_io::REPO_HEADER,
+                    Some(Scope::Repo),
+                ),
+                Scope::User => (
+                    crate::turtle_io::user_ttl_path(dir),
+                    crate::turtle_io::USER_HEADER,
+                    Some(Scope::User),
+                ),
+            };
+            let updated: Vec<Memory> = self
+                .all_memories_for_scope(scope_filter.as_ref())
+                .await?
+                .into_iter()
+                .map(|m| {
+                    if m.id == compact || m.id == expanded {
+                        merged.clone()
+                    } else {
+                        m
+                    }
+                })
+                .collect();
+            crate::turtle_io::write_memory_file(&path, &updated, header)?;
+        }
+
+        // Ledger: retract all old triples and insert updated ones in a single transaction
+        let mut insert_body = memory_to_jsonld(&merged);
+        insert_body.as_object_mut().unwrap().remove("@context");
+        let update_doc = json!({
+            "@context": { "mem": "https://ns.flur.ee/memory#" },
+            "where": { "@id": &compact, "?p": "?o" },
+            "delete": { "@id": &compact, "?p": "?o" },
+            "insert": insert_body
+        });
+        self.fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .update(&update_doc)
+            .commit()
+            .await?;
+
+        // Update the file watermark only after cache commits succeed.
+        if let Some(dir) = &self.memory_dir {
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
+        }
+
+        debug!(id = %compact, "Memory updated in place");
+        drop(file_lock);
+        Ok(compact)
+    }
+
+    /// Delete a memory by retracting all its triples.
+    ///
+    /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
+    /// then the ledger cache is updated. This is the only non-append file mutation.
+    pub async fn forget(&self, id: &str) -> Result<()> {
+        let _guard = self.lock_mutation().await?;
+        let file_lock = self.acquire_file_lock().await?;
+        self.initialize().await?;
+        self.sync_under_lock().await?;
+
+        let expanded = expand_id(id);
+        let compact = compact_id(&expanded);
+
+        // Load the memory to know its scope (for file routing)
+        let mem = self
+            .get(&expanded)
+            .await?
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
+
+        // File is truth — rewrite excluding the forgotten memory first
+        if let Some(dir) = &self.memory_dir {
+            let (path, header, scope_filter) = match mem.scope {
+                Scope::Repo => (
+                    crate::turtle_io::repo_ttl_path(dir),
+                    crate::turtle_io::REPO_HEADER,
+                    Some(Scope::Repo),
+                ),
+                Scope::User => (
+                    crate::turtle_io::user_ttl_path(dir),
+                    crate::turtle_io::USER_HEADER,
+                    Some(Scope::User),
+                ),
+            };
+            // Get all memories for this scope, then exclude the one being forgotten.
+            // Compare both compact and expanded forms since Memory.id may use either.
+            let remaining: Vec<Memory> = self
+                .all_memories_for_scope(scope_filter.as_ref())
+                .await?
+                .into_iter()
+                .filter(|m| m.id != compact && m.id != expanded)
+                .collect();
+            crate::turtle_io::write_memory_file(&path, &remaining, header)?;
+        }
+
+        // Then update the ledger cache (JSON-LD @context expands mem: prefix)
+        let delete_doc = json!({
+            "@context": {
+                "mem": "https://ns.flur.ee/memory#"
+            },
+            "where": { "@id": &compact, "?p": "?o" },
+            "delete": { "@id": &compact, "?p": "?o" }
+        });
+
+        self.fluree
+            .graph(MEMORY_LEDGER_ID)
+            .transact()
+            .update(&delete_doc)
+            .commit()
+            .await?;
+
+        // Update the file watermark only after cache commit succeeds.
+        if let Some(dir) = &self.memory_dir {
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
+        }
+
+        debug!(id = %id, "Memory forgotten");
+        drop(file_lock);
+        Ok(())
+    }
+
+    /// Get ALL memories for a scope.
+    ///
+    /// Used by `forget()` and `update()` to rewrite the Turtle file.
+    async fn all_memories_for_scope(&self, scope: Option<&Scope>) -> Result<Vec<Memory>> {
+        self.initialize().await?;
+
+        let mut where_clauses = vec![
+            "?id a ?type".to_string(),
+            "?id <https://ns.flur.ee/memory#content> ?content".to_string(),
+            "?id <https://ns.flur.ee/memory#createdAt> ?createdAt".to_string(),
+        ];
+
+        if let Some(scope) = scope {
+            where_clauses.push(format!(
+                "?id <https://ns.flur.ee/memory#scope> <{}>",
+                scope.iri()
+            ));
+        }
+
+        let sparql = format!(
+            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\nWHERE {{\n  {}\n  {}\n}}\nORDER BY ASC(?id)",
+            where_clauses.join(" .\n  "),
+            optional_memory_clauses(),
+        );
+
+        let result = self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .query()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await?;
+
+        parse_memories_from_sparql_results(&result)
+    }
+
+    /// Get all memories matching the filter.
+    pub async fn current_memories(&self, filter: &MemoryFilter) -> Result<Vec<Memory>> {
+        self.initialize().await?;
+
+        // Build SPARQL query with filters
+        let mut where_clauses = vec![
+            "?id a ?type".to_string(),
+            "?id <https://ns.flur.ee/memory#content> ?content".to_string(),
+            "?id <https://ns.flur.ee/memory#createdAt> ?createdAt".to_string(),
+        ];
+
+        // Apply kind filter
+        if let Some(kind) = &filter.kind {
+            where_clauses.push(format!(
+                "?id a <{}>",
+                kind.class_iri()
+                    .replace("mem:", "https://ns.flur.ee/memory#")
+            ));
+        }
+
+        // Apply tag filter
+        for tag in &filter.tags {
+            let tag = escape_sparql_string(tag);
+            where_clauses.push(format!("?id <https://ns.flur.ee/memory#tag> \"{tag}\""));
+        }
+
+        // Apply branch filter
+        if let Some(branch) = &filter.branch {
+            let branch = escape_sparql_string(branch);
+            where_clauses.push(format!(
+                "?id <https://ns.flur.ee/memory#branch> \"{branch}\""
+            ));
+        }
+
+        // Apply scope filter (IRI-based)
+        if let Some(scope) = &filter.scope {
+            where_clauses.push(format!(
+                "?id <https://ns.flur.ee/memory#scope> <{}>",
+                scope.iri()
+            ));
+        }
+
+        let sparql = format!(
+            "SELECT ?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives ?updatedAt\nWHERE {{\n  {}\n  {}\n}}\nORDER BY DESC(?createdAt)",
+            where_clauses.join(" .\n  "),
+            optional_memory_clauses(),
+        );
+
+        let result = self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .query()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await?;
+
+        parse_memories_from_sparql_results(&result)
+    }
+
+    /// Get memory store status summary, including previews of recent memories.
+    pub async fn status(&self) -> Result<MemoryStatus> {
+        let memory_dir = self.memory_dir.as_ref().map(|p| p.display().to_string());
+
+        if !self.is_initialized().await? {
+            return Ok(MemoryStatus {
+                initialized: false,
+                total_memories: 0,
+                by_kind: Vec::new(),
+                total_tags: 0,
+                recent: Vec::new(),
+                memory_dir,
+            });
+        }
+
+        let all = self.current_memories(&MemoryFilter::default()).await?;
+
+        let mut by_kind: std::collections::HashMap<MemoryKind, usize> =
+            std::collections::HashMap::new();
+        let mut total_tags = 0;
+
+        for m in &all {
+            *by_kind.entry(m.kind).or_default() += 1;
+            total_tags += m.tags.len();
+        }
+
+        let by_kind: Vec<(MemoryKind, usize)> = by_kind.into_iter().collect();
+
+        // Build previews of the most recent memories (up to 10)
+        let recent: Vec<MemoryPreview> = all
+            .iter()
+            .take(10)
+            .map(|m| {
+                let summary = preview_utf8(&m.content, 100);
+                MemoryPreview {
+                    id: m.id.clone(),
+                    kind: m.kind,
+                    summary,
+                    tags: m.tags.clone(),
+                }
+            })
+            .collect();
+
+        Ok(MemoryStatus {
+            initialized: true,
+            total_memories: all.len(),
+            by_kind,
+            total_tags,
+            recent,
+            memory_dir,
+        })
+    }
+
+    /// Export all memories as JSON.
+    pub async fn export(&self) -> Result<Value> {
+        self.initialize().await?;
+        let all = self.current_memories(&MemoryFilter::default()).await?;
+        Ok(serde_json::to_value(&all)?)
+    }
+
+    /// Full-text recall: BM25-ranked search over memory content.
+    ///
+    /// Uses the native `@fulltext` datatype and `fulltext()` scoring function
+    /// to rank memories by relevance. Returns `(memory_id, bm25_score)` pairs
+    /// ordered by descending score, limited to non-zero matches.
+    pub async fn recall_fulltext(
+        &self,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        self.initialize().await?;
+
+        // Escape backslashes before quotes — the s-expression parser resolves
+        // `\\` and `\"`, and content with an unescaped `"` followed by `)`
+        // used to wedge the parser in an infinite loop (a permanently pinned
+        // tokio worker per occurrence).
+        let bind_expr = format!(
+            "(fulltext ?content \"{}\")",
+            query_text.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+
+        let query = json!({
+            "@context": {
+                "mem": "https://ns.flur.ee/memory#"
+            },
+            "select": ["?id", "?score"],
+            "where": [
+                {
+                    "@id": "?id",
+                    "mem:content": "?content"
+                },
+                ["bind", "?score", bind_expr],
+                ["filter", "(> ?score 0)"]
+            ],
+            "orderBy": [["desc", "?score"]],
+            "limit": limit
+        });
+
+        let result = self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .query()
+            .jsonld(&query)
+            .execute_formatted()
+            .await?;
+
+        // Parse the flat-array result: [[id, score], ...]
+        let mut pairs = Vec::new();
+        if let Some(rows) = result.as_array() {
+            for row in rows {
+                if let Some(arr) = row.as_array() {
+                    if let (Some(id), Some(score)) = (
+                        arr.first().and_then(|v| v.as_str()),
+                        arr.get(1).and_then(serde_json::Value::as_f64),
+                    ) {
+                        pairs.push((id.to_string(), score));
+                    }
+                }
+            }
+        }
+
+        Ok(pairs)
+    }
+
+    /// Execute a raw SPARQL query against the memory ledger.
+    ///
+    /// Returns the raw JSON result from Fluree.
+    pub async fn query_sparql(&self, sparql: &str) -> Result<Value> {
+        self.initialize().await?;
+
+        let result = self
+            .fluree
+            .graph(MEMORY_LEDGER_ID)
+            .query()
+            .sparql(sparql)
+            .execute_formatted()
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Import memories from a JSON array.
+    ///
+    /// Returns the number of memories imported.
+    pub async fn import(&self, data: Value) -> Result<usize> {
+        let _guard = self.lock_mutation().await?;
+        self.initialize().await?;
+
+        let memories: Vec<Memory> = serde_json::from_value(data)?;
+        let count = memories.len();
+
+        for mut mem in memories {
+            if crate::secrets::SecretDetector::has_secrets(&mem.content) {
+                mem.content = crate::secrets::SecretDetector::redact(&mem.content);
+            }
+            if let Some(rationale) = mem.rationale.as_deref() {
+                if crate::secrets::SecretDetector::has_secrets(rationale) {
+                    mem.rationale = Some(crate::secrets::SecretDetector::redact(rationale));
+                }
+            }
+            if let Some(alternatives) = mem.alternatives.as_deref() {
+                if crate::secrets::SecretDetector::has_secrets(alternatives) {
+                    mem.alternatives = Some(crate::secrets::SecretDetector::redact(alternatives));
+                }
+            }
+
+            let doc = memory_to_jsonld(&mem);
+
+            self.fluree
+                .graph(MEMORY_LEDGER_ID)
+                .transact()
+                .insert(&doc)
+                .commit()
+                .await?;
+        }
+
+        Ok(count)
+    }
+
+    async fn acquire_file_lock(&self) -> Result<Option<std::fs::File>> {
+        match &self.memory_dir {
+            Some(dir) => Ok(Some(crate::file_sync::acquire_memory_lock(dir).await?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPARQL result parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Parse SPARQL JSON results format into a list of Memory structs.
+///
+/// The SPARQL results format is:
+/// ```json
+/// { "results": { "bindings": [ { "var": { "value": "..." }, ... }, ... ] } }
+/// ```
+///
+/// Or the Fluree flat table format:
+/// ```json
+/// [ [ val1, val2, ... ], ... ]
+/// ```
+fn parse_memories_from_sparql_results(result: &Value) -> Result<Vec<Memory>> {
+    // Try SPARQL JSON Results format first
+    if let Some(bindings) = result
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(|b| b.as_array())
+    {
+        return parse_from_sparql_bindings(bindings);
+    }
+
+    // Try Fluree flat array format: [[val, val, ...], ...]
+    if let Some(rows) = result.as_array() {
+        return parse_from_flat_rows(rows);
+    }
+
+    Ok(Vec::new())
+}
+
+/// Parse a single memory from SPARQL results where the ID is known (not a binding variable).
+///
+/// The `get()` query uses `<{id}>` as a constant, so `?id` is NOT in the result bindings.
+/// We inject the known ID into each binding so `parse_from_sparql_bindings` can process them.
+fn parse_memory_from_sparql_results(id: &str, result: &Value) -> Result<Option<Memory>> {
+    // Inject the known ID into bindings since the get() query doesn't select ?id
+    if let Some(bindings) = result
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(|b| b.as_array())
+    {
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        let patched: Vec<Value> = bindings
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                if let Some(obj) = b.as_object_mut() {
+                    obj.insert(
+                        "id".to_string(),
+                        serde_json::json!({"type": "uri", "value": id}),
+                    );
+                }
+                b
+            })
+            .collect();
+        let memories = parse_from_sparql_bindings(&patched)?;
+        if memories.is_empty() {
+            return Ok(None);
+        }
+        return Ok(merge_memory_rows(id, &memories));
+    }
+
+    // Fallback: try generic parse
+    let memories = parse_memories_from_sparql_results(result)?;
+    if memories.is_empty() {
+        return Ok(None);
+    }
+    Ok(merge_memory_rows(id, &memories))
+}
+
+/// Parse memories from SPARQL bindings format.
+fn parse_from_sparql_bindings(bindings: &[Value]) -> Result<Vec<Memory>> {
+    use std::collections::HashMap;
+
+    // Group bindings by subject ID — compact to `mem:` prefix form (canonical)
+    let mut grouped: HashMap<String, Vec<&Value>> = HashMap::new();
+    for binding in bindings {
+        if let Some(id) = extract_binding_value(binding, "id") {
+            grouped.entry(compact_id(&id)).or_default().push(binding);
+        }
+    }
+
+    let mut memories = Vec::new();
+    for (id, rows) in grouped {
+        if let Some(mem) = merge_bindings_to_memory(&id, &rows) {
+            memories.push(mem);
+        }
+    }
+
+    Ok(memories)
+}
+
+/// Parse memories from Fluree flat row format.
+///
+/// Expected column order matches the SELECT clause:
+/// `?id ?type ?content ?scope ?severity ?tag ?artifactRef ?branch ?createdAt ?rationale ?alternatives`
+fn parse_from_flat_rows(rows: &[Value]) -> Result<Vec<Memory>> {
+    use std::collections::HashMap;
+
+    // Group rows by subject ID — compact to `mem:` prefix form (canonical)
+    let mut grouped: HashMap<String, Vec<&Value>> = HashMap::new();
+    for row in rows {
+        if let Some(arr) = row.as_array() {
+            if let Some(id) = arr.first().and_then(|v| v.as_str()) {
+                grouped.entry(compact_id(id)).or_default().push(row);
+            }
+        }
+    }
+
+    let mut memories = Vec::new();
+    for (id, rows) in grouped {
+        if let Some(mem) = merge_flat_rows_to_memory(&id, &rows) {
+            memories.push(mem);
+        }
+    }
+
+    Ok(memories)
+}
+
+fn extract_binding_value(binding: &Value, var: &str) -> Option<String> {
+    binding
+        .get(var)
+        .and_then(|v| v.get("value").or(Some(v)))
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string)
+}
+
+fn merge_bindings_to_memory(id: &str, bindings: &[&Value]) -> Option<Memory> {
+    let first = bindings.first()?;
+
+    let type_str = extract_binding_value(first, "type")?;
+    let content = extract_binding_value(first, "content")?;
+    let created_at = extract_binding_value(first, "createdAt")?;
+
+    let kind = iri_to_kind(&type_str)?;
+
+    // Collect multi-value fields across rows
+    let mut tags: Vec<String> = Vec::new();
+    let mut artifact_refs: Vec<String> = Vec::new();
+    for b in bindings {
+        if let Some(tag) = extract_binding_value(b, "tag") {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        if let Some(aref) = extract_binding_value(b, "artifactRef") {
+            if !artifact_refs.contains(&aref) {
+                artifact_refs.push(aref);
+            }
+        }
+    }
+
+    let scope = extract_binding_value(first, "scope")
+        .and_then(|s| crate::types::Scope::parse_str(&s))
+        .unwrap_or_default();
+
+    let severity = extract_binding_value(first, "severity")
+        .and_then(|s| crate::types::Severity::parse_str(&s));
+
+    Some(Memory {
+        id: id.to_string(),
+        kind,
+        content,
+        tags,
+        scope,
+        severity,
+        artifact_refs,
+        branch: extract_binding_value(first, "branch"),
+        created_at,
+        updated_at: extract_binding_value(first, "updatedAt"),
+        rationale: extract_binding_value(first, "rationale"),
+        alternatives: extract_binding_value(first, "alternatives"),
+    })
+}
+
+fn merge_flat_rows_to_memory(id: &str, rows: &[&Value]) -> Option<Memory> {
+    let first = rows.first()?.as_array()?;
+    if first.len() < 9 {
+        return None;
+    }
+
+    // Column indices match SELECT order:
+    // 0=id, 1=type, 2=content, 3=scope, 4=severity,
+    // 5=tag, 6=artifactRef, 7=branch, 8=createdAt,
+    // 9=rationale, 10=alternatives, 11=updatedAt
+    let type_str = first.get(1)?.as_str()?;
+    let content = first.get(2)?.as_str()?.to_string();
+    let created_at = first.get(8)?.as_str()?.to_string();
+
+    let kind = iri_to_kind(type_str)?;
+
+    let mut tags: Vec<String> = Vec::new();
+    let mut artifact_refs: Vec<String> = Vec::new();
+    for row in rows {
+        if let Some(arr) = row.as_array() {
+            if let Some(tag) = arr.get(5).and_then(|v| v.as_str()) {
+                if !tags.contains(&tag.to_string()) {
+                    tags.push(tag.to_string());
+                }
+            }
+            if let Some(aref) = arr.get(6).and_then(|v| v.as_str()) {
+                if !artifact_refs.contains(&aref.to_string()) {
+                    artifact_refs.push(aref.to_string());
+                }
+            }
+        }
+    }
+
+    let scope = first
+        .get(3)
+        .and_then(|v| v.as_str())
+        .and_then(crate::types::Scope::parse_str)
+        .unwrap_or_default();
+
+    let severity = first
+        .get(4)
+        .and_then(|v| v.as_str())
+        .and_then(crate::types::Severity::parse_str);
+
+    Some(Memory {
+        id: id.to_string(),
+        kind,
+        content,
+        tags,
+        scope,
+        severity,
+        artifact_refs,
+        branch: first.get(7).and_then(|v| v.as_str()).map(String::from),
+        created_at,
+        updated_at: first.get(11).and_then(|v| v.as_str()).map(String::from),
+        rationale: first.get(9).and_then(|v| v.as_str()).map(String::from),
+        alternatives: first.get(10).and_then(|v| v.as_str()).map(String::from),
+    })
+}
+
+/// Merge multiple result rows for the same ID into one Memory.
+fn merge_memory_rows(id: &str, memories: &[Memory]) -> Option<Memory> {
+    let first = memories.first()?;
+    if memories.len() == 1 {
+        return Some(first.clone());
+    }
+
+    let mut tags: Vec<String> = Vec::new();
+    let mut artifact_refs: Vec<String> = Vec::new();
+    for m in memories {
+        for tag in &m.tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        for aref in &m.artifact_refs {
+            if !artifact_refs.contains(aref) {
+                artifact_refs.push(aref.clone());
+            }
+        }
+    }
+
+    Some(Memory {
+        id: id.to_string(),
+        kind: first.kind,
+        content: first.content.clone(),
+        tags,
+        scope: first.scope.clone(),
+        severity: first.severity.clone(),
+        artifact_refs,
+        branch: first.branch.clone(),
+        created_at: first.created_at.clone(),
+        updated_at: first.updated_at.clone(),
+        rationale: first.rationale.clone(),
+        alternatives: first.alternatives.clone(),
+    })
+}
+
+/// Convert a full IRI or prefixed name to a MemoryKind.
+fn iri_to_kind(iri: &str) -> Option<MemoryKind> {
+    let local = if let Some(stripped) = iri.strip_prefix("https://ns.flur.ee/memory#") {
+        stripped
+    } else if let Some(stripped) = iri.strip_prefix("mem:") {
+        stripped
+    } else {
+        iri
+    };
+
+    match local {
+        "Fact" => Some(MemoryKind::Fact),
+        "Decision" => Some(MemoryKind::Decision),
+        "Constraint" => Some(MemoryKind::Constraint),
+        // Backwards compat: map removed kinds to Fact
+        "Preference" | "Artifact" => Some(MemoryKind::Fact),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::FlureeBuilder;
+
+    #[tokio::test]
+    async fn is_initialized_finds_memory_ledger_by_normalized_id() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger(MEMORY_LEDGER)
+            .await
+            .expect("create memory ledger");
+        let store = MemoryStore::new(fluree, None);
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "ledger_exists should accept the normalized __memory:main ledger id"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_fulltext_survives_quotes_and_parens_in_query() {
+        // Regression for the MCP hang: content with a quote-then-paren
+        // sequence, fed back as the related-memories recall query, used to
+        // wedge the s-expression parser in an infinite loop.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize");
+
+        let content = r#"emit_list_item stores index metadata ("not rdf-list bnodes") and silently prunes operator-kept rows. Applies to the scalar-Eq push.""#;
+        let input = crate::types::MemoryInput {
+            kind: MemoryKind::Fact,
+            content: content.to_string(),
+            tags: vec!["repro".to_string()],
+            scope: crate::types::Scope::Repo,
+            severity: None,
+            artifact_refs: vec![],
+            branch: None,
+            rationale: Some(r#"backslash \ and "quotes" too"#.to_string()),
+            alternatives: None,
+        };
+        store.add(input).await.expect("add");
+
+        let hits = store
+            .recall_fulltext(content, 4)
+            .await
+            .expect("recall must parse, not hang");
+        assert!(
+            !hits.is_empty(),
+            "the just-added memory should match its own content"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_no_fields_stamps_updated_at() {
+        // A no-field update is the "I re-verified this at HEAD" signal, so it
+        // must move the timestamp even though nothing else changes.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize");
+
+        let id = store
+            .add(crate::types::MemoryInput {
+                kind: MemoryKind::Fact,
+                content: "Ledger ids normalize to `<name>:<branch>`".to_string(),
+                tags: vec!["ledger".to_string()],
+                scope: crate::types::Scope::Repo,
+                severity: None,
+                artifact_refs: vec![],
+                branch: None,
+                rationale: None,
+                alternatives: None,
+            })
+            .await
+            .expect("add");
+
+        let before = store.get(&id).await.expect("get").expect("memory exists");
+        assert!(
+            before.updated_at.is_none(),
+            "a freshly added memory has never been updated"
+        );
+
+        store
+            .update(
+                &id,
+                MemoryUpdate {
+                    content: None,
+                    tags: None,
+                    severity: None,
+                    artifact_refs: None,
+                    rationale: None,
+                    alternatives: None,
+                },
+            )
+            .await
+            .expect("no-op update");
+
+        let after = store.get(&id).await.expect("get").expect("memory exists");
+        assert_eq!(after.content, before.content, "content must be untouched");
+        assert!(
+            after.updated_at.is_some(),
+            "a no-field update must still stamp updated_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn updated_at_survives_a_rebuild_from_files() {
+        // The `.ttl` file is the source of truth, so a stamp that only lives in
+        // this process's ledger would silently vanish on the next `git pull`
+        // rebuild. Write with one store, read with a second that must rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join(".fluree-memory");
+
+        let writer = MemoryStore::new(
+            FlureeBuilder::memory().build_memory(),
+            Some(memory_dir.clone()),
+        );
+        writer.initialize().await.expect("initialize");
+        let id = writer
+            .add(crate::types::MemoryInput {
+                kind: MemoryKind::Fact,
+                content: "Refs are repo-relative and must resolve at HEAD".to_string(),
+                tags: vec!["memory".to_string()],
+                scope: crate::types::Scope::Repo,
+                severity: None,
+                artifact_refs: vec![],
+                branch: None,
+                rationale: None,
+                alternatives: None,
+            })
+            .await
+            .expect("add");
+        writer
+            .update(
+                &id,
+                MemoryUpdate {
+                    content: None,
+                    tags: None,
+                    severity: None,
+                    artifact_refs: None,
+                    rationale: None,
+                    alternatives: None,
+                },
+            )
+            .await
+            .expect("re-verify");
+
+        let reader = MemoryStore::new_ephemeral_ledger(
+            FlureeBuilder::memory().build_memory(),
+            Some(memory_dir),
+        );
+        reader.ensure_synced().await.expect("rebuild from files");
+
+        let loaded = reader
+            .get(&id)
+            .await
+            .expect("get")
+            .expect("memory survives the rebuild");
+        assert!(
+            loaded.updated_at.is_some(),
+            "updatedAt must survive the .ttl round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_and_reinit_drops_by_whole_ledger_name() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize memory store");
+
+        store
+            .drop_and_reinit()
+            .await
+            .expect("drop and reinitialize memory ledger");
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "memory ledger should exist after drop_and_reinit"
+        );
+    }
+}

@@ -1,0 +1,1048 @@
+//! Fluree CLI library.
+//!
+//! This crate provides the types, command handlers, and utilities that
+//! power the `fluree` CLI binary. Library consumers can import these
+//! directly to build alternative interfaces (web UI, TUI, etc.) on top
+//! of the same command logic.
+
+/// `User-Agent` for the CLI's own HTTP calls. Some fronts (the AWS WAF
+/// common rule set among them) refuse requests that carry none.
+pub const USER_AGENT: &str = concat!("fluree/", env!("CARGO_PKG_VERSION"));
+
+pub mod account;
+pub mod cli;
+pub mod commands;
+pub mod config;
+pub mod context;
+pub mod detect;
+pub mod error;
+pub mod graph_source_display;
+pub mod input;
+pub mod output;
+pub mod remote_client;
+
+use cli::{Cli, Commands};
+use fluree_db_api::server_defaults::{generate_config_template_for, ConfigFormat, FlureeDir};
+
+/// Dispatch a parsed [`Cli`] to the appropriate command handler.
+///
+/// This is the main entry point for executing CLI commands. The binary
+/// calls this after parsing args and initializing tracing. Library
+/// consumers can construct a [`Cli`] programmatically and call this
+/// directly, or call individual command handlers from [`commands`].
+pub async fn run(cli: Cli) -> error::CliResult<()> {
+    // Set the global remote HTTP timeout from CLI args before dispatching.
+    context::set_remote_timeout(std::time::Duration::from_secs(cli.timeout));
+
+    let config_path = cli.config.as_deref();
+    let direct = cli.direct;
+
+    match cli.command {
+        Commands::Init { global, format } => {
+            let config_format = match format {
+                cli::InitFormat::Toml => ConfigFormat::Toml,
+                cli::InitFormat::Jsonld => ConfigFormat::JsonLd,
+            };
+            commands::init::run(global, config_format)
+        }
+
+        Commands::Create {
+            ledger,
+            from,
+            import,
+            memory,
+            no_user,
+            remote,
+        } => {
+            if from.is_some() && memory.is_some() {
+                return Err(error::CliError::Usage(
+                    "--from and --memory are mutually exclusive".into(),
+                ));
+            }
+            // Create-specific flags take precedence; fall back to global flags.
+            let import_opts = import.opts(cli.memory_budget_mb, cli.parallelism);
+
+            // `--remote` doesn't write any local state, so it must work even
+            // when the user has no project-local `.fluree/` directory — fall
+            // back to global config for remote registration lookups.
+            if let Some(remote_name) = remote {
+                if memory.is_some() {
+                    return Err(error::CliError::Usage(
+                        "--remote cannot import memory history; \
+                         run `fluree create <ledger> --memory ...` locally, then \
+                         `fluree publish <remote> <ledger>`."
+                            .to_string(),
+                    ));
+                }
+                let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+                return match from.as_deref() {
+                    // `.flpack` archives restore wholesale via the remote's
+                    // import endpoint — the generic "push any local data to a
+                    // server" path (build locally in any format → export to
+                    // .flpack → import here).
+                    Some(path) if commands::create::is_flpack_path(path) => {
+                        commands::create::run_remote_flpack_import(
+                            &ledger,
+                            &remote_name,
+                            path,
+                            &fluree_dir,
+                        )
+                        .await
+                    }
+                    // Raw source data (TTL/JSON-LD/JSONL/CSV/Cypher …) uploads
+                    // to servers that advertise `source-upload` and runs the
+                    // bulk-import pipeline server-side; the handler falls back
+                    // to a clear error (export to .flpack / create locally)
+                    // when the server doesn't offer it.
+                    Some(path) => {
+                        commands::create::run_remote_source_import(
+                            &ledger,
+                            &remote_name,
+                            path,
+                            &fluree_dir,
+                            &import_opts,
+                        )
+                        .await
+                    }
+                    None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
+                };
+            }
+
+            // Local-create paths still require a project `.fluree/` so the
+            // new ledger lands in a discoverable place rather than $FLUREE_HOME.
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+
+            if let Some(memory_path) = memory {
+                return commands::create::run_memory_import(
+                    &ledger,
+                    &memory_path,
+                    no_user,
+                    &fluree_dir,
+                    cli.quiet,
+                )
+                .await;
+            }
+
+            commands::create::run(
+                &ledger,
+                from.as_deref(),
+                &fluree_dir,
+                cli.verbose,
+                cli.quiet,
+                &import_opts,
+            )
+            .await
+        }
+
+        Commands::Use { ledger } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::use_cmd::run(&ledger, &fluree_dir).await
+        }
+
+        Commands::List { remote } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::list::run(&fluree_dir, remote.as_deref(), direct).await
+        }
+
+        Commands::Info {
+            ledger,
+            remote,
+            graph,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::info::run(
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                graph.as_deref(),
+            )
+            .await
+        }
+
+        Commands::Branch { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::branch::run(action, &fluree_dir, direct).await
+        }
+
+        #[cfg(feature = "server")]
+        Commands::Cluster { action } => commands::cluster::run(action).await,
+
+        Commands::Encryption { action } => commands::encryption::run(action, config_path).await,
+
+        Commands::Drop {
+            name,
+            force,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::drop::run(&name, force, &fluree_dir, remote.as_deref(), direct).await
+        }
+
+        Commands::Graph { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            let globals = commands::graph::GlobalFlags {
+                verbose: cli.verbose,
+                quiet: cli.quiet,
+                memory_budget_mb: cli.memory_budget_mb,
+                parallelism: cli.parallelism,
+            };
+            commands::graph::run(action, &fluree_dir, direct, globals).await
+        }
+
+        Commands::Bm25 { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::bm25::run(action, &fluree_dir, direct).await
+        }
+
+        Commands::Insert {
+            args,
+            ledger,
+            expr,
+            file,
+            format,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::insert::run(
+                &args,
+                ledger.as_deref(),
+                expr.as_deref(),
+                file.as_deref(),
+                format.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                &policy,
+            )
+            .await
+        }
+
+        Commands::Update {
+            args,
+            ledger,
+            expr,
+            file,
+            format,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::update::run(
+                &args,
+                ledger.as_deref(),
+                expr.as_deref(),
+                file.as_deref(),
+                format.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                &policy,
+            )
+            .await
+        }
+
+        Commands::Load {
+            ledger,
+            from,
+            cypher,
+            jsonld,
+            batch_size,
+            field_terminator,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            let template = commands::load::Template::from_flags(cypher, jsonld)?;
+            commands::load::run(
+                ledger.as_deref(),
+                &from,
+                template,
+                batch_size,
+                &field_terminator,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
+        Commands::Upsert {
+            args,
+            ledger,
+            expr,
+            file,
+            format,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::upsert::run(
+                &args,
+                ledger.as_deref(),
+                expr.as_deref(),
+                file.as_deref(),
+                format.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                &policy,
+            )
+            .await
+        }
+
+        Commands::Sync {
+            args,
+            ledger,
+            graph,
+            expr,
+            file,
+            format,
+            dry_run,
+            allow_empty,
+            json,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::graph_sync::run(commands::graph_sync::SyncArgs {
+                args: &args,
+                ledger: ledger.as_deref(),
+                graph: graph.as_deref(),
+                expr: expr.as_deref(),
+                file: file.as_deref(),
+                format: format.as_deref(),
+                dry_run,
+                allow_empty,
+                json,
+                remote: remote.as_deref(),
+                direct,
+                policy: &policy,
+                dirs: &fluree_dir,
+            })
+            .await
+        }
+
+        Commands::Query {
+            args,
+            ledger,
+            expr,
+            file,
+            format,
+            envelope,
+            normalize_arrays,
+            bench,
+            explain,
+            sparql,
+            jsonld,
+            cypher,
+            at,
+            remote,
+            connection,
+            track,
+            track_fuel,
+            track_time,
+            track_policy,
+            max_fuel,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::query::run(
+                &args,
+                ledger.as_deref(),
+                expr.as_deref(),
+                file.as_deref(),
+                &format,
+                envelope,
+                normalize_arrays,
+                bench,
+                explain,
+                sparql,
+                jsonld,
+                cypher,
+                at.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                connection.as_deref(),
+                direct,
+                commands::query::TrackingFlags {
+                    track,
+                    track_fuel,
+                    track_time,
+                    track_policy,
+                    max_fuel,
+                },
+                &policy,
+            )
+            .await
+        }
+
+        Commands::MultiQuery {
+            args,
+            expr,
+            file,
+            format,
+            normalize_arrays,
+            output,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::multi_query::run(
+                &args,
+                expr.as_deref(),
+                file.as_deref(),
+                &format,
+                normalize_arrays,
+                &output,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                &policy,
+            )
+            .await
+        }
+
+        Commands::History {
+            entity,
+            ledger,
+            from,
+            to,
+            predicate,
+            format,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::history::run(
+                &entity,
+                ledger.as_deref(),
+                &from,
+                &to,
+                predicate.as_deref(),
+                &format,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
+        Commands::Context { action } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            match action {
+                cli::ContextAction::Get { ledger, remote } => {
+                    commands::context_cmd::get(
+                        ledger.as_deref(),
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::ContextAction::Set {
+                    ledger,
+                    expr,
+                    file,
+                    remote,
+                } => {
+                    commands::context_cmd::set(
+                        ledger.as_deref(),
+                        expr.as_deref(),
+                        file.as_ref(),
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
+        #[cfg(feature = "graphql")]
+        Commands::Graphql {
+            args,
+            ledger,
+            expr,
+            file,
+            variables,
+            operation,
+            schema,
+            bootstrap,
+            explain,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            // A GraphQL document always starts with `{`, `query`, `mutation`,
+            // `fragment` or `...`; a ledger name never does.
+            let looks_like_document = |s: &String| {
+                let t = s.trim_start();
+                t.starts_with('{')
+                    || t.starts_with("query")
+                    || t.starts_with("mutation")
+                    || t.starts_with("fragment")
+            };
+            let (positional_ledger, positional_query) = match args.len() {
+                0 => (None, None),
+                1 if looks_like_document(&args[0]) => (None, Some(args[0].clone())),
+                1 => (Some(args[0].clone()), None),
+                _ => (Some(args[0].clone()), Some(args[1].clone())),
+            };
+            commands::graphql::run(
+                ledger.as_deref().or(positional_ledger.as_deref()),
+                positional_query.as_deref(),
+                expr.as_deref(),
+                file.as_ref(),
+                variables.as_deref(),
+                operation.as_deref(),
+                schema,
+                bootstrap,
+                explain,
+                &fluree_dir,
+            )
+            .await
+        }
+
+        #[cfg(feature = "shacl")]
+        Commands::Validate {
+            target,
+            graph,
+            shacl,
+            shacl_graph,
+            include_attached,
+            format,
+            fail_on,
+        } => {
+            commands::validate::run(
+                target.as_deref(),
+                graph.as_deref(),
+                shacl.as_deref(),
+                shacl_graph.as_deref(),
+                include_attached,
+                &format,
+                &fail_on,
+                config_path,
+            )
+            .await
+        }
+
+        Commands::Export {
+            ledger,
+            format,
+            output,
+            no_indexes,
+            all_graphs,
+            system_graphs,
+            graph,
+            raw_reifies,
+            context,
+            context_file,
+            at,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::export::run(
+                ledger.as_deref(),
+                format.as_deref(),
+                output.as_deref(),
+                no_indexes,
+                all_graphs,
+                system_graphs,
+                graph.as_deref(),
+                raw_reifies,
+                context.as_deref(),
+                context_file.as_deref(),
+                at.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
+        Commands::Log {
+            ledger,
+            oneline,
+            count,
+            all,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::log::run(
+                ledger.as_deref(),
+                oneline,
+                count,
+                all,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
+        Commands::Verify {
+            ledger,
+            limit,
+            json,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::verify::run(ledger.as_deref(), limit, json, &fluree_dir).await
+        }
+
+        Commands::Show {
+            commit,
+            ledger,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::show::run(
+                &commit,
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                cli.direct,
+            )
+            .await
+        }
+
+        Commands::Config { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::ConfigAction::SetOrigins { ledger, file } => {
+                    commands::config_cmd::run_set_origins(&ledger, &file, &fluree_dir).await
+                }
+                other => commands::config_cmd::run(other, &fluree_dir),
+            }
+        }
+
+        Commands::Prefix { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::prefix::run(action, &fluree_dir)
+        }
+
+        Commands::Completions { shell } => {
+            commands::completions::run(shell);
+            Ok(())
+        }
+
+        Commands::Manifest { output } => commands::manifest::run(output.as_deref()),
+
+        Commands::Token { action } => commands::token::run(action),
+
+        Commands::Remote { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::remote::run(action, &fluree_dir).await
+        }
+
+        Commands::Auth { action } => {
+            // `auth status` also reports the machine's fluree.ai sign-in,
+            // which needs no project.
+            match config::require_fluree_dir(config_path) {
+                Ok(fluree_dir) => commands::auth::run(action, Some(&fluree_dir)).await,
+                Err(error::CliError::NoFlureeDir)
+                    if matches!(
+                        action,
+                        cli::AuthAction::Status { remote: None }
+                            | cli::AuthAction::Token { account: true, .. }
+                    ) =>
+                {
+                    commands::auth::run(action, None).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        Commands::Login { url, no_browser } => {
+            commands::login::run_login(Some(url), !no_browser).await
+        }
+
+        Commands::Logout => commands::login::run_logout().await,
+
+        Commands::Upstream { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::upstream::run(action, &fluree_dir).await
+        }
+
+        Commands::Fetch { remote } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sync::run_fetch(&remote, &fluree_dir).await
+        }
+
+        Commands::Pull { ledger, no_indexes } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sync::run_pull(ledger.as_deref(), no_indexes, &fluree_dir).await
+        }
+
+        Commands::Push { ledger } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sync::run_push(ledger.as_deref(), &fluree_dir).await
+        }
+
+        Commands::Publish {
+            remote,
+            ledger,
+            remote_name,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sync::run_publish(
+                &remote,
+                ledger.as_deref(),
+                remote_name.as_deref(),
+                &fluree_dir,
+            )
+            .await
+        }
+
+        Commands::Clone {
+            args,
+            origin,
+            token,
+            alias,
+            no_indexes,
+            no_txns,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            if let Some(origin_uri) = origin {
+                // --origin mode: args = [ledger]
+                if args.len() != 1 {
+                    return Err(error::CliError::Usage(
+                        "with --origin, provide exactly one positional arg: <ledger>".into(),
+                    ));
+                }
+                commands::sync::run_clone_origin(
+                    &origin_uri,
+                    token.as_deref(),
+                    &args[0],
+                    alias.as_deref(),
+                    no_indexes,
+                    no_txns,
+                    &fluree_dir,
+                )
+                .await
+            } else {
+                // Named-remote mode: args = [remote, ledger]
+                if args.len() != 2 {
+                    return Err(error::CliError::Usage(
+                        "usage: fluree clone <remote> <ledger>  or  fluree clone --origin <uri> <ledger>".into(),
+                    ));
+                }
+                commands::sync::run_clone(
+                    &args[0],
+                    &args[1],
+                    alias.as_deref(),
+                    no_indexes,
+                    no_txns,
+                    &fluree_dir,
+                )
+                .await
+            }
+        }
+
+        Commands::Track { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::track::run(action, &fluree_dir).await
+        }
+
+        Commands::Cache { action } => commands::cache::run(action),
+
+        Commands::Index { ledger } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::index::run_index(ledger.as_deref(), &fluree_dir).await
+        }
+
+        Commands::Reindex { ledger, remote } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref(), direct)
+                .await
+        }
+
+        Commands::Sweep {
+            ledger,
+            dry_run,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sweep::run_sweep(
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                commands::sweep::SweepMode::from_dry_run(dry_run),
+            )
+            .await
+        }
+
+        #[cfg(feature = "server")]
+        Commands::Server { action } => commands::server::run(action, config_path).await,
+
+        #[cfg(not(feature = "server"))]
+        Commands::Server { .. } => Err(error::CliError::Server(
+            "server support not compiled. Rebuild with `--features server`.".into(),
+        )),
+
+        Commands::Model { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::model::run(&action, &fluree_dir, direct).await
+        }
+
+        // Reads files only: no project, no ledger.
+        Commands::Ontology { action } => commands::ontology::run(action),
+        Commands::Catalog { action } => commands::ontology::run_catalog(action),
+
+        Commands::Memory { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::memory::run(action, &fluree_dir).await
+        }
+
+        Commands::Sql { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::SqlAction::Map(args) => {
+                    commands::sql::run_sql_map(*args, &fluree_dir, direct).await
+                }
+                cli::SqlAction::Check { name } => {
+                    commands::sql::run_sql_check(&name, &fluree_dir).await
+                }
+                cli::SqlAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::SqlAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::SqlAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
+        Commands::Delta { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::DeltaAction::Map(args) => {
+                    commands::delta::run_delta_map(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Browse(args) => {
+                    commands::delta::run_delta_browse(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Preview(args) => {
+                    commands::delta::run_delta_preview(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Verify(args) => {
+                    commands::delta::run_delta_verify(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Generate(args) => {
+                    commands::delta::run_delta_generate(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Validate(args) => {
+                    commands::delta::run_delta_validate(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::DeltaAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::DeltaAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
+        Commands::Iceberg { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::IcebergAction::Map(args) => {
+                    commands::iceberg::run_iceberg_map(*args, &fluree_dir, direct).await
+                }
+                cli::IcebergAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::IcebergAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::IcebergAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
+        #[cfg(feature = "iceberg")]
+        Commands::Materialize {
+            graph_source,
+            into,
+            output,
+            output_path,
+            verify,
+            max_performance,
+            allow_mor_deletes,
+            allow_duplicate_parent_keys,
+            home,
+            tmp_dir,
+        } => {
+            // `--home` resolves through the same helper as `--config` (it takes
+            // precedence); else the tracked `.fluree/` or the global home.
+            let fluree_dir = config::require_fluree_dir_or_global(home.as_deref().or(config_path))?;
+            let params = commands::materialize::MaterializeParams {
+                graph_source: &graph_source,
+                into: into.as_deref(),
+                output,
+                output_path: output_path.as_deref(),
+                verify,
+                max_performance,
+                allow_mor_deletes,
+                allow_duplicate_parent_keys,
+                parallelism: cli.parallelism,
+                memory_budget_mb: cli.memory_budget_mb,
+                quiet: cli.quiet,
+                tmp_dir: tmp_dir.as_deref(),
+            };
+            commands::materialize::run(&fluree_dir, &params).await
+        }
+
+        #[cfg(not(feature = "iceberg"))]
+        Commands::Materialize { .. } => Err(error::CliError::Usage(
+            "`fluree materialize` requires the `iceberg` feature (enabled by default)".to_string(),
+        )),
+
+        Commands::Mcp { action } => match action {
+            cli::McpAction::Serve {
+                transport,
+                toolsets,
+            } => {
+                let toolsets = commands::mcp::parse_toolsets(&toolsets)?;
+
+                // Only resolve (and, if needed, create) a Fluree directory when
+                // the memory toolset is enabled — a docs-only server is stateless
+                // and must not require or create a `.fluree/` directory.
+                //
+                // IMPORTANT: this must not print to stdout/stderr (stdio
+                // transport uses stdout for JSON-RPC).
+                let fluree_dir = if toolsets.contains(&fluree_db_mcp::Toolset::Memory) {
+                    Some(resolve_mcp_fluree_dir(config_path)?)
+                } else {
+                    None
+                };
+                commands::mcp::serve::run(&transport, &toolsets, fluree_dir.as_ref()).await
+            }
+            // init/install need no project directory — the server lazy-inits its
+            // store and the docs toolset is stateless.
+            cli::McpAction::Init { ide, toolsets } | cli::McpAction::Install { ide, toolsets } => {
+                commands::mcp::init(ide.as_deref(), &toolsets)
+            }
+            cli::McpAction::Status => commands::mcp::status(),
+        },
+
+        // Docs are embedded in the binary — no project directory needed.
+        Commands::Docs { action } => commands::docs::run(action),
+
+        // Writes no ledger, so a project is optional: one found (or the
+        // global config) supplies `[doc]` and the cache.
+        Commands::Doc {
+            action: cli::DocAction::Parse(args),
+        } => {
+            let fluree_dir = match config_path {
+                Some(_) => Some(config::require_fluree_dir_or_global(config_path)?),
+                None => config::find_or_global_fluree_dir(),
+            };
+            commands::doc::run_parse(args, fluree_dir.as_ref()).await
+        }
+        Commands::Doc {
+            action: cli::DocAction::Read(args),
+        } => {
+            let fluree_dir = match config_path {
+                Some(_) => Some(config::require_fluree_dir_or_global(config_path)?),
+                None => config::find_or_global_fluree_dir(),
+            };
+            commands::doc::run_read(args, fluree_dir.as_ref()).await
+        }
+        Commands::Doc { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::doc::run(action, &fluree_dir).await
+        }
+    }
+}
+
+/// Resolve the Fluree directory for an MCP server that includes the memory
+/// toolset. IDEs may spawn `fluree mcp serve` from a cwd outside a project with
+/// a local `.fluree/`, so fall back to (and create) global directories.
+fn resolve_mcp_fluree_dir(config_path: Option<&std::path::Path>) -> error::CliResult<FlureeDir> {
+    if let Some(p) = config_path {
+        return config::require_fluree_dir(Some(p));
+    }
+    if let Some(local) = config::find_fluree_dir() {
+        return Ok(local);
+    }
+    let global = FlureeDir::global()
+        .ok_or_else(|| error::CliError::Config("cannot determine global directories".into()))?;
+
+    // For split global dirs, use an absolute data-dir storage path so the server
+    // finds the right directory regardless of cwd.
+    let storage_override = if !global.is_unified() {
+        let path = global.data_dir().join("storage");
+        let path_str = path.to_str().ok_or_else(|| {
+            error::CliError::Config(format!(
+                "data directory path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        Some(path_str.to_owned())
+    } else {
+        None
+    };
+
+    let template = generate_config_template_for(ConfigFormat::Toml, storage_override.as_deref());
+    config::init_fluree_dir(&global, &template, ConfigFormat::Toml.filename())?;
+    Ok(global)
+}

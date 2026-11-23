@@ -1,0 +1,917 @@
+//! Query options parsing
+//!
+//! Parses JSON-LD query modifiers:
+//! - `limit` - maximum number of results
+//! - `offset` - skip first N results
+//! - `distinct` / `selectDistinct` - remove duplicate rows
+//! - `orderBy` - sort results
+//! - `groupBy` - group results for aggregation
+//! - `having` - filter aggregated groups
+//! - `depth` - auto-expand nested objects to depth N
+//! - `reasoning` - enable/disable reasoning modes
+//!
+//! # Example
+//!
+//! ```json
+//! {
+//!   "select": ["?x"],
+//!   "where": { "ex:name": "?x" },
+//!   "limit": 10,
+//!   "offset": 20,
+//!   "orderBy": ["?x"],
+//!   "distinct": true
+//! }
+//! ```
+
+use super::ast::{
+    UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedExpression, UnresolvedFilterValue,
+    UnresolvedOptions, UnresolvedSortDirection, UnresolvedSortSpec,
+};
+use super::error::{ParseError, Result};
+use super::filter_common;
+use super::filter_sexpr;
+use serde_json::Value as JsonValue;
+use std::sync::Arc;
+
+/// Validate that a string looks like a variable (starts with ?)
+fn validate_var_name(name: &str) -> Result<()> {
+    if !name.starts_with('?') {
+        return Err(ParseError::InvalidVariable(name.to_string()));
+    }
+    Ok(())
+}
+
+/// An `orderBy` term's variable. An expression in its place (`(count ?e)`) is
+/// [`ParseError::InvalidOrderBy`], whose message says how to sort on one.
+fn validate_order_var(name: &str) -> Result<()> {
+    if name.trim_start().starts_with('(') {
+        return Err(ParseError::InvalidOrderBy);
+    }
+    validate_var_name(name)
+}
+
+/// Parse depth option for graph select auto-expansion
+///
+/// Default is 0 (no auto-expansion).
+///
+/// # Example
+///
+/// ```json
+/// { "depth": 3 }
+/// ```
+pub fn parse_depth(obj: &serde_json::Map<String, JsonValue>) -> Result<usize> {
+    match obj.get("depth") {
+        None => Ok(0), // Default: no auto-expansion
+        Some(v) => {
+            // Use as_i64() to catch negative numbers
+            let n = v
+                .as_i64()
+                .ok_or_else(|| ParseError::InvalidOption("depth must be a number".into()))?;
+            if n < 0 {
+                return Err(ParseError::InvalidOption(
+                    "depth must be non-negative".into(),
+                ));
+            }
+            Ok(n as usize)
+        }
+    }
+}
+
+/// Parse limit from JSON
+///
+/// # Example
+///
+/// ```json
+/// { "limit": 100 }
+/// ```
+pub fn parse_limit(obj: &serde_json::Map<String, JsonValue>) -> Result<Option<usize>> {
+    match obj.get("limit") {
+        None => Ok(None),
+        Some(v) => {
+            // Use as_i64() to catch negative numbers, then validate
+            let n = v.as_i64().ok_or(ParseError::InvalidLimit)?;
+            if n < 0 {
+                return Err(ParseError::InvalidLimit);
+            }
+            Ok(Some(n as usize))
+        }
+    }
+}
+
+/// Parse offset from JSON
+///
+/// # Example
+///
+/// ```json
+/// { "offset": 50 }
+/// ```
+pub fn parse_offset(obj: &serde_json::Map<String, JsonValue>) -> Result<Option<usize>> {
+    match obj.get("offset") {
+        None => Ok(None),
+        Some(v) => {
+            // Use as_i64() to catch negative numbers, then validate
+            let n = v.as_i64().ok_or(ParseError::InvalidOffset)?;
+            if n < 0 {
+                return Err(ParseError::InvalidOffset);
+            }
+            Ok(Some(n as usize))
+        }
+    }
+}
+
+/// Parse distinct from JSON (supports both "distinct" and "selectDistinct")
+///
+/// # Example
+///
+/// ```json
+/// { "distinct": true }
+/// ```
+///
+/// or
+///
+/// ```json
+/// { "selectDistinct": true }
+/// ```
+pub fn parse_distinct(obj: &serde_json::Map<String, JsonValue>) -> bool {
+    obj.get("distinct")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || obj
+            .get("selectDistinct")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// Parse orderBy from JSON
+///
+/// Supports multiple formats for compatibility:
+/// - `"orderBy": "?x"` - single variable (defaults to ascending)
+/// - `"orderBy": ["?x", "?y"]` - multiple variables
+/// - `"orderBy": ["asc", "?x"]` - SPARQL translator form
+/// - `"orderBy": "(desc ?x)"` - EDN-ish string form
+/// - `"orderBy": {"var": "?x", "direction": "desc"}` - Rust-native JSON form
+///
+/// # Examples
+///
+/// ```json
+/// { "orderBy": "?x" }
+/// ```
+///
+/// ```json
+/// { "orderBy": ["?x", "(desc ?y)"] }
+/// ```
+///
+/// ```json
+/// { "orderBy": [{"var": "?x", "direction": "asc"}] }
+/// ```
+pub fn parse_order_by(obj: &serde_json::Map<String, JsonValue>) -> Result<Vec<UnresolvedSortSpec>> {
+    // Accept both camelCase and kebab-case for compatibility.
+    let Some(val) = obj.get("orderBy").or_else(|| obj.get("order-by")) else {
+        return Ok(Vec::new());
+    };
+
+    match val {
+        // Collection of ordering terms
+        JsonValue::Array(arr) => arr.iter().map(parse_single_order_term).collect(),
+        // Single ordering term (scalar / object / ["asc","?x"])
+        other => Ok(vec![parse_single_order_term(other)?]),
+    }
+}
+
+/// Parse a single order term from any supported format
+///
+/// Supports multiple formats for compatibility:
+/// - Object: `{"var":"?x","direction":"desc"}`
+/// - String: `"?x"` (defaults asc) or `"(desc ?x)"` (EDN-ish)
+/// - Array: `["asc", "?x"]` (SPARQL translator form)
+fn parse_single_order_term(item: &JsonValue) -> Result<UnresolvedSortSpec> {
+    match item {
+        JsonValue::Object(map) => parse_order_term_object(map),
+        JsonValue::String(s) => parse_order_term_string(s),
+        JsonValue::Array(arr) => parse_order_term_array(arr),
+        _ => Err(ParseError::InvalidOrderBy),
+    }
+}
+
+/// Parse Rust-native JSON object form: `{"var":"?x","direction":"desc"}`
+fn parse_order_term_object(map: &serde_json::Map<String, JsonValue>) -> Result<UnresolvedSortSpec> {
+    let var = map
+        .get("var")
+        .and_then(|v| v.as_str())
+        .ok_or(ParseError::InvalidOrderBy)?;
+    validate_order_var(var)?;
+
+    // Accept both "direction" and "order" as synonyms (clients vary)
+    let dir_val = map
+        .get("direction")
+        .or_else(|| map.get("order"))
+        .and_then(|v| v.as_str());
+
+    let direction = match dir_val {
+        None => UnresolvedSortDirection::Asc,
+        Some(s) => parse_sort_direction(s)?,
+    };
+
+    Ok(UnresolvedSortSpec {
+        var: Arc::from(var),
+        direction,
+    })
+}
+
+/// Parse string form: `"?x"` (plain var) or `"(desc ?x)"` (EDN-ish)
+fn parse_order_term_string(s: &str) -> Result<UnresolvedSortSpec> {
+    let trimmed = s.trim();
+
+    // EDN-ish string form: "(asc ?x)" / "(desc ?x)"
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = trimmed.trim_start_matches('(').trim_end_matches(')').trim();
+        let parts: Vec<&str> = inner.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(ParseError::InvalidOrderBy);
+        }
+        let direction = parse_sort_direction(parts[0])?;
+        let var = parts[1];
+        validate_order_var(var)?;
+        return Ok(UnresolvedSortSpec {
+            var: Arc::from(var),
+            direction,
+        });
+    }
+
+    // Plain var string (defaults to ascending)
+    validate_order_var(trimmed)?;
+    Ok(UnresolvedSortSpec {
+        var: Arc::from(trimmed),
+        direction: UnresolvedSortDirection::Asc,
+    })
+}
+
+/// Parse SPARQL translator array form: `["asc","?x"]` or `["desc","?x"]`
+fn parse_order_term_array(arr: &[JsonValue]) -> Result<UnresolvedSortSpec> {
+    if arr.len() != 2 {
+        return Err(ParseError::InvalidOrderBy);
+    }
+    let dir = arr[0].as_str().ok_or(ParseError::InvalidOrderBy)?;
+    let var = arr[1].as_str().ok_or(ParseError::InvalidOrderBy)?;
+    let direction = parse_sort_direction(dir)?;
+    validate_order_var(var)?;
+    Ok(UnresolvedSortSpec {
+        var: Arc::from(var),
+        direction,
+    })
+}
+
+/// Parse sort direction string ("asc" or "desc")
+fn parse_sort_direction(s: &str) -> Result<UnresolvedSortDirection> {
+    match s.to_lowercase().as_str() {
+        "asc" => Ok(UnresolvedSortDirection::Asc),
+        "desc" => Ok(UnresolvedSortDirection::Desc),
+        other => Err(ParseError::InvalidSortDirection(other.to_string())),
+    }
+}
+
+/// Parse groupBy from JSON
+///
+/// # Example
+///
+/// ```json
+/// { "groupBy": ["?x", "?y"] }
+/// ```
+pub fn parse_group_by(obj: &serde_json::Map<String, JsonValue>) -> Result<Vec<Arc<str>>> {
+    // Accept both camelCase and kebab-case for compatibility.
+    let Some(val) = obj.get("groupBy").or_else(|| obj.get("group-by")) else {
+        return Ok(Vec::new());
+    };
+    match val {
+        JsonValue::String(s) => {
+            validate_var_name(s)?;
+            Ok(vec![Arc::from(s.as_str())])
+        }
+        JsonValue::Array(arr) => arr
+            .iter()
+            .map(|item| {
+                let var = item.as_str().ok_or(ParseError::InvalidGroupBy)?;
+                validate_var_name(var)?;
+                Ok(Arc::from(var))
+            })
+            .collect(),
+        _ => Err(ParseError::InvalidGroupBy),
+    }
+}
+
+/// Parse HAVING and extract aggregate specs from S-expression forms.
+///
+/// Compatibility:
+/// - allow `"having": "(>= (count ?x) 2)"` and `"having": "(>= (avg ?x) 10)"`
+/// - aggregate forms inside HAVING are rewritten into real query aggregates,
+///   and the HAVING expression is rewritten to reference the aggregate output var.
+pub(crate) fn parse_having_with_aggregates(
+    obj: &serde_json::Map<String, JsonValue>,
+    parse_filter_expr: impl Fn(&JsonValue) -> Result<UnresolvedExpression>,
+) -> Result<(Option<UnresolvedExpression>, Vec<UnresolvedAggregateSpec>)> {
+    let Some(having_val) = obj.get("having") else {
+        return Ok((None, Vec::new()));
+    };
+
+    let raw_expr = match having_val {
+        JsonValue::String(s) if s.trim_start().starts_with('(') => {
+            filter_sexpr::parse_s_expression(s)?
+        }
+        other => parse_filter_expr(other)?,
+    };
+    filter_common::reject_constant_bool_expr(&raw_expr, "having")?;
+
+    let mut aggregates: Vec<UnresolvedAggregateSpec> = Vec::new();
+    let mut counter: usize = 0;
+    let rewritten = rewrite_having_aggregates(raw_expr, &mut aggregates, &mut counter)?;
+    Ok((Some(rewritten), aggregates))
+}
+
+fn rewrite_having_aggregates(
+    expr: UnresolvedExpression,
+    aggregates: &mut Vec<UnresolvedAggregateSpec>,
+    counter: &mut usize,
+) -> Result<UnresolvedExpression> {
+    use super::ast::UnresolvedExpression as E;
+
+    let rewrite_child = |e: UnresolvedExpression,
+                         aggregates: &mut Vec<UnresolvedAggregateSpec>,
+                         counter: &mut usize|
+     -> Result<UnresolvedExpression> {
+        rewrite_having_aggregates(e, aggregates, counter)
+    };
+
+    match expr {
+        E::Var(_) | E::Const(_) => Ok(expr),
+
+        E::And(exprs) => Ok(E::And(
+            exprs
+                .into_iter()
+                .map(|e| rewrite_child(e, aggregates, counter))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+
+        E::Or(exprs) => Ok(E::Or(
+            exprs
+                .into_iter()
+                .map(|e| rewrite_child(e, aggregates, counter))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+
+        E::Not(inner) => Ok(E::Not(Box::new(rewrite_child(
+            *inner, aggregates, counter,
+        )?))),
+
+        E::In {
+            expr,
+            values,
+            negated,
+        } => Ok(E::In {
+            expr: Box::new(rewrite_child(*expr, aggregates, counter)?),
+            values: values
+                .into_iter()
+                .map(|e| rewrite_child(e, aggregates, counter))
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        }),
+
+        E::Call { func, args } => {
+            let name_lc = func.as_ref().to_ascii_lowercase();
+            let agg_fn = match name_lc.as_str() {
+                "count" => Some(UnresolvedAggregateFn::Count),
+                "avg" => Some(UnresolvedAggregateFn::Avg),
+                "sum" => Some(UnresolvedAggregateFn::Sum),
+                "min" => Some(UnresolvedAggregateFn::Min),
+                "max" => Some(UnresolvedAggregateFn::Max),
+                _ => None,
+            };
+
+            if let Some(function) = agg_fn {
+                if args.len() != 1 {
+                    return Err(ParseError::InvalidFilter(format!(
+                        "HAVING aggregate {func} requires exactly 1 argument"
+                    )));
+                }
+
+                match &args[0] {
+                    E::Var(v) => {
+                        let out = Arc::from(format!("?__having_agg{}", *counter));
+                        *counter += 1;
+                        aggregates.push(UnresolvedAggregateSpec {
+                            function,
+                            input_var: Arc::clone(v),
+                            output_var: Arc::clone(&out),
+                        });
+                        Ok(E::Var(out))
+                    }
+                    // Allow COUNT(*) in s-expression form: (count "*")
+                    E::Const(UnresolvedFilterValue::String(s))
+                        if s.as_ref() == "*"
+                            && matches!(function, UnresolvedAggregateFn::Count) =>
+                    {
+                        let out = Arc::from(format!("?__having_agg{}", *counter));
+                        *counter += 1;
+                        aggregates.push(UnresolvedAggregateSpec {
+                            function,
+                            input_var: Arc::from("*"),
+                            output_var: Arc::clone(&out),
+                        });
+                        Ok(E::Var(out))
+                    }
+                    _ => Err(ParseError::InvalidFilter(
+                        "HAVING aggregate argument must be a variable".to_string(),
+                    )),
+                }
+            } else {
+                // Non-aggregate function: just rewrite its arguments.
+                let rewritten_args = args
+                    .into_iter()
+                    .map(|e| rewrite_child(e, aggregates, counter))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(E::Call {
+                    func,
+                    args: rewritten_args,
+                })
+            }
+        }
+
+        // EXISTS/NOT EXISTS makes no sense in HAVING expressions
+        E::Exists { .. } => Err(ParseError::InvalidFilter(
+            "EXISTS/NOT EXISTS not supported in HAVING expressions".to_string(),
+        )),
+    }
+}
+
+/// Parse reasoning mode(s) from query options
+///
+/// Supports:
+/// - `"reasoning": "none"` - disable all reasoning
+/// - `"reasoning": "rdfs"` - RDFS only
+/// - `"reasoning": "owl2ql"` - OWL2-QL (implies RDFS)
+/// - `"reasoning": ["rdfs", "owl2ql"]` - multiple modes
+/// - `"rules": [...]` - query-time datalog rules (enables datalog automatically)
+/// - No key present - no reasoning (reasoning is opt-in)
+///
+/// These keys are canonical at the **top level** of the query object, and are
+/// also accepted inside `opts` as an alias. The top level wins key by key: a
+/// key it carries is read from there, and `opts` supplies the rest.
+///
+/// # Example
+///
+/// ```json
+/// { "reasoning": "rdfs" }
+/// ```
+///
+/// or
+///
+/// ```json
+/// { "rules": [...datalog rules...] }
+/// ```
+///
+/// or, equivalently,
+///
+/// ```json
+/// { "opts": { "reasoning": "rdfs" } }
+/// ```
+pub fn parse_reasoning(
+    obj: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<crate::ir::ReasoningModes>> {
+    // Each key comes from the top level when it is there, else from `opts`,
+    // so a request reads as if every key were written at the top level. A
+    // modifier at the top level (`reasoningBudget`, `reasoningTime`) beside a
+    // mode in `opts` runs that mode under it; letting any top-level key make
+    // the top level the only source dropped the `opts` mode in silence
+    // (fluree/db#1883). A budget or time alone enables no mode, but it is
+    // still carried, so a ledger-config default mode runs under it.
+    //
+    // `opts` is accepted because users reasonably guess that query-level knobs
+    // live there, since several genuinely do (`objectVarParsing`,
+    // `includeSystemFacts`, `t`, `maxFuel`, ...), and
+    // `{"opts": {"reasoning": "datalog"}}` used to be silently ignored: no
+    // error, no reasoning, an empty result set (fluree/db#1863).
+    //
+    // Honoring it grants no privilege a top-level key does not already grant —
+    // ledger-config override control is applied downstream to the *parsed*
+    // modes (`config_resolver::merge_reasoning` -> `effective_reasoning`),
+    // where `Force` wins over a query-supplied mode whatever its source.
+    // Rejecting unknown `opts` keys instead is not viable: `opts` is a
+    // deliberately open bag, and the server injects into it (`identity`,
+    // `policy-values`, `policyClass`), so a whitelist would break forward
+    // compatibility with its own writers.
+    let opts = obj.get("opts").and_then(JsonValue::as_object);
+    let from_opts: Vec<(&str, &JsonValue)> = REASONING_KEYS
+        .iter()
+        .filter(|key| !obj.contains_key(**key))
+        .filter_map(|&key| Some((key, opts?.get(key)?)))
+        .collect();
+    if from_opts.is_empty() {
+        if REASONING_KEYS.iter().any(|key| obj.contains_key(*key)) {
+            return reasoning_from(obj);
+        }
+        return Ok(None);
+    }
+    let mut merged = obj.clone();
+    for (key, value) in from_opts {
+        merged.insert(key.to_string(), value.clone());
+    }
+    reasoning_from(&merged)
+}
+
+/// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
+/// the top level of the query object; also accepted inside `opts`.
+const REASONING_KEYS: &[&str] = &[
+    "reasoning",
+    "rules",
+    "ontology",
+    "reasoningBudget",
+    "reasoningTime",
+];
+
+fn reasoning_from(
+    obj: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<crate::ir::ReasoningModes>> {
+    // Reconstruct the query object for from_query_json
+    let query_obj = JsonValue::Object(obj.clone());
+    crate::ir::ReasoningModes::from_query_json(&query_obj)
+        .map(Some)
+        .map_err(|e| ParseError::InvalidOption(format!("reasoning: {e}")))
+}
+
+/// Parse all query options from JSON
+///
+/// Note: `aggregates` field is populated by `parse_select` from S-expression syntax,
+/// not from a separate "aggregates" key.
+///
+/// # Example
+///
+/// ```json
+/// {
+///   "limit": 10,
+///   "offset": 5,
+///   "distinct": true,
+///   "orderBy": ["?x"],
+///   "groupBy": ["?category"]
+/// }
+/// ```
+pub fn parse_options(
+    obj: &serde_json::Map<String, JsonValue>,
+    parse_filter_expr: impl Fn(&JsonValue) -> Result<UnresolvedExpression>,
+) -> Result<UnresolvedOptions> {
+    let (having, having_aggs) = parse_having_with_aggregates(obj, &parse_filter_expr)?;
+    Ok(UnresolvedOptions {
+        limit: parse_limit(obj)?,
+        offset: parse_offset(obj)?,
+        distinct: parse_distinct(obj),
+        order_by: parse_order_by(obj)?,
+        group_by: parse_group_by(obj)?,
+        aggregates: having_aggs, // will be merged with aggregates from select clause
+        having,
+        reasoning: parse_reasoning(obj)?,
+        object_var_parsing: parse_object_var_parsing(obj),
+        include_system_facts: parse_include_system_facts(obj),
+        union_default_graph: parse_union_default_graph(obj)?,
+    })
+}
+
+pub fn parse_object_var_parsing(obj: &serde_json::Map<String, JsonValue>) -> bool {
+    if let Some(opts) = obj.get("opts").and_then(|v| v.as_object()) {
+        if let Some(flag) = opts.get("objectVarParsing") {
+            return flag.as_bool().unwrap_or(true);
+        }
+    }
+    obj.get("objectVarParsing")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Parse `opts.includeSystemFacts: true` from the top-level query
+/// object. Defaults to `false`.
+///
+/// **Scope:** the flag only relaxes the **variable-predicate** scan
+/// filter — i.e. patterns like `{"@id": "?ann", "?p": "?o"}`. Direct
+/// user mention of `f:reifies*` IRIs is rejected at parse time
+/// regardless of the flag (see
+/// `parse::reject_user_authored_reifies_in_query`); the rejection is
+/// the contract-level boundary because the only legitimate way for a
+/// triple naming `f:reifies*` to enter the pattern stream is via the
+/// `expand_edge_annotation_patterns` IR rewrite. Allowing direct
+/// mention even under the flag would let `BinaryScanOperator`'s
+/// bound-predicate fast path scan the system arenas without the
+/// JSON-LD/SPARQL syntactic envelope.
+///
+/// History-range queries surface `f:reifies*` events through a
+/// separate operator path (`BinaryHistoryScanOperator` → inner scan
+/// with `mode == TemporalMode::History`) and don't need the flag.
+pub fn parse_include_system_facts(obj: &serde_json::Map<String, JsonValue>) -> bool {
+    let opts = match obj.get("opts").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return false,
+    };
+    opts.get("includeSystemFacts")
+        .or_else(|| opts.get("include_system_facts"))
+        .or_else(|| opts.get("include-system-facts"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Parse `opts.unionDefaultGraph` from the top-level query object: the
+/// request's own union default graph switch, `None` when absent. A value that
+/// is not a boolean is an error, never a silently ignored option.
+pub fn parse_union_default_graph(obj: &serde_json::Map<String, JsonValue>) -> Result<Option<bool>> {
+    let Some(opts) = obj.get("opts").and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+    let Some(value) = opts.get("unionDefaultGraph") else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        ParseError::InvalidOption(format!(
+            "opts.unionDefaultGraph must be true or false, got {value}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn union_default_graph_opt() {
+        let parse = |v: JsonValue| parse_union_default_graph(v.as_object().unwrap());
+        assert_eq!(parse(json!({})).unwrap(), None);
+        assert_eq!(parse(json!({"opts": {}})).unwrap(), None);
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": true}})).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": false}})).unwrap(),
+            Some(false)
+        );
+        let err = parse(json!({"opts": {"unionDefaultGraph": "yes"}})).unwrap_err();
+        assert!(err.to_string().contains("unionDefaultGraph"), "{err}");
+    }
+
+    fn reasoning_of(v: &JsonValue) -> Option<crate::ir::ReasoningModes> {
+        parse_reasoning(v.as_object().unwrap()).unwrap()
+    }
+
+    /// `{"opts": {"reasoning": ...}}` used to be silently ignored: no error,
+    /// no reasoning, an empty result set (fluree/db#1863).
+    #[test]
+    fn reasoning_accepted_inside_opts() {
+        let modes = reasoning_of(&json!({"opts": {"reasoning": "datalog"}}))
+            .expect("opts.reasoning must enable reasoning");
+        assert!(modes.datalog, "expected datalog mode, got {modes:?}");
+    }
+
+    #[test]
+    fn reasoning_top_level_still_wins_over_opts() {
+        let modes = reasoning_of(&json!({
+            "reasoning": "datalog",
+            "opts": {"reasoning": "owl2rl"}
+        }))
+        .expect("top-level reasoning must enable reasoning");
+        assert!(modes.datalog, "top level should win, got {modes:?}");
+        assert!(!modes.owl2rl, "opts must not be consulted, got {modes:?}");
+    }
+
+    /// `opts` supplies every key the top level leaves out, so a top-level
+    /// modifier beside an `opts` mode runs that mode under it (fluree/db#1883).
+    #[test]
+    fn opts_fills_keys_the_top_level_omits() {
+        let modes = reasoning_of(&json!({
+            "rules": [],
+            "opts": {"reasoning": "owl2rl"}
+        }))
+        .expect("a top-level rules key is a reasoning key");
+        assert!(modes.owl2rl, "opts.reasoning must apply, got {modes:?}");
+
+        let modes = reasoning_of(&json!({
+            "reasoningBudget": {"maxFacts": 42},
+            "opts": {"reasoning": "datalog"}
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog, "opts.reasoning must apply, got {modes:?}");
+        assert_eq!(modes.max_facts, Some(42));
+
+        let modes = reasoning_of(&json!({
+            "reasoningTime": "2026-01-01T00:00:00Z",
+            "opts": {"reasoning": "datalog"}
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog, "opts.reasoning must apply, got {modes:?}");
+        assert!(modes.evaluation_time.is_some(), "time dropped: {modes:?}");
+    }
+
+    /// A key both carry is read from the top level; the others still come
+    /// from `opts`.
+    #[test]
+    fn the_top_level_wins_key_by_key() {
+        let modes = reasoning_of(&json!({
+            "reasoning": "datalog",
+            "reasoningBudget": {"maxFacts": 1},
+            "opts": {
+                "reasoning": "owl2rl",
+                "reasoningBudget": {"maxFacts": 2},
+                "reasoningTime": "2026-01-01T00:00:00Z"
+            }
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog && !modes.owl2rl, "got {modes:?}");
+        assert_eq!(modes.max_facts, Some(1));
+        assert!(modes.evaluation_time.is_some(), "time dropped: {modes:?}");
+    }
+
+    #[test]
+    fn rules_and_ontology_and_budget_also_aliased_in_opts() {
+        let modes = reasoning_of(&json!({
+            "opts": {"rules": [{"where": {}, "insert": {}}]}
+        }))
+        .expect("opts.rules must enable datalog");
+        assert!(modes.datalog, "rules should enable datalog, got {modes:?}");
+
+        let modes = reasoning_of(&json!({
+            "opts": {"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": 42}}
+        }))
+        .expect("opts.reasoningBudget must be carried");
+        assert_eq!(modes.max_facts, Some(42));
+
+        let modes = reasoning_of(&json!({
+            "opts": {"reasoning": "rdfs", "ontology": {"@graph": []}}
+        }))
+        .expect("opts.ontology must be carried");
+        assert!(modes.ontology.is_some(), "ontology dropped: {modes:?}");
+    }
+
+    #[test]
+    fn unrelated_opts_keys_do_not_enable_reasoning() {
+        assert!(reasoning_of(&json!({"opts": {"identity": "did:key:z6Mk"}})).is_none());
+        assert!(reasoning_of(&json!({"opts": {}})).is_none());
+        assert!(reasoning_of(&json!({"opts": null})).is_none());
+        assert!(reasoning_of(&json!({})).is_none());
+    }
+
+    /// A malformed value inside `opts` must surface the same error a
+    /// malformed top-level value does, not be quietly dropped.
+    #[test]
+    fn malformed_reasoning_in_opts_errors() {
+        let v = json!({"opts": {"rules": "not-an-array"}});
+        assert!(parse_reasoning(v.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_parse_limit() {
+        let json_val = json!({"limit": 100});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_limit(obj).unwrap(), Some(100));
+
+        let json_val = json!({});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_limit(obj).unwrap(), None);
+
+        let json_val = json!({"limit": -1});
+        let obj = json_val.as_object().unwrap();
+        assert!(parse_limit(obj).is_err());
+    }
+
+    #[test]
+    fn test_parse_offset() {
+        let json_val = json!({"offset": 50});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_offset(obj).unwrap(), Some(50));
+
+        let json_val = json!({});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_offset(obj).unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_distinct() {
+        let json_val = json!({"distinct": true});
+        let obj = json_val.as_object().unwrap();
+        assert!(parse_distinct(obj));
+
+        let json_val = json!({"selectDistinct": true});
+        let obj = json_val.as_object().unwrap();
+        assert!(parse_distinct(obj));
+
+        let json_val = json!({});
+        let obj = json_val.as_object().unwrap();
+        assert!(!parse_distinct(obj));
+    }
+
+    #[test]
+    fn test_parse_order_by_single_var() {
+        let json_val = json!({"orderBy": "?x"});
+        let obj = json_val.as_object().unwrap();
+        let specs = parse_order_by(obj).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].var.as_ref(), "?x");
+        assert_eq!(specs[0].direction, UnresolvedSortDirection::Asc);
+    }
+
+    #[test]
+    fn test_parse_order_by_edn_string() {
+        let json_val = json!({"orderBy": "(desc ?y)"});
+        let obj = json_val.as_object().unwrap();
+        let specs = parse_order_by(obj).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].var.as_ref(), "?y");
+        assert_eq!(specs[0].direction, UnresolvedSortDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_sparql_form() {
+        let json_val = json!({"orderBy": [["asc", "?x"], ["desc", "?y"]]});
+        let obj = json_val.as_object().unwrap();
+        let specs = parse_order_by(obj).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].direction, UnresolvedSortDirection::Asc);
+        assert_eq!(specs[1].direction, UnresolvedSortDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_object_form() {
+        let json_val = json!({
+            "orderBy": {"var": "?x", "direction": "desc"}
+        });
+        let obj = json_val.as_object().unwrap();
+        let specs = parse_order_by(obj).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].var.as_ref(), "?x");
+        assert_eq!(specs[0].direction, UnresolvedSortDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_expression_names_the_alias_route() {
+        // An expression or aggregate where a variable belongs gets the message
+        // that says how to sort on one, in every term form.
+        for val in [
+            json!("(desc (count ?e))"),
+            json!(["(desc (count ?e))"]),
+            json!([["desc", "(count ?e)"]]),
+            json!([{"var": "(count ?e)", "direction": "desc"}]),
+        ] {
+            let obj = json!({ "orderBy": val });
+            let err = parse_order_by(obj.as_object().unwrap()).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidOrderBy), "{val}: {err:?}");
+            assert!(
+                err.to_string().contains("select it under an alias"),
+                "{val}: {err}"
+            );
+        }
+        // A bare word is still a malformed variable.
+        let obj = json!({ "orderBy": ["name"] });
+        assert!(matches!(
+            parse_order_by(obj.as_object().unwrap()).unwrap_err(),
+            ParseError::InvalidVariable(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_order_by_mixed_forms() {
+        let json_val = json!({
+            "orderBy": ["?x", "(desc ?y)", ["asc", "?z"]]
+        });
+        let obj = json_val.as_object().unwrap();
+        let specs = parse_order_by(obj).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].direction, UnresolvedSortDirection::Asc);
+        assert_eq!(specs[1].direction, UnresolvedSortDirection::Desc);
+        assert_eq!(specs[2].direction, UnresolvedSortDirection::Asc);
+    }
+
+    #[test]
+    fn test_parse_group_by() {
+        let json_val = json!({"groupBy": ["?x", "?y"]});
+        let obj = json_val.as_object().unwrap();
+        let vars = parse_group_by(obj).unwrap();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].as_ref(), "?x");
+        assert_eq!(vars[1].as_ref(), "?y");
+    }
+
+    #[test]
+    fn test_parse_group_by_invalid_var() {
+        let json_val = json!({"groupBy": ["x"]}); // Missing '?'
+        let obj = json_val.as_object().unwrap();
+        assert!(parse_group_by(obj).is_err());
+    }
+
+    #[test]
+    fn test_parse_depth() {
+        let json_val = json!({"depth": 3});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_depth(obj).unwrap(), 3);
+
+        let json_val = json!({});
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(parse_depth(obj).unwrap(), 0);
+
+        let json_val = json!({"depth": -1});
+        let obj = json_val.as_object().unwrap();
+        assert!(parse_depth(obj).is_err());
+    }
+}

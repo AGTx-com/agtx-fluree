@@ -1,0 +1,140 @@
+//! Iceberg REST catalog support for Fluree DB graph sources.
+//!
+//! This crate provides Iceberg table access via REST catalogs (primarily Polaris),
+//! including authentication, vended credentials, metadata loading, and data scanning.
+//!
+//! # Features
+//!
+//! - `aws` - Enables AWS SDK integration (S3 storage + credential provider) and
+//!   the Send Parquet reader used by the query engine.
+//!
+//! # Architecture
+//!
+//! The crate is organized into several modules:
+//!
+//! - [`auth`] - Authentication providers (bearer tokens, OAuth2 client credentials,
+//!   Google identities)
+//! - [`host_identity`] - The operator's policy for host-derived identities
+//! - [`catalog`] - REST catalog client for table discovery and metadata location
+//! - [`credential`] - Vended credentials handling and caching
+//! - [`metadata`] - Iceberg table metadata parsing and snapshot selection
+//! - [`config`] - Graph source configuration schemas for nameservice integration
+//! - [`manifest`] - Manifest list and manifest file parsing (Avro format)
+//! - [`scan`] - Scan planning with partition/file pruning
+//! - [`io`] - Storage abstraction and Parquet reading
+//!
+//! # Example
+//!
+//! ```ignore
+//! use fluree_db_iceberg::{
+//!     auth::{AuthConfig, BearerTokenAuth},
+//!     catalog::{RestCatalogClient, RestCatalogConfig, CatalogClient},
+//!     config::IcebergGsConfig,
+//!     scan::{ScanConfig, ScanPlanner},
+//! };
+//!
+//! // Create a catalog client with bearer token auth
+//! let config = RestCatalogConfig {
+//!     uri: "https://polaris.example.com".to_string(),
+//!     ..Default::default()
+//! };
+//! let auth = BearerTokenAuth::new("my-token".to_string());
+//! let client = RestCatalogClient::new(config, Arc::new(auth))?;
+//!
+//! // Load table metadata
+//! let table_id = parse_table_identifier("openflights.airlines")?;
+//! let response = client.load_table(&table_id, true).await?;
+//!
+//! // Plan a scan with projection and filter
+//! let scan_config = ScanConfig::new()
+//!     .with_projection(vec![1, 2])  // field IDs
+//!     .with_filter(Expression::gt(1, "id", LiteralValue::Int64(100)));
+//! let planner = ScanPlanner::new(&storage, &metadata, scan_config);
+//! let plan = planner.plan_scan().await?;
+//! ```
+
+pub mod auth;
+pub mod catalog;
+pub mod config;
+pub mod config_value;
+pub mod credential;
+pub mod error;
+pub mod host_identity;
+pub mod io;
+pub mod local_guard;
+pub mod manifest;
+pub mod metadata;
+pub mod mor_guard;
+pub mod net;
+pub(crate) mod renew;
+pub mod scan;
+pub mod stats;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+/// Read an on/off environment switch that defaults to **on** — only `0`, `false`,
+/// `off`, or `no` (trimmed, case-insensitive) disable it. This is the crate-local
+/// twin of `fluree-db-query`'s `r2rml::env_switch_enabled` (id=3717339924): the two
+/// crates can't share the symbol (fluree-db-query depends on fluree-db-iceberg, not
+/// the reverse), so the falsy-spelling set is duplicated here ONCE, and the crate's
+/// kill switches call this instead of each hand-rolling the same match. Call sites
+/// cache the result in a per-switch `OnceLock` — set switches at process startup.
+#[cfg(feature = "aws")]
+pub(crate) fn env_switch_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+// Re-export commonly used types
+#[cfg(feature = "aws")]
+pub use auth::{AwsCredentials, AwsSubjectCredentials};
+pub use auth::{GoogleCredentials, IdentityContext};
+pub use config::{
+    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, StorageAuth,
+    TableConfig,
+};
+pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
+pub use error::{GoogleTokenStage, IcebergError, Result};
+pub use host_identity::{
+    HostIdentityKind, HostIdentityPolicy, AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
+};
+pub use local_guard::{
+    ensure_local_location_allowed, is_local_location, local_roots, resolve_local_path,
+    LOCAL_ROOTS_ENV,
+};
+pub use mor_guard::{
+    ensure_no_delete_manifests, ensure_no_summary_deletes, mor_deletes_allowed,
+    summary_indicates_deletes, ALLOW_MOR_DELETES_ENV,
+};
+
+// Re-export Phase 2 types for convenience
+pub use io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType, IcebergStorage};
+pub use manifest::{DataFile, ManifestContent, ManifestEntry, ManifestListEntry, TypedValue};
+pub use scan::{
+    ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan, ScanPlanner,
+};
+pub use stats::{
+    aggregate_column_stats, read_snapshot_data_files, typed_value_to_json, AggregatedColumnStats,
+    ManifestListTotals, TableStatsAggregation,
+};
+
+// AWS/Send-safe types
+#[cfg(feature = "aws")]
+pub use catalog::SendDirectCatalogClient;
+/// Re-export of the shared on-disk blob cache (one global budget across Fluree's
+/// own object storage and Iceberg). The provider builds one per cache directory
+/// and threads it into the Parquet readers.
+#[cfg(feature = "aws")]
+pub use fluree_db_core::disk_cache::DiskArtifactCache;
+#[cfg(feature = "aws")]
+pub use io::{
+    GcsIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
+    SendParquetReader, StorageScope,
+};
+#[cfg(feature = "aws")]
+pub use scan::SendScanPlanner;

@@ -1,0 +1,1349 @@
+//! Integration tests for deep tracing span instrumentation.
+//!
+//! Verifies that queries, transactions, and commits produce the expected
+//! span hierarchy with correct names, levels, and parent-child relationships.
+//!
+//! These tests programmatically verify what the OTEL/Jaeger harness validates
+//! visually — they are the automated acceptance criteria for Phases 1-5.
+//!
+//! All tests use `current_thread` tokio flavor to ensure the thread-local
+//! `set_default()` subscriber captures spans from all async work.
+
+use crate::support;
+use crate::support::span_capture;
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
+
+/// Seed a small dataset and return the ledger state.
+async fn seed_people(fluree: &support::MemoryFluree, ledger_id: &str) -> support::MemoryLedger {
+    let ledger0 = support::genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "@type": "ex:User",
+                "schema:name": "Alice",
+                "schema:age": 30
+            },
+            {
+                "@id": "ex:bob",
+                "@type": "ex:User",
+                "schema:name": "Bob",
+                "schema:age": 25
+            }
+        ]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed insert")
+        .ledger
+}
+
+// =============================================================================
+// AC-1: Query waterfall — verify query preparation and execution spans
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac1_fql_query_waterfall() {
+    let (_store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac1-jsonld:main").await;
+
+    // Clear seeding spans by creating a fresh store (re-init tracing)
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "select": ["?name"],
+        "where": {
+            "@id": "?s",
+            "@type": "ex:User",
+            "schema:name": "?name"
+        }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query).await;
+    assert!(result.is_ok(), "query should succeed: {:?}", result.err());
+
+    // Verify query preparation hierarchy exists
+    assert!(
+        store.has_span("query_prepare"),
+        "query_prepare span should exist. Captured spans: {:?}",
+        store.span_names()
+    );
+    assert!(
+        store.has_span("reasoning_prep"),
+        "reasoning_prep span should exist"
+    );
+    assert!(
+        store.has_span("pattern_rewrite"),
+        "pattern_rewrite span should exist"
+    );
+    assert!(store.has_span("plan"), "plan span should exist");
+    assert!(store.has_span("query_run"), "query_run span should exist");
+
+    // Verify levels
+    let qp = store.find_span("query_prepare").unwrap();
+    assert_eq!(
+        qp.level,
+        tracing::Level::DEBUG,
+        "query_prepare should be DEBUG"
+    );
+
+    let rp = store.find_span("reasoning_prep").unwrap();
+    assert_eq!(
+        rp.level,
+        tracing::Level::DEBUG,
+        "reasoning_prep should be DEBUG"
+    );
+
+    let pr = store.find_span("pattern_rewrite").unwrap();
+    assert_eq!(
+        pr.level,
+        tracing::Level::DEBUG,
+        "pattern_rewrite should be DEBUG"
+    );
+
+    let plan = store.find_span("plan").unwrap();
+    assert_eq!(plan.level, tracing::Level::DEBUG, "plan should be DEBUG");
+
+    let qr = store.find_span("query_run").unwrap();
+    assert_eq!(qr.level, tracing::Level::DEBUG, "query_run should be DEBUG");
+
+    // Verify parent-child: reasoning_prep should be child of query_prepare
+    assert_eq!(
+        rp.parent_name.as_deref(),
+        Some("query_prepare"),
+        "reasoning_prep should be child of query_prepare"
+    );
+
+    // pattern_rewrite should be child of query_prepare
+    assert_eq!(
+        pr.parent_name.as_deref(),
+        Some("query_prepare"),
+        "pattern_rewrite should be child of query_prepare"
+    );
+
+    // plan should be child of query_prepare
+    assert_eq!(
+        plan.parent_name.as_deref(),
+        Some("query_prepare"),
+        "plan should be child of query_prepare"
+    );
+
+    // Verify deferred fields on pattern_rewrite
+    assert!(
+        pr.fields.contains_key("patterns_before"),
+        "pattern_rewrite should have patterns_before field"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac1_sparql_query_waterfall() {
+    let (_store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac1-sparql:main").await;
+
+    // Re-init tracing to capture only query spans
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?name WHERE {
+            ?s a ex:User .
+            ?s schema:name ?name .
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, sparql).await;
+    assert!(
+        result.is_ok(),
+        "SPARQL query should succeed: {:?}",
+        result.err()
+    );
+
+    // Same hierarchy as JSON-LD — execution path is shared
+    assert!(
+        store.has_span("query_prepare"),
+        "query_prepare span should exist"
+    );
+    assert!(
+        store.has_span("reasoning_prep"),
+        "reasoning_prep span should exist"
+    );
+    assert!(
+        store.has_span("pattern_rewrite"),
+        "pattern_rewrite span should exist"
+    );
+    assert!(store.has_span("plan"), "plan span should exist");
+    assert!(store.has_span("query_run"), "query_run span should exist");
+}
+
+// =============================================================================
+// AC-2a: Insert waterfall — verify staging and commit spans
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac2a_insert_waterfall() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac2a:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [{
+            "@id": "ex:alice",
+            "@type": "ex:User",
+            "schema:name": "Alice"
+        }]
+    });
+
+    let result = fluree.insert(ledger0, &insert).await;
+    assert!(result.is_ok(), "insert should succeed: {:?}", result.err());
+
+    // Verify staging spans
+    assert!(
+        store.has_span("txn_stage"),
+        "txn_stage span should exist. Captured spans: {:?}",
+        store.span_names()
+    );
+
+    let stage = store.find_span("txn_stage").unwrap();
+    assert_eq!(
+        stage.level,
+        tracing::Level::DEBUG,
+        "txn_stage should be DEBUG"
+    );
+
+    // Insert should produce insert_gen and cancellation sub-spans
+    assert!(store.has_span("insert_gen"), "insert_gen span should exist");
+    assert!(
+        store.has_span("cancellation"),
+        "cancellation span should exist"
+    );
+
+    // Verify staging sub-span levels
+    let ig = store.find_span("insert_gen").unwrap();
+    assert_eq!(
+        ig.level,
+        tracing::Level::DEBUG,
+        "insert_gen should be DEBUG"
+    );
+
+    // Verify parent-child relationships.
+    //
+    // Post streaming-WHERE refactor, `insert_gen` is emitted per-batch
+    // inside the `where_exec` loop (was previously a sibling of `where_exec`
+    // under `txn_stage` in the eager path). `cancellation` stays a direct
+    // child of `txn_stage` since it runs after the WHERE stream closes.
+    assert_eq!(
+        ig.parent_name.as_deref(),
+        Some("where_exec"),
+        "insert_gen should be child of where_exec (per-batch emission)"
+    );
+
+    let cancel = store.find_span("cancellation").unwrap();
+    assert_eq!(
+        cancel.parent_name.as_deref(),
+        Some("txn_stage"),
+        "cancellation should be child of txn_stage"
+    );
+
+    // Verify commit hierarchy
+    assert!(store.has_span("txn_commit"), "txn_commit span should exist");
+
+    let commit = store.find_span("txn_commit").unwrap();
+    assert_eq!(
+        commit.level,
+        tracing::Level::DEBUG,
+        "txn_commit should be DEBUG"
+    );
+
+    // Verify commit sub-spans exist (key I/O phases)
+    assert!(
+        store.has_span("commit_nameservice_lookup"),
+        "commit_nameservice_lookup should exist"
+    );
+    assert!(
+        store.has_span("commit_verify_sequencing"),
+        "commit_verify_sequencing should exist"
+    );
+    assert!(
+        store.has_span("commit_apply_to_novelty"),
+        "commit_apply_to_novelty should exist"
+    );
+
+    // Verify commit sub-spans are children of txn_commit
+    let ns_lookup = store.find_span("commit_nameservice_lookup").unwrap();
+    assert_eq!(
+        ns_lookup.parent_name.as_deref(),
+        Some("txn_commit"),
+        "commit_nameservice_lookup should be child of txn_commit"
+    );
+}
+
+// =============================================================================
+// AC-2b: Update waterfall — verify WHERE + DELETE + INSERT staging
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac2b_update_waterfall() {
+    let (_store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac2b:main").await;
+
+    // Re-init to capture only update spans
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let update = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "where": {
+            "@id": "?s",
+            "schema:name": "Alice"
+        },
+        "delete": {
+            "@id": "?s",
+            "schema:age": "?any"
+        },
+        "insert": {
+            "@id": "?s",
+            "schema:age": 31
+        }
+    });
+
+    let result = fluree.update(ledger, &update).await;
+    assert!(result.is_ok(), "update should succeed: {:?}", result.err());
+
+    // Verify full staging hierarchy for updates
+    assert!(
+        store.has_span("txn_stage"),
+        "txn_stage should exist. Captured spans: {:?}",
+        store.span_names()
+    );
+
+    // Updates should produce WHERE execution span
+    assert!(
+        store.has_span("where_exec"),
+        "where_exec span should exist for updates"
+    );
+
+    let we = store.find_span("where_exec").unwrap();
+    assert_eq!(
+        we.level,
+        tracing::Level::DEBUG,
+        "where_exec should be DEBUG"
+    );
+    assert_eq!(
+        we.parent_name.as_deref(),
+        Some("txn_stage"),
+        "where_exec should be child of txn_stage"
+    );
+
+    // Updates should produce delete_gen span
+    assert!(
+        store.has_span("delete_gen"),
+        "delete_gen span should exist for updates"
+    );
+
+    let dg = store.find_span("delete_gen").unwrap();
+    assert_eq!(
+        dg.level,
+        tracing::Level::DEBUG,
+        "delete_gen should be DEBUG"
+    );
+    // Post streaming-WHERE refactor, `delete_gen` is emitted per-batch
+    // inside the `where_exec` loop.
+    assert_eq!(
+        dg.parent_name.as_deref(),
+        Some("where_exec"),
+        "delete_gen should be child of where_exec (per-batch emission)"
+    );
+
+    // And insert_gen + cancellation
+    assert!(store.has_span("insert_gen"), "insert_gen should exist");
+    assert!(store.has_span("cancellation"), "cancellation should exist");
+
+    // Verify deferred fields on staging spans
+    let we = store.find_span("where_exec").unwrap();
+    assert!(
+        we.fields.contains_key("pattern_count"),
+        "where_exec should have pattern_count field"
+    );
+
+    let ig = store.find_span("insert_gen").unwrap();
+    assert!(
+        ig.fields.contains_key("template_count"),
+        "insert_gen should have template_count field"
+    );
+}
+
+// =============================================================================
+// AC-5: Zero noise at INFO — no debug/trace spans at production default
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac5_zero_noise_at_info() {
+    let (store, _guard) = span_capture::init_info_only_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac5:main").await;
+
+    // Run a query
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "select": ["?name"],
+        "where": {
+            "@id": "?s",
+            "@type": "ex:User",
+            "schema:name": "?name"
+        }
+    });
+    let _ = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    // Verify: no debug or trace spans captured
+    let debug_spans = store.debug_spans();
+    assert!(
+        debug_spans.is_empty(),
+        "At INFO level, no debug spans should be captured. Found: {:?}",
+        debug_spans.iter().map(|s| s.name).collect::<Vec<_>>()
+    );
+
+    let trace_spans = store.trace_spans();
+    assert!(
+        trace_spans.is_empty(),
+        "At INFO level, no trace spans should be captured. Found: {:?}",
+        trace_spans.iter().map(|s| s.name).collect::<Vec<_>>()
+    );
+
+    // All operation spans are now debug_span!, so at INFO level the API layer
+    // should produce ZERO spans. This validates the true zero-overhead guarantee:
+    // without otel or debug logging, no span metadata is allocated.
+    let all_spans = store.span_names();
+    assert!(
+        all_spans.is_empty(),
+        "At INFO level, zero spans should be captured from the API layer (all are debug_span!). Found: {all_spans:?}"
+    );
+}
+
+// =============================================================================
+// AC-3: Deferred field recording — verify fields are populated after creation
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac3_deferred_fields_recorded() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac3:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:User", "schema:name": "Alice"},
+            {"@id": "ex:bob", "@type": "ex:User", "schema:name": "Bob"}
+        ]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert should succeed");
+
+    // Verify insert_gen has deferred assertion_count recorded
+    let ig = store
+        .find_span("insert_gen")
+        .expect("insert_gen should exist");
+    assert!(
+        ig.fields.contains_key("assertion_count"),
+        "insert_gen should have assertion_count deferred field recorded. Fields: {:?}",
+        ig.fields
+    );
+
+    // The assertion count should be > 0 (we inserted two entities with type + name)
+    let count: u64 = ig
+        .fields
+        .get("assertion_count")
+        .unwrap()
+        .parse()
+        .expect("assertion_count should be a u64");
+    assert!(count > 0, "assertion_count should be > 0, got {count}");
+
+    // Verify pattern_rewrite has patterns_after deferred field recorded
+    // (patterns_after is set via Span::current().record())
+    // Note: pattern_rewrite only happens during queries, not during inserts.
+    // We'll verify it in the query path.
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let ledger = fluree
+        .insert(support::genesis_ledger(&fluree, "ac3b:main"), &insert)
+        .await
+        .unwrap()
+        .ledger;
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "select": ["?name"],
+        "where": {
+            "@id": "?s",
+            "@type": "ex:User",
+            "schema:name": "?name"
+        }
+    });
+
+    support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    let pr = store
+        .find_span("pattern_rewrite")
+        .expect("pattern_rewrite should exist");
+    assert!(
+        pr.fields.contains_key("patterns_before"),
+        "pattern_rewrite should have patterns_before. Fields: {:?}",
+        pr.fields
+    );
+}
+
+// =============================================================================
+// AC-4: Commit sub-span hierarchy — verify all I/O phases
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn ac4_commit_subspan_hierarchy() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac4:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [{
+            "@id": "ex:alice",
+            "@type": "ex:User",
+            "schema:name": "Alice"
+        }]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert should succeed");
+
+    // All commit sub-spans should be children of txn_commit
+    let expected_commit_children = [
+        "commit_nameservice_lookup",
+        "commit_verify_sequencing",
+        "commit_namespace_delta",
+        "commit_build_record",
+        "commit_generate_metadata_flakes",
+        "commit_apply_to_novelty",
+    ];
+
+    for &child_name in &expected_commit_children {
+        let child = store.find_span(child_name);
+        assert!(
+            child.is_some(),
+            "{child_name} span should exist. Captured: {:?}",
+            store.span_names()
+        );
+        let child = child.unwrap();
+        assert_eq!(
+            child.level,
+            tracing::Level::DEBUG,
+            "{child_name} should be DEBUG level"
+        );
+        assert_eq!(
+            child.parent_name.as_deref(),
+            Some("txn_commit"),
+            "{child_name} should be child of txn_commit"
+        );
+    }
+}
+
+// =============================================================================
+// AC-6: Top-level operation span coverage (H-5)
+// =============================================================================
+
+/// Verify the query span hierarchy in the API layer.
+///
+/// In the API layer, the query runner emits `query_prepare` and `query_run`.
+/// There is no wrapping `query_execute` span here — that span exists only in the
+/// server route handler (and other top-level wrappers).
+///
+/// The `query_execute` span only exists in:
+/// - The server route handler (`routes/query.rs`)
+/// - The `execute()` convenience function (`execute.rs`)
+#[tokio::test(flavor = "current_thread")]
+async fn api_query_hierarchy_has_prepare_and_run_at_top() {
+    let (_store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac6-qe:main").await;
+
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "select": ["?name"],
+        "where": {
+            "@id": "?s",
+            "@type": "ex:User",
+            "schema:name": "?name"
+        }
+    });
+
+    support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    // query_prepare and query_run should exist (these are the API-layer top-level spans)
+    assert!(
+        store.has_span("query_prepare"),
+        "query_prepare should exist. Captured: {:?}",
+        store.span_names()
+    );
+    assert!(store.has_span("query_run"), "query_run should exist");
+
+    // query_execute does NOT exist in the API layer — it's a server route span
+    assert!(
+        !store.has_span("query_execute"),
+        "query_execute should NOT exist in the API layer (it wraps prepare+run in the server route only)"
+    );
+
+    // query_prepare sub-spans should be children of query_prepare
+    let rp = store.find_span("reasoning_prep").unwrap();
+    assert_eq!(rp.parent_name.as_deref(), Some("query_prepare"));
+    let pr = store.find_span("pattern_rewrite").unwrap();
+    assert_eq!(pr.parent_name.as_deref(), Some("query_prepare"));
+    let plan = store.find_span("plan").unwrap();
+    assert_eq!(plan.parent_name.as_deref(), Some("query_prepare"));
+}
+
+/// Verify the transaction span hierarchy in the API layer.
+///
+/// In the API layer, `fluree.insert()` calls `stage()` + `commit()` directly,
+/// so there is no wrapping `transact_execute` span (that only exists in the
+/// server route handler).
+#[tokio::test(flavor = "current_thread")]
+async fn api_transaction_hierarchy_has_stage_and_commit_at_top() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac6-te:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [{
+            "@id": "ex:alice",
+            "@type": "ex:User",
+            "schema:name": "Alice"
+        }]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert should succeed");
+
+    // txn_stage and txn_commit should both exist
+    assert!(store.has_span("txn_stage"), "txn_stage should exist");
+    assert!(store.has_span("txn_commit"), "txn_commit should exist");
+
+    // In the API layer, transact_execute does NOT exist (it's a server-only span)
+    assert!(
+        !store.has_span("transact_execute"),
+        "transact_execute should NOT exist in the API layer — it's a server route span only"
+    );
+}
+
+// =============================================================================
+// AC-7: Negative tests — spans do NOT cross operation boundaries (L-6)
+// =============================================================================
+
+/// Verify query spans do NOT appear in the transaction path and vice versa.
+#[tokio::test(flavor = "current_thread")]
+async fn query_spans_not_in_transaction_path() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac7-neg:main");
+
+    // Only do an insert (no query)
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [{
+            "@id": "ex:alice",
+            "@type": "ex:User",
+            "schema:name": "Alice"
+        }]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert should succeed");
+
+    // Transaction path should NOT produce query-specific spans
+    assert!(
+        !store.has_span("query_prepare"),
+        "query_prepare should NOT appear in insert path"
+    );
+    assert!(
+        !store.has_span("query_run"),
+        "query_run should NOT appear in insert path"
+    );
+    assert!(
+        !store.has_span("reasoning_prep"),
+        "reasoning_prep should NOT appear in insert path"
+    );
+    assert!(
+        !store.has_span("pattern_rewrite"),
+        "pattern_rewrite should NOT appear in insert path"
+    );
+    assert!(
+        !store.has_span("plan"),
+        "plan should NOT appear in pure insert path"
+    );
+}
+
+/// Verify transaction spans do NOT appear in the query path.
+#[tokio::test(flavor = "current_thread")]
+async fn transaction_spans_not_in_query_path() {
+    let (_store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "ac7-neg2:main").await;
+
+    // Re-init to capture only query spans
+    drop(_guard);
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    // Only do a query (no transaction)
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "select": ["?name"],
+        "where": {
+            "@id": "?s",
+            "@type": "ex:User",
+            "schema:name": "?name"
+        }
+    });
+
+    support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    // Query path should NOT produce transaction-specific spans
+    assert!(
+        !store.has_span("txn_stage"),
+        "txn_stage should NOT appear in query path"
+    );
+    assert!(
+        !store.has_span("txn_commit"),
+        "txn_commit should NOT appear in query path"
+    );
+    assert!(
+        !store.has_span("insert_gen"),
+        "insert_gen should NOT appear in query path"
+    );
+    assert!(
+        !store.has_span("delete_gen"),
+        "delete_gen should NOT appear in query path"
+    );
+    assert!(
+        !store.has_span("commit_nameservice_lookup"),
+        "commit_nameservice_lookup should NOT appear in query path"
+    );
+}
+
+// =============================================================================
+// AC-8: Span close tracking — verify spans are properly closed (L-2)
+// =============================================================================
+
+/// Verify that all captured spans are properly closed (no leaked guards).
+#[tokio::test(flavor = "current_thread")]
+async fn all_spans_properly_closed() {
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "ac8:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "@graph": [{
+            "@id": "ex:alice",
+            "@type": "ex:User",
+            "schema:name": "Alice"
+        }]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert should succeed");
+
+    // All spans should be closed — no leaked guards
+    let unclosed = store.unclosed_spans();
+    assert!(
+        unclosed.is_empty(),
+        "All spans should be closed after operation completes. Unclosed: {:?}",
+        unclosed.iter().map(|s| s.name).collect::<Vec<_>>()
+    );
+}
+
+// =============================================================================
+// Annotation read-path spans — inject_annotations + annotation_arena_lookup
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_hydration_emits_inject_annotations_span() {
+    // A subject-hydration query against an annotated edge should emit
+    // an `inject_annotations` span tagged with the chosen path
+    // (`scan` here — no arena reader on a memory ledger that hasn't
+    // been reindexed). On non-annotation ledgers the formatter's
+    // zero-cost gate skips the span entirely; that contract is
+    // covered by `ac5_zero_noise_at_info` above (any span at all
+    // would fail it on a non-annotation workload — the API layer is
+    // span-clean at INFO).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-annotations:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    // Re-init capture so only the hydration query produces spans.
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let _ = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("hydration query");
+
+    assert!(
+        store.has_span("inject_annotations"),
+        "annotation hydration must emit inject_annotations. Captured: {:?}",
+        store.span_names()
+    );
+    let inject = store
+        .find_span("inject_annotations")
+        .expect("inject_annotations recorded");
+    assert_eq!(
+        inject.level,
+        tracing::Level::DEBUG,
+        "inject_annotations must be DEBUG (per CLAUDE.md tracing convention)"
+    );
+    let path = inject
+        .fields
+        .get("path")
+        .map(String::as_str)
+        .unwrap_or("<missing>");
+    assert_eq!(
+        path, "scan",
+        "memory ledger without a sealed arena takes the scan path; got {path:?}"
+    );
+    assert!(
+        inject.fields.contains_key("annotation_count"),
+        "inject_annotations must record annotation_count: fields = {:?}",
+        inject.fields
+    );
+
+    // Without an arena reader the inner span should not fire.
+    assert!(
+        !store.has_span("annotation_arena_lookup"),
+        "annotation_arena_lookup must not fire when no arena is sealed"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
+    // Retracting a base edge that has annotations should emit a
+    // `cascade_reifies_bundle` span tagged with the cascade row
+    // count. On non-annotation ledgers the gate skips it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main");
+    let after_insert = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let _ = fluree
+        .update(
+            after_insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": { "@id": "ex:acme" }
+                }
+            }),
+        )
+        .await
+        .expect("base-edge retract");
+
+    assert!(
+        store.has_span("cascade_reifies_bundle"),
+        "annotated base-edge retract must emit cascade_reifies_bundle. Captured: {:?}",
+        store.span_names()
+    );
+    let cascade = store
+        .find_span("cascade_reifies_bundle")
+        .expect("cascade_reifies_bundle recorded");
+    assert_eq!(cascade.level, tracing::Level::DEBUG);
+    assert!(
+        cascade.fields.contains_key("cascade_count"),
+        "cascade_reifies_bundle must record cascade_count: fields = {:?}",
+        cascade.fields
+    );
+}
+
+// =============================================================================
+// AC-9: Cyclic BGP operator spans — scan / index build / prune / wedge / enumerate
+// =============================================================================
+
+/// The CyclicBgpOperator fast path must surface its open() phases as DEBUG
+/// spans under `query_run` so traces can attribute time to edge scans,
+/// relation index builds, semi-join pruning, wedge builds, and enumeration.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn ac9_cyclic_bgp_operator_spans() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig, QueryInput};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ac9/cyclic-spans:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    // Directed triangle (RefOnly mode).
+                    {"@id": "ex:n1", "ex:p1": {"@id": "ex:n2"}},
+                    {"@id": "ex:n2", "ex:p2": {"@id": "ex:n3"}},
+                    {"@id": "ex:n3", "ex:p3": {"@id": "ex:n1"}},
+                    // Mixed square (EncodedObject mode, wedge-eligible).
+                    {"@id": "ex:n40", "ex:p4": {"@id": "ex:n3"}},
+                    {"@id": "ex:n1", "ex:p5": {"@id": "ex:n40"}}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = result.ledger;
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            let (store, _guard) = span_capture::init_test_tracing();
+            let view = fluree.db(ledger_id).await.expect("load view");
+            assert!(
+                store.has_span("ledger_view_load"),
+                "ledger_view_load span should wrap view acquisition. Captured: {:?}",
+                store.span_names()
+            );
+
+            let triangle = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?c ex:p3 ?a }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(triangle))
+                .await
+                .expect("triangle query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            let square = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c ?d
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?d ex:p4 ?c . ?a ex:p5 ?d }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(square))
+                .await
+                .expect("square query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            for name in [
+                "cyclic_scan_relation",
+                "cyclic_index_build",
+                "cyclic_prune",
+                "cyclic_wedge_build",
+                "cyclic_enumerate",
+            ] {
+                assert!(
+                    store.has_span(name),
+                    "{name} span should exist. Captured spans: {:?}",
+                    store.span_names()
+                );
+                let span = store.find_span(name).unwrap();
+                assert_eq!(span.level, tracing::Level::DEBUG, "{name} should be DEBUG");
+            }
+        })
+        .await;
+}
+
+// =============================================================================
+// overlay_translate — novelty→overlay-op translation on binary scan open
+// =============================================================================
+
+/// Seed + reindex + one novelty commit against a file-backed ledger, so a
+/// query's scan open takes the binary path and runs `overlay_translate`
+/// (memory-only ledgers never open a binary cursor).
+#[cfg(feature = "native")]
+async fn seed_overlay_ledger() -> (fluree_db_api::Fluree, tempfile::TempDir) {
+    use fluree_db_api::ReindexOptions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger = fluree
+        .create_ledger("tracing-overlay:main")
+        .await
+        .expect("create");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:name": "a", "ex:tag": "t"},
+            {"@id": "ex:b", "ex:name": "b", "ex:tag": "t"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &insert).await.expect("seed").ledger;
+    fluree
+        .reindex("tracing-overlay:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let update = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where":  {"@id": "ex:a", "ex:name": "?n"},
+        "delete": {"@id": "ex:a", "ex:name": "?n"},
+        "insert": {"@id": "ex:a", "ex:name": "a2"}
+    });
+    fluree
+        .update(ledger, &update)
+        .await
+        .expect("novelty commit");
+    (fluree, dir)
+}
+
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn overlay_translate_span_emits_at_debug_with_fields() {
+    use fluree_db_api::QueryInput;
+
+    let (fluree, _dir) = seed_overlay_ledger().await;
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let view = fluree.db("tracing-overlay:main").await.expect("view");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?p", "?o"],
+        "where": {"@id": "ex:a", "?p": "?o"}
+    });
+    fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+
+    let span = store
+        .find_span("overlay_translate")
+        .expect("overlay_translate span should be emitted on a novelty-backed binary scan");
+    assert_eq!(span.level, tracing::Level::DEBUG);
+    assert!(
+        span.fields.contains_key("bounded"),
+        "fields: {:?}",
+        span.fields
+    );
+    assert!(
+        span.fields.contains_key("cache_hit"),
+        "deferred cache_hit field missing: {:?}",
+        span.fields
+    );
+    assert!(
+        span.fields.contains_key("ops_len"),
+        "deferred ops_len field missing: {:?}",
+        span.fields
+    );
+}
+
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn overlay_translate_not_visible_at_info() {
+    use fluree_db_api::QueryInput;
+
+    let (fluree, _dir) = seed_overlay_ledger().await;
+    let (store, _guard) = span_capture::init_info_only_tracing();
+
+    let view = fluree.db("tracing-overlay:main").await.expect("view");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?p", "?o"],
+        "where": {"@id": "ex:a", "?p": "?o"}
+    });
+    fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+
+    assert!(
+        !store.has_span("overlay_translate"),
+        "overlay_translate must be zero-noise at info level"
+    );
+}
+
+// =============================================================================
+// AC-10: Index install spans — index_install / index_install_wait / index_install_lock
+// =============================================================================
+
+/// Installing a freshly built index root into a cached ledger handle must
+/// emit `index_install` with two children that aggregate independently:
+/// `index_install_wait` (state-lock acquisition) and `index_install_lock`
+/// (the guarded novelty-trim + dict-reseed + store swap). No event may fire
+/// inside the exclusive section — with a `fmt` layer attached an event
+/// dispatch is a formatted write to a shared writer, an observer effect on
+/// exactly the section the spans exist to measure.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn ac10_index_install_spans() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ac10/install-spans:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "ex:name": "Alice"
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = result.ledger;
+            let commit_t = ledger.t();
+
+            // Cache the handle at its unindexed state so the notify path
+            // below has something to install into.
+            let _cached = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cache ledger handle");
+
+            // Phase 1: capture at DEBUG across build + install.
+            let (store, guard) = span_capture::init_test_tracing();
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, commit_t).await;
+            support::wait_for_index_application(&fluree, ledger_id, commit_t).await;
+
+            for name in ["index_install", "index_install_wait", "index_install_lock"] {
+                assert!(
+                    store.has_span(name),
+                    "{name} span should exist after an index install. Captured: {:?}",
+                    store.span_names()
+                );
+                let span = store.find_span(name).unwrap();
+                assert_eq!(span.level, tracing::Level::DEBUG, "{name} should be DEBUG");
+                assert!(span.closed, "{name} must close (no span leak)");
+            }
+
+            let install = store.find_span("index_install").unwrap();
+            assert!(
+                install.fields.contains_key("ledger_id"),
+                "index_install must carry ledger_id: fields = {:?}",
+                install.fields
+            );
+            assert_eq!(
+                install.fields.get("index_t").map(String::as_str),
+                Some(commit_t.to_string().as_str()),
+                "index_install must record the installed index_t"
+            );
+
+            // Wait vs hold must aggregate independently: both are children of
+            // index_install, so each name's durations answer its own question
+            // (contention vs guarded work) without per-trace arithmetic.
+            for name in ["index_install_wait", "index_install_lock"] {
+                let span = store.find_span(name).unwrap();
+                assert_eq!(
+                    span.parent_name.as_deref(),
+                    Some("index_install"),
+                    "{name} must nest under index_install"
+                );
+            }
+
+            // The pre-split shapes must not resurface: the version-embedding
+            // span name, the aggregate wait+hold span, and the in-lock event.
+            assert!(
+                !store.has_span("apply_index_v2"),
+                "span renamed to index_install (a v3 would rename the operation)"
+            );
+            assert!(
+                !store.has_span("apply_index_install_lock"),
+                "aggregate wait+hold span replaced by the wait/lock split"
+            );
+            assert!(
+                !store.has_event("install lock acquired"),
+                "no event may fire inside the exclusive install section"
+            );
+            drop(guard);
+
+            // Phase 2: a second commit + install cycle at INFO-only must be
+            // silent — the install spans are DEBUG-tier, zero noise at the
+            // production default.
+            let (store, _guard) = span_capture::init_info_only_tracing();
+            let insert2 = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "ex:name": "Bob"
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert2,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("second insert");
+            let commit_t2 = result.ledger.t();
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, commit_t2).await;
+            support::wait_for_index_application(&fluree, ledger_id, commit_t2).await;
+
+            for name in ["index_install", "index_install_wait", "index_install_lock"] {
+                assert!(
+                    !store.has_span(name),
+                    "{name} must be invisible at INFO level. Captured: {:?}",
+                    store.span_names()
+                );
+            }
+        })
+        .await;
+}

@@ -1,0 +1,379 @@
+//! `NoveltyFactState` — the current-state fact index for the in-memory novelty
+//! window.
+//!
+//! This is **not** database-wide uniqueness. It records, per graph, the *latest
+//! known op for a fact identity within the current novelty window* — i.e. what
+//! `Novelty::apply_commit` needs to apply RDF set semantics without scanning the
+//! sorted index vectors (and, once novelty is segmented, without scanning every
+//! segment). Persisted-index duplicates are still resolved later by the overlay
+//! cursor / index merge, exactly as today.
+//!
+//! ## Why it exists
+//!
+//! Dedup previously bisected the per-graph SPOT vector (`fact_currently_-
+//! asserted_in_graph`). Segmented novelty removes that single sorted vector, so
+//! the dedup oracle is lifted into this structure behind a seam. It is backed by
+//! a persistent map (`imbl::OrdMap`) so `clone` is O(1) structural sharing —
+//! preserving the novelty clone win under concurrent readers.
+//!
+//! ## Complexity
+//!
+//! `clone` is O(1), but `is_asserted` / `record` are **O(log novelty_facts)**
+//! (a balanced-tree probe plus `FactKey` cloning), *not* O(1). This is still far
+//! cheaper than the old O(total-novelty) index re-merge it replaced, and the
+//! `log` factor is dominated by the per-commit segment build. If a slope
+//! measurement ever shows residual growth attributable to dedup, the candidate
+//! is `imbl::HashMap` for amortized O(1) — but note that would switch key
+//! equality from `Ord` (matching `same_identity` / `IndexType::compare`) to
+//! `Hash`/`Eq`, and `FlakeValue`'s `Eq` treats cross-representation numerics
+//! (`Long(3) == Double(3.0) == BigInt(3)`) as equal where `Ord` may not. That is
+//! a semantic change the current equivalence harness (which only generates
+//! `Long`) would not catch, so it needs dedicated cross-type dedup tests first.
+//!
+//! ## Identity & graph scoping
+//!
+//! The key is `(s, p, o, dt, m)`; its derived `Ord` matches `same_identity`
+//! ordering (s, p, then object value, datatype, then meta). Graph is **not** part
+//! of the key — `Flake` equality ignores `g`, so state is held in a separate map
+//! per `g_id`.
+
+use fluree_db_core::same_t::supersedes;
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue, GraphId, Sid};
+use imbl::OrdMap;
+
+/// Fact identity within one graph: `(s, p, o, dt, m)`. Derived `Ord` is
+/// component-wise (s, p, o, dt, m), which equals `same_identity`'s ordering.
+type FactKey = (Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+
+#[cfg(test)]
+pub(crate) fn fact_state_key(f: &Flake) -> FactKey {
+    key_of(f)
+}
+
+fn key_of(f: &Flake) -> FactKey {
+    (
+        f.s.clone(),
+        f.p.clone(),
+        f.o.clone(),
+        f.dt.clone(),
+        f.m.clone(),
+    )
+}
+
+/// Per-graph "latest known op for an identity, within the current novelty
+/// window." The stored value is `(t, op)`: the resolved transaction time and
+/// op (`true` = currently asserted, `false` = currently retracted tombstone).
+/// Cheap to clone (persistent map).
+///
+/// Trimming the window ([`Self::trim_through`]) moves a cutoff instead of
+/// rebuilding the maps: an entry at or below it names an op the index now
+/// holds, so it reads as absent, which is what a rebuild from the surviving
+/// flakes would make it. Any op recorded after the trim has a higher `t`, so
+/// it supersedes a stale entry under the same rule. Stale entries are
+/// removed a bounded number at a time by [`Self::sweep`].
+#[derive(Clone, Default)]
+pub(crate) struct NoveltyFactState {
+    /// Indexed by `g_id`; `None` for graphs with no novelty yet.
+    pub(crate) graphs: Vec<Option<OrdMap<FactKey, (i64, bool)>>>,
+    /// Entries at or below this `t` are stale.
+    cutoff: i64,
+    /// Per graph, where the sweep of stale entries resumes: `None` when
+    /// there is nothing left to sweep, `Some(None)` from the first key.
+    sweep: Vec<Option<Option<FactKey>>>,
+}
+
+impl NoveltyFactState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Is `flake`'s identity currently asserted in graph `g`'s novelty window?
+    /// Absent identity → `false`.
+    pub(crate) fn is_asserted(&self, g: GraphId, flake: &Flake) -> bool {
+        self.graphs
+            .get(g as usize)
+            .and_then(Option::as_ref)
+            .and_then(|m| m.get(&key_of(flake)))
+            .is_some_and(|&(t, op)| op && t > self.cutoff)
+    }
+
+    /// Forget graph `g`'s window entirely, as dropping the graph does.
+    pub(crate) fn forget_graph(&mut self, g: GraphId) {
+        if let Some(map) = self.graphs.get_mut(g as usize) {
+            *map = None;
+        }
+        if let Some(from) = self.sweep.get_mut(g as usize) {
+            *from = None;
+        }
+    }
+
+    /// Drop the ops at or below `cutoff_t` from the window, as trimming
+    /// novelty through it does. A graph whose remaining flakes `survivors`
+    /// hands over is rebuilt from them now, so a trim that leaves few, or none,
+    /// keeps none of the trimmed window resident on a ledger that goes idle;
+    /// the rest move the cutoff and are swept by later commits (see
+    /// [`NoveltyFactState`]).
+    pub(crate) fn trim_through<'a, I>(
+        &mut self,
+        cutoff_t: i64,
+        mut survivors: impl FnMut(GraphId) -> Option<I>,
+    ) where
+        I: Iterator<Item = &'a Flake>,
+    {
+        self.cutoff = self.cutoff.max(cutoff_t);
+        let mut rebuilt = vec![false; self.graphs.len()];
+        for (g, rebuilt) in rebuilt.iter_mut().enumerate() {
+            if self.graphs[g].is_none() {
+                continue;
+            }
+            let Some(flakes) = survivors(g as GraphId) else {
+                continue;
+            };
+            self.graphs[g] = None;
+            for flake in flakes {
+                self.record(g as GraphId, flake);
+            }
+            *rebuilt = true;
+        }
+        self.sweep = self
+            .graphs
+            .iter()
+            .zip(&rebuilt)
+            .map(|(m, &rebuilt)| (m.is_some() && !rebuilt).then_some(None))
+            .collect();
+    }
+
+    /// Remove up to `budget` stale entries' worth of the maps, examining at
+    /// most `budget` entries, so the cost of trimming spreads over the
+    /// commits that follow it.
+    pub(crate) fn sweep(&mut self, budget: usize) {
+        let mut left = budget;
+        for (g, from) in self.sweep.iter_mut().enumerate() {
+            if left == 0 {
+                return;
+            }
+            let Some(start) = from.as_ref() else {
+                continue;
+            };
+            let Some(Some(m)) = self.graphs.get_mut(g) else {
+                *from = None;
+                continue;
+            };
+            let lower = match start {
+                Some(key) => std::ops::Bound::Excluded(key.clone()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut stale: Vec<FactKey> = Vec::new();
+            let mut last: Option<&FactKey> = None;
+            let mut examined = 0usize;
+            for (key, &(t, _)) in m.range((lower, std::ops::Bound::Unbounded)) {
+                if examined == left {
+                    break;
+                }
+                examined += 1;
+                if t <= self.cutoff {
+                    stale.push(key.clone());
+                }
+                last = Some(key);
+            }
+            let last = last.cloned();
+            for key in &stale {
+                m.remove(key);
+            }
+            left -= examined;
+            *from = if examined == 0 || left > 0 {
+                // Reached the end of this graph's map.
+                None
+            } else {
+                Some(last)
+            };
+        }
+    }
+
+    /// Record `flake` as an op for its identity in graph `g`. Lifecycle
+    /// resolution is **order-independent**: the highest-`t` op wins, and on a
+    /// same-`t` tie the assert ([`fluree_db_core::same_t`]). That is the rule
+    /// the query overlay (`resolve_overlay_ops`) and every index build apply,
+    /// so `fact_state` cannot disagree with what a read would see no matter
+    /// what order records arrive in (commit/batch order, the sorted bulk walk,
+    /// or the `clear_up_to` rebuild).
+    pub(crate) fn record(&mut self, g: GraphId, flake: &Flake) {
+        let idx = g as usize;
+        if idx >= self.graphs.len() {
+            self.graphs.resize_with(idx + 1, || None);
+        }
+        let m = self.graphs[idx].get_or_insert_with(OrdMap::new);
+        let key = key_of(flake);
+        let wins = match m.get(&key) {
+            Some(&cur) => supersedes((flake.t, flake.op), cur),
+            None => true,
+        };
+        if wins {
+            m.insert(key, (flake.t, flake.op));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(s: u16, t: i64, op: bool, lang: Option<&str>) -> Flake {
+        Flake::new(
+            Sid::new(1, format!("s{s}")),
+            Sid::new(1, "p"),
+            FlakeValue::Long(7),
+            Sid::new(2, "long"),
+            t,
+            op,
+            lang.map(FlakeMeta::with_lang),
+        )
+    }
+
+    /// A bounded sweep removes stale entries only, across calls, and none
+    /// of it changes an answer.
+    #[test]
+    fn sweep_removes_only_stale_entries_in_bounded_steps() {
+        let mut fs = NoveltyFactState::new();
+        for s in 0..100u16 {
+            fs.record(0, &mk(s, i64::from(s % 10) + 1, true, None));
+        }
+        fs.trim_through(5, |_| None::<std::iter::Empty<&Flake>>);
+        let live = |fs: &NoveltyFactState| {
+            (0..100u16)
+                .filter(|&s| fs.is_asserted(0, &mk(s, 0, true, None)))
+                .count()
+        };
+        assert_eq!(live(&fs), 50);
+        let mut steps = 0;
+        while fs.sweep.iter().any(Option::is_some) {
+            fs.sweep(7);
+            assert_eq!(live(&fs), 50);
+            steps += 1;
+        }
+        assert!(steps > 10, "the sweep took bounded steps ({steps})");
+        assert_eq!(
+            fs.graphs[0].as_ref().unwrap().len(),
+            50,
+            "only stale entries removed"
+        );
+    }
+
+    #[test]
+    fn assert_then_retract_then_reassert() {
+        // A real lifecycle is a sequence of distinct-`t` commits.
+        let mut fs = NoveltyFactState::new();
+        let f = mk(1, 0, true, None); // `t` irrelevant to identity lookup
+        assert!(!fs.is_asserted(0, &f), "absent => not asserted");
+        fs.record(0, &mk(1, 1, true, None));
+        assert!(fs.is_asserted(0, &f));
+        fs.record(0, &mk(1, 2, false, None)); // retract @ later t
+        assert!(!fs.is_asserted(0, &f), "retract tombstones");
+        fs.record(0, &mk(1, 3, true, None)); // reassert @ later t
+        assert!(fs.is_asserted(0, &f), "later reassert wins");
+    }
+
+    #[test]
+    fn same_t_assert_holds_order_independent() {
+        // A same-`t` assert+retract of one identity resolves to PRESENT (the
+        // assert holds), matching overlay lifecycle resolution and every index
+        // build — regardless of the order the two ops are recorded.
+        let mut fs = NoveltyFactState::new();
+        fs.record(0, &mk(1, 5, true, None));
+        fs.record(0, &mk(1, 5, false, None));
+        assert!(
+            fs.is_asserted(0, &mk(1, 5, true, None)),
+            "assert then retract"
+        );
+
+        let mut fs2 = NoveltyFactState::new();
+        fs2.record(0, &mk(2, 5, false, None));
+        fs2.record(0, &mk(2, 5, true, None));
+        assert!(
+            fs2.is_asserted(0, &mk(2, 5, true, None)),
+            "retract then assert"
+        );
+    }
+
+    #[test]
+    fn highest_t_wins_regardless_of_record_order() {
+        // An older op recorded after a newer one must not clobber it.
+        let mut fs = NoveltyFactState::new();
+        fs.record(0, &mk(1, 9, true, None)); // newer assert recorded first
+        fs.record(0, &mk(1, 2, false, None)); // older retract recorded after
+        assert!(
+            fs.is_asserted(0, &mk(1, 9, true, None)),
+            "stale lower-t op cannot override the resolved latest op"
+        );
+    }
+
+    #[test]
+    fn graphs_are_independent() {
+        let mut fs = NoveltyFactState::new();
+        let f = mk(1, 1, true, None);
+        fs.record(1, &f);
+        assert!(fs.is_asserted(1, &f));
+        assert!(!fs.is_asserted(0, &f), "default graph unaffected");
+        assert!(!fs.is_asserted(2, &f), "other graph unaffected");
+    }
+
+    #[test]
+    fn meta_is_part_of_identity() {
+        let mut fs = NoveltyFactState::new();
+        fs.record(0, &mk(1, 1, true, Some("en")));
+        assert!(fs.is_asserted(0, &mk(1, 1, true, Some("en"))));
+        assert!(
+            !fs.is_asserted(0, &mk(1, 1, true, Some("fr"))),
+            "different lang = different identity"
+        );
+        assert!(
+            !fs.is_asserted(0, &mk(1, 1, true, None)),
+            "no-meta = different identity"
+        );
+    }
+
+    /// Two language tags at the SAME list position are two identities.
+    ///
+    /// [`meta_is_part_of_identity`] above reads as if it covers this, and does
+    /// not: every meta it builds has `i: None`, and `FlakeMeta`'s ordering only
+    /// used to consult `lang` when neither side carried a list index. So
+    /// `{en, i: 0}` and `{fr, i: 0}` were one `FactKey` slot, `is_asserted`
+    /// answered `true` for a fact this map had never seen, and the per-commit
+    /// dedup dropped it (#1711). The key carries no `t`, so it bit across any
+    /// two commits, not only same-`t` ones.
+    #[test]
+    fn one_list_position_under_two_language_tags_is_two_identities() {
+        fn at(lang: &str, i: i32, t: i64, op: bool) -> Flake {
+            Flake::new(
+                Sid::new(1, "s1"),
+                Sid::new(1, "p"),
+                FlakeValue::Long(7),
+                Sid::new(2, "long"),
+                t,
+                op,
+                Some(FlakeMeta {
+                    lang: Some(lang.to_string()),
+                    i: Some(i),
+                }),
+            )
+        }
+
+        let mut fs = NoveltyFactState::new();
+        fs.record(0, &at("en", 0, 1, true));
+        assert!(fs.is_asserted(0, &at("en", 0, 1, true)));
+        assert!(
+            !fs.is_asserted(0, &at("fr", 0, 1, true)),
+            "a second tag at the same list position is a distinct fact, \
+             not one already asserted"
+        );
+
+        // Both recorded: retracting one must not tombstone the other.
+        fs.record(0, &at("fr", 0, 2, true));
+        fs.record(0, &at("en", 0, 3, false));
+        assert!(!fs.is_asserted(0, &at("en", 0, 3, false)), "@en retracted");
+        assert!(
+            fs.is_asserted(0, &at("fr", 0, 2, true)),
+            "@fr must survive its twin's retraction"
+        );
+    }
+}

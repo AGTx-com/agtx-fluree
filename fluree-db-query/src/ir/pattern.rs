@@ -1,0 +1,1040 @@
+//! The `Pattern` enum and the variants that wrap nested `Vec<Pattern>` —
+//! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
+//! `ServiceEndpoint` types they depend on.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::adapters::{
+    GeoSearchPattern, IndexSearchPattern, R2rmlPattern, S2SearchPattern, VectorSearchPattern,
+};
+use super::expression::{Expression, Function};
+use super::grouping::Grouping;
+use super::path::{PropertyPathPattern, ShortestPathPattern};
+use super::triple::{Ref, TriplePattern};
+use crate::binding::Binding;
+use crate::sort::SortSpec;
+use crate::var_registry::VarId;
+
+/// Resolved subquery pattern
+///
+/// Represents a nested query within a WHERE clause. The subquery's results
+/// are merged with the parent solution on shared variables (correlated join).
+///
+/// Syntax: `["query", { "select": [...], "where": {...}, ... }]`
+#[derive(Debug, Clone)]
+pub struct SubqueryPattern {
+    /// Variables to select from the subquery (output schema)
+    pub select: Vec<VarId>,
+    /// WHERE patterns of the subquery
+    pub patterns: Vec<Pattern>,
+    /// Limit on results (None = unlimited)
+    pub limit: Option<usize>,
+    /// Offset to skip (None = 0)
+    pub offset: Option<usize>,
+    /// Whether to apply DISTINCT to results
+    pub distinct: bool,
+    /// ORDER BY specs. Empty when the subquery is unordered.
+    pub ordering: Vec<SortSpec>,
+    /// Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)` or
+    /// `ORDER BY DESC(COUNT(?o))`). Mirrors [`crate::ir::Query::order_binds`]:
+    /// each `(var, expr)` is evaluated once per solution as a dedicated stage
+    /// after grouping/aggregation/HAVING/post-binds and before the sort, and
+    /// the matching [`SortSpec`] in `ordering` references the synthetic `var`.
+    /// Empty for JSON-LD subqueries (no expression-ORDER-BY surface syntax).
+    pub order_binds: Vec<(VarId, Expression)>,
+    /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
+    pub grouping: Option<Grouping>,
+    /// Whether this subquery must be evaluated INDEPENDENTLY of the enclosing
+    /// pattern (its complete, ordered, sliced solution sequence computed, then
+    /// joined). SPARQL 1.1 §18.2 sub-`SELECT`s are always uncorrelated and set
+    /// this; the executor then never seeds the inner query per parent row (which
+    /// would correlate it / let an inner LIMIT apply per row). JSON-LD subqueries
+    /// default to `false` (per-row seeding). Note this is NOT a pure LATERAL pin:
+    /// per-row mode seeds only the self-produced correlation vars (`join_keys`)
+    /// and RECONCILES the OPTIONAL/UNION-produced ones (`reconcile_vars`) at merge
+    /// (Family B, W3C join-scope-1) instead of pinning them — so an OPTIONAL/UNION
+    /// -bound correlation var of an existing JSON-LD `["query"]` subquery now
+    /// joins per §18.4 rather than being forced to the parent value. See
+    /// `SubqueryOperator::reconcile_vars`.
+    pub uncorrelated: bool,
+    /// Correlation variables with EXPLICIT lateral-import semantics — Cypher's
+    /// `CALL (p) { … }` scope clause. A pinned var is always seeded to the
+    /// parent's value in per-row mode (never left to the Family-B reconcile,
+    /// even when the body binds it only via OPTIONAL — openCypher defines the
+    /// import as a per-row binding), and a pinned var the body does not itself
+    /// produce forces per-row evaluation (evaluate-once + hash-join cannot
+    /// retain zero-match parents). Empty for SPARQL/JSON-LD subqueries, whose
+    /// correlation semantics are inferred (§18.2/§18.4).
+    pub pinned_vars: Vec<VarId>,
+}
+
+impl SubqueryPattern {
+    /// Create a new subquery pattern
+    pub fn new(select: Vec<VarId>, patterns: Vec<Pattern>) -> Self {
+        Self {
+            select,
+            patterns,
+            limit: None,
+            offset: None,
+            distinct: false,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            grouping: None,
+            uncorrelated: false,
+            pinned_vars: Vec::new(),
+        }
+    }
+
+    /// Pin explicit lateral-import variables (Cypher `CALL (p)`); see
+    /// [`Self::pinned_vars`].
+    pub fn with_pinned_vars(mut self, pinned: Vec<VarId>) -> Self {
+        self.pinned_vars = pinned;
+        self
+    }
+
+    /// Mark this subquery as uncorrelated (SPARQL 1.1 §18.2 — evaluated
+    /// independently, then joined). See [`Self::uncorrelated`].
+    pub fn with_uncorrelated(mut self) -> Self {
+        self.uncorrelated = true;
+        self
+    }
+
+    /// Set limit
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Set offset
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// Set distinct
+    pub fn with_distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+
+    /// Set ORDER BY specs.
+    pub fn with_ordering(mut self, specs: Vec<SortSpec>) -> Self {
+        self.ordering = specs;
+        self
+    }
+
+    /// Set the expression-based ORDER BY binds (see [`Self::order_binds`]).
+    pub fn with_order_binds(mut self, order_binds: Vec<(VarId, Expression)>) -> Self {
+        self.order_binds = order_binds;
+        self
+    }
+
+    /// Set the aggregation phase (GROUP BY / aggregates / HAVING).
+    pub fn with_grouping(mut self, grouping: Grouping) -> Self {
+        self.grouping = Some(grouping);
+        self
+    }
+
+    /// Variables the subquery exposes to its enclosing scope (its SELECT list).
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.select.clone()
+    }
+
+    /// Rename every occurrence of variable `old` to `new` across the whole
+    /// subquery scope: SELECT list, WHERE patterns, grouping, ORDER BY, and
+    /// expression-ORDER-BY binds. Used by the equijoin-filter fold.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        for v in &mut self.select {
+            if *v == old {
+                *v = new;
+            }
+        }
+        for p in &mut self.patterns {
+            p.substitute_var(old, new);
+        }
+        let rename_order_bind: fn(&mut Expression, VarId, VarId) = self
+            .grouping
+            .as_ref()
+            .map_or(Expression::substitute_var, |g| g.group_row_renamer(old));
+        if let Some(g) = &mut self.grouping {
+            g.substitute_var(old, new);
+        }
+        for spec in &mut self.ordering {
+            if spec.var == old {
+                spec.var = new;
+            }
+        }
+        for (v, expr) in &mut self.order_binds {
+            if *v == old {
+                *v = new;
+            }
+            rename_order_bind(expr, old, new);
+        }
+    }
+
+    /// Variables mentioned anywhere in the subquery, including inside its
+    /// body. Body-internal variables that aren't in `select` are still
+    /// listed; correlation analysis at the call site can subtract
+    /// [`Self::produced_vars`] if it needs only the free variables.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        vars.extend(self.select.iter().copied());
+        vars
+    }
+}
+
+// ============================================================================
+// Graph Pattern Types
+// ============================================================================
+
+/// Graph name in a GRAPH pattern - use strings, not Sids
+///
+/// Graph names in datasets are ledger aliases/IRIs, not guaranteed
+/// to be encodable via any single DB's namespace table.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphName {
+    /// Concrete graph IRI (string, not Sid)
+    Iri(Arc<str>),
+    /// Variable (iterates all named graphs, binds as IRI string)
+    Var(VarId),
+}
+
+// ============================================================================
+// Service Pattern
+// ============================================================================
+
+/// A service endpoint - where to execute the inner patterns
+///
+/// SPARQL: `SERVICE <endpoint> { ... }` or `SERVICE ?var { ... }`
+///
+/// For local ledger queries, the endpoint IRI should be in the format:
+/// `fluree:ledger:<alias>` or `fluree:ledger:<alias>:<branch>`
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServiceEndpoint {
+    /// Concrete service endpoint IRI
+    ///
+    /// For local ledger queries: `fluree:ledger:mydb:main`
+    Iri(Arc<str>),
+    /// Variable endpoint (iterates all known services if unbound)
+    Var(VarId),
+}
+
+/// Service pattern for executing patterns against external or local services.
+///
+/// SPARQL: `SERVICE <endpoint> { ... }` or `SERVICE SILENT <endpoint> { ... }`
+///
+/// For local Fluree ledger queries, use the `fluree:ledger:` scheme:
+/// - `SERVICE <fluree:ledger:mydb:main> { ?s ?p ?o }`
+///
+/// # Semantics
+///
+/// - If the endpoint is an IRI in the `fluree:ledger:` namespace, patterns are
+///   executed against that ledger from the current dataset
+/// - For external endpoints, the implementation could support SPARQL federation (future)
+/// - If `silent` is true, errors from the service are ignored (empty result)
+/// - Variable endpoints iterate over available services in the dataset
+#[derive(Debug, Clone)]
+pub struct ServicePattern {
+    /// Whether SERVICE SILENT was specified
+    ///
+    /// If true, service errors produce empty results instead of query failure.
+    pub silent: bool,
+    /// The service endpoint (IRI or variable)
+    pub endpoint: ServiceEndpoint,
+    /// The patterns to execute at the service
+    pub patterns: Vec<Pattern>,
+    /// Original SPARQL text for the SERVICE body (for remote execution).
+    ///
+    /// Populated during SPARQL lowering by extracting the source text between
+    /// the braces of the SERVICE block. `None` for JSON-LD originated queries.
+    /// Used by `ServiceOperator` to send the body verbatim to remote endpoints
+    /// without needing an IR-to-SPARQL serializer.
+    pub source_body: Option<Arc<str>>,
+    /// The parent query's prologue, re-rendered as SPARQL, to prepend to the
+    /// outgoing sub-query.
+    ///
+    /// Because `source_body` is a verbatim slice of the SERVICE block, any
+    /// prefixed name or relative IRI in it is only meaningful under the parent
+    /// query's `PREFIX` / `BASE` declarations — which live outside that slice.
+    /// Shipping the body without them changes what the query means: a prefixed
+    /// name fails at the remote with "Undefined prefix", and a relative IRI
+    /// silently resolves against a different base and matches a different term.
+    ///
+    /// Rendered from the lowerer's already-resolved prefix map rather than
+    /// sliced out of the source, so relative `PREFIX` IRIs arrive base-resolved
+    /// and no literal in the body is ever rewritten. Empty string when the query
+    /// declared no prologue; `None` for JSON-LD originated queries.
+    pub source_prologue: Option<Arc<str>>,
+}
+
+impl ServicePattern {
+    /// Create a new SERVICE pattern
+    pub fn new(silent: bool, endpoint: ServiceEndpoint, patterns: Vec<Pattern>) -> Self {
+        Self {
+            silent,
+            endpoint,
+            patterns,
+            source_body: None,
+            source_prologue: None,
+        }
+    }
+
+    /// Create a new SERVICE pattern with captured source body text and the
+    /// prologue that body's prefixed names and relative IRIs resolve under.
+    ///
+    /// The two are captured together because the body is only interpretable
+    /// under that prologue — see [`source_prologue`](Self::source_prologue).
+    pub fn with_source_body(
+        silent: bool,
+        endpoint: ServiceEndpoint,
+        patterns: Vec<Pattern>,
+        source_body: Arc<str>,
+        source_prologue: Arc<str>,
+    ) -> Self {
+        Self {
+            silent,
+            endpoint,
+            patterns,
+            source_body: Some(source_body),
+            source_prologue: Some(source_prologue),
+        }
+    }
+
+    /// The complete SPARQL query text to send to a remote endpoint for this
+    /// SERVICE block, or `None` when no source body was captured.
+    ///
+    /// Prologue first, so the body's prefixed names and relative IRIs resolve
+    /// remotely to exactly the IRIs they resolve to locally. The body is wrapped
+    /// in braces unconditionally: `parse_group_graph_pattern` unwraps a
+    /// single-pattern group, so the slice may or may not carry its own, and
+    /// double braces are legal SPARQL.
+    pub fn remote_query_text(&self) -> Option<String> {
+        let body = self.source_body.as_deref()?;
+        let prologue = self.source_prologue.as_deref().unwrap_or("");
+        Some(format!("{prologue}SELECT * WHERE {{ {body} }}"))
+    }
+
+    /// Variables this service pattern adds to the row's binding set: the
+    /// produced bindings of the inner patterns (which the remote endpoint
+    /// returns), plus the endpoint variable itself when the endpoint is a
+    /// variable (the row gets bound to the iterating service IRI).
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::produced_vars)
+            .collect();
+        if let ServiceEndpoint::Var(v) = &self.endpoint {
+            vars.push(*v);
+        }
+        vars
+    }
+
+    /// Variables mentioned anywhere in this service pattern.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        if let ServiceEndpoint::Var(v) = &self.endpoint {
+            vars.push(*v);
+        }
+        vars
+    }
+}
+
+// ============================================================================
+// Pattern Enum
+// ============================================================================
+
+/// Logical pattern IR - mirrors where clause structure
+///
+/// Each variant represents a different pattern type in the query.
+/// Ordering is preserved to enable filter inlining at the correct position.
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// A basic triple pattern (subject, predicate, object)
+    Triple(TriplePattern),
+
+    /// A triple pattern answered in SPARQL's view of RDF lists: its stored
+    /// triples that are not list members, and the list triples that match it
+    /// (see [`crate::list_view`]). Introduced by
+    /// [`crate::list_view::rewrite_patterns`] just before planning; no
+    /// lowering produces one.
+    ListView(crate::list_view::ListViewPattern),
+
+    /// A filter expression to evaluate against each solution
+    /// Positioned in where clause order for inline attachment
+    Filter(Expression),
+
+    /// Optional clause - left join semantics
+    /// Contains ordered patterns that may or may not match
+    Optional(Vec<Pattern>),
+
+    /// Union of pattern branches - any branch may match
+    Union(Vec<Vec<Pattern>>),
+
+    /// Bind a computed value to a variable
+    Bind { var: VarId, expr: Expression },
+
+    /// UNWIND a runtime list-valued expression: for each input row, evaluate
+    /// `list` to a `Binding::List` and emit one output row per element with
+    /// `var` bound to it. An empty/unbound list drops the row (Cypher
+    /// semantics). Cypher `UNWIND <expr> AS var` over a non-constant list
+    /// (e.g. `UNWIND nodes(path) AS n`); a constant list lowers to `Values`.
+    Unwind { var: VarId, list: Expression },
+
+    /// Inline values - constant rows to join with
+    Values {
+        vars: Vec<VarId>,
+        rows: Vec<Vec<Binding>>,
+    },
+
+    /// MINUS clause - anti-join semantics (set difference)
+    /// Contains patterns to match; solutions matching these are removed
+    Minus(Vec<Pattern>),
+
+    /// EXISTS clause - filter rows where subquery matches
+    Exists(Vec<Pattern>),
+
+    /// NOT EXISTS clause - filter rows where subquery does NOT match
+    NotExists(Vec<Pattern>),
+
+    /// Property path pattern (transitive traversal)
+    PropertyPath(PropertyPathPattern),
+
+    /// Anchored shortest-path pattern (Cypher `shortestPath`/`allShortestPaths`).
+    ///
+    /// Both endpoints must be bound by a preceding pattern; binds a path value
+    /// to `path_var` via bidirectional BFS. See [`ShortestPathPattern`].
+    ShortestPath(ShortestPathPattern),
+
+    /// Subquery pattern - nested query with result merging
+    ///
+    /// Executes a nested query and merges results with the parent solution.
+    /// Shared variables are correlated (joined on matching values).
+    Subquery(SubqueryPattern),
+
+    /// Index search pattern - BM25 full-text search against a graph source
+    ///
+    /// Queries a graph source (e.g., BM25 index) and produces result bindings.
+    IndexSearch(IndexSearchPattern),
+
+    /// Vector search pattern - similarity search against a vector graph source
+    ///
+    /// Queries a vector index and produces result bindings.
+    VectorSearch(VectorSearchPattern),
+
+    /// R2RML scan pattern - queries Iceberg graph source via R2RML mappings
+    ///
+    /// Scans Iceberg tables through R2RML term maps and produces RDF bindings.
+    R2rml(R2rmlPattern),
+
+    /// GeoSearch pattern - proximity search using binary index GeoPoint encoding
+    GeoSearch(GeoSearchPattern),
+
+    /// S2 spatial search pattern - complex geometry queries using S2 sidecar index
+    S2Search(S2SearchPattern),
+
+    /// Named graph pattern - scopes inner patterns to a specific graph
+    ///
+    /// SPARQL: `GRAPH <iri> { ... }` or `GRAPH ?g { ... }`
+    ///
+    /// Semantics:
+    /// - `GraphName::Iri(s)`: Execute inner patterns against that specific named graph
+    /// - `GraphName::Var(v)`: If bound, use that graph; if unbound, iterate all named
+    ///   graphs and bind `?v` to each graph IRI
+    ///
+    /// Graph-not-found produces empty result (not an error).
+    Graph {
+        /// The graph name (concrete IRI or variable)
+        name: GraphName,
+        /// Inner patterns to execute within the graph context
+        patterns: Vec<Pattern>,
+    },
+
+    /// Service pattern - executes patterns against another ledger or endpoint
+    ///
+    /// SPARQL: `SERVICE <endpoint> { ... }` or `SERVICE SILENT <endpoint> { ... }`
+    ///
+    /// For local Fluree ledger queries, use the `fluree:ledger:` scheme:
+    /// - `SERVICE <fluree:ledger:orders:main> { ?s :order/total ?total }`
+    ///
+    /// # Semantics
+    ///
+    /// - For `fluree:ledger:<alias>` endpoints, patterns are executed against
+    ///   the named ledger from the current dataset
+    /// - Results are joined with the outer query on shared variables
+    /// - If `silent` is true, service errors produce empty results
+    Service(ServicePattern),
+
+    /// Internal — iterate the dataset's *default* graph sources and
+    /// run `patterns` once per source.
+    ///
+    /// Distinct from [`Pattern::Graph`], which iterates **named**
+    /// graphs (SPARQL `GRAPH ?g { ... }`). This variant exists to let
+    /// the edge-annotation expansion correlate its triple chain with
+    /// a single source under multi-source default-graph queries
+    /// (`from: [g1, g2]`); without it the f:reifies* lookups fan
+    /// across all sources and produce an N×M cross-product against
+    /// each base-edge match.
+    ///
+    /// Per-source correlation comes from `with_graph_ref` switching
+    /// the execution context per iteration — no synthetic variable is
+    /// bound or exposed in the operator schema. Synthesis happens in
+    /// `expand_edge_annotation_patterns`; users cannot author this
+    /// variant directly.
+    DefaultGraphSource {
+        /// Patterns to execute once per default graph source.
+        patterns: Vec<Pattern>,
+    },
+
+    /// Edge-rooted annotation pattern.
+    ///
+    /// Lowered from JSON-LD `@annotation` (or its `@edge` alias) blocks
+    /// attached to an object position. The annotation is the subject of
+    /// the body patterns; the edge `(s, p, o)` is the reified base
+    /// triple.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(matched_edge, attached_annotation)` pair: a base
+    /// edge with two parallel annotations produces two rows. This is
+    /// the multiplicity contract that supports Cypher fidelity.
+    ///
+    /// # Execution
+    ///
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
+    EdgeAnnotation {
+        /// The annotated edge (base triple).
+        edge: TriplePattern,
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
+
+    /// Annotation-rooted pattern — reverse direction of [`Pattern::EdgeAnnotation`].
+    ///
+    /// Lowered from JSON-LD `@reifies`. The enclosing node-map is the
+    /// annotation subject; `@reifies` names the base triple it reifies.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(annotation, base_edge)` pair. The base edge must be
+    /// **currently asserted and policy-visible** before a row is emitted
+    /// (M1 enforcement) — otherwise this operator would leak hidden
+    /// edges via annotation existence.
+    ///
+    /// # Execution
+    ///
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
+    AnnotationTarget {
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// The base edge being reified.
+        edge: TriplePattern,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
+}
+
+/// Columns of a VALUES table that bind their variable on every row: those with
+/// no UNDEF cell. A table with no rows binds every column vacuously.
+pub fn values_bound_in_every_row<'a>(
+    vars: &'a [VarId],
+    rows: &'a [Vec<Binding>],
+) -> impl Iterator<Item = VarId> + 'a {
+    vars.iter()
+        .enumerate()
+        .filter(|(col, _)| {
+            rows.iter()
+                .all(|row| row.get(*col).is_some_and(Binding::is_bound))
+        })
+        .map(|(_, var)| *var)
+}
+
+/// Whether column `col` of a VALUES table is UNDEF on every row. A table with
+/// no rows has no such column: it emits no solution, not one of any value.
+pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
+/// Variables some pattern of `patterns` may bind (the planner's
+/// `must_bind_vars` gives the ones bound on every row).
+pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::produced_vars).collect()
+}
+
+/// How a pattern constrains the order of the other patterns in its group.
+///
+/// Every pass that reorders a group asks this rather than keeping its own list.
+/// Hand-kept lists drifted narrower than the planner's, each time as silent
+/// wrong rows around a left join or anti-join: #1924, #1690, the R2RML
+/// rewrite's OPTIONAL-only sort, then its fusions lifting a scan past a MINUS.
+/// [`Pattern::order_role`] is an exhaustive match, so a new kind of pattern is
+/// a decision made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderRole {
+    /// Joins its group; free to move among the other joins.
+    Join,
+    /// OPTIONAL: a left join whose left side is what is written before it.
+    LeftJoin,
+    /// MINUS: an anti-join whose left side is what is written before it.
+    AntiJoin,
+    /// FILTER: constrains the whole group wherever it is written.
+    GroupFilter,
+    /// EXISTS / NOT EXISTS: a test over the whole group, which the planner
+    /// places after the patterns written before it.
+    GroupTest,
+}
+
+impl OrderRole {
+    /// Whether the patterns written before this one are its left side, so a
+    /// pattern written after it that shares one of its variables cannot move
+    /// above it (nor one written before it below).
+    pub fn is_positional(self) -> bool {
+        matches!(self, OrderRole::LeftJoin | OrderRole::AntiJoin)
+    }
+}
+
+impl Pattern {
+    /// This pattern's [`OrderRole`] in its group.
+    pub fn order_role(&self) -> OrderRole {
+        match self {
+            Pattern::Optional(_) => OrderRole::LeftJoin,
+            Pattern::Minus(_) => OrderRole::AntiJoin,
+            Pattern::Filter(_) => OrderRole::GroupFilter,
+            Pattern::Exists(_) | Pattern::NotExists(_) => OrderRole::GroupTest,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Union(_)
+            | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
+            | Pattern::Values { .. }
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => OrderRole::Join,
+        }
+    }
+
+    /// Whether this pattern reads the dataset rather than its row alone. One
+    /// that does answers for the graph it runs in, so it cannot move into a
+    /// GRAPH or SERVICE body written beside it.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Pattern::Filter(expr) | Pattern::Bind { expr, .. } => expr.reads_dataset(),
+            Pattern::Unwind { list, .. } => list.reads_dataset(),
+            Pattern::Values { .. } => false,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Optional(_)
+            | Pattern::Union(_)
+            | Pattern::Minus(_)
+            | Pattern::Exists(_)
+            | Pattern::NotExists(_)
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => true,
+        }
+    }
+
+    /// Apply `f` once to every immediate nested pattern list inside this
+    /// pattern, reconstructing the surrounding container around the result.
+    ///
+    /// This walks every variant that is structurally a container of
+    /// `Vec<Pattern>` — Optional, Minus, Exists, NotExists, Graph, Service,
+    /// Subquery — plus each branch of Union (`f` is called per branch). Leaf
+    /// variants (Triple, Filter, Bind, Values, PropertyPath, IndexSearch,
+    /// VectorSearch, R2rml, GeoSearch, S2Search) pass through unchanged.
+    ///
+    /// The IR is honest about what's a container; callers decide which
+    /// containers their semantics permit recursing into. A site that does
+    /// not want to descend into, say, `Pattern::Service` (because the inner
+    /// patterns target a remote endpoint) intercepts that variant in its
+    /// own match arms before falling through to `map_subpatterns`.
+    pub fn map_subpatterns<F>(self, f: &mut F) -> Self
+    where
+        F: FnMut(Vec<Pattern>) -> Vec<Pattern>,
+    {
+        match self {
+            Pattern::Optional(inner) => Pattern::Optional(f(inner)),
+            Pattern::Minus(inner) => Pattern::Minus(f(inner)),
+            Pattern::Exists(inner) => Pattern::Exists(f(inner)),
+            Pattern::NotExists(inner) => Pattern::NotExists(f(inner)),
+            Pattern::Union(branches) => Pattern::Union(branches.into_iter().map(&mut *f).collect()),
+            Pattern::Graph { name, patterns } => Pattern::Graph {
+                name,
+                patterns: f(patterns),
+            },
+            Pattern::Service(sp) => Pattern::Service(ServicePattern {
+                patterns: f(sp.patterns),
+                ..sp
+            }),
+            Pattern::Subquery(sp) => Pattern::Subquery(SubqueryPattern {
+                patterns: f(sp.patterns),
+                ..sp
+            }),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body: f(body),
+            },
+            Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body: f(body),
+            },
+            Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
+                patterns: f(patterns),
+            },
+            other => other,
+        }
+    }
+
+    /// Rename every occurrence of variable `old` to `new` within this pattern,
+    /// recursively. Used by the equijoin-filter fold ([`crate::filter_fold`])
+    /// after it proves `old` and `new` are equal. The fold's eligibility check
+    /// guarantees the renamed variable never appears in a property-path or
+    /// search-adapter pattern, so those arms are debug-asserted no-ops.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        const UNHANDLED: &str =
+            "filter_fold: substitute_var reached an unhandled pattern containing the renamed var";
+        let rename = |v: &mut VarId| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        match self {
+            Pattern::Triple(tp) => tp.substitute_var(old, new),
+            Pattern::ListView(lv) => lv.triple.substitute_var(old, new),
+            Pattern::Filter(expr) => expr.substitute_var(old, new),
+            Pattern::Bind { var, expr } => {
+                rename(var);
+                expr.substitute_var(old, new);
+            }
+            Pattern::Unwind { var, list } => {
+                rename(var);
+                list.substitute_var(old, new);
+            }
+            Pattern::Values { vars, .. } => vars.iter_mut().for_each(rename),
+            Pattern::Optional(inner)
+            | Pattern::Minus(inner)
+            | Pattern::Exists(inner)
+            | Pattern::NotExists(inner) => {
+                for p in inner {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    for p in branch {
+                        p.substitute_var(old, new);
+                    }
+                }
+            }
+            Pattern::Subquery(sq) => sq.substitute_var(old, new),
+            Pattern::Graph { name, patterns } => {
+                if let GraphName::Var(v) = name {
+                    rename(v);
+                }
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::Service(sp) => {
+                if let ServiceEndpoint::Var(v) = &mut sp.endpoint {
+                    rename(v);
+                }
+                for p in &mut sp.patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::PropertyPath(pp) => {
+                debug_assert!(!pp.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::ShortestPath(sp) => {
+                debug_assert!(!sp.referenced_vars().contains(&old), "{UNHANDLED}");
+                debug_assert!(sp.path_var != old, "{UNHANDLED}");
+            }
+            Pattern::IndexSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::VectorSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::R2rml(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::GeoSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::S2Search(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                edge.substitute_var(old, new);
+                if let Ref::Var(v) = annotation {
+                    rename(v);
+                }
+                for p in body {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::DefaultGraphSource { patterns } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+        }
+    }
+
+    /// Check if this is a triple pattern
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Pattern::Triple(_))
+    }
+
+    /// Get the triple pattern if this is a Triple
+    pub fn as_triple(&self) -> Option<&TriplePattern> {
+        match self {
+            Pattern::Triple(tp) => Some(tp),
+            _ => None,
+        }
+    }
+
+    /// Variables mentioned anywhere in this pattern, recursively. Includes
+    /// vars referenced by filters and bind expressions, vars in subquery
+    /// bodies (not just their SELECT lists), and vars used as inputs by
+    /// search-adapter patterns.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        match self {
+            Pattern::Triple(tp) => tp.referenced_vars(),
+            Pattern::Filter(expr) => expr.referenced_vars(),
+            Pattern::Optional(inner) => inner.iter().flat_map(Pattern::referenced_vars).collect(),
+            Pattern::Union(branches) => branches
+                .iter()
+                .flat_map(|branch| branch.iter().flat_map(Pattern::referenced_vars))
+                .collect(),
+            Pattern::Bind { var, expr } => {
+                let mut vars = expr.referenced_vars();
+                vars.push(*var);
+                vars
+            }
+            Pattern::Unwind { var, list } => {
+                let mut vars = list.referenced_vars();
+                vars.push(*var);
+                vars
+            }
+            Pattern::Values { vars, .. } => vars.clone(),
+            Pattern::Minus(inner) | Pattern::Exists(inner) | Pattern::NotExists(inner) => {
+                inner.iter().flat_map(Pattern::referenced_vars).collect()
+            }
+            Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::ListView(lv) => lv.referenced_vars(),
+            Pattern::ShortestPath(sp) => sp.referenced_vars(),
+            Pattern::Subquery(sq) => sq.referenced_vars(),
+            Pattern::IndexSearch(isp) => isp.referenced_vars(),
+            Pattern::VectorSearch(vsp) => vsp.referenced_vars(),
+            Pattern::R2rml(r2rml) => r2rml.referenced_vars(),
+            Pattern::GeoSearch(gsp) => gsp.referenced_vars(),
+            Pattern::S2Search(s2p) => s2p.referenced_vars(),
+            Pattern::Graph { name, patterns } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
+                if let GraphName::Var(v) = name {
+                    vars.push(*v);
+                }
+                vars
+            }
+            Pattern::Service(sp) => sp.referenced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.referenced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::referenced_vars));
+                vars
+            }
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::referenced_vars).collect()
+            }
+        }
+    }
+
+    /// Variables this pattern adds to the binding set of matched rows.
+    ///
+    /// Pure filters (`Filter`, `Minus`, `Exists`, `NotExists`) return the
+    /// empty set — they remove rows but don't introduce bindings. `Bind`
+    /// produces only its target variable, not the variables its expression
+    /// reads. `Subquery` exposes only its SELECT list outward, not body
+    /// internals.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        match self {
+            Pattern::Triple(tp) => tp.produced_vars(),
+            Pattern::Filter(_) => Vec::new(),
+            Pattern::Optional(inner) => inner.iter().flat_map(Pattern::produced_vars).collect(),
+            Pattern::Union(branches) => branches
+                .iter()
+                .flat_map(|branch| branch.iter().flat_map(Pattern::produced_vars))
+                .collect(),
+            Pattern::Bind { var, .. } => vec![*var],
+            Pattern::Unwind { var, .. } => vec![*var],
+            Pattern::Values { vars, .. } => vars.clone(),
+            Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
+            Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::ListView(lv) => lv.produced_vars(),
+            Pattern::ShortestPath(sp) => sp.produced_vars(),
+            Pattern::Subquery(sq) => sq.produced_vars(),
+            Pattern::IndexSearch(isp) => isp.produced_vars(),
+            Pattern::VectorSearch(vsp) => vsp.produced_vars(),
+            Pattern::R2rml(r2rml) => r2rml.produced_vars(),
+            Pattern::GeoSearch(gsp) => gsp.produced_vars(),
+            Pattern::S2Search(s2p) => s2p.produced_vars(),
+            Pattern::Graph { name, patterns } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::produced_vars).collect();
+                if let GraphName::Var(v) = name {
+                    vars.push(*v);
+                }
+                vars
+            }
+            Pattern::Service(sp) => sp.produced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.produced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::produced_vars));
+                vars
+            }
+            // The wrapper itself binds no new variables — only the
+            // inner subplan produces vars, which surface unchanged
+            // to the outer schema. Per-source correlation is purely
+            // an execution-context switch (`with_graph_ref`), not a
+            // join-key binding.
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::produced_vars).collect()
+            }
+        }
+    }
+
+    /// True if any expression inside this pattern (recursively, through any
+    /// nested patterns) calls `target`. Mirrors [`Expression::contains_function`]
+    /// at the pattern level.
+    pub fn contains_function(&self, target: &Function) -> bool {
+        match self {
+            Pattern::Filter(expr) => expr.contains_function(target),
+            Pattern::Bind { expr, .. } => expr.contains_function(target),
+            Pattern::Unwind { list, .. } => list.contains_function(target),
+            Pattern::Exists(inner) | Pattern::NotExists(inner) | Pattern::Minus(inner) => {
+                inner.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::Optional(inner) => inner.iter().any(|p| p.contains_function(target)),
+            Pattern::Union(branches) => branches
+                .iter()
+                .any(|branch| branch.iter().any(|p| p.contains_function(target))),
+            Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
+            Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
+            Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                body.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::DefaultGraphSource { patterns, .. } => {
+                patterns.iter().any(|p| p.contains_function(target))
+            }
+            // Other pattern variants cannot contain general expressions.
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::triple::{Ref, Term};
+    use fluree_db_core::Sid;
+
+    fn test_pattern() -> TriplePattern {
+        TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(100, "name")),
+            Term::Var(VarId(1)),
+        )
+    }
+
+    #[test]
+    fn test_pattern_variables() {
+        let pattern = Pattern::Triple(test_pattern());
+        let vars = pattern.referenced_vars();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&VarId(0)));
+        assert!(vars.contains(&VarId(1)));
+    }
+}

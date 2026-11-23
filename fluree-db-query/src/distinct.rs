@@ -1,0 +1,759 @@
+//! Distinct operator for removing duplicate rows
+//!
+//! The `DistinctOperator` deduplicates rows based on all columns in the schema.
+//! It uses a HashSet to track seen rows, processing batches incrementally.
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::group_aggregate::{binding_to_group_key_normalized, is_vector_binding, GroupKeyOwned};
+use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
+use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use hashbrown::hash_table::{Entry, HashTable};
+use rustc_hash::FxHasher;
+use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+/// Row signature type for deduplication
+/// `Binding` implements `Hash` and `Eq`, so `Vec<Binding>` can be used as a hash key.
+type RowSignature = Vec<Binding>;
+
+/// Distinct operator - removes duplicate rows
+///
+/// Uses a streaming approach: processes one batch at a time, maintaining a
+/// HashSet of seen row signatures. Memory usage grows with the number of
+/// unique rows seen.
+///
+/// Wraps a child operator and emits each unique row combination exactly once.
+pub struct DistinctOperator {
+    /// Child operator
+    child: BoxedOperator,
+    /// Seen row signatures, each with its hash: a row's hash reads every
+    /// binding (a vector's every component), so growing the table reuses it
+    /// rather than hashing each row again.
+    seen: HashTable<(u64, RowSignature)>,
+    /// Seen rows that hold a vector, keyed by value
+    /// ([`binding_to_group_key_normalized`]): a stored vector keys as a slice
+    /// of its arena, so neither probing nor keeping a row decodes it. Kept
+    /// apart from `seen` (a vector equals no other term), so a row without
+    /// one pays only the check that it has none.
+    seen_keyed: HashTable<(u64, Vec<GroupKeyOwned>)>,
+    /// Output schema (same as child)
+    schema: Arc<[VarId]>,
+    /// Operator state
+    state: OperatorState,
+    /// Store for normalizing decoded bindings to their encoded form before
+    /// hashing, so mixed-representation streams (scan ∪ VALUES/BIND) dedup
+    /// correctly. `None` outside single-ledger binary execution.
+    norm: Option<EqualityNorm>,
+}
+
+impl DistinctOperator {
+    /// Create a new distinct operator
+    ///
+    /// # Arguments
+    ///
+    /// * `child` - The child operator to deduplicate
+    pub fn new(child: BoxedOperator) -> Self {
+        let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
+        Self {
+            child,
+            seen: HashTable::new(),
+            seen_keyed: HashTable::new(),
+            schema,
+            state: OperatorState::Created,
+            norm: None,
+        }
+    }
+
+    /// Recover the child when a runtime-only dedup wrapper is closed.
+    pub(crate) fn into_child(self) -> BoxedOperator {
+        self.child
+    }
+
+    /// Get the number of unique rows seen so far
+    pub fn unique_count(&self) -> usize {
+        self.seen.len() + self.seen_keyed.len()
+    }
+
+    /// Extract row signature from batch at given row index.
+    #[inline]
+    fn extract_signature_with_len(batch: &Batch, row_idx: usize, cols: usize) -> RowSignature {
+        let mut sig = Vec::with_capacity(cols);
+        for col in 0..cols {
+            sig.push(batch.get_by_col(row_idx, col).clone());
+        }
+        sig
+    }
+
+    #[inline]
+    fn row_hash_with_len(batch: &Batch, row_idx: usize, cols: usize) -> u64 {
+        let mut h = FxHasher::default();
+        // Match `Vec<T>` / slice hashing which incorporates length.
+        cols.hash(&mut h);
+        for col in 0..cols {
+            batch.get_by_col(row_idx, col).hash(&mut h);
+        }
+        h.finish()
+    }
+}
+
+#[async_trait]
+impl Operator for DistinctOperator {
+    // The trait object has no Default; replace it with a closed wrapper's stub.
+    #[allow(clippy::box_default)]
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        if self.state != OperatorState::Created {
+            return None;
+        }
+        self.state = OperatorState::Closed;
+        Some(std::mem::replace(
+            &mut self.child,
+            Box::new(crate::seed::EmptyOperator::new()),
+        ))
+    }
+
+    /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
+    /// many input rows into one, so producing `k` distinct rows can require
+    /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so
+    /// the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "DISTINCT row-budget swallowed (unsound to forward: dedup collapses rows)"
+        );
+    }
+
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        if !self.state.can_open() {
+            if self.state.is_closed() {
+                return Err(crate::error::QueryError::OperatorClosed);
+            }
+            return Err(crate::error::QueryError::OperatorAlreadyOpened);
+        }
+
+        self.child.open(ctx).await?;
+        self.seen.clear();
+        self.seen_keyed.clear();
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if !self.state.can_next() {
+            if self.state == OperatorState::Created {
+                return Err(crate::error::QueryError::OperatorNotOpened);
+            }
+            return Ok(None);
+        }
+
+        loop {
+            // Get next batch from child
+            let batch = match self.child.next_batch(ctx).await? {
+                Some(b) => b,
+                None => {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                }
+            };
+
+            // Find rows that are not duplicates.
+            //
+            // IMPORTANT: avoid allocating/cloning a `Vec<Binding>` per row. We compute
+            // the hash directly from the batch row, probe the set with a borrowed
+            // equality check, and only allocate the full signature for rows that
+            // are genuinely new.
+            let num_cols = self.schema.len();
+
+            // Zero-column input: every WHERE variable was projected away, so every
+            // row is the empty tuple and they are all duplicates of one another —
+            // DISTINCT over N of them is exactly one row, or none if the child was
+            // empty. This needs its own arm because a column-less `Batch` carries no
+            // row count (`Batch::new` reads it off `columns.first()`), so the
+            // general path below would build a zero-row batch and its
+            // `columns.first() … unwrap_or(true)` guard would read "all duplicates"
+            // forever, swallowing the whole stream. `Batch::empty_schema_with_len`
+            // is the constructor that preserves a row count without columns.
+            //
+            // Reachable from a CONSTRUCT whose template is entirely constant
+            // (`CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }`): the graph result
+            // licenses WHERE-level dedup while the template needs no variable, so
+            // the block prunes to an empty schema.
+            if num_cols == 0 {
+                if batch.is_empty() {
+                    continue;
+                }
+                if self.seen.is_empty() {
+                    self.seen
+                        .insert_unique(0, (0, RowSignature::new()), |(hash, _)| *hash);
+                    return Ok(Some(Batch::empty_schema_with_len(1)));
+                }
+                continue;
+            }
+
+            let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            // Reused across rows: a duplicate row costs a hash and a probe, no
+            // allocation; only rows that survive are copied into an owned key.
+            let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
+            let mut keyed: Vec<GroupKeyOwned> = Vec::with_capacity(num_cols);
+
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
+            for row_idx in 0..batch.len() {
+                if self.norm.is_some()
+                    && (0..num_cols).any(|col| is_vector_binding(batch.get_by_col(row_idx, col)))
+                {
+                    keyed.clear();
+                    for col in 0..num_cols {
+                        keyed.push(binding_to_group_key_normalized(
+                            batch.get_by_col(row_idx, col),
+                            dicts,
+                            gv,
+                        )?);
+                    }
+                    let mut h = FxHasher::default();
+                    keyed.hash(&mut h);
+                    let hash = h.finish();
+                    let entry = self.seen_keyed.entry(
+                        hash,
+                        |(h, key)| *h == hash && *key == keyed,
+                        |(h, _)| *h,
+                    );
+                    if let Entry::Vacant(v) = entry {
+                        v.insert((hash, std::mem::take(&mut keyed)));
+                        for (col_idx, col) in columns.iter_mut().enumerate() {
+                            col.push(batch.get_by_col(row_idx, col_idx).clone());
+                        }
+                    }
+                    continue;
+                }
+                if self.norm.is_some() {
+                    // Normalize decoded bindings to encoded form so mixed
+                    // representations of the same value dedup (encoded
+                    // bindings pass through untouched, borrowed).
+                    scratch.clear();
+                    for col in 0..num_cols {
+                        scratch.push(normalize_for_key_cow(
+                            batch.get_by_col(row_idx, col),
+                            dicts,
+                            gv,
+                        )?);
+                    }
+                    // `Cow` hashes as the binding it wraps, so this equals the
+                    // stored `Vec<Binding>` hash the map recomputes on rehash.
+                    let mut h = FxHasher::default();
+                    scratch.hash(&mut h);
+                    let hash = h.finish();
+                    let entry = self.seen.entry(
+                        hash,
+                        |(h, sig)| {
+                            *h == hash
+                                && sig.len() == scratch.len()
+                                && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
+                        },
+                        |(h, _)| *h,
+                    );
+                    if let Entry::Vacant(v) = entry {
+                        let signature: RowSignature =
+                            scratch.iter().map(|b| b.as_ref().clone()).collect();
+                        v.insert((hash, signature));
+                        for (col_idx, col) in columns.iter_mut().enumerate() {
+                            col.push(batch.get_by_col(row_idx, col_idx).clone());
+                        }
+                    }
+                    continue;
+                }
+
+                let hash = Self::row_hash_with_len(&batch, row_idx, num_cols);
+                let entry = self.seen.entry(
+                    hash,
+                    |(h, sig)| {
+                        if *h != hash || sig.len() != num_cols {
+                            return false;
+                        }
+                        for col in 0..num_cols {
+                            let Some(b) = sig.get(col) else {
+                                return false;
+                            };
+                            if b != batch.get_by_col(row_idx, col) {
+                                return false;
+                            }
+                        }
+                        true
+                    },
+                    |(h, _)| *h,
+                );
+
+                if let Entry::Vacant(v) = entry {
+                    let signature = Self::extract_signature_with_len(&batch, row_idx, num_cols);
+                    v.insert((hash, signature));
+
+                    for (col_idx, col) in columns.iter_mut().enumerate() {
+                        col.push(batch.get_by_col(row_idx, col_idx).clone());
+                    }
+                }
+            }
+
+            // A key comparison that failed to read counted its pair as
+            // distinct; fail rather than emit on it.
+            ctx.check_key_reads()?;
+
+            if columns.first().map(std::vec::Vec::is_empty).unwrap_or(true) {
+                // All rows were duplicates, try next batch
+                continue;
+            }
+
+            return Ok(Some(Batch::new(self.schema.clone(), columns)?));
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.seen.clear(); // Release memory
+        self.seen_keyed.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        // Can't estimate deduplication impact without data statistics
+        // Return child estimate as upper bound
+        self.child.estimated_rows()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::QueryError;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
+
+    /// Mock operator that emits predefined batches
+    struct MockOperator {
+        batches: Vec<Batch>,
+        idx: usize,
+        schema: Arc<[VarId]>,
+        state: OperatorState,
+    }
+
+    impl MockOperator {
+        fn new(batches: Vec<Batch>) -> Self {
+            let schema = batches
+                .first()
+                .map(|b| Arc::from(b.schema().to_vec().into_boxed_slice()))
+                .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()));
+            Self {
+                batches,
+                idx: 0,
+                schema,
+                state: OperatorState::Created,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Operator for MockOperator {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            self.idx = 0;
+            self.state = OperatorState::Open;
+            Ok(())
+        }
+
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            if self.state != OperatorState::Open {
+                return Ok(None);
+            }
+
+            if self.idx < self.batches.len() {
+                let batch = self.batches[self.idx].clone();
+                self.idx += 1;
+                Ok(Some(batch))
+            } else {
+                self.state = OperatorState::Exhausted;
+                Ok(None)
+            }
+        }
+
+        fn close(&mut self) {
+            self.state = OperatorState::Closed;
+        }
+
+        fn estimated_rows(&self) -> Option<usize> {
+            Some(
+                self.batches
+                    .iter()
+                    .map(super::super::binding::Batch::len)
+                    .sum(),
+            )
+        }
+    }
+
+    fn make_batch_with_values(schema: Arc<[VarId]>, values: Vec<i64>) -> Batch {
+        let columns = vec![values
+            .into_iter()
+            .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+            .collect()];
+        Batch::new(schema, columns).unwrap()
+    }
+
+    fn make_batch_2col(schema: Arc<[VarId]>, col1: Vec<i64>, col2: Vec<i64>) -> Batch {
+        assert_eq!(col1.len(), col2.len());
+        let columns = vec![
+            col1.into_iter()
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .collect(),
+            col2.into_iter()
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .collect(),
+        ];
+        Batch::new(schema, columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_distinct_all_unique() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch = make_batch_with_values(schema.clone(), vec![1, 2, 3, 4, 5]);
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 5);
+        assert_eq!(distinct_op.unique_count(), 5);
+
+        // Should be exhausted
+        let result2 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result2.is_none());
+    }
+
+    /// Zero-column input: every row is the empty tuple, so DISTINCT over any
+    /// number of them is exactly one row — and one row *total*, across every
+    /// batch in the stream.
+    ///
+    /// A column-less `Batch` carries no row count through `Batch::new` (it reads
+    /// the count off `columns.first()`), so the general dedup path built a
+    /// zero-row batch and then its `columns.first() … unwrap_or(true)` guard
+    /// read "all rows were duplicates" on every batch and swallowed the whole
+    /// stream. `CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }` reaches this: the
+    /// graph result licenses WHERE-level dedup while the constant template needs
+    /// no variable, so the block prunes to an empty schema and the query
+    /// returned an empty graph instead of its one triple.
+    #[tokio::test]
+    async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Three batches of empty tuples: 4 rows, then 0, then 2.
+        let mock = MockOperator::new(vec![
+            Batch::empty_schema_with_len(4),
+            Batch::empty_schema_with_len(0),
+            Batch::empty_schema_with_len(2),
+        ]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let first = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(
+            first.is_some(),
+            "zero-column DISTINCT must emit the single empty-tuple row"
+        );
+        assert_eq!(first.unwrap().len(), 1);
+
+        assert!(
+            distinct_op.next_batch(&ctx).await.unwrap().is_none(),
+            "the remaining empty tuples are duplicates of the first"
+        );
+    }
+
+    /// The other half: a child that produced no rows at all must stay empty —
+    /// the fix must not manufacture a row out of an empty solution sequence.
+    #[tokio::test]
+    async fn test_distinct_zero_column_empty_child_stays_empty() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(0)]);
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        assert!(distinct_op.next_batch(&ctx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_distinct_all_duplicates() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch = make_batch_with_values(schema.clone(), vec![1, 1, 1, 1, 1]);
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(distinct_op.unique_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_mixed() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        // 1, 2, 1, 3, 2, 1, 4 => unique: 1, 2, 3, 4
+        let batch = make_batch_with_values(schema.clone(), vec![1, 2, 1, 3, 2, 1, 4]);
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        let batch = result.unwrap();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(distinct_op.unique_count(), 4);
+
+        // Verify the values are 1, 2, 3, 4 (first occurrences)
+        let vals: Vec<i64> = (0..batch.len())
+            .filter_map(|i| {
+                if let Binding::Lit {
+                    val: FlakeValue::Long(v),
+                    ..
+                } = batch.get_by_col(i, 0)
+                {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_across_batches() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch1 = make_batch_with_values(schema.clone(), vec![1, 2, 3]);
+        let batch2 = make_batch_with_values(schema.clone(), vec![2, 3, 4]); // 2, 3 are dupes
+        let batch3 = make_batch_with_values(schema.clone(), vec![1, 5, 1]); // 1 is dupe
+        let mock = MockOperator::new(vec![batch1, batch2, batch3]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        // First batch: all unique (1, 2, 3)
+        let result1 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result1.is_some());
+        assert_eq!(result1.unwrap().len(), 3);
+
+        // Second batch: only 4 is new
+        let result2 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().len(), 1);
+
+        // Third batch: only 5 is new
+        let result3 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result3.is_some());
+        assert_eq!(result3.unwrap().len(), 1);
+
+        assert_eq!(distinct_op.unique_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_batch_all_dupes_skipped() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch1 = make_batch_with_values(schema.clone(), vec![1, 2, 3]);
+        let batch2 = make_batch_with_values(schema.clone(), vec![1, 2, 3]); // all dupes
+        let batch3 = make_batch_with_values(schema.clone(), vec![4, 5]); // new values
+        let mock = MockOperator::new(vec![batch1, batch2, batch3]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        // First batch: all unique
+        let result1 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result1.is_some());
+        assert_eq!(result1.unwrap().len(), 3);
+
+        // Second batch is all dupes, should skip to third
+        let result2 = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().len(), 2); // batch3's rows
+
+        assert_eq!(distinct_op.unique_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_multi_column() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        // (1, 1), (1, 2), (1, 1) - third is dupe of first
+        let batch = make_batch_2col(schema.clone(), vec![1, 1, 1], vec![1, 2, 1]);
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 2); // (1,1) and (1,2)
+        assert_eq!(distinct_op.unique_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_with_unbound() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let columns = vec![vec![
+            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+            Binding::Unbound,
+            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")), // dupe of first
+            Binding::Unbound,                                       // dupe of second Unbound
+        ]];
+        let batch = Batch::new(schema.clone(), columns).unwrap();
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 2); // Long(1) and Unbound
+        assert_eq!(distinct_op.unique_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_with_poisoned() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let columns = vec![vec![
+            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+            Binding::Poisoned,
+            Binding::Poisoned, // dupe of first Poisoned
+            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")), // dupe of first
+        ]];
+        let batch = Batch::new(schema.clone(), columns).unwrap();
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 2); // Long(1) and Poisoned
+        assert_eq!(distinct_op.unique_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_preserves_schema() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)].into_boxed_slice());
+        let columns: Vec<Vec<Binding>> = (0..3)
+            .map(|col| {
+                (0..5)
+                    .map(|row| {
+                        Binding::lit(
+                            FlakeValue::Long((col * 10 + row) as i64),
+                            Sid::new(1, "long"),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let batch = Batch::new(schema.clone(), columns).unwrap();
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        assert_eq!(distinct_op.schema(), &[VarId(0), VarId(1), VarId(2)]);
+
+        distinct_op.open(&ctx).await.unwrap();
+
+        let result = distinct_op.next_batch(&ctx).await.unwrap().unwrap();
+        assert_eq!(result.schema(), &[VarId(0), VarId(1), VarId(2)]);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_state_transitions() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let batch = make_batch_with_values(schema.clone(), vec![1, 2, 3]);
+        let mock = MockOperator::new(vec![batch]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+
+        // Can't call next_batch before open
+        let err = distinct_op.next_batch(&ctx).await;
+        assert!(matches!(err, Err(QueryError::OperatorNotOpened)));
+
+        // Open successfully
+        distinct_op.open(&ctx).await.unwrap();
+
+        // Can't open twice
+        let err = distinct_op.open(&ctx).await;
+        assert!(matches!(err, Err(QueryError::OperatorAlreadyOpened)));
+
+        // Get result
+        let _ = distinct_op.next_batch(&ctx).await.unwrap();
+
+        // Close
+        distinct_op.close();
+        assert_eq!(distinct_op.unique_count(), 0); // Cleared on close
+
+        // Can't open after close
+        let err = distinct_op.open(&ctx).await;
+        assert!(matches!(err, Err(QueryError::OperatorClosed)));
+    }
+}

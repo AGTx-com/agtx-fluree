@@ -1,0 +1,476 @@
+# Setting Groups
+
+Each setting group configures a different subsystem. Groups are resolved independently — locking down one group does not affect others.
+
+All setting groups can appear on both `f:LedgerConfig` (ledger-wide defaults) and `f:GraphConfig` (per-graph overrides), except where noted.
+
+## System defaults
+
+When no config graph is present (or a setting group is absent), the system defaults apply:
+
+| Setting group | System default |
+|---------------|----------------|
+| Policy | Enforcement off for requests carrying no policy inputs; **fail-closed** for requests that do (see below) |
+| SHACL | Disabled — no shape validation, even when the ledger holds shapes |
+| Reasoning | Disabled — no OWL/RDFS inference |
+| Datalog | Disabled — no rule evaluation |
+| Transact constraints | Disabled — no uniqueness enforcement |
+| Query defaults | The default graph holds only its own triples (no union default graph) |
+| Override control | `f:OverrideAll` — any request can override any setting |
+
+An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
+
+- A request that carries **no policy inputs** — no identity, no `policy-class`, no inline `policy` — is governed by the ledger's [policy defaults](#policy-defaults) when the ledger configures any; `f:defaultAllow false`, for example, denies it. On a ledger with no policy configuration it reads everything. This is the case that makes a fresh ledger feel fully open.
+- A request that carries **any** of those inputs is enforced. If the identity has no policies granting it anything and nothing sets `f:defaultAllow true`, it reads no data — authenticating *reduces* what a caller sees on an unpoliced ledger. Setting `f:defaultAllow true` on the ledger is what opens an unpoliced ledger to identity-carrying requests.
+
+Schema flakes (`rdf:type` with a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`) bypass view policy, so even a fully denied identity can read the ontology. Writing them is checked by modify policy like any other triple.
+
+To find out whether a given request was enforced, ask for policy tracking — see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
+
+---
+
+## Policy defaults
+
+**Group predicate**: `f:policyDefaults`
+
+Controls default policy enforcement behavior.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Applies to requests with and without policy inputs |
+| `f:policySource` | `f:GraphRef` | (none) | Graph containing policy rules (`f:Allow`, `f:Modify`, etc.) |
+| `f:policyClass` | IRI or list | (none) | Default policy classes to apply |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating (see [Override control](override-control.md)) |
+
+`f:policySource` is non-overridable — it can only be changed by writing to the config graph, not at query time. `f:defaultAllow` and `f:policyClass` are overridable (subject to override control).
+
+When `f:policySource` is set, the policy loader scans the specified graph for policy rules instead of the default graph. This keeps policy rules separate from end-user data. If `f:policySource` is not set, policies are loaded from the default graph (backward compatible).
+
+`f:policySource` and the policy defaults are honored on **both reads and writes**: queries load view rules from the configured graph, and transactions load `f:modify` rules from the same graph before staging. Config-declared `f:policyClass` / `f:defaultAllow` defaults apply to transactions even when the request itself carries no policy inputs — an operator who relocates policy into a named graph (or a model ledger) gets the same enforcement on writes as on reads.
+
+**Cross-ledger references are supported on `f:policySource`.** The graph source can name another ledger via `f:ledger`, so a single model ledger can hold policy rules that govern many data ledgers. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the configuration pattern and the contract on `f:policyClass` filtering, baseline `f:AccessPolicy` semantics, and the failure modes.
+
+**Not yet honored on `f:policySource`** (parsed by the config layer but rejected at request time with a clear error): `f:atT` temporal pinning, `f:trustPolicy` verification, `f:rollbackGuard` freshness constraints. Cross-ledger references are also supported on `f:constraintsSource`, `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported), `f:shapesSource`, and `f:rulesSource`. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the end-to-end configuration patterns and failure modes shared by all five subsystems.
+
+### Example: policies in the default graph
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:policyDefaults [
+      f:defaultAllow false ;
+      f:policySource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector f:defaultGraph ]
+      ] ;
+      f:overrideControl f:OverrideAll
+    ] .
+}
+```
+
+### Example: policies in a named graph
+
+Storing policy rules in a dedicated named graph keeps them out of the default data graph. The identity's `f:policyClass` triples must also be in the policy graph.
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:policyDefaults [
+      f:defaultAllow false ;
+      f:policySource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector <urn:fluree:mydb:main/policy> ]
+      ]
+    ] .
+}
+```
+
+---
+
+## SHACL defaults
+
+**Group predicate**: `f:shaclDefaults`
+
+Controls SHACL shape validation at transaction time.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:shaclEnabled` | boolean | `false` | Enable or disable SHACL validation |
+| `f:shapesSource` | `f:GraphRef` | (none) | Graph containing SHACL shapes |
+| `f:additionalDataSource` | `f:GraphRef` (repeatable) | (none) | Graph read with the graph being validated, as one graph, when its nodes are checked; see [Validating against other graphs](../guides/cookbook-shacl.md#validating-against-other-graphs) |
+| `f:validationMode` | IRI | `f:ValidationReject` | `f:ValidationReject` (reject invalid data) or `f:ValidationWarn` (log warning, allow) |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+
+`f:shapesSource` and `f:additionalDataSource` are non-overridable: no request can change them. `f:shaclEnabled` and `f:validationMode` are overridable per graph. A per-graph `f:additionalDataSource` list replaces the ledger-wide list for that graph.
+
+Shapes alone never enable SHACL: a graph is validated only when its effective SHACL group (the ledger-wide group merged with the graph's override) sets `f:shaclEnabled true`.
+
+| Effective SHACL group for a graph | Validation |
+|---|---|
+| None: no config, a config without a SHACL group, or an empty group | Off, whatever shapes the ledger holds |
+| `f:shaclEnabled true` | On, in `f:validationMode` (default `f:ValidationReject`) |
+| `f:shaclEnabled false` or unset | Off |
+
+A ledger that holds shapes with no graph enabling them reports `shapes present; SHACL enforcement not configured` in ledger info. To enable SHACL, see [Enabling SHACL](writing-config.md#enabling-shacl). The config graph and the `#txn-meta` graph are never validated.
+
+`f:validationMode` can additionally be overridden per **transaction** via
+`opts.validationMode` (`"warn"` / `"reject"`): strengthening is always
+honored, softening only when `f:overrideControl` permits it for the
+request's verified identity. See
+[Override control](override-control.md#shacl-fshacldefaults).
+
+Inline shapes sent with a transaction (`opts.shapes`) are a request setting governed by `f:overrideControl`, not by `f:shaclEnabled`; see [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:shaclDefaults [
+      f:shaclEnabled true ;
+      f:shapesSource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector f:defaultGraph ]
+      ] ;
+      f:validationMode f:ValidationReject ;
+      f:overrideControl f:OverrideNone
+    ] .
+}
+```
+
+---
+
+## Reasoning defaults
+
+**Group predicate**: `f:reasoningDefaults`
+
+Controls OWL/RDFS reasoning applied at query time.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:reasoningModes` | IRI, string, or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog`. Accepts repeated IRI objects (`f:reasoningModes f:rdfs, f:datalog`), string literals (`"rdfs"`), or an RDF collection of either (`( "rdfs" "datalog" )`); mode names are case-insensitive |
+| `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
+| `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
+| `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |
+| `f:reasoningMaxMemoryMb` | integer | derived from `f:reasoningMaxFacts` | Materialization budget: max megabytes of derived facts before the closure is capped |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+
+`f:schemaSource` is non-overridable. `f:reasoningModes` and the budget fields
+are overridable.
+
+The budget fields are a **correctness control**: a capped materialization is
+an incomplete closure, so reasoning queries may silently miss entailments.
+A capped run surfaces in tracked query responses as a `reasoning` block with
+`"capped": true` (and in the `x-fdb-reasoning` response header). The budget
+can be configured without `f:reasoningModes` — it then governs queries that
+request reasoning themselves. Queries may supply their own budget via the
+`"reasoningBudget"` key (JSON-LD) or `# PRAGMA reasoning-max-facts:` /
+`# PRAGMA reasoning-max-seconds:` (SPARQL), subject to `f:overrideControl`.
+Server-wide defaults come from `FLUREE_REASONING_MAX_FACTS` /
+`FLUREE_REASONING_MAX_SECONDS` (lowest precedence above the built-ins).
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:reasoningDefaults [
+      f:reasoningModes f:RDFS ;
+      f:schemaSource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector f:defaultGraph ]
+      ] ;
+      f:overrideControl f:OverrideAll
+    ] .
+}
+```
+
+---
+
+## Datalog defaults
+
+**Group predicate**: `f:datalogDefaults`
+
+Controls Fluree's stored datalog rules (`f:rule`).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:datalogEnabled` | boolean | `false` | Enable or disable datalog rule evaluation |
+| `f:rulesSource` | `f:GraphRef` | (none) | Graph containing `f:rule` definitions |
+| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+
+`f:rulesSource` is non-overridable. `f:datalogEnabled` and `f:allowQueryTimeRules` are overridable.
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:datalogDefaults [
+      f:datalogEnabled true ;
+      f:rulesSource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector f:defaultGraph ]
+      ] ;
+      f:allowQueryTimeRules false ;
+      f:overrideControl f:OverrideNone
+    ] .
+}
+```
+
+---
+
+## Transact defaults
+
+**Group predicate**: `f:transactDefaults`
+
+Controls transaction-time constraint enforcement, such as property value uniqueness.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:uniqueEnabled` | boolean | `false` | Enable unique constraint enforcement |
+| `f:constraintsSource` | `f:GraphRef` or list | default graph | Graph(s) containing constraint annotations (e.g., `f:enforceUnique`) |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+
+When `f:uniqueEnabled` is `true` and `f:constraintsSource` is omitted, the default graph is used as the constraint source.
+
+### Additive merge semantics
+
+Unlike other setting groups where per-graph values **replace** ledger-wide values field-by-field, transact defaults use **additive** merge semantics:
+
+- **`f:uniqueEnabled`**: Once enabled at the ledger level, it stays enabled for all graphs. Per-graph configs cannot disable it.
+- **`f:constraintsSource`**: Per-graph sources are **added to** ledger-wide sources, not substituted. A graph checks annotations from all sources (ledger-wide + graph-specific).
+
+This prevents a per-graph override from accidentally disabling enforcement or dropping constraint sources.
+
+Note: additive merge is still subject to override control. If the ledger-wide `f:overrideControl` for `f:transactDefaults` is `f:OverrideNone`, per-graph additions are blocked entirely — the ledger-wide settings are final.
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix ex: <http://example.org/ns/> .
+
+# Define constraint annotations in the default graph
+ex:email f:enforceUnique true .
+ex:ssn   f:enforceUnique true .
+
+# Enable enforcement via config
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:transactDefaults [
+      f:uniqueEnabled true ;
+      f:constraintsSource [
+        a f:GraphRef ;
+        f:graphSource [ f:graphSelector f:defaultGraph ]
+      ]
+    ] .
+}
+```
+
+See [Unique constraints](unique-constraints.md) for full details on `f:enforceUnique`.
+
+---
+
+## Full-text defaults
+
+**Group predicate**: `f:fullTextDefaults`
+
+Declares properties whose string values should be indexed for BM25 full-text
+scoring without requiring the `@fulltext` datatype per value, and sets the
+default analyzer language for untagged plain strings.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `f:defaultLanguage` | BCP-47 string | `"en"` | Analyzer language for plain (`xsd:string`) values on configured properties |
+| `f:property` | `f:FullTextProperty` list | empty | One node per property to full-text index |
+| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+
+Each `f:property` entry is an `f:FullTextProperty` node carrying `f:target` —
+the IRI of the property being indexed. Additional optional knobs (per-property
+language, tokenizer, etc.) can be added to `f:FullTextProperty` in the future
+without breaking the schema.
+
+The `@fulltext` datatype retains its zero-config shortcut semantics: any value
+tagged `@fulltext` always indexes as English, regardless of what
+`f:fullTextDefaults` declares. Configured plain-string paths and
+`@fulltext`-datatype English content share the same per-property English
+arena — no duplication.
+
+`rdf:langString` values auto-route to per-language arenas by their tag. An
+unrecognized BCP-47 tag tokenizes + lowercases only (no stopwords, no
+stemming) — consistent on both indexing and query sides.
+
+### Additive merge semantics
+
+Like `f:transactDefaults`, `f:fullTextDefaults` uses additive merge. Per-graph
+`f:property` entries are appended to the ledger-wide list (deduping by
+target IRI — per-graph wins on a collision). Per-graph `f:defaultLanguage`
+shadows the ledger-wide value. Ledger-wide `f:OverrideNone` blocks per-graph
+overrides entirely.
+
+### Config changes require a manual reindex
+
+Editing `f:fullTextDefaults` never triggers any indexing automatically. Arenas
+reflect the config that was in effect at their build time; to pick up a
+changed property list or default language, run a full reindex (`fluree
+reindex …` or equivalent). Until then, existing arenas stay authoritative and
+novelty written after the config change is scored with whatever language the
+current effective config resolves to — which may produce temporarily
+mismatched scoring until the reindex completes.
+
+An in-flight reindex operates on a point-in-time snapshot and will not see a
+config change committed during its run. Wait for the reindex to finish, then
+trigger a new one against the post-change state.
+
+### Example
+
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix ex: <http://example.org/ns/> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:fullTextDefaults [
+      a f:FullTextDefaults ;
+      f:defaultLanguage "en" ;
+      f:property [ a f:FullTextProperty ; f:target ex:title ] ,
+                 [ a f:FullTextProperty ; f:target ex:body ]
+    ] .
+}
+```
+
+### Per-graph override example
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:fullTextDefaults [
+      a f:FullTextDefaults ;
+      f:defaultLanguage "en" ;
+      f:property [ a f:FullTextProperty ; f:target ex:title ]
+    ] ;
+    f:graphOverrides [
+      a f:GraphConfig ;
+      f:targetGraph <urn:example:productCatalog> ;
+      f:fullTextDefaults [
+        a f:FullTextDefaults ;
+        f:defaultLanguage "es" ;
+        f:property [ a f:FullTextProperty ; f:target ex:productName ]
+      ]
+    ] .
+}
+```
+
+Under this config, queries touching the `productCatalog` graph analyze
+untagged plain strings as Spanish (`"es"`); other graphs keep English.
+`ex:title` is full-text indexed everywhere (ledger-wide); `ex:productName`
+is indexed only in the `productCatalog` graph.
+
+See [Inline fulltext search](../indexing-and-search/fulltext.md) for the
+end-user guide — when to pick this path over the `@fulltext` datatype,
+supported languages, per-graph multilingual setups, the reindex workflow,
+and how configured properties interact with `@fulltext`-datatype values.
+
+---
+
+## Ledger-scoped settings
+
+Some settings are structurally tied to the ledger as a whole and are **not meaningful per-graph**. They live exclusively on `f:LedgerConfig` and are ignored if present on `f:GraphConfig`.
+
+Override control does not apply to ledger-scoped settings. `f:servingDefaults` changes only by writing to the config graph; `f:queryDefaults` sets what a query reads when the query does not say, and any request may say.
+
+### `f:queryDefaults` — query defaults
+
+| Field | Type | Meaning |
+|---|---|---|
+| `f:unionDefaultGraph` | boolean | A query that does not choose its own default graph reads the **union** of the ledger's default graph and all its named graphs (default `false`) |
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main>  a f:LedgerConfig ;
+                    f:queryDefaults <urn:cfg:query> .
+    <urn:cfg:query> f:unionDefaultGraph true .
+}
+```
+
+With the setting on, a query with no `FROM` — or one whose `FROM` names only the ledger itself — matches its default-graph patterns against every graph of the ledger, as one graph: a triple stored in two graphs is one triple, and a property path follows edges from graph to graph. The reserved `#txn-meta` and `#config` graphs are never part of the union. `GRAPH` patterns address the named graphs exactly as before, and a `FROM` naming a graph reads just that graph.
+
+A query can decide for itself either way, with `# PRAGMA union-default-graph: true | false` in SPARQL or `"opts": {"unionDefaultGraph": true | false}` in JSON-LD. The union changes what a query reads, not what it may read: each graph is read under the same policy a `GRAPH` pattern reading it would be.
+
+The setting applies to reads only. Transactions write to the graphs they name, and the `WHERE` of an update — including the reads inside a Cypher write statement — matches the default graph alone. History queries (`FROM … TO …`) also read the default graph alone.
+
+See [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph).
+
+### `f:servingDefaults` — serving posture
+
+Declares which serving tiers the ledger's **origin server** offers to callers. Fields (all optional; absent means allowed):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `f:serveQuery` | boolean | Origin executes queries for this ledger (`false` → query endpoints return 403 with a stable message) |
+| `f:serveBlocks` | boolean | Origin serves raw replication content — storage-proxy blocks/objects, commit blobs, pack streams (`false` → those endpoints return 404) |
+| `f:publicVisibility` | boolean | Ledger is discoverable/readable without a token (default `false`; reserved for the anonymous access tier) |
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main>    a f:LedgerConfig ;
+                      f:servingDefaults <urn:cfg:serving> .
+    <urn:cfg:serving> f:serveQuery  false ;
+                      f:serveBlocks true .
+}
+```
+
+The example above is the "bring your own compute" posture: consumers fetch index blocks and execute queries client-side (peer mode); the origin refuses to spend query compute.
+
+Serving gates bind **only the origin's serving surface** (transaction-role servers). A read-only peer or a consumer that mounts the ledger's blocks always queries its own copy freely — the posture travels with the config graph but is deliberately not enforced on replicas, since restricting what a holder of the full blocks does locally is not enforceable anyway. Peers negotiate the mode via the `serving` field on nameservice record responses (see [Query peers](../operations/query-peers.md)).
+
+> **Note:** `f:authzSource` (an identity/relationship graph used by policy evaluation) is planned as a ledger-scoped setting but is not yet implemented. When available, it will let the config graph specify which graph contains identity data (e.g., DID→role mappings) for policy resolution.
+
+---
+
+## `f:GraphRef`: referencing source graphs
+
+Several fields (`f:policySource`, `f:shapesSource`, `f:schemaSource`, `f:rulesSource`, `f:constraintsSource`) use `f:GraphRef` to point at graphs containing rules, shapes, schema, or constraints.
+
+A `f:GraphRef` has two levels: the outer node carries the type and optional trust/rollback settings, and a nested `f:graphSource` object carries the source coordinates:
+
+| Field | Level | Type | Description |
+|-------|-------|------|-------------|
+| `f:graphSource` | `f:GraphRef` | object | Nested source coordinates (required) |
+| `f:trustPolicy` | `f:GraphRef` | object | How to verify the referenced graph (future) |
+| `f:rollbackGuard` | `f:GraphRef` | object | Freshness constraints (future) |
+| `f:graphSelector` | `f:graphSource` | IRI | Target graph: `f:defaultGraph`, `f:txnMetaGraph`, or a named graph IRI |
+| `f:ledger` | `f:graphSource` | IRI | Ledger identifier. Supported on `f:policySource`, `f:constraintsSource`, `f:schemaSource` (single graph only), `f:shapesSource`, and `f:rulesSource`. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the shared resolver contract and failure modes. |
+| `f:atT` | `f:graphSource` | integer | Pin to a specific transaction time (optional) |
+
+For the common case of referencing a graph within the same ledger, only `f:graphSelector` is needed inside `f:graphSource`:
+
+```trig
+f:shapesSource [
+  a f:GraphRef ;
+  f:graphSource [ f:graphSelector f:defaultGraph ]
+] .
+```
+
+For referencing the config graph itself (co-resident rules/shapes):
+
+```trig
+f:policySource [
+  a f:GraphRef ;
+  f:graphSource [ f:graphSelector <urn:fluree:mydb:main#config> ]
+] .
+```
+
+Cross-ledger `f:GraphRef` (using `f:ledger` to reference another ledger) is honored by all five governance source predicates: `f:policySource`, `f:constraintsSource`, `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported on schema), `f:shapesSource`, and `f:rulesSource`. See [Cross-ledger policy](../security/cross-ledger-policy.md) for end-to-end patterns.

@@ -1,0 +1,67 @@
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'fluree-db-python/docs/**'
+      - 'fluree-db-python/python/**'
+      - 'fluree-db-python/README.md'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: 'latest'
+
+      - name: Build
+        run: mdbook build docs
+
+      # The [preprocessor.llms] step (docs/scripts/llms_preproc.py) ran during
+      # the build above and staged llms.txt, llms-full.txt, and a raw .md mirror
+      # into docs/.llms-staging. Copy them into the published site root.
+      - name: Stage llms.txt artifacts into the published site
+        run: cp -R docs/.llms-staging/. docs/book/
+
+      # The Python API reference, read from the package source (no engine
+      # build), published under /python/.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Build the Python API reference
+        run: |
+          python -m pip install -r fluree-db-python/docs/requirements.txt
+          python -m sphinx -q -b html -d "$RUNNER_TEMP/python-doctrees" fluree-db-python/docs docs/book/python
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

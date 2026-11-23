@@ -1,0 +1,477 @@
+//! Policy index building
+//!
+//! This module provides functions to build O(1) indexed policy sets from
+//! a list of policy restrictions.
+//!
+//! # Key Design Decisions
+//!
+//! - Class policies are indexed INTO `by_property`, not a separate index
+//! - Implicit properties (@id, rdf:type) are always included for class policies
+//! - Insertion order is preserved within each bucket
+//! - Each policy is indexed once per property (no duplicates)
+
+use crate::types::{PolicyAction, PolicyRestriction, PolicySet, PropertyPolicyEntry, TargetMode};
+use fluree_db_core::IndexStats;
+use fluree_db_core::Sid;
+use fluree_vocab::namespaces::{JSON_LD, RDF};
+use std::collections::HashSet;
+
+/// Get the @id property SID
+fn id_property() -> Sid {
+    Sid::new(JSON_LD, "id")
+}
+
+/// Get the rdf:type property SID
+fn rdf_type_property() -> Sid {
+    Sid::new(RDF, "type")
+}
+
+/// Build indexed policy set from restrictions.
+///
+/// # Arguments
+///
+/// * `restrictions` - List of policy restrictions in parse order
+/// * `stats` - Database stats for class→property mapping (optional)
+/// * `action_filter` - Filter to only include policies matching this action (View or Modify)
+///
+/// # Returns
+///
+/// A `PolicySet` with:
+/// - `restrictions` - All matching restrictions in parse order
+/// - `by_subject` - Index from subject SID to restriction indices
+/// - `by_property` - Index from property SID to restriction indices (includes class policies!)
+/// - `defaults` - Default-bucket policy indices
+pub fn build_policy_set(
+    restrictions: Vec<PolicyRestriction>,
+    stats: Option<&IndexStats>,
+    action_filter: PolicyAction,
+    hierarchy: Option<&fluree_db_core::SchemaHierarchy>,
+) -> PolicySet {
+    let mut set = PolicySet::new();
+
+    for mut restriction in restrictions {
+        // RDFS entailment (always on for enforcement): a class policy also
+        // governs instances of subclasses, and a property policy also
+        // governs subproperties. Expanding here — before indexing — means
+        // the class→property union, class_check_needed computation, and the
+        // four evaluation-time `for_classes` checks all see the closure.
+        if let Some(h) = hierarchy {
+            if !restriction.for_classes.is_empty() {
+                let expanded: Vec<Sid> = restriction
+                    .for_classes
+                    .iter()
+                    .flat_map(|c| h.subclasses_of(c).iter().cloned())
+                    .collect();
+                restriction.for_classes.extend(expanded);
+            }
+            if restriction.target_mode == TargetMode::OnProperty {
+                let expanded: Vec<Sid> = restriction
+                    .targets
+                    .iter()
+                    .flat_map(|p| h.subproperties_of(p).iter().cloned())
+                    .collect();
+                restriction.targets.extend(expanded);
+            }
+        }
+
+        // Filter by action
+        match (&restriction.action, &action_filter) {
+            (PolicyAction::Both, _) => {}                      // Matches any filter
+            (PolicyAction::View, PolicyAction::View) => {}     // View matches view
+            (PolicyAction::Modify, PolicyAction::Modify) => {} // Modify matches modify
+            _ => continue,                                     // Skip non-matching
+        }
+
+        let idx = set.restrictions.len();
+        set.restrictions.push(restriction);
+        let restriction = &set.restrictions[idx];
+
+        match restriction.target_mode {
+            TargetMode::OnSubject => {
+                // Index by each target subject
+                for subject_sid in &restriction.targets {
+                    set.by_subject
+                        .entry(subject_sid.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+            TargetMode::OnProperty => {
+                // Index by each target property
+                // If the policy also has class restrictions (OnProperty + OnClass combined),
+                // we need to check the subject's class during evaluation.
+                let class_check_needed = restriction.class_policy;
+                for property_sid in &restriction.targets {
+                    set.by_property
+                        .entry(property_sid.clone())
+                        .or_default()
+                        .push(PropertyPolicyEntry {
+                            idx,
+                            class_check_needed,
+                        });
+                }
+            }
+            TargetMode::OnClass if action_filter == PolicyAction::Modify => {
+                // Modify sets index class policies by class, selected at
+                // evaluation time by the subject's classes (see
+                // `PolicySet::by_class`). The view-set stats expansion below
+                // misses properties the class has never used in committed
+                // data, so for a write an allow would silently fail to cover
+                // them.
+                for class_sid in &restriction.for_classes {
+                    set.by_class.entry(class_sid.clone()).or_default().push(idx);
+                }
+            }
+            TargetMode::OnClass => {
+                // View sets: class policies are indexed INTO by_property
+                // Collect all properties for this restriction (union across classes + implicit)
+                let mut props_for_restriction: HashSet<Sid> = HashSet::new();
+
+                // Add properties from all target classes via stats
+                if let Some(db_stats) = stats {
+                    for class_sid in &restriction.for_classes {
+                        let class_props = get_properties_for_class(class_sid, db_stats);
+                        props_for_restriction.extend(class_props);
+                    }
+                }
+
+                // ALWAYS include implicit properties @id and rdf:type
+                props_for_restriction.insert(id_property());
+                props_for_restriction.insert(rdf_type_property());
+
+                // Index this restriction ONCE per property, always checking
+                // the subject's classes. Statistics credit a property only to
+                // typed subjects, so "only the target classes use it" says
+                // nothing of an untyped subject that carries it.
+                for prop in props_for_restriction {
+                    set.by_property
+                        .entry(prop)
+                        .or_default()
+                        .push(PropertyPolicyEntry {
+                            idx,
+                            class_check_needed: true,
+                        });
+                }
+            }
+            TargetMode::Default => {
+                // Default-bucket policies
+                set.defaults.push(idx);
+            }
+        }
+    }
+
+    set
+}
+
+/// Get all properties used by instances of a class from stats.
+///
+/// Returns an empty vec if the class is not found or stats are unavailable.
+fn get_properties_for_class(class_sid: &Sid, stats: &IndexStats) -> Vec<Sid> {
+    let Some(ref classes) = stats.classes else {
+        return vec![];
+    };
+
+    for class_entry in classes {
+        if &class_entry.class_sid == class_sid {
+            return class_entry
+                .properties
+                .iter()
+                .map(|p| p.property_sid.clone())
+                .collect();
+        }
+    }
+
+    vec![]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::PolicyValue;
+    use fluree_db_core::{ClassPropertyUsage, ClassStatEntry};
+
+    fn make_sid(ns: u16, name: &str) -> Sid {
+        Sid::new(ns, name)
+    }
+
+    fn make_prop_restriction(id: &str, property: Sid) -> PolicyRestriction {
+        PolicyRestriction {
+            id: id.to_string(),
+            target_mode: TargetMode::OnProperty,
+            targets: [property].into_iter().collect(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: PolicyValue::Allow,
+            required: false,
+            message: None,
+            class_policy: false,
+            for_classes: HashSet::new(),
+            class_check_needed: false,
+        }
+    }
+
+    fn make_class_restriction(id: &str, class: Sid) -> PolicyRestriction {
+        PolicyRestriction {
+            id: id.to_string(),
+            target_mode: TargetMode::OnClass,
+            targets: HashSet::new(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: PolicyValue::Allow,
+            required: false,
+            message: None,
+            class_policy: true,
+            for_classes: [class].into_iter().collect(),
+            class_check_needed: true, // Will be computed
+        }
+    }
+
+    fn make_default_restriction(id: &str) -> PolicyRestriction {
+        PolicyRestriction {
+            id: id.to_string(),
+            target_mode: TargetMode::Default,
+            targets: HashSet::new(),
+            action: PolicyAction::Both,
+            verbs: None,
+            value: PolicyValue::Deny,
+            required: false,
+            message: None,
+            class_policy: false,
+            for_classes: HashSet::new(),
+            class_check_needed: false,
+        }
+    }
+
+    fn make_stats_with_class(class_sid: Sid, property_sids: Vec<Sid>) -> IndexStats {
+        IndexStats {
+            flakes: 100,
+            size: 5000,
+            properties: None,
+            classes: Some(vec![ClassStatEntry {
+                class_sid,
+                count: 10,
+                properties: property_sids
+                    .into_iter()
+                    .map(|p| ClassPropertyUsage {
+                        property_sid: p,
+                        datatypes: Vec::new(),
+                        langs: Vec::new(),
+                        ref_classes: Vec::new(),
+                    })
+                    .collect(),
+            }]),
+            graphs: None,
+            historical_since_t: None,
+        }
+    }
+
+    #[test]
+    fn test_build_policy_set_property_index() {
+        let restrictions = vec![
+            make_prop_restriction("p1", make_sid(100, "name")),
+            make_prop_restriction("p2", make_sid(100, "age")),
+        ];
+
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
+
+        assert_eq!(set.restrictions.len(), 2);
+        assert_eq!(
+            set.by_property.get(&make_sid(100, "name")).unwrap().len(),
+            1
+        );
+        assert_eq!(set.by_property.get(&make_sid(100, "age")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_policy_set_class_index() {
+        let person_class = make_sid(100, "Person");
+        let name_prop = make_sid(100, "name");
+        let age_prop = make_sid(100, "age");
+
+        let stats = make_stats_with_class(
+            person_class.clone(),
+            vec![name_prop.clone(), age_prop.clone()],
+        );
+
+        let restrictions = vec![make_class_restriction("c1", person_class)];
+
+        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View, None);
+
+        assert_eq!(set.restrictions.len(), 1);
+
+        // Should be indexed for name, age, @id, and rdf:type
+        assert!(set.by_property.contains_key(&name_prop));
+        assert!(set.by_property.contains_key(&age_prop));
+        assert!(set.by_property.contains_key(&id_property()));
+        assert!(set.by_property.contains_key(&rdf_type_property()));
+    }
+
+    /// The reasoned variant selects the class policy by subject, on every
+    /// property, and leaves property policies where they were.
+    #[test]
+    fn a_reasoned_view_selects_class_policies_by_subject() {
+        let person = make_sid(100, "Person");
+        let name = make_sid(100, "name");
+        let stats = make_stats_with_class(person.clone(), vec![name.clone()]);
+        let restrictions = vec![
+            make_class_restriction("c1", person.clone()),
+            make_prop_restriction("p1", name.clone()),
+        ];
+        let set = build_policy_set(restrictions, Some(&stats), PolicyAction::View, None);
+        let reasoned = set
+            .selecting_classes_by_subject()
+            .expect("has a class policy");
+
+        assert_eq!(reasoned.by_class.get(&person), Some(&vec![0]));
+        let on_name: Vec<usize> = reasoned.by_property[&name].iter().map(|e| e.idx).collect();
+        assert_eq!(on_name, vec![1]);
+        assert!(!reasoned.by_property.contains_key(&rdf_type_property()));
+        let salary = make_sid(100, "salary");
+        assert!(!set.covers_predicate(&salary));
+        assert!(reasoned.covers_predicate(&salary));
+        let entries =
+            reasoned.policy_entries_for_flake(&make_sid(100, "alice"), &salary, &[person]);
+        assert_eq!(entries.iter().map(|e| e.idx).collect::<Vec<_>>(), vec![0]);
+
+        let property_only = build_policy_set(
+            vec![make_prop_restriction("p1", name)],
+            Some(&stats),
+            PolicyAction::View,
+            None,
+        );
+        assert!(property_only.selecting_classes_by_subject().is_none());
+    }
+
+    #[test]
+    fn test_build_policy_set_class_index_modify_uses_by_class() {
+        let person_class = make_sid(100, "Person");
+        let name_prop = make_sid(100, "name");
+
+        let stats = make_stats_with_class(person_class.clone(), vec![name_prop.clone()]);
+
+        let mut restriction = make_class_restriction("c1", person_class.clone());
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        assert_eq!(set.restrictions.len(), 1);
+        // Modify sets index class policies by class, never via stats expansion.
+        assert_eq!(set.by_class.get(&person_class), Some(&vec![0]));
+        assert!(set.by_property.is_empty());
+        // Class policies are predicate-agnostic on modify: every predicate
+        // is potentially covered.
+        assert!(set.covers_predicate(&make_sid(100, "never-seen")));
+    }
+
+    /// Modify class policies must cover properties the class has never used
+    /// in committed data (absent from stats).
+    #[test]
+    fn test_modify_class_policy_covers_never_used_property() {
+        let person_class = make_sid(100, "Person");
+        let name_prop = make_sid(100, "name");
+        let novel_prop = make_sid(100, "brandNewField");
+
+        let stats = make_stats_with_class(person_class.clone(), vec![name_prop]);
+
+        let mut restriction = make_class_restriction("c1", person_class.clone());
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        let subject = make_sid(100, "alice");
+        let entries = set.policy_entries_for_flake(
+            &subject,
+            &novel_prop,
+            std::slice::from_ref(&person_class),
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "class policy must apply to novel property"
+        );
+        assert!(!entries[0].class_check_needed);
+    }
+
+    /// A stats-"exclusive" property must NOT make a modify class policy apply
+    /// to a non-instance: the staged flake can be the first counterexample to
+    /// the stats.
+    #[test]
+    fn test_modify_class_policy_does_not_leak_via_exclusive_property() {
+        let person_class = make_sid(100, "Person");
+        let company_class = make_sid(100, "Company");
+        let ssn_prop = make_sid(100, "ssn");
+
+        // Stats: ssn used ONLY by Person (exclusive).
+        let stats = make_stats_with_class(person_class.clone(), vec![ssn_prop.clone()]);
+
+        let mut restriction = make_class_restriction("c1", person_class);
+        restriction.action = PolicyAction::Modify;
+
+        let set = build_policy_set(vec![restriction], Some(&stats), PolicyAction::Modify, None);
+
+        // Staged flake writes the "exclusive" property onto a Company subject.
+        let subject = make_sid(100, "acme");
+        let entries = set.policy_entries_for_flake(&subject, &ssn_prop, &[company_class]);
+        assert!(
+            entries.is_empty(),
+            "class policy must not apply to a non-instance"
+        );
+    }
+
+    /// A view class policy checks the subject's classes even on a property
+    /// statistics credit only to its classes: an untyped subject carrying the
+    /// property counts toward no class.
+    #[test]
+    fn test_view_class_policy_checks_classes_on_an_exclusive_property() {
+        let person_class = make_sid(100, "Person");
+        let ssn_prop = make_sid(100, "ssn");
+        let stats = make_stats_with_class(person_class.clone(), vec![ssn_prop.clone()]);
+
+        let set = build_policy_set(
+            vec![make_class_restriction("c1", person_class)],
+            Some(&stats),
+            PolicyAction::View,
+            None,
+        );
+
+        let untyped = make_sid(100, "b");
+        let entries = set.policy_entries_for_flake(&untyped, &ssn_prop, &[]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].class_check_needed);
+    }
+
+    #[test]
+    fn test_build_policy_set_defaults() {
+        let restrictions = vec![
+            make_prop_restriction("p1", make_sid(100, "name")),
+            make_default_restriction("d1"),
+        ];
+
+        let set = build_policy_set(restrictions, None, PolicyAction::View, None);
+
+        assert_eq!(set.restrictions.len(), 2);
+        assert_eq!(set.defaults.len(), 1);
+        assert_eq!(set.defaults[0], 1); // Index of the default restriction
+    }
+
+    #[test]
+    fn test_action_filter() {
+        let mut view_restriction = make_prop_restriction("v1", make_sid(100, "name"));
+        view_restriction.action = PolicyAction::View;
+
+        let mut modify_restriction = make_prop_restriction("m1", make_sid(100, "age"));
+        modify_restriction.action = PolicyAction::Modify;
+
+        let restrictions = vec![view_restriction, modify_restriction];
+
+        // Filter for View only
+        let view_set = build_policy_set(restrictions.clone(), None, PolicyAction::View, None);
+        assert_eq!(view_set.restrictions.len(), 1);
+        assert_eq!(view_set.restrictions[0].id, "v1");
+
+        // Filter for Modify only
+        let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify, None);
+        assert_eq!(modify_set.restrictions.len(), 1);
+        assert_eq!(modify_set.restrictions[0].id, "m1");
+    }
+}

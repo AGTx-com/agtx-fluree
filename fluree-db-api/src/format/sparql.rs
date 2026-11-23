@@ -1,0 +1,1290 @@
+//! SPARQL 1.1 Query Results JSON format
+//!
+//! W3C standard format with type metadata:
+//! ```json
+//! {
+//!   "head": {"vars": ["s", "name"]},
+//!   "results": {"bindings": [{
+//!     "s": {"type": "uri", "value": "http://example.org/alice"},
+//!     "name": {"type": "literal", "value": "Alice"}
+//!   }]}
+//! }
+//! ```
+//!
+//! Key features:
+//! - Variable names without `?` prefix
+//! - Each binding: `{"type": "literal|uri|bnode", "value": "...", "datatype"?: "...", "xml:lang"?: "..."}`
+//! - Omit datatype for inferable types (xsd:string, xsd:integer, xsd:double, xsd:boolean)
+//! - One binding object per solution. A per-group list (`Binding::Grouped`,
+//!   which only a JSON-LD query projects) has no SPARQL-results form, so it is
+//!   a [`FormatError`], like a Cypher path or list.
+
+use super::config::FormatterConfig;
+use super::datatype::may_omit_datatype;
+use super::iri::IriCompactor;
+use super::json_write::push_json_string;
+use super::{materialize, FormatError, Result};
+use crate::QueryResult;
+use fluree_db_core::FlakeValue;
+use fluree_db_query::binding::Binding;
+use fluree_db_query::VarRegistry;
+use fluree_graph_ir::canonical_xsd_double;
+use serde_json::{json, Map, Value as JsonValue};
+
+/// Format query results in SPARQL 1.1 JSON format
+pub fn format(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    _config: &FormatterConfig,
+) -> Result<JsonValue> {
+    let (vars, head_vars) = compute_head(result);
+
+    let select_one = result.output.is_select_one();
+    let mut bindings = Vec::new();
+
+    'batches: for batch in &result.batches {
+        for row_idx in 0..batch.len() {
+            // Collect bindings for this row
+            let row_bindings: Vec<_> = head_vars
+                .iter()
+                .map(|&var_id| {
+                    let binding = batch.get(row_idx, var_id).unwrap_or(&Binding::Unbound);
+                    (var_id, binding)
+                })
+                .collect();
+
+            let row = format_sparql_row(result, &row_bindings, &result.vars, compactor)?;
+            bindings.push(JsonValue::Object(row));
+            if select_one {
+                // SelectOne: only return a single formatted row.
+                break 'batches;
+            }
+        }
+    }
+
+    // Build the SPARQL JSON structure
+    Ok(json!({
+        "head": {"vars": vars},
+        "results": {"bindings": bindings}
+    }))
+}
+
+/// Compute the `head.vars` names (without `?`) and the parallel `VarId` list,
+/// ordered lexicographically by name. Shared by the DOM, the buffered streaming
+/// String path, and the NDJSON streaming path so the head order can never drift
+/// between them.
+pub(crate) fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarId>) {
+    // For wildcard, use the operator schema (all variables); fall back to the
+    // VarRegistry when batches are empty (W3C: exists-02 etc.).
+    let head_vars: Vec<fluree_db_query::VarId> = if result.output.is_wildcard() {
+        result
+            .batches
+            .first()
+            .map(|b| {
+                b.schema()
+                    .iter()
+                    .copied()
+                    // Skip internal variables from wildcard output: planner/aggregate
+                    // synthetics (?__pp0, ?__s0, ...) and annotation reifier synthetics (?#...).
+                    .filter(|&vid| !is_internal_var_name(result.vars.name(vid)))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                result
+                    .vars
+                    .iter()
+                    .filter(|(name, _)| !is_internal_var_name(name))
+                    .map(|(_, id)| id)
+                    .collect()
+            })
+    } else {
+        result.output.projected_vars_or_empty()
+    };
+
+    // Order head vars lexicographically by name (stable across planner reorderings).
+    let mut head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
+        .iter()
+        .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
+        .collect();
+    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let vars: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
+    let head_vars: Vec<fluree_db_query::VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();
+    (vars, head_vars)
+}
+
+/// Stream SPARQL 1.1 JSON results directly into a `String`, byte-identical to
+/// `serde_json::to_string(&format(...))` for the non-`select_one` SELECT case.
+///
+/// Every row streams cell-by-cell with no per-cell `serde_json::Value`
+/// allocation. `select_one`, ASK, CONSTRUCT, and `pretty` are handled by the
+/// caller on the DOM path and never reach here.
+pub fn format_string(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    _config: &FormatterConfig,
+) -> Result<String> {
+    debug_assert!(
+        !result.output.is_select_one(),
+        "format_string is only for the non-select_one path; select_one routes through the DOM"
+    );
+
+    let (vars, head_vars) = compute_head(result);
+
+    // Pre-size: rows × cols × an estimated per-cell width plus envelope slack.
+    let est = (result.row_count() + 1)
+        .saturating_mul(head_vars.len().max(1))
+        .saturating_mul(64)
+        .saturating_add(64);
+    let mut out = String::with_capacity(est);
+
+    out.push_str("{\"head\":{\"vars\":[");
+    for (i, name) in vars.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, name);
+    }
+    out.push_str("]},\"results\":{\"bindings\":[");
+
+    let mut first_binding = true;
+    for batch in &result.batches {
+        let schema = batch.schema();
+        // Map each head var to its column index in this batch once per batch.
+        let cols: Vec<Option<usize>> = head_vars
+            .iter()
+            .map(|&v| schema.iter().position(|&sv| sv == v))
+            .collect();
+
+        for row_idx in 0..batch.len() {
+            if !first_binding {
+                out.push(',');
+            }
+            first_binding = false;
+            out.push('{');
+            let mut first_cell = true;
+            for (k, &col) in cols.iter().enumerate() {
+                if let Some(col) = col {
+                    let binding = batch.get_by_col(row_idx, col);
+                    write_cell(
+                        &mut out,
+                        result,
+                        binding,
+                        &vars[k],
+                        compactor,
+                        &mut first_cell,
+                    )?;
+                }
+            }
+            out.push('}');
+        }
+    }
+
+    out.push_str("]}}");
+    Ok(out)
+}
+
+/// Append NDJSON `{"type":"row","row":{...}}` records — one per result row,
+/// each newline-terminated — for every row in `batch`. Returns the count of row
+/// records written.
+///
+/// The row body (`{...}`) is produced by the same [`write_cell`] path as the
+/// buffered [`format_string`] binding objects, so a streamed row is
+/// byte-identical to the corresponding SPARQL-JSON binding object — only the
+/// surrounding framing differs (an NDJSON record wrapper instead of an array
+/// element). `head_vars`/`vars` come from [`compute_head`] and are computed
+/// once by the driver, then reused per batch.
+pub(crate) fn stream_ndjson_rows(
+    out: &mut String,
+    result: &QueryResult,
+    batch: &crate::Batch,
+    head_vars: &[fluree_db_query::VarId],
+    vars: &[String],
+    compactor: &IriCompactor,
+) -> Result<usize> {
+    let schema = batch.schema();
+    // Map each head var to its column index in this batch once per batch.
+    let cols: Vec<Option<usize>> = head_vars
+        .iter()
+        .map(|&v| schema.iter().position(|&sv| sv == v))
+        .collect();
+
+    for row_idx in 0..batch.len() {
+        out.push_str("{\"type\":\"row\",\"row\":{");
+        let mut first_cell = true;
+        for (k, &col) in cols.iter().enumerate() {
+            if let Some(col) = col {
+                let binding = batch.get_by_col(row_idx, col);
+                write_cell(out, result, binding, &vars[k], compactor, &mut first_cell)?;
+            }
+        }
+        out.push_str("}}\n");
+    }
+    Ok(batch.len())
+}
+
+/// Write one `"name":{term}` cell, or nothing for Unbound/Poisoned/null literals
+/// (omitted per the SPARQL Results spec, matching [`format_binding`]).
+fn write_cell(
+    out: &mut String,
+    result: &QueryResult,
+    binding: &Binding,
+    name: &str,
+    compactor: &IriCompactor,
+    first_cell: &mut bool,
+) -> Result<()> {
+    // Late materialization: resolve encoded bindings to a concrete binding (the
+    // same step the DOM path takes), then stream the result.
+    if binding.is_encoded() {
+        let materialized = materialize::materialize_binding(result, binding)?;
+        return write_cell(out, result, &materialized, name, compactor, first_cell);
+    }
+
+    // Omitted cells produce no key at all.
+    match binding {
+        Binding::Unbound | Binding::Poisoned => return Ok(()),
+        Binding::Lit {
+            val: FlakeValue::Null,
+            ..
+        } => return Ok(()),
+        _ => {}
+    }
+
+    if !*first_cell {
+        out.push(',');
+    }
+    *first_cell = false;
+    push_json_string(out, name);
+    out.push(':');
+    write_term(out, binding, compactor)
+}
+
+/// Write the `{"type":...,"value":...}` term object for a (non-omitted) binding.
+fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> Result<()> {
+    match binding {
+        Binding::Sid { sid, .. } => write_node(out, &compactor.render_id_sid(sid)?),
+        Binding::IriMatch { iri, .. } => write_node(out, &compactor.render_id_iri(iri)),
+        // Raw graph-source IRI: CURIE-compacted for sparql_json of a graph-source
+        // result so virtual output matches native (F9); otherwise emitted verbatim
+        // — which is also the absolute form the W3C profile requires.
+        Binding::Iri(iri) => {
+            if compactor.compacts_graph_source_iris() {
+                write_node(out, &compactor.compact_id_iri(iri));
+            } else {
+                write_node(out, iri.as_ref());
+            }
+        }
+        Binding::Lit { val, dtc, .. } => {
+            let dt_iri = compactor.decode_sid(dtc.datatype())?;
+            write_literal(
+                out,
+                val,
+                dtc.lang_tag(),
+                &dt_iri,
+                compactor.emits_absolute_iris(),
+            )?;
+        }
+        Binding::Grouped(_) => return Err(grouped_cell_error()),
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+            return Err(FormatError::InvalidBinding(
+                "SPARQL results have no path/list type (Cypher-only)".to_string(),
+            ));
+        }
+        Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+            unreachable!("encoded bindings are materialized before write_term")
+        }
+        Binding::Unbound | Binding::Poisoned => unreachable!("omitted before write_term"),
+    }
+    Ok(())
+}
+
+/// Write a node reference as `{"type":"uri"|"bnode","value":...}`.
+fn write_node(out: &mut String, iri: &str) {
+    if let Some(label) = iri.strip_prefix("_:") {
+        out.push_str(r#"{"type":"bnode","value":"#);
+        push_json_string(out, label);
+    } else {
+        out.push_str(r#"{"type":"uri","value":"#);
+        push_json_string(out, iri);
+    }
+    out.push('}');
+}
+
+/// Write a literal term. SPARQL JSON encodes every literal value as a JSON
+/// string and carries the datatype for non-inferable / non-string types.
+fn write_literal(
+    out: &mut String,
+    val: &FlakeValue,
+    lang: Option<&str>,
+    dt_iri: &str,
+    w3c_strict: bool,
+) -> Result<()> {
+    match val {
+        FlakeValue::String(s) => {
+            out.push_str(r#"{"type":"literal","value":"#);
+            push_json_string(out, s);
+            if let Some(lang) = lang {
+                out.push_str(r#","xml:lang":"#);
+                push_json_string(out, lang);
+            } else if !may_omit_datatype(dt_iri, w3c_strict) {
+                out.push_str(r#","datatype":"#);
+                push_json_string(out, dt_iri);
+            }
+            out.push('}');
+        }
+        FlakeValue::Ref(_) => {
+            return Err(FormatError::InvalidBinding(
+                "Binding::Lit invariant violated: contains Ref".to_string(),
+            ));
+        }
+        FlakeValue::Null => unreachable!("null literals are omitted before write_literal"),
+        // Every other value type is rendered as its string lexical form with the
+        // datatype attached (matching the DOM `format_binding`).
+        other => {
+            let value = scalar_lexical(other);
+            out.push_str(r#"{"type":"literal","value":"#);
+            push_json_string(out, &value);
+            out.push_str(r#","datatype":"#);
+            push_json_string(out, dt_iri);
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// The lexical string form of a non-string literal value, matching the DOM
+/// `format_binding` value strings exactly.
+fn scalar_lexical(val: &FlakeValue) -> String {
+    match val {
+        FlakeValue::Long(n) => n.to_string(),
+        // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved).
+        FlakeValue::Double(d) => canonical_xsd_double(*d),
+        FlakeValue::Boolean(b) => b.to_string(),
+        FlakeValue::Vector(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        FlakeValue::Json(json_str) => json_str.clone(),
+        FlakeValue::BigInt(n) => n.to_string(),
+        FlakeValue::Decimal(d) => d.to_plain_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Strip the leading '?' from a variable name
+fn strip_question_mark(var_name: &str) -> String {
+    var_name.strip_prefix('?').unwrap_or(var_name).to_string()
+}
+
+use super::is_internal_var_name;
+
+/// Format a single binding to SPARQL JSON format
+///
+/// Returns None for Unbound/Poisoned (omit from output per SPARQL spec)
+fn format_binding(
+    result: &QueryResult,
+    binding: &Binding,
+    compactor: &IriCompactor,
+) -> Result<Option<JsonValue>> {
+    // Late materialization for encoded bindings.
+    if binding.is_encoded() {
+        let materialized = super::materialize::materialize_binding(result, binding)?;
+        return format_binding(result, &materialized, compactor);
+    }
+
+    match binding {
+        // Unbound/Poisoned: omit from SPARQL JSON (not an error, just absent)
+        Binding::Unbound | Binding::Poisoned => Ok(None),
+
+        // Reference (IRI or blank node)
+        Binding::Sid { sid, .. } => {
+            // A `uri` value names a node, so it's an `@id`-position identifier.
+            // Under the W3C profile it is the absolute IRI (issue #45); under the
+            // Fluree display profile it compacts via `@base` + explicit prefixes,
+            // never `@vocab` (issue #1280).
+            let iri = compactor.render_id_sid(sid)?;
+            // Check if it's a blank node (starts with _:)
+            if iri.starts_with("_:") {
+                Ok(Some(json!({
+                    "type": "bnode",
+                    "value": iri.strip_prefix("_:").unwrap_or(&iri)
+                })))
+            } else {
+                Ok(Some(json!({
+                    "type": "uri",
+                    "value": iri
+                })))
+            }
+        }
+
+        // IriMatch: canonical IRI, rendered for the output profile (multi-ledger mode)
+        Binding::IriMatch { iri, .. } => {
+            let compacted = compactor.render_id_iri(iri);
+            if compacted.starts_with("_:") {
+                Ok(Some(json!({
+                    "type": "bnode",
+                    "value": compacted.strip_prefix("_:").unwrap_or(&compacted)
+                })))
+            } else {
+                Ok(Some(json!({
+                    "type": "uri",
+                    "value": compacted
+                })))
+            }
+        }
+
+        // Raw IRI string (from graph source, not in namespace table).
+        // CURIE-compacted for sparql_json of a graph-source result so virtual
+        // output matches native (F9); otherwise emitted verbatim. Parity with the
+        // streaming `write_term` arm above: both render the same string, then split
+        // on the `_:` blank-node prefix.
+        Binding::Iri(iri) => {
+            let rendered = if compactor.compacts_graph_source_iris() {
+                compactor.compact_id_iri(iri)
+            } else {
+                iri.to_string()
+            };
+            if let Some(label) = rendered.strip_prefix("_:") {
+                Ok(Some(json!({
+                    "type": "bnode",
+                    "value": label
+                })))
+            } else {
+                Ok(Some(json!({
+                    "type": "uri",
+                    "value": rendered
+                })))
+            }
+        }
+
+        // Literal value
+        Binding::Lit { val, dtc, .. } => {
+            let dt = dtc.datatype();
+            // Decode datatype sid to full IRI
+            let dt_iri = compactor.decode_sid(dt)?;
+
+            match val {
+                FlakeValue::String(s) => {
+                    if let Some(lang_tag) = dtc.lang_tag() {
+                        // Language-tagged string
+                        Ok(Some(json!({
+                            "type": "literal",
+                            "value": s,
+                            "xml:lang": lang_tag
+                        })))
+                    } else if may_omit_datatype(&dt_iri, compactor.emits_absolute_iris()) {
+                        // Omittable - a bare value denotes exactly this term
+                        Ok(Some(json!({
+                            "type": "literal",
+                            "value": s
+                        })))
+                    } else {
+                        // Everything else carries its datatype
+                        Ok(Some(json!({
+                            "type": "literal",
+                            "value": s,
+                            "datatype": dt_iri
+                        })))
+                    }
+                }
+                FlakeValue::Long(n) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": n.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::Double(d) => {
+                    // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved).
+                    // Include datatype for numeric literals.
+                    Ok(Some(json!({
+                        "type": "literal",
+                        "value": canonical_xsd_double(*d),
+                        "datatype": dt_iri
+                    })))
+                }
+                FlakeValue::Boolean(b) => {
+                    // Include datatype for non-string literals.
+                    Ok(Some(json!({
+                        "type": "literal",
+                        "value": b.to_string(),
+                        "datatype": dt_iri
+                    })))
+                }
+                FlakeValue::Vector(v) => {
+                    // SPARQL Query Results JSON does not have an array literal type.
+                    // Encode as a stringified JSON array and preserve the datatype IRI.
+                    let value = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
+                    Ok(Some(json!({
+                        "type": "literal",
+                        "value": value,
+                        "datatype": dt_iri
+                    })))
+                }
+                FlakeValue::Json(json_str) => {
+                    // SPARQL JSON uses the full RDF datatype IRI (not the JSON-LD "@json" keyword)
+                    Ok(Some(json!({
+                        "type": "literal",
+                        "value": json_str,
+                        "datatype": dt_iri
+                    })))
+                }
+                FlakeValue::Null => Ok(None),
+                FlakeValue::Ref(_) => {
+                    // This should never happen due to Binding invariant
+                    Err(FormatError::InvalidBinding(
+                        "Binding::Lit invariant violated: contains Ref".to_string(),
+                    ))
+                }
+                // Extended numeric types
+                FlakeValue::BigInt(n) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": n.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::Decimal(d) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": d.to_plain_string(),
+                    "datatype": dt_iri
+                }))),
+                // Temporal types
+                FlakeValue::DateTime(dt) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": dt.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::Date(d) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": d.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::Time(t) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": t.to_string(),
+                    "datatype": dt_iri
+                }))),
+                // Additional temporal types
+                FlakeValue::GYear(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::GYearMonth(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::GMonth(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::GDay(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::GMonthDay(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::YearMonthDuration(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::DayTimeDuration(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::Duration(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+                FlakeValue::GeoPoint(v) => Ok(Some(json!({
+                    "type": "literal",
+                    "value": v.to_string(),
+                    "datatype": dt_iri
+                }))),
+            }
+        }
+
+        Binding::Grouped(_) => Err(grouped_cell_error()),
+
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+            Err(FormatError::InvalidBinding(
+                "SPARQL results have no path/list type (Cypher-only)".to_string(),
+            ))
+        }
+
+        Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+            unreachable!(
+                "Encoded bindings should have been materialized before SPARQL JSON formatting"
+            )
+        }
+    }
+}
+
+// NOTE: encoded binding materialization is centralized in `format::materialize`.
+
+/// A per-group list in a SPARQL-results cell. Only a JSON-LD query projects one
+/// (a SPARQL query cannot: `Grouping::first_ungrouped_read` rejects it at plan
+/// time), and SPARQL results have no list type. Expanding it into one row per
+/// element — what this formatter used to do — invents solutions and drops the
+/// row of an empty list.
+pub(crate) fn grouped_cell_error() -> FormatError {
+    FormatError::InvalidBinding(
+        "SPARQL results have no list type: a JSON-LD query projected a per-group list \
+         (a variable its grouping neither keys nor aggregates); aggregate it (e.g. with \
+         group-concat) or use a JSON-LD output format"
+            .to_string(),
+    )
+}
+
+/// Format a single row of scalar bindings to a SPARQL JSON binding object
+fn format_sparql_row(
+    result: &QueryResult,
+    bindings: &[(fluree_db_query::VarId, &Binding)],
+    vars: &VarRegistry,
+    compactor: &IriCompactor,
+) -> Result<Map<String, JsonValue>> {
+    let mut obj = Map::new();
+
+    for &(var_id, binding) in bindings {
+        if let Some(formatted) = format_binding(result, binding, compactor)? {
+            let var_name = strip_question_mark(vars.name(var_id));
+            obj.insert(var_name, formatted);
+        }
+    }
+
+    Ok(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::Sid;
+    use std::collections::HashMap;
+
+    fn make_test_compactor() -> IriCompactor {
+        let mut namespaces = HashMap::new();
+        namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
+        namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
+        namespaces.insert(100, "http://example.org/".to_string());
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
+    }
+
+    /// Create a minimal QueryResult for tests that don't need binary_store.
+    fn make_test_result() -> QueryResult {
+        QueryResult {
+            vars: VarRegistry::new(),
+            t: Some(0),
+            novelty: None,
+            context: crate::ParsedContext::default(),
+            orig_context: None,
+            output: crate::QueryOutput::select_all(vec![]),
+            batches: vec![],
+            binary_graph: None,
+            from_graph_source: false,
+            advisories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_strip_question_mark() {
+        assert_eq!(strip_question_mark("?name"), "name");
+        assert_eq!(strip_question_mark("name"), "name");
+        assert_eq!(strip_question_mark("?"), "");
+    }
+
+    #[test]
+    fn test_format_binding_uri() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::sid(Sid::new(100, "alice"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "uri", "value": "http://example.org/alice"})
+        );
+    }
+
+    #[test]
+    fn test_format_binding_literal_string() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::lit(
+            FlakeValue::String("Alice".to_string()),
+            Sid::new(2, "string"),
+        );
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        // xsd:string is inferable, so no datatype
+        assert_eq!(formatted, json!({"type": "literal", "value": "Alice"}));
+    }
+
+    #[test]
+    fn test_format_binding_literal_long() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::lit(FlakeValue::Long(42), Sid::new(2, "long"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        // SPARQL JSON includes datatype for typed literals
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "42", "datatype": "http://www.w3.org/2001/XMLSchema#long"})
+        );
+    }
+
+    #[test]
+    fn test_format_binding_literal_boolean() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"})
+        );
+    }
+
+    #[test]
+    fn test_format_binding_language_tagged() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::lit_lang(FlakeValue::String("Hello".to_string()), "en");
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "Hello", "xml:lang": "en"})
+        );
+    }
+
+    #[test]
+    fn test_format_binding_non_inferable_datatype() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::lit(
+            FlakeValue::String("2024-01-15".to_string()),
+            Sid::new(2, "date"),
+        );
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        // xsd:date is NOT inferable, so include datatype
+        assert_eq!(
+            formatted,
+            json!({
+                "type": "literal",
+                "value": "2024-01-15",
+                "datatype": "http://www.w3.org/2001/XMLSchema#date"
+            })
+        );
+    }
+
+    #[test]
+    fn test_format_binding_unbound() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+        let binding = Binding::Unbound;
+        let formatted = format_binding(&result, &binding, &compactor).unwrap();
+        assert!(formatted.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming `format_string` parity with the DOM `format` + serde_json.
+    // ------------------------------------------------------------------
+
+    use fluree_db_query::var_registry::VarRegistry;
+    use std::sync::Arc;
+
+    fn make_result(var_names: &[&str], rows: Vec<Vec<Binding>>) -> QueryResult {
+        let mut vars = VarRegistry::new();
+        let var_ids: Vec<fluree_db_query::VarId> =
+            var_names.iter().map(|&n| vars.get_or_insert(n)).collect();
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); var_ids.len()];
+        for row in rows {
+            for (col, b) in row.into_iter().enumerate() {
+                columns[col].push(b);
+            }
+        }
+        let batch = fluree_db_query::binding::Batch::new(
+            Arc::from(var_ids.clone().into_boxed_slice()),
+            columns,
+        )
+        .unwrap();
+        QueryResult {
+            vars,
+            t: Some(0),
+            novelty: None,
+            context: crate::ParsedContext::default(),
+            orig_context: None,
+            output: crate::QueryOutput::select_all(var_ids),
+            batches: vec![batch],
+            binary_graph: None,
+            from_graph_source: false,
+            advisories: Vec::new(),
+        }
+    }
+
+    /// The streaming serializer must be byte-identical to compact-serializing the
+    /// DOM tree produced by `format`.
+    fn assert_parity(result: &QueryResult, compactor: &IriCompactor) {
+        let dom = format(result, compactor, &FormatterConfig::sparql_json()).unwrap();
+        let want = serde_json::to_string(&dom).unwrap();
+        let got = format_string(result, compactor, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(got, want, "streaming SPARQL JSON diverged from DOM");
+    }
+
+    /// F9 load-bearing guard: the SAME graph-source `Binding::Iri` row renders
+    /// as a full IRI when the compactor's graph-source flag is OFF (native /
+    /// non-graph-source path) and as a CURIE when it is ON (graph-source
+    /// sparql_json). The namespace-code map is empty on purpose — compaction is
+    /// driven entirely by the query context's declared `edw:` prefix.
+    #[test]
+    fn graph_source_iri_compaction_is_flag_scoped() {
+        let ctx = crate::ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" }))
+            .unwrap();
+        let ns = std::sync::Arc::new(HashMap::new());
+        let full = "http://ns.fluree.dev/edw#name";
+        let r = make_result(&["?p"], vec![vec![Binding::iri(full)]]);
+
+        // Flag OFF → raw full IRI (native behavior, unchanged).
+        let off = IriCompactor::new(std::sync::Arc::clone(&ns), &ctx);
+        let s_off =
+            serde_json::to_string(&format(&r, &off, &FormatterConfig::sparql_json()).unwrap())
+                .unwrap();
+        assert!(
+            s_off.contains(full),
+            "flag off must render the full IRI: {s_off}"
+        );
+        assert!(
+            !s_off.contains("edw:name"),
+            "flag off must not compact: {s_off}"
+        );
+
+        // Flag ON → CURIE (virtual matches native).
+        let on = IriCompactor::new(ns, &ctx).with_graph_source_iri_compaction(true);
+        let s_on =
+            serde_json::to_string(&format(&r, &on, &FormatterConfig::sparql_json()).unwrap())
+                .unwrap();
+        assert!(
+            s_on.contains("edw:name"),
+            "flag on must compact to the CURIE: {s_on}"
+        );
+        assert!(
+            !s_on.contains(full),
+            "flag on must not leave the full IRI: {s_on}"
+        );
+    }
+
+    /// The streaming (`write_term`) and DOM (`format_binding`) `Binding::Iri` arms
+    /// must flip together: with the graph-source flag ON, both compact — so DOM
+    /// and streaming stay byte-identical, and a future change to only one arm
+    /// breaks this parity test (the diagnosed PR-6 failure mode). Includes a
+    /// blank-node `Iri` so the `_:` split is exercised on both arms.
+    #[test]
+    fn parity_graph_source_iri_compaction() {
+        let ctx = crate::ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" }))
+            .unwrap();
+        let on = IriCompactor::new(std::sync::Arc::new(HashMap::new()), &ctx)
+            .with_graph_source_iri_compaction(true);
+        let r = make_result(
+            &["?p", "?b"],
+            vec![vec![
+                Binding::iri("http://ns.fluree.dev/edw#name"),
+                Binding::iri("_:b0"),
+            ]],
+        );
+        assert_parity(&r, &on);
+        // Guard against a both-raw no-op passing parity: confirm it actually compacted.
+        let s = serde_json::to_string(&format(&r, &on, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        assert!(
+            s.contains("edw:name"),
+            "expected compaction under the flag: {s}"
+        );
+    }
+
+    #[test]
+    fn parity_scalar_terms() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?uri", "?str", "?long", "?bool", "?lang", "?date"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "alice")),
+                Binding::lit(
+                    FlakeValue::String("Alice & <Bob>".to_string()),
+                    Sid::new(2, "string"),
+                ),
+                Binding::lit(FlakeValue::Long(42), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean")),
+                Binding::lit_lang(FlakeValue::String("Bonjour".to_string()), "fr"),
+                Binding::lit(
+                    FlakeValue::String("2024-01-15".to_string()),
+                    Sid::new(2, "date"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_double_special_and_normal() {
+        let c = make_test_compactor();
+        for d in [
+            3.13_f64,
+            1e30,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let r = make_result(
+                &["?d"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            assert_parity(&r, &c);
+        }
+    }
+
+    #[test]
+    fn parity_blank_node_and_unbound() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?a", "?b", "?c"],
+            vec![vec![
+                Binding::sid(Sid::new(0, "_:b1")),
+                Binding::Unbound,
+                Binding::sid(Sid::new(100, "x")),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_multi_row() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?s", "?n"],
+            vec![
+                vec![
+                    Binding::sid(Sid::new(100, "a")),
+                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                ],
+                vec![
+                    Binding::sid(Sid::new(100, "b")),
+                    Binding::lit(FlakeValue::String("two".to_string()), Sid::new(2, "string")),
+                ],
+                vec![Binding::Unbound, Binding::Unbound],
+            ],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_empty_results() {
+        let c = make_test_compactor();
+        let r = make_result(&["?s", "?p"], vec![]);
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_wildcard() {
+        let c = make_test_compactor();
+        let mut r = make_result(
+            &["?s", "?p"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "a")),
+                Binding::lit(FlakeValue::Long(7), Sid::new(2, "long")),
+            ]],
+        );
+        r.output = crate::QueryOutput::select_all(vec![]); // wildcard
+        assert_parity(&r, &c);
+    }
+
+    /// A per-group list has no SPARQL-results form: every writer refuses it
+    /// rather than expanding it into one row per element (a cartesian product
+    /// across list columns, and a dropped row for an empty list).
+    #[test]
+    fn grouped_cell_is_a_format_error() {
+        let c = make_test_compactor();
+        for list in [
+            Binding::Grouped(vec![
+                Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
+            ]),
+            Binding::Grouped(Vec::new()),
+        ] {
+            let r = make_result(
+                &["?a", "?b"],
+                vec![vec![
+                    list,
+                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                ]],
+            );
+            let config = FormatterConfig::sparql_json();
+            assert!(format(&r, &c, &config).is_err());
+            assert!(format_string(&r, &c, &config).is_err());
+            let (vars, head_vars) = compute_head(&r);
+            let mut out = String::new();
+            assert!(
+                stream_ndjson_rows(&mut out, &r, &r.batches[0], &head_vars, &vars, &c).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parity_json_and_vector_values() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?j", "?v"],
+            vec![vec![
+                Binding::lit(
+                    FlakeValue::Json(r#"{"k":1}"#.to_string()),
+                    Sid::new(3, "JSON"),
+                ),
+                Binding::lit(
+                    FlakeValue::Vector(vec![1.0, 2.5, -3.0].into()),
+                    Sid::new(2, "double"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_extended_value_types() {
+        use fluree_db_core::coerce::coerce_string_value;
+        use fluree_vocab::xsd;
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?big", "?dec", "?dt"],
+            vec![vec![
+                Binding::lit(
+                    coerce_string_value("99999999999999999999999999", xsd::INTEGER).unwrap(),
+                    Sid::new(2, "integer"),
+                ),
+                Binding::lit(
+                    coerce_string_value("3.14159265358979", xsd::DECIMAL).unwrap(),
+                    Sid::new(2, "decimal"),
+                ),
+                Binding::lit(
+                    coerce_string_value("2024-01-15T10:30:00Z", xsd::DATE_TIME).unwrap(),
+                    Sid::new(2, "dateTime"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #45: the W3C profile emits absolute IRIs and keeps datatypes.
+    // ------------------------------------------------------------------
+
+    /// A context declaring `ex:` (as a `PREFIX ex:` prologue lowers to) plus a
+    /// `@base` — the two things that shortened `uri` cells on main.
+    fn prefixed_context() -> crate::ParsedContext {
+        crate::ParsedContext::parse(
+            None,
+            &json!({ "ex": "http://example.org/", "@base": "http://base.example/" }),
+        )
+        .unwrap()
+    }
+
+    fn w3c_compactor(ctx: &crate::ParsedContext) -> IriCompactor {
+        IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), ctx).with_absolute_iris(true)
+    }
+
+    fn make_test_namespaces() -> HashMap<u16, String> {
+        let mut m = HashMap::new();
+        m.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
+        m.insert(100, "http://example.org/".to_string());
+        m.insert(101, "http://base.example/".to_string());
+        m
+    }
+
+    /// Every node-reference binding kind renders the absolute IRI under the W3C
+    /// profile, through BOTH the DOM and the streaming entry point. `?based` is
+    /// the `@base` case: on main a `BASE`-only prologue produced a bare relative
+    /// reference, which SRJ cannot express at all.
+    #[test]
+    fn w3c_profile_emits_absolute_iris_for_every_node_binding() {
+        let ctx = prefixed_context();
+        let c = w3c_compactor(&ctx);
+        let r = make_result(
+            &["?sid", "?match", "?raw", "?based"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "s2")),
+                Binding::IriMatch {
+                    iri: std::sync::Arc::from("http://example.org/s3"),
+                    primary_sid: Sid::new(100, "s3"),
+                    ledger_alias: std::sync::Arc::from("test:main"),
+                },
+                Binding::iri("http://example.org/s4"),
+                Binding::sid(Sid::new(101, "thing")),
+            ]],
+        );
+
+        let dom = serde_json::to_string(&format(&r, &c, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        let streamed = format_string(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(dom, streamed, "DOM and streaming must agree");
+
+        for want in [
+            "http://example.org/s2",
+            "http://example.org/s3",
+            "http://example.org/s4",
+            "http://base.example/thing",
+        ] {
+            assert!(dom.contains(want), "missing {want} in {dom}");
+        }
+        for forbidden in [r#""ex:s2""#, r#""ex:s3""#, r#""ex:s4""#, r#""thing""#] {
+            assert!(!dom.contains(forbidden), "leaked {forbidden} in {dom}");
+        }
+    }
+
+    /// The same bindings under the Fluree display profile still compact — so the
+    /// test above is measuring the flag, not the absence of a usable context.
+    #[test]
+    fn display_profile_still_compacts_node_bindings() {
+        let ctx = prefixed_context();
+        let c = IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), &ctx);
+        let r = make_result(
+            &["?sid", "?based"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "s2")),
+                Binding::sid(Sid::new(101, "thing")),
+            ]],
+        );
+        assert_parity(&r, &c);
+        let dom = serde_json::to_string(&format(&r, &c, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        assert!(dom.contains(r#""ex:s2""#), "{dom}");
+        assert!(dom.contains(r#""value":"thing""#), "{dom}");
+    }
+
+    /// Issue #45 (b): a string-backed literal carrying an "inferable" datatype —
+    /// what `STRDT("2", xsd:integer)` produces — must keep its `datatype` in the
+    /// W3C profile. Dropping it makes the cell denote `"2"^^xsd:string`, a
+    /// different RDF term. `xsd:string` itself stays bare (a simple literal).
+    #[test]
+    fn w3c_profile_keeps_datatype_on_string_backed_literals() {
+        let ctx = crate::ParsedContext::default();
+        let c = w3c_compactor(&ctx);
+        let r = make_result(
+            &["?i", "?b", "?d", "?s"],
+            vec![vec![
+                Binding::lit(FlakeValue::String("2".into()), Sid::new(2, "integer")),
+                Binding::lit(FlakeValue::String("true".into()), Sid::new(2, "boolean")),
+                Binding::lit(FlakeValue::String("2".into()), Sid::new(2, "decimal")),
+                Binding::lit(FlakeValue::String("hi".into()), Sid::new(2, "string")),
+            ]],
+        );
+
+        let dom = format(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        let streamed = format_string(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(serde_json::to_string(&dom).unwrap(), streamed);
+
+        let row = &dom["results"]["bindings"][0];
+        for (var, dt) in [("i", "integer"), ("b", "boolean"), ("d", "decimal")] {
+            assert_eq!(
+                row[var]["datatype"],
+                json!(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
+                "xsd:{dt} lost its datatype: {row}"
+            );
+        }
+        assert!(
+            row["s"]["datatype"].is_null(),
+            "xsd:string stays bare: {row}"
+        );
+
+        // The display profile keeps today's looser behavior.
+        let display = IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), &ctx);
+        let loose = format(&r, &display, &FormatterConfig::sparql_json()).unwrap();
+        assert!(loose["results"]["bindings"][0]["i"]["datatype"].is_null());
+    }
+
+    #[test]
+    fn test_format_binding_double_special_values() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+
+        // NaN
+        let binding = Binding::lit(FlakeValue::Double(f64::NAN), Sid::new(2, "double"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "NaN", "datatype": "http://www.w3.org/2001/XMLSchema#double"})
+        );
+
+        // Positive infinity
+        let binding = Binding::lit(FlakeValue::Double(f64::INFINITY), Sid::new(2, "double"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"})
+        );
+
+        // Negative infinity
+        let binding = Binding::lit(FlakeValue::Double(f64::NEG_INFINITY), Sid::new(2, "double"));
+        let formatted = format_binding(&result, &binding, &compactor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            formatted,
+            json!({"type": "literal", "value": "-INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"})
+        );
+    }
+
+    /// Finite doubles serialize in the W3C canonical `xsd:double` lexical form
+    /// (issue #1445 / W3C csv03): `1.0E6`, not Rust-Display `1000000`.
+    #[test]
+    fn test_format_binding_double_canonical_form() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+
+        for (d, expected) in [
+            (1_000_000.0, "1.0E6"),
+            (1e30, "1.0E30"),
+            (0.001, "1.0E-3"),
+            (-3.0, "-3.0E0"),
+            (0.0, "0.0E0"),
+        ] {
+            let binding = Binding::lit(FlakeValue::Double(d), Sid::new(2, "double"));
+            let formatted = format_binding(&result, &binding, &compactor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                formatted,
+                json!({"type": "literal", "value": expected, "datatype": "http://www.w3.org/2001/XMLSchema#double"})
+            );
+        }
+
+        // Both the DOM and the streaming writer emit the canonical form.
+        let r = make_result(
+            &["?d"],
+            vec![vec![Binding::lit(
+                FlakeValue::Double(1_000_000.0),
+                Sid::new(2, "double"),
+            )]],
+        );
+        assert_parity(&r, &compactor);
+        let out = format_string(&r, &compactor, &FormatterConfig::sparql_json()).unwrap();
+        assert!(out.contains(r#""value":"1.0E6""#), "{out}");
+    }
+}

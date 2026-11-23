@@ -1,0 +1,153 @@
+[package]
+name = "fluree-db-iceberg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Iceberg REST catalog support for Fluree DB graph sources"
+
+[features]
+default = []
+# AWS SDK integration (credential provider + S3 storage). GCS-backed tables are
+# read through the same S3 SDK path with the transport pinned to HTTP/1.1 (see
+# the `aws-smithy-http-client` / `hyper-rustls` deps below). Enables the shared
+# native disk cache (read-through for S3 data files).
+aws = [
+    "dep:aws-credential-types",
+    "dep:aws-sdk-s3",
+    "dep:aws-sdk-glue",
+    "dep:aws-sdk-s3tables",
+    "dep:aws-config",
+    "dep:aws-smithy-http-client",
+    "dep:hyper-rustls",
+    "fluree-db-core/native",
+    # The Arrow columnar reader (`arrow_reader.rs`) is the only `arrow` user and
+    # is itself `#[cfg(feature = "aws")]`, so pull `arrow` + `parquet/arrow` only
+    # here — a non-`aws` build compiles neither.
+    "dep:arrow",
+    "parquet/arrow",
+    # The row filter's set membership (`IN`) hashes every row of a scan.
+    "dep:hashbrown",
+    # Google identity: service-account JWT assertions (RS256) and the
+    # Workload Identity Federation subject token (a SigV4-signed AWS
+    # GetCallerIdentity request). The metadata server and gcloud user ADC need
+    # neither and work without this feature.
+    "dep:jsonwebtoken",
+    "dep:aws-sigv4",
+    # Google Cloud Storage reads (`io::gcs`), over the `object_store` GCS
+    # backend Delta Kernel already links; see the dependency below.
+    "dep:object_store",
+    "dep:reqwest012",
+]
+[dependencies]
+# Core dependencies
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+
+# Deterministic hashing for disk-cache filenames (immutable source paths).
+xxhash-rust = { workspace = true }
+
+# Async runtime
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+futures.workspace = true
+
+# HTTP client for REST catalog
+reqwest = { workspace = true, features = ["form", "query"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Time handling (for credential expiration)
+chrono.workspace = true
+
+# Randomness (for OAuth2 jitter)
+rand.workspace = true
+
+# URL encoding for namespace paths
+urlencoding = "2"
+
+# Logging
+tracing.workspace = true
+
+# Byte handling
+bytes.workspace = true
+
+# Avro for manifest files
+apache-avro.workspace = true
+
+# Parquet for data files (metadata + range-read column access). The `arrow`
+# feature is enabled by the `aws` feature (the Arrow reader's only consumer).
+parquet = { workspace = true }
+
+# LRU cache for Parquet footer caching
+lru.workspace = true
+
+# Concurrent collections (for bounded semaphore in S3 reads)
+dashmap.workspace = true
+
+# Optional: AWS SDK (credential provider + S3 storage)
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
+aws-sdk-s3tables = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+# HTTP/1.1-pinned transport for the S3 SDK when reading GCS-backed tables (avoids
+# the smithy-rs HTTP/2 range-read bug against the GCS S3-interop endpoint). The
+# `hyper-014` feature exposes the client builder that accepts a custom connector.
+aws-smithy-http-client = { workspace = true, features = ["hyper-014"], optional = true }
+hyper-rustls = { workspace = true, optional = true }
+# Google identity (see the `aws` feature): the version the lockfile already
+# carries through the AWS SDK.
+aws-sigv4 = { version = "1.4.2", optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+# Binds a cached Google token to the secret that minted it (a service-account
+# key, an ADC refresh token), in memory only. Unconditional: gcloud user ADC
+# works without the `aws` feature.
+sha2 = { workspace = true }
+# The GCS reader (`io::gcs`). Pinned to the exact version Delta Kernel 0.28
+# pins, whose `gcp` backend every shipped binary already links, so this adds
+# no second copy; used only behind the `io::gcs` shim.
+object_store = { version = "=0.13.2", default-features = false, features = ["gcp"], optional = true }
+# The reqwest `object_store` 0.13 is built on (0.12, already linked through it):
+# the GCS reader builds that client itself, to follow no redirects
+# (`object_store` sets no redirect policy). Adds no crate to the build.
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, optional = true }
+
+# Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
+# `aws` feature). `default-features = false` drops the unused csv/json readers
+# (compile-time only; LTO already strips them from the binary).
+arrow = { workspace = true, optional = true }
+hashbrown = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+fluree-test-support = { path = "../fluree-test-support" }
+wiremock = "0.6"
+http.workspace = true
+
+[[example]]
+name = "read_rest_catalog"
+required-features = ["aws"]
+
+[[example]]
+name = "read_local_iceberg"
+required-features = ["aws"]
+
+# smoke_minio uses the aws-gated S3IcebergStorage, so it must not be built under
+# default features (bare `cargo test -p fluree-db-iceberg` compiles examples).
+[[example]]
+name = "smoke_minio"
+required-features = ["aws"]
+
+[[example]]
+name = "read_glue"
+required-features = ["aws"]
+
+[lints]
+workspace = true

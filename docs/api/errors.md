@@ -1,0 +1,738 @@
+# Errors and Status Codes
+
+This document provides a complete reference for HTTP status codes and error responses in the Fluree API.
+
+## Error Response Format
+
+`fluree-server` errors return a consistent JSON structure:
+
+```json
+{
+  "error": "Human-readable error description",
+  "status": 400,
+  "@type": "err:db/BadRequest",
+  "cause": {
+    "error": "Optional nested cause",
+    "status": 400,
+    "@type": "err:db/JsonParse"
+  }
+}
+```
+
+**Fields:**
+- `error`: Human-readable error message (primary diagnostic text)
+- `status`: HTTP status code (numeric)
+- `@type`: Compact error type IRI (stable, machine-readable category)
+- `cause`: Optional nested cause chain (only present for select errors)
+
+**Stability note:** clients (including the Fluree CLI) may pattern-match on substrings within the `error` field for targeted hints, so error messages should be stable across releases.
+
+## HTTP Status Codes
+
+### Success Codes (2xx)
+
+#### 200 OK
+
+The request succeeded.
+
+**Used for:**
+- Successful queries
+- Successful transactions
+- Successful GET requests
+
+**Example:**
+```json
+{
+  "t": 5,
+  "timestamp": "2024-01-22T10:30:00.000Z",
+  "commit_id": "bafybeig...commitT5"
+}
+```
+
+**Multi-query envelope (`POST /multi-query`) returns 200 even when individual sub-queries fail.** The aggregate outcome is reported in the response body's `status` field (`"ok"` | `"partial"` | `"all_failed"`), with per-alias failures in `errors`. Clients should branch on `body.status` for the aggregate; HTTP 4xx / 5xx are reserved for envelope-level failures (validation, snapshot resolution, response-size cap). See [Multi-query envelope](multi-query.md#http-status-mapping) for the full mapping.
+
+#### 201 Created
+
+A new resource was created.
+
+**Used for:**
+- Ledger creation
+- Index creation
+
+**Example:**
+```json
+{
+  "ledger_id": "mydb:main",
+  "created": "2024-01-22T10:00:00.000Z"
+}
+```
+
+#### 204 No Content
+
+Request succeeded with no response body.
+
+**Used for:**
+- DELETE operations
+- Administrative commands
+
+### Client Error Codes (4xx)
+
+#### 400 Bad Request
+
+The request is malformed or contains invalid data.
+
+**Common Causes:**
+- Invalid JSON syntax
+- Invalid JSON-LD structure
+- Invalid SPARQL syntax
+- Invalid IRI format
+- Type mismatch
+- Invalid branch operation (`err:api/BadRequest`), such as branching from a ledger with no commits or merging a branch into itself
+- A `t` beyond the ledger's current head (`err:api/BadRequest`), such as syncing a search index through a commit that does not exist yet
+- A search index (BM25, vector, geo) named where a graph is read, as the query target or in `FROM`, `FROM NAMED` or `GRAPH` (`err:db/GraphSourceNotAGraph`). Query a BM25 or vector index with an `f:graphSource` pattern, with its source ledger as the dataset
+- A graph source's connection, auth or storage identity refused before anything is built (`err:api/InvalidGraphSourceConfig`): an unknown field, flat and structured fields mixed, auth given two ways or only partly, or an environment variable the server does not list. The message names the field, never its value. See [Iceberg connection](endpoints.md#iceberg-connection)
+- A graph source's Google credential configuration refused (`err:auth/GoogleCredentialsInvalid`): a Workload Identity Federation configuration with a field outside the accepted subset, a malformed service-account key, or a `quota_project` that is not a project id. Names the field, never its value
+- A path the source's storage identity does not serve (`err:storage/SchemeNotServed`): a `gs://` file on an AWS identity with no GCS interoperability endpoint, an `s3://` file on a Google identity, or a local path a catalog returned. The identity is chosen by the source's `io.storage_auth`, never by the path
+
+**Error typing:**
+
+The server includes a compact error type IRI in the `@type` field. This is the
+preferred stable, machine-readable category for programmatic handling.
+
+**Example:**
+```json
+{
+  "error": "Invalid JSON: expected value at line 5, column 12",
+  "status": 400,
+  "@type": "err:db/JsonParse"
+}
+```
+
+**How to Fix:**
+- Validate JSON syntax
+- Check IRI formats
+- Verify JSON-LD structure
+- Review the `error` message and optional `cause`
+
+#### 401 Unauthorized
+
+Authentication is required but not provided or invalid.
+
+**Common Causes:**
+- Missing authentication credentials
+- Invalid API key
+- Expired JWT token
+- Invalid signature (for signed requests)
+- Google refused the token exchange for a graph source's identity (`err:auth/GoogleTokenExchange`): the service-account key, WIF configuration or user credentials were not accepted. `403` when Google answered `PERMISSION_DENIED`, `502` when it gave no usable answer. The message carries Google's error code, never a response body
+
+**Example:**
+```json
+{
+  "error": "Bearer token required",
+  "status": 401,
+  "@type": "err:db/Unauthorized"
+}
+```
+
+**How to Fix:**
+- Provide valid authentication credentials
+- Check API key or token
+- Renew expired tokens
+- Verify signature process for signed requests
+
+#### 403 Forbidden
+
+The server understood the request but refused the operation under its access policy.
+
+**Common Causes:**
+- Insufficient permissions for operation
+- Policy denies access
+- Ledger access restricted
+
+A write rejected by a modify policy returns `403` with
+`@type: "err:policy/AccessDenied"`, and `error` carries the policy's
+`f:exMessage` when it has one. Malformed transactions still return `400`.
+
+**Example:**
+```json
+{
+  "error": "Employees may not modify document content.",
+  "status": 403,
+  "@type": "err:policy/AccessDenied"
+}
+```
+
+A query over a graph source also returns `403` when the source's catalog or object store refuses the read, with an `@type` naming which one refused:
+
+- `err:catalog/AccessDenied`: the catalog refused the table to the principal the source uses. This covers Iceberg REST catalogs (a `403` from `loadTable`, or a `401` that persists after one token refresh), AWS Glue and S3 Tables (the server's AWS identity lacks the catalog permission or a Lake Formation grant), and Unity Catalog for Delta sources. `error` reads `Catalog denied access to table '<table>': …`, followed by the catalog's own reply. On a query, AWS identities in that reply (the server's role and account, as `arn:…`) are replaced with `arn:<redacted>`; the full text is in the server log.
+- `err:catalog/CredentialsNotVended`: an Iceberg REST catalog authorized the table but vended no storage credentials, and the source requires them. The read is refused rather than made with the server's own AWS identity.
+- `err:storage/AccessDenied`: the catalog answered, but the object store refused a read of the table's files (`Storage access denied for s3://…`). As above, a query's error redacts AWS identities from the store's reason and the server logs the full text.
+- `err:catalog/QuotaProjectRequired`: a Google catalog (BigLake) refused the request because it names no quota project. Set the source's `quota_project` (see [Iceberg on Google](../graph-sources/iceberg.md)); a broader grant does not help.
+- `err:auth/HostIdentityRefused`: the source asked for an identity borrowed from the host (ambient AWS, ambient Azure, the GCE/GKE metadata server, the host's application-default credentials, host-signed WIF) that the operator's `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` does not allow; or an ambient AWS source named a bucket outside `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS`, or an `s3_endpoint` while that list is set; or a Google host identity's token would go to a host outside Google's APIs and `FLUREE_GOOGLE_TOKEN_HOSTS`. See [Configuration](../operations/configuration.md).
+- `err:auth/GoogleTokenExchange` (`403` when Google answered `PERMISSION_DENIED`): see [401](#401-unauthorized).
+
+See [Iceberg → Connection Issues](../graph-sources/iceberg.md#connection-issues) for causes and fixes.
+
+**How to Fix:**
+- Verify user has required permissions
+- Check policy configuration
+- Contact administrator for access
+
+#### 404 Not Found
+
+The requested resource doesn't exist.
+
+**Common Causes:**
+- Ledger doesn't exist
+- Entity not found
+- Endpoint doesn't exist
+
+**Example:**
+```json
+{
+  "error": "Ledger not found: mydb:main",
+  "status": 404,
+  "@type": "err:db/LedgerNotFound"
+}
+```
+
+**How to Fix:**
+- Verify ledger name spelling
+- Check if ledger was created
+- Verify entity IRI
+
+A dataset member (`FROM` / `FROM NAMED`, JSON-LD `from` / `fromNamed`, or a
+`graph()` / `db()` address) that names a graph its ledger does not have is a
+404 with `@type` `err:db/GraphNotFound`:
+
+```json
+{
+  "error": "Graph not found: ...",
+  "status": 404,
+  "@type": "err:db/GraphNotFound"
+}
+```
+
+A commit reference that names no commit of the ledger (an `@commit:` pin,
+`at`, commit show's `commit`, or a revert's commits) is a 404 with `@type`
+`err:db/CommitNotFound`. A malformed one (too short, an abbreviated CID, or a
+prefix that matches several commits) is a 400.
+
+A reference that names another ledger where only the target ledger can be
+read (a ledger route's dataset, a view's JSON-LD `from`, an update's `USING`)
+is a 400, as is one whose grammar is wrong.
+
+#### 408 Request Timeout
+
+The request took too long to process.
+
+**Common Causes:**
+- Query timeout exceeded, or the query was cancelled (`err:db/QueryCancelled`)
+- Complex query taking too long
+- Database under heavy load
+- A read-after-write wait for a `t` the ledger has not reached yet (`err:db/ReadAfterWriteTimeout`)
+
+**Example:**
+```json
+{
+  "error": "Query error: Query cancelled: timeout",
+  "status": 408,
+  "@type": "err:db/QueryCancelled"
+}
+```
+
+**How to Fix:**
+- Simplify query
+- Add more specific filters
+- Use LIMIT clause
+- Increase timeout setting
+- Check server load
+
+#### 409 Conflict
+
+The request conflicts with current server state.
+
+**Common Causes:**
+- Concurrent modification conflict (`err:db/CommitConflict`) that the server did not retry. When the server retried and every attempt lost, the answer is a 503 `err:db/CommitContention` instead.
+- Ledger already exists (`err:db/LedgerExists`)
+- Branch conflict (`err:db/CommitConflict`), such as a merge or rebase with `strategy=abort` meeting conflicting changes, or another maintenance operation holding the ledger (retry when it completes)
+- A merge, rebase or revert whose result would leave a config setting group's fields outside the config graph or a single-valued setting with two values, or that would carry one branch's config or `#txn-meta` writes into another (`err:db/CommitConflict`; see [Behavior changes](../reference/compatibility.md#behavior-changes))
+- The ledger advanced while a reindex ran (`err:system/ReindexConflict`)
+- Syncing a graph source that has been dropped (`err:db/GraphSourceRetracted`)
+- Querying a graph source that has no R2RML mapping, or one that defines no `rr:TriplesMap` (`err:db/GraphSourceUnmapped`): one registered before registration refused both. Register it again under the same name, with a mapping that defines one, to replace it
+- An Iceberg table that carries merge-on-read delete files (`err:iceberg/MergeOnReadDeletes`)
+
+**Example:**
+```json
+{
+  "error": "Ledger already exists: mydb:main",
+  "status": 409,
+  "@type": "err:db/LedgerExists"
+}
+```
+
+**How to Fix:**
+- Use different ledger name
+- Handle concurrent modifications with retry logic
+- Check resource state before modifying
+
+#### 413 Payload Too Large
+
+The request was refused because of its size. The server emits **two distinct
+`@type` codes** on this status — clients must branch on `@type`, not the
+status, because the remedies differ.
+
+**`err:db/PayloadTooLarge`** — the raw HTTP request body exceeds the server's
+configured body-size limit. Rejected before parsing; nothing was staged.
+
+```json
+{
+  "error": "request body exceeds the configured limit",
+  "status": 413,
+  "@type": "err:db/PayloadTooLarge"
+}
+```
+
+Fix: send a smaller request (split large transactions into batches) or raise
+the server's body limit.
+
+**`err:db/NoveltyDeltaTooLarge`** — the parsed transaction's novelty delta
+alone meets or exceeds `reindex_max_bytes`, so no amount of indexer draining
+can ever admit it. This is a permanent refusal of this payload at this
+configuration — retrying the same request can never succeed, which is why it
+is a 413 and not the retryable 503 below, and why it never carries
+`Retry-After`.
+
+```json
+{
+  "error": "Transaction would exceed novelty limit: current=0, delta=2048576, max=1048576",
+  "status": 413,
+  "@type": "err:db/NoveltyDeltaTooLarge"
+}
+```
+
+Fix: split the transaction into smaller pieces (each below
+`reindex_max_bytes`) or raise `--reindex-max-bytes`.
+
+#### 415 Unsupported Media Type
+
+The Content-Type is not supported.
+
+**Common Causes:**
+- Wrong Content-Type header
+- Unsupported format
+- Missing Content-Type header
+
+**Example:**
+```json
+{
+  "error": "Content-Type not supported: text/plain",
+  "status": 415,
+  "@type": "err:db/UnsupportedMediaType"
+}
+```
+
+**How to Fix:**
+- Set correct Content-Type header
+- Use supported format
+- Check API documentation for supported types
+
+#### 422 Unprocessable Entity
+
+The request is well-formed but semantically invalid.
+
+**Common Causes:**
+- Invalid data values
+- Business rule violation
+- Semantic constraint violation
+
+**Example:**
+```json
+{
+  "error": "semantic constraint violation",
+  "status": 422,
+  "@type": "err:db/ConstraintViolation"
+}
+```
+
+**How to Fix:**
+- Validate data before submitting
+- Check business rules
+- Review constraint requirements
+
+**`err:db/DatatypeLimitExceeded`**: the write would bring the ledger past the
+number of distinct datatypes its index can store. Fifteen common datatypes
+are reserved and never count, among them `xsd:string`, `xsd:integer`, and
+`rdf:langString`. A ledger holds at most 16,369 others, including other XSD
+types such as `xsd:int`. Each datatype IRI counts once, from the first write
+that uses it, and still counts after its data is retracted. See
+[Datatype Limit](../concepts/datatypes.md#datatype-limit). The write is refused before anything is committed, so the ledger
+is unchanged. Transactions, SPARQL updates, and pushed commits all return
+this code.
+
+```json
+{
+  "error": "datatype limit exceeded: the ledger holds 16369 of at most 16369 non-reserved datatypes, and this write would add 1 more",
+  "status": 422,
+  "@type": "err:db/DatatypeLimitExceeded"
+}
+```
+
+Datatype IDs are never released, so retrying the same write cannot succeed,
+and the response carries no `Retry-After`. Fix: type the new values with
+datatypes the ledger already holds.
+
+**`Invalid vector`** (`err:db/InvalidTransaction`): a `@vector` value has no
+elements or more than 65,535, or its length differs from the one its property
+already holds in that graph. The message names the property and the graph. A
+property's length is not reset when its vectors are retracted, so retrying the
+same write cannot succeed, and the response carries no `Retry-After`. Fix: put
+vectors of another length on another property or in another graph. See
+[Length](../indexing-and-search/vector-search.md#length).
+
+#### 429 Too Many Requests
+
+Rate limit exceeded.
+
+**Common Causes:**
+- Too many requests in time window
+- Exceeded quota
+
+**Example:**
+```json
+{
+  "error": "rate limit exceeded",
+  "status": 429,
+  "@type": "err:db/RateLimited"
+}
+```
+
+**Response Headers:**
+```http
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1642857645
+Retry-After: 45
+```
+
+**How to Fix:**
+- Wait before retrying (check Retry-After header)
+- Implement exponential backoff
+- Reduce request rate
+- Request higher rate limit
+
+### Server Error Codes (5xx)
+
+#### 500 Internal Server Error
+
+An unexpected error occurred on the server.
+
+**Common Causes:**
+- Unhandled exception
+- Database error
+- Internal logic error
+- A nameservice lookup a query needed failed, for instance while checking
+  whether a `GRAPH <iri>` names a graph source (`err:system/NameServiceError`).
+  The query fails rather than read a possible graph source as an empty graph;
+  the request itself was fine, so retry it.
+- Reading the ledger's config failed (`err:storage/ReadFailure`). Writes,
+  branch operations, push and queries fail rather than run without the checks
+  the config sets; retry once storage recovers.
+
+**Example:**
+```json
+{
+  "error": "internal error",
+  "status": 500,
+  "@type": "err:db/Internal"
+}
+```
+
+**How to Fix:**
+- Check server logs
+- Report to system administrator
+- Retry request
+- Contact support if persists
+
+#### 501 Not Implemented
+
+The server was built without a capability the request needs.
+
+**Common Causes:**
+- Querying a graph source whose reader this build was compiled without
+  (`err:db/GraphSourceUnsupported`): an Iceberg or R2RML source on a build
+  without the `iceberg` feature, a SQL source without `sql`, a Delta source
+  without `delta`. The record was registered by a build that had the reader
+  and shares this nameservice.
+
+**Example:**
+```json
+{
+  "error": "Query error: graph source 'orders:main' is an Iceberg graph source, which this build cannot read: it was compiled without the 'iceberg' feature",
+  "status": 501,
+  "@type": "err:db/GraphSourceUnsupported"
+}
+```
+
+**How to Fix:**
+- Query the source through a server built with the feature the message names
+- Rebuild with that feature
+
+#### 502 Bad Gateway
+
+Error communicating with upstream service.
+
+**Common Causes:**
+- Storage backend unavailable
+- Nameservice unavailable
+- Network error
+- Google's token endpoint or metadata server gave no usable answer for a graph source's identity (`err:auth/GoogleTokenExchange`)
+
+**Example:**
+```json
+{
+  "error": "upstream service error",
+  "status": 502,
+  "@type": "err:db/BadGateway"
+}
+```
+
+**How to Fix:**
+- Check storage backend status
+- Verify network connectivity
+- Check AWS/cloud service status
+- Retry with backoff
+
+#### 503 Service Unavailable
+
+Retryable capacity pressure: every 503 this server emits means "the request
+was refused by a condition that clears on its own — come back shortly". None
+of them indicate a fault in the request. The `@type` identifies the cause:
+
+| `@type` | Cause |
+|---|---|
+| `err:db/NoveltyAtMax` | Novelty backpressure: in-memory novelty is at `reindex_max_bytes` (or this transaction would cross it, while still fitting once novelty drains). Clears when the indexer catches up. |
+| `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
+| `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
+| `err:db/IndexNotLoaded` | The server has not loaded the ledger's index: it failed to load, or the one the server holds is older than the ledger's. The write was refused before it read or committed anything; the same request can succeed once the index loads. |
+| `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
+
+**Example:**
+```json
+{
+  "error": "Transaction error: Novelty at maximum size, reindexing required",
+  "status": 503,
+  "@type": "err:db/NoveltyAtMax"
+}
+```
+
+**Response Headers:** every 503 carries `Retry-After` (delta-seconds,
+jittered per response to spread out synchronized retries):
+```http
+Retry-After: 5
+```
+
+**How to Fix:**
+- Wait at least `Retry-After` seconds, then retry the same request
+- Idempotent retries are safe: replay the request with the same
+  `Idempotency-Key` — a novelty or index-not-loaded refusal does not
+  consume the key
+- Keep your own exponential backoff as the outer bound for repeated 503s
+- If a ledger 503s persistently, check indexer health and
+  `--reindex-max-bytes` sizing; for `err:db/IndexNotLoaded`, check the
+  server log for why the ledger's index failed to load
+
+#### 504 Gateway Timeout
+
+Upstream service didn't respond in time.
+
+**Common Causes:**
+- Storage backend timeout
+- Long-running query
+- Network latency
+- Waiting on an index build that did not finish within its timeout (`err:system/IndexTimeout`)
+
+**Example:**
+```json
+{
+  "error": "gateway timeout",
+  "status": 504,
+  "@type": "err:db/GatewayTimeout"
+}
+```
+
+**How to Fix:**
+- Retry request
+- Check storage backend performance
+- Simplify query
+- Increase timeout settings
+
+#### 507 Insufficient Storage
+
+The query's in-memory joins or aggregates outgrew the query memory budget, so
+it was stopped before it could exhaust the server's memory. Distinct from the
+408 timeout: the query is too memory-heavy, not too slow, and retrying it
+unchanged fails the same way.
+
+**How to Fix:**
+- Narrow the query with more selective patterns or filters
+- Aggregate over fewer groups, or page through the results
+- Over an R2RML graph source (Iceberg, Delta, SQL), declare the keys of
+  the tables whose rows never repeat a subject: a map no key proves
+  subject-unique holds the solutions it has seen against this budget (see
+  [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade))
+
+## Error Handling Best Practices
+
+### 1. Always Check Status Codes
+
+Check HTTP status before parsing response:
+
+```javascript
+const response = await fetch(url, options);
+if (!response.ok) {
+  const err = await response.json();
+  // err.error is the primary human-readable message, err["@type"] is the stable category.
+  throw new Error(`${err["@type"] || "err:unknown"}: ${err.error}`);
+}
+```
+
+### 2. Implement Retry Logic
+
+Retry transient errors with exponential backoff:
+
+```javascript
+async function retryRequest(fn, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isRetryable(err) || i === maxRetries - 1) {
+        throw err;
+      }
+      await sleep(Math.pow(2, i) * 1000);
+    }
+  }
+}
+
+function isRetryable(err) {
+  return [408, 429, 502, 503, 504].includes(err.status);
+}
+```
+
+### 3. Handle Rate Limits
+
+Respect rate limit headers:
+
+```javascript
+if (response.status === 429) {
+  const retryAfter = response.headers.get('Retry-After');
+  await sleep(retryAfter * 1000);
+  return retryRequest(fn);
+}
+```
+
+### 4. Log Error Details
+
+Log complete error context for debugging:
+
+```javascript
+console.error({
+  status: response.status,
+  error: errorData.error,
+  error_type: errorData["@type"],
+  cause: errorData.cause,
+  requestId: response.headers.get('X-Request-ID')
+});
+```
+
+### 5. User-Friendly Messages
+
+Show appropriate messages to users:
+
+```javascript
+function getUserMessage(error) {
+  switch (error["@type"]) {
+    case 'err:db/LedgerNotFound':
+      return 'Database not found. Please check the name.';
+    case 'err:db/Timeout':
+      return 'Query took too long. Please try a simpler query.';
+    case 'err:db/RateLimited':
+      return 'Too many requests. Please wait a moment.';
+    default:
+      return 'An error occurred. Please try again.';
+  }
+}
+```
+
+### 6. Graceful Degradation
+
+Handle errors gracefully:
+
+```javascript
+try {
+  const data = await query(ledger);
+  return data;
+} catch (err) {
+  if (err["@type"] === 'err:db/LedgerNotFound') {
+    // Create ledger and retry
+    await createLedger(ledger);
+    return await query(ledger);
+  }
+  throw err;
+}
+```
+
+### 7. Circuit Breaker Pattern
+
+Prevent cascading failures:
+
+```javascript
+class CircuitBreaker {
+  constructor(threshold = 5, timeout = 60000) {
+    this.failures = 0;
+    this.threshold = threshold;
+    this.timeout = timeout;
+    this.state = 'CLOSED';
+  }
+  
+  async execute(fn) {
+    if (this.state === 'OPEN') {
+      throw new Error('Circuit breaker is OPEN');
+    }
+    
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+  
+  onSuccess() {
+    this.failures = 0;
+    this.state = 'CLOSED';
+  }
+  
+  onFailure() {
+    this.failures++;
+    if (this.failures >= this.threshold) {
+      this.state = 'OPEN';
+      setTimeout(() => {
+        this.state = 'HALF_OPEN';
+        this.failures = 0;
+      }, this.timeout);
+    }
+  }
+}
+```
+
+## Related Documentation
+
+- [Overview](overview.md) - API overview
+- [Endpoints](endpoints.md) - API endpoints
+- [Signed Requests](signed-requests.md) - Authentication
+- [Troubleshooting](../troubleshooting/README.md) - General troubleshooting
+- [Common Errors](../troubleshooting/common-errors.md) - Common error solutions

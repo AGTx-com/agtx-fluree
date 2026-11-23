@@ -1,0 +1,1824 @@
+use crate::config;
+use crate::context;
+use crate::detect;
+use crate::error::{CliError, CliResult};
+use fluree_db_api::server_defaults::FlureeDir;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Import tuning options passed from global + create-specific CLI flags.
+pub struct ImportOpts {
+    pub memory_budget_mb: usize,
+    pub parallelism: usize,
+    pub chunk_size_mb: usize,
+    /// Namespace salting minted blank-node ids. `None` = the ledger id.
+    pub skolem_namespace: Option<String>,
+    pub leaflet_rows: usize,
+    pub leaflets_per_leaf: usize,
+    /// CSV/Cypher import: how relationship (edge) properties are encoded.
+    pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    /// CSV/Cypher import: base IRI namespace for minted ids/predicates/classes.
+    /// `None` = the format's default (CSV: `http://example.org/`; Cypher: bare
+    /// namespace-0 names).
+    pub base_iri: Option<String>,
+}
+
+/// Where a bulk import's data goes.
+#[derive(Clone, Copy)]
+pub(crate) enum ImportTarget<'a> {
+    /// A new ledger, created by the import (`fluree create --from`).
+    NewLedger,
+    /// A new named graph of an existing ledger (`fluree graph import`).
+    Graph(&'a str),
+}
+
+/// `fluree create <ledger> --remote <name>` — create an empty ledger on the
+/// remote server. Only the empty-create case is supported; bulk imports
+/// (`--from`, `--memory`) require local data ingestion and are dispatched
+/// before this is reached. Active-ledger pointer is **not** touched —
+/// remote storage is separate from local.
+pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let response = client.create_ledger(&ledger_id).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to create '{ledger}' on remote '{remote_name}': {e}"
+        ))
+    })?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = response
+        .get("ledger")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ledger_id);
+    println!("Created ledger '{resolved}' on remote '{remote_name}'");
+    Ok(())
+}
+
+/// `fluree create <ledger> --remote <name> --from <archive>.flpack` — restore a
+/// ledger onto a remote server from a local `.flpack` archive. The remote
+/// creates the ledger under `ledger` (which may differ from the archived
+/// ledger's name). No local state is written — remote storage is separate.
+///
+/// Picks the upload path from the server's advertised capabilities: a direct
+/// streamed `POST /import` by default, or the negotiated presigned-upload flow
+/// when the server is size-capped and the archive exceeds its direct limit.
+pub async fn run_remote_flpack_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+    let size = meta.len();
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger)?;
+
+    let cap = client.fetch_import_capability().await;
+    let result = if cap.needs_negotiated_upload(size) {
+        run_remote_flpack_negotiated(&client, ledger, &ledger_id, remote_name, path, size).await?
+    } else {
+        run_remote_flpack_direct(&client, ledger, &ledger_id, remote_name, path, size).await?
+    };
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    print_remote_import_summary(remote_name, &ledger_id, &result);
+    Ok(())
+}
+
+/// Direct path: stream the archive straight to `POST /import/<ledger>`.
+async fn run_remote_flpack_direct(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+    eprintln!(
+        "Importing '{}' to remote '{}' from {} ({})...",
+        ledger.cyan(),
+        remote_name,
+        path.display(),
+        format_human_bytes(size),
+    );
+    client.import_ledger(ledger_id, path).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to import '{ledger}' to remote '{remote_name}': {e}"
+        ))
+    })
+}
+
+/// Negotiated path: mint an upload slot, PUT the archive out-of-band, notify
+/// `complete`, then poll status to a terminal state.
+async fn run_remote_flpack_negotiated(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+
+    eprintln!(
+        "Uploading '{}' to remote '{}' via presigned upload ({})...",
+        ledger.cyan(),
+        remote_name,
+        format_human_bytes(size),
+    );
+
+    // 1. Mint an upload slot. The server picks single-PUT vs multipart by the
+    //    declared size and returns either an `upload` or a `multipart` block.
+    let mint = client
+        .mint_import_upload(ledger_id, Some(size))
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    // 2. Upload the archive — multipart when the server minted parts, else a
+    //    single streamed PUT.
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(client, &mint, path, size).await?
+    } else {
+        upload_single(client, &mint, path).await?
+    };
+
+    // 3. Notify the server to begin the restore (carrying the part list for
+    //    multipart; an empty slice for single-PUT).
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; restoring on '{remote_name}'...");
+
+    // 4. Poll status to a terminal state.
+    poll_remote_import(client, &import_id).await
+}
+
+/// Single-PUT upload: stream the whole archive to the one minted URL.
+async fn upload_single(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use std::collections::HashMap;
+
+    let upload = &mint["upload"];
+    let url = upload["url"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing upload.url".to_string()))?;
+    let headers: HashMap<String, String> = json_string_map(&upload["headers"]);
+    client
+        .put_upload_file(url, &headers, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive: {e}")))?;
+    Ok(Vec::new())
+}
+
+/// Multipart upload: PUT each part to its minted URL, returning the completed
+/// `(part_number, etag)` list for the `complete` call.
+async fn upload_multipart(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+    size: u64,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use crate::remote_client::MintedPart;
+
+    let mp = &mint["multipart"];
+    let part_size = mp["part_size_bytes"]
+        .as_u64()
+        .ok_or_else(|| CliError::Remote("multipart mint missing part_size_bytes".to_string()))?;
+    if part_size == 0 {
+        return Err(CliError::Remote(
+            "multipart mint returned part_size_bytes = 0".to_string(),
+        ));
+    }
+    let parts_json = mp["parts"]
+        .as_array()
+        .ok_or_else(|| CliError::Remote("multipart mint missing parts array".to_string()))?;
+    let parts: Vec<MintedPart> = parts_json
+        .iter()
+        .map(|p| {
+            let part_number = p["part_number"]
+                .as_u64()
+                .ok_or_else(|| CliError::Remote("multipart part missing part_number".to_string()))?
+                as u32;
+            let url = p["url"]
+                .as_str()
+                .ok_or_else(|| CliError::Remote("multipart part missing url".to_string()))?
+                .to_string();
+            Ok(MintedPart {
+                part_number,
+                url,
+                headers: json_string_map(&p["headers"]),
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    eprintln!(
+        "  uploading {} parts of up to {} each...",
+        parts.len(),
+        format_human_bytes(part_size.min(size)),
+    );
+
+    client
+        .put_upload_parts(&parts, part_size, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive parts: {e}")))
+}
+
+/// Collect a JSON object of string values into a `HashMap`, dropping non-string
+/// entries. Used for the per-upload `headers` block.
+fn json_string_map(v: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll `import-upload/{id}` until the import reaches a terminal state.
+async fn poll_remote_import(
+    client: &crate::remote_client::RemoteLedgerClient,
+    import_id: &str,
+) -> CliResult<serde_json::Value> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        let status = client
+            .import_upload_status(import_id)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to poll import status: {e}")))?;
+        match status["status"].as_str() {
+            Some("succeeded") => return Ok(status["result"].clone()),
+            Some("failed") => {
+                let err = status["error"].as_str().unwrap_or("unknown error");
+                return Err(CliError::Remote(format!("remote import failed: {err}")));
+            }
+            Some("running" | "awaiting-upload") => {}
+            other => {
+                // `other` is `Option<&str>`; Debug-printing it rendered the
+                // Rust container — `unexpected remote import status:
+                // Some("weird")`. Show the status the way the server sent it,
+                // and fall back to the raw JSON when the field is absent or
+                // isn't a string (`null`, a number, an object) so the message
+                // still names what arrived.
+                let shown = other.map_or_else(|| status["status"].to_string(), ToString::to_string);
+                return Err(CliError::Remote(format!(
+                    "unexpected remote import status: {shown}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Remote(
+                "timed out waiting for remote import to complete".to_string(),
+            ));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(3));
+    }
+}
+
+/// `fluree create <ledger> --remote <name> --from <data>` for non-`.flpack`
+/// inputs: upload the raw source file to a server advertising
+/// `source-upload` and let it run the bulk-import pipeline (the same formats
+/// `fluree create --from` takes locally). Single files only — a directory
+/// can't ride one upload slot; pack it or create locally and publish.
+pub async fn run_remote_source_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    if !path.is_file() {
+        return Err(CliError::Usage(format!(
+            "--remote --from requires a single file ({} is a directory); \
+             create locally then `fluree publish {remote_name} {ledger}`, or export \
+             to .flpack (`fluree export <ledger> --format ledger -o out.flpack`).",
+            path.display()
+        )));
+    }
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger)?;
+
+    let cap = client.fetch_import_capability().await;
+    if !cap.supports_source_upload() {
+        return Err(CliError::Usage(format!(
+            "remote '{remote_name}' does not offer server-side bulk import (source-upload); \
+             export to .flpack first (`fluree export <ledger> --format ledger -o out.flpack`), \
+             or create locally then `fluree publish {remote_name} {ledger}`."
+        )));
+    }
+
+    let result = upload_source_import(
+        &client,
+        &cap,
+        &ledger_id,
+        remote_name,
+        path,
+        import_opts,
+        ImportTarget::NewLedger,
+    )
+    .await?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = result["ledger_id"].as_str().unwrap_or(&ledger_id);
+    let t = result["t"].as_i64().unwrap_or(0);
+    let flakes = result["flake_count"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported '{}' to remote '{}' — t={}, {} flakes",
+        "✓".green(),
+        resolved,
+        remote_name,
+        t,
+        flakes,
+    );
+    Ok(())
+}
+
+/// Upload the single source file `path` for a bulk import on the server
+/// behind `client`, into `target` of `ledger_id`, and wait for it: the mint →
+/// upload → complete → poll handshake of the negotiated `.flpack` path, with
+/// a mint body that declares the source kind and filename so the server
+/// stages with the right extension and runs the pipeline on complete.
+/// Returns the job's result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_source_import(
+    client: &crate::remote_client::RemoteLedgerClient,
+    cap: &crate::remote_client::ImportCapability,
+    ledger_id: &str,
+    server_label: &str,
+    path: &Path,
+    import_opts: &ImportOpts,
+    target: ImportTarget<'_>,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+
+    if import_opts.skolem_namespace.is_some() && !cap.supports_skolem_source_upload() {
+        return Err(CliError::Usage(format!(
+            "'{server_label}' would ignore --skolem-namespace (it does not offer \
+             source-upload-skolem); upgrade it, or import without the option"
+        )));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CliError::Input(format!("unusable file name: {}", path.display())))?;
+    let size = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?
+        .len();
+    let graph = match target {
+        ImportTarget::NewLedger => None,
+        ImportTarget::Graph(iri) => Some(iri),
+    };
+
+    eprintln!(
+        "Uploading '{}' to '{}' for server-side bulk import ({}, {})...",
+        ledger_id.cyan(),
+        server_label,
+        filename,
+        format_human_bytes(size),
+    );
+    let mint = client
+        .mint_source_import_upload(
+            ledger_id,
+            Some(size),
+            filename,
+            import_opts.edge_policy,
+            import_opts.base_iri.as_deref(),
+            graph,
+            import_opts.skolem_namespace.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            CliError::Remote(format!("failed to start upload to '{server_label}': {e}"))
+        })?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(client, &mint, path, size).await?
+    } else {
+        upload_single(client, &mint, path).await?
+    };
+
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; importing on '{server_label}'...");
+    poll_remote_import(client, &import_id).await
+}
+
+/// Print the shared success summary for a remote import (both paths).
+fn print_remote_import_summary(remote_name: &str, ledger_id: &str, result: &serde_json::Value) {
+    use colored::Colorize;
+    let resolved = result["ledger_id"].as_str().unwrap_or(ledger_id);
+    let commits = result["commits"].as_u64().unwrap_or(0);
+    let txn_blobs = result["txn_blobs"].as_u64().unwrap_or(0);
+    let index_artifacts = result["index_artifacts"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported '{}' to remote '{}' — {} commits, {} txn blobs, {} index artifacts",
+        "✓".green(),
+        resolved,
+        remote_name,
+        commits,
+        txn_blobs,
+        index_artifacts,
+    );
+}
+
+pub async fn run(
+    ledger: &str,
+    from: Option<&Path>,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    // Refuse if this alias is already tracked (mutual exclusion)
+    let store = config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+    if store.get_tracked(&context::to_ledger_id(ledger)?).is_some() {
+        return Err(CliError::Usage(format!(
+            "alias '{ledger}' is already used by a tracked ledger.\n  \
+             Run `fluree track remove {ledger}` first, or choose a different name."
+        )));
+    }
+
+    let fluree = context::build_fluree(dirs).await?;
+
+    match from {
+        Some(path) if is_flpack_path(path) => {
+            run_flpack_import(&fluree, ledger, path, dirs).await?;
+        }
+        // CSV (single file or a directory containing .csv) is streamed to
+        // newline-delimited JSON-LD and loaded through the chunked bulk-import
+        // pipeline. Checked before the directory / bulk branches, which only
+        // understand RDF/JSON-LD.
+        Some(path) if is_csv_input(path) => {
+            run_csv_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs,
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
+        }
+        // Cypher scripts (.cypher/.cyp/.cql of CREATE / MATCH…CREATE
+        // statements) are converted to newline-delimited JSON-LD and loaded
+        // through the same chunked bulk-import pipeline.
+        Some(path) if is_cypher_input(path) => {
+            run_cypher_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs,
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
+        }
+        Some(path) if path.is_dir() => {
+            // Validate directory format (catches mixed formats & empty dirs).
+            fluree_db_api::scan_directory_format(path)?;
+            run_bulk_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs.data_dir(),
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
+        }
+        Some(path) if is_import_path(path)? => {
+            // Bulk import: Turtle or JSON-LD file (any size).
+            // The import pipeline handles both small (single-chunk) and large
+            // (auto-split) files via resolve_chunk_source.
+            run_bulk_import(
+                &fluree,
+                ledger,
+                ImportTarget::NewLedger,
+                path,
+                dirs.data_dir(),
+                verbose,
+                quiet,
+                import_opts,
+            )
+            .await?;
+        }
+        Some(path) => {
+            // Non-Turtle single file: detect format.
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?;
+            let format = detect::detect_data_format(Some(path), &content, None)?;
+
+            match format {
+                detect::DataFormat::Turtle | detect::DataFormat::Trig => {
+                    // Safety redirect: if a .ttl file reaches this branch
+                    // (e.g., due to path/extension edge cases), always route
+                    // through the import pipeline to avoid novelty limits.
+                    run_bulk_import(
+                        &fluree,
+                        ledger,
+                        ImportTarget::NewLedger,
+                        path,
+                        dirs.data_dir(),
+                        verbose,
+                        quiet,
+                        import_opts,
+                    )
+                    .await?;
+                }
+                detect::DataFormat::JsonLd => {
+                    // JSON-LD: create ledger + transact
+                    fluree.create_ledger(ledger).await?;
+
+                    let json: serde_json::Value = serde_json::from_str(&content)?;
+                    let result = fluree
+                        .graph(ledger)
+                        .transact()
+                        .insert(&json)
+                        .commit()
+                        .await?;
+
+                    config::write_active_ledger(dirs.data_dir(), ledger)?;
+                    println!(
+                        "Created ledger '{}' ({} flakes, t={})",
+                        ledger, result.receipt.flake_count, result.receipt.t
+                    );
+                }
+            }
+        }
+        None => {
+            // Create empty ledger
+            fluree.create_ledger(ledger).await?;
+            config::write_active_ledger(dirs.data_dir(), ledger)?;
+            println!("Created ledger '{ledger}'");
+        }
+    }
+
+    Ok(())
+}
+
+/// `fluree graph import` run in-process: bulk-import `path` into the new
+/// graph `graph_iri` of the existing ledger `ledger`. The import indexes the
+/// ledger to its head first when its index trails it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_graph_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    graph_iri: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let ledger_id = context::to_ledger_id(ledger)?;
+    let graph_iri = fluree_db_api::graph_import_target(&ledger_id, graph_iri)?;
+    let record = fluree
+        .nameservice()
+        .lookup(&ledger_id)
+        .await?
+        .ok_or_else(|| CliError::NotFound(format!("ledger '{ledger}' not found")))?;
+    if record.index_t < record.commit_t && !quiet {
+        eprintln!(
+            "  {} indexing {} (t={}..{}) before the import...",
+            "index:".cyan().bold(),
+            ledger_id,
+            record.index_t + 1,
+            record.commit_t
+        );
+    }
+
+    let target = ImportTarget::Graph(&graph_iri);
+    if is_csv_input(path) {
+        run_csv_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs,
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if is_cypher_input(path) {
+        run_cypher_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs,
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if path.is_dir() {
+        fluree_db_api::scan_directory_format(path)?;
+        run_bulk_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs.data_dir(),
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else if is_import_path(path)? {
+        run_bulk_import(
+            fluree,
+            &ledger_id,
+            target,
+            path,
+            dirs.data_dir(),
+            verbose,
+            quiet,
+            import_opts,
+        )
+        .await
+    } else {
+        Err(CliError::Usage(format!(
+            "{} is not a format `graph import` reads: use Turtle, N-Triples, JSON-LD, \
+             JSONL/NDJSON (optionally .gz/.zst), CSV or Cypher",
+            path.display()
+        )))
+    }
+}
+
+/// Run the bulk import pipeline for a Turtle file or directory.
+///
+/// Prints effective import settings (memory budget, parallelism, chunk size,
+/// run budget) to stderr so the user can cancel if the values look excessive.
+/// Shows a live progress bar unless `quiet` is set.
+#[allow(clippy::too_many_arguments)]
+async fn run_bulk_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    target: ImportTarget<'_>,
+    path: &Path,
+    fluree_dir: &Path,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use colored::Colorize;
+    use fluree_db_api::ImportPhase;
+    use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+    if verbose {
+        println!("Importing from: {}", path.display());
+    }
+
+    let ledger_owned = ledger.to_string();
+
+    let mut builder = match target {
+        ImportTarget::NewLedger => fluree.create(ledger).import(path),
+        ImportTarget::Graph(iri) => fluree.import_into_graph(ledger, iri).import(path),
+    };
+    if import_opts.parallelism > 0 {
+        builder = builder.parallelism(import_opts.parallelism);
+    }
+    if import_opts.memory_budget_mb > 0 {
+        builder = builder.memory_budget_mb(import_opts.memory_budget_mb);
+    }
+    if import_opts.chunk_size_mb > 0 {
+        builder = builder.chunk_size_mb(import_opts.chunk_size_mb);
+    }
+    if let Some(ns) = import_opts.skolem_namespace.as_deref() {
+        builder = builder.skolem_namespace(ns);
+    }
+    if import_opts.leaflet_rows != 25_000 {
+        builder = builder.leaflet_rows(import_opts.leaflet_rows);
+    }
+    if import_opts.leaflets_per_leaf != 10 {
+        builder = builder.leaflets_per_leaf(import_opts.leaflets_per_leaf);
+    }
+    let settings = builder.effective_import_settings();
+    let mem_auto = import_opts.memory_budget_mb == 0;
+    let par_auto = import_opts.parallelism == 0;
+    if !quiet {
+        eprintln!(
+            "Import settings: memory budget {} MB{}, parallelism {}{}, chunk size {} MB",
+            settings.memory_budget_mb,
+            if mem_auto { " (auto)" } else { "" },
+            settings.parallelism,
+            if par_auto { " (auto)" } else { "" },
+            settings.chunk_size_mb,
+        );
+        if mem_auto || par_auto {
+            eprintln!("  Override with --memory-budget-mb and --parallelism");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Crash breadcrumb for customer support (survives SIGSEGV/OOM-kill).
+    //
+    // The CLI defaults to "no logs" for UX; when the process dies hard (e.g.
+    // SIGSEGV under memory pressure), there is no Rust panic message.
+    //
+    // We write a small JSON "breadcrumb" file periodically during import so
+    // users can attach it to bug reports. This is intentionally minimal and
+    // low-frequency (<= 1 write/sec).
+    // ------------------------------------------------------------------------
+    let breadcrumb_path: Option<std::path::PathBuf> = {
+        let crash_dir = fluree_dir.join("crash");
+        if std::fs::create_dir_all(&crash_dir).is_ok() {
+            let pid = std::process::id();
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let name = format!(
+                "import_{}_{}_{}.json",
+                sanitize_for_filename(ledger),
+                ts,
+                pid
+            );
+            let p = crash_dir.join(name);
+            // Initial record (best-effort).
+            let started_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let init = serde_json::json!({
+                "kind": "bulk_import",
+                "ledger": ledger_owned,
+                "pid": pid,
+                "started_epoch_ms": started_ms,
+                "source_path": path.display().to_string(),
+                "settings": {
+                    "memory_budget_mb": settings.memory_budget_mb,
+                    "parallelism": settings.parallelism,
+                    "chunk_size_mb": settings.chunk_size_mb,
+                    "max_inflight_chunks": settings.max_inflight_chunks,
+                    "leaflet_rows": import_opts.leaflet_rows,
+                    "leaflets_per_leaf": import_opts.leaflets_per_leaf
+                },
+                "status": "running",
+                "last_phase": "starting"
+            });
+            let _ = std::fs::write(&p, serde_json::to_vec_pretty(&init).unwrap_or_default());
+            Some(p)
+        } else {
+            None
+        }
+    };
+    let breadcrumb_last_write: std::sync::Arc<std::sync::Mutex<std::time::Instant>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
+    // Two progress bars shown simultaneously: Committing and Indexing.
+    // The active phase advances while the other stays at 0% or 100%.
+    let multi = if quiet {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    } else {
+        MultiProgress::new()
+    };
+
+    let style =
+        ProgressStyle::with_template("{prefix:12} {spinner:.dim} [{bar:25}] {percent:>3}%  {msg}")
+            .unwrap()
+            .tick_strings(&["|", "/", "-", "\\", " "])
+            .progress_chars("=>-");
+
+    let scan_bar = multi.add(ProgressBar::new(100));
+    scan_bar.set_style(style.clone());
+    scan_bar.set_prefix(format!("{}", "Reading".green().bold()));
+    scan_bar.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let commit_bar = multi.add(ProgressBar::new(100));
+    commit_bar.set_style(style.clone());
+    commit_bar.set_prefix(format!("{}", "Committing".green().bold()));
+    commit_bar.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let index_bar = multi.add(ProgressBar::new(100));
+    index_bar.set_style(style);
+    index_bar.set_prefix(format!("{}", "Indexing".green().bold()));
+    index_bar.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let sb = scan_bar.clone();
+    let cb = commit_bar.clone();
+    let ib = index_bar.clone();
+    // Track when the commit phase actually starts (first Committing event),
+    // so M flakes/s reflects commit throughput, not reading/parsing time.
+    let commit_start: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // Whether we've received any Scanning event (streaming mode). When true,
+    // the scan bar manages its own lifecycle — the Committing handler must not
+    // clear it prematurely.
+    let is_streaming_scan = std::sync::atomic::AtomicBool::new(false);
+    let breadcrumb_path_for_cb = breadcrumb_path.clone();
+    let breadcrumb_last_write_for_cb = std::sync::Arc::clone(&breadcrumb_last_write);
+    let breadcrumb_ledger_for_cb = ledger_owned.clone();
+    builder = builder.on_progress(move |phase| {
+        // Best-effort: update crash breadcrumb at most once per second.
+        // Avoid heavy work in the callback when the progress bars are active.
+        if let Some(ref p) = breadcrumb_path_for_cb {
+            if let Ok(mut last) = breadcrumb_last_write_for_cb.lock() {
+                if last.elapsed() >= Duration::from_secs(1) {
+                    *last = std::time::Instant::now();
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let phase_str = format!("{phase:?}");
+                    let doc = serde_json::json!({
+                        "kind": "bulk_import",
+                        "ledger": breadcrumb_ledger_for_cb,
+                        "pid": std::process::id(),
+                        "updated_epoch_ms": now_ms,
+                        "status": "running",
+                        "last_phase": phase_str
+                    });
+                    let _ = std::fs::write(p, serde_json::to_vec_pretty(&doc).unwrap_or_default());
+                }
+            }
+        }
+        // Continue with normal progress handling below.
+        match phase {
+            ImportPhase::Parsing {
+                chunk,
+                total,
+                chunk_bytes,
+            } => {
+                let mb = chunk_bytes as f64 / (1024.0 * 1024.0);
+                cb.set_length(total as u64);
+                cb.set_position(chunk.saturating_sub(1) as u64);
+                cb.set_message(format!("Parsing chunk {chunk} ({mb:.0} MB)..."));
+            }
+            ImportPhase::Scanning {
+                bytes_read,
+                total_bytes,
+            } => {
+                is_streaming_scan.store(true, std::sync::atomic::Ordering::Relaxed);
+                let gb_read = bytes_read as f64 / (1024.0 * 1024.0 * 1024.0);
+                if total_bytes > 0 {
+                    // Known total — normal percentage bar.
+                    sb.set_length(total_bytes);
+                    sb.set_position(bytes_read);
+                    let gb_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    sb.set_message(format!("{gb_read:.1} / {gb_total:.1} GB"));
+                    if bytes_read >= total_bytes {
+                        sb.finish_with_message(format!("{gb_total:.1} GB"));
+                    }
+                } else {
+                    // Unknown total (compressed source — uncompressed size
+                    // not known ahead of time). Show running bytes only; the
+                    // bar's length is left at a sentinel so it never renders
+                    // as complete, and the Committing handler will clear it
+                    // when reading is genuinely done.
+                    sb.set_length(u64::MAX);
+                    sb.set_position(bytes_read);
+                    sb.set_message(format!("{gb_read:.2} GB read"));
+                }
+            }
+            ImportPhase::Committing {
+                chunk,
+                total,
+                cumulative_flakes,
+                ..
+            } => {
+                // For non-streaming imports (small files, directories), scanning
+                // never happens — hide the scan bar on the first Committing event.
+                // For streaming imports, the scan bar finishes itself via
+                // finish_with_message() when reading completes; don't kill it here
+                // while the reader thread is still active.
+                if !sb.is_finished()
+                    && !is_streaming_scan.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    sb.finish_and_clear();
+                }
+                let t0 = *commit_start.get_or_init(std::time::Instant::now);
+                if total > 0 {
+                    // Estimated totals can undercount (e.g. compressed ndjson
+                    // sources) — never let the length fall below the position,
+                    // which would render the bar overfull.
+                    cb.set_length((total as u64).max(chunk as u64));
+                } else {
+                    // Unknown total: sentinel length so the bar never renders
+                    // as complete (mirrors the Scanning handler).
+                    cb.set_length(u64::MAX);
+                }
+                cb.set_position(chunk as u64);
+                let secs = t0.elapsed().as_secs_f64();
+                let rate = if secs > 0.0 {
+                    cumulative_flakes as f64 / secs / 1_000_000.0
+                } else {
+                    0.0
+                };
+                cb.set_message(format!("{rate:.2} M flakes/s"));
+            }
+            ImportPhase::PreparingIndex { stage } => {
+                cb.finish();
+                // Unknown-total streaming scan (compressed input) leaves the
+                // scan bar without a natural finish event from the reader.
+                // By PreparingIndex, parsing is fully done so reading must be
+                // too — lock the bar at its last reported byte count.
+                if !sb.is_finished() {
+                    sb.finish();
+                }
+                // Show activity immediately (avoid "Indexing 0%" during merge/remap).
+                ib.set_length(100);
+                ib.set_position(1);
+                ib.set_message(stage.to_string());
+            }
+            ImportPhase::Indexing {
+                stage,
+                processed_flakes,
+                total_flakes,
+                stage_elapsed_secs,
+            } => {
+                cb.finish();
+                ib.set_length(total_flakes);
+                // Start at 1% minimum so the bar shows activity immediately
+                let pos = if processed_flakes == 0 && total_flakes > 0 {
+                    total_flakes / 100
+                } else {
+                    processed_flakes
+                };
+                ib.set_position(pos);
+                let rate = if stage_elapsed_secs > 0.0 {
+                    processed_flakes as f64 / 1_000_000.0 / stage_elapsed_secs
+                } else {
+                    0.0
+                };
+                ib.set_message(format!("{stage} {rate:.2} M flakes/s"));
+            }
+            ImportPhase::Done => {
+                ib.finish();
+                // Mark breadcrumb as complete (best-effort).
+                if let Some(ref p) = breadcrumb_path_for_cb {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let doc = serde_json::json!({
+                        "kind": "bulk_import",
+                        "ledger": breadcrumb_ledger_for_cb,
+                        "pid": std::process::id(),
+                        "updated_epoch_ms": now_ms,
+                        "status": "done"
+                    });
+                    let _ = std::fs::write(p, serde_json::to_vec_pretty(&doc).unwrap_or_default());
+                }
+            }
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let result = match builder.execute().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Persist failure marker for customer bug reports (best-effort).
+            if let Some(ref p) = breadcrumb_path {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let doc = serde_json::json!({
+                    "kind": "bulk_import",
+                    "ledger": ledger_owned,
+                    "pid": std::process::id(),
+                    "updated_epoch_ms": now_ms,
+                    "status": "error",
+                    "error": e.to_string()
+                });
+                let _ = std::fs::write(p, serde_json::to_vec_pretty(&doc).unwrap_or_default());
+            }
+            return Err(e.into());
+        }
+    };
+    let elapsed = start.elapsed();
+
+    let secs = elapsed.as_secs_f64();
+    let total_m = result.flake_count as f64 / 1_000_000.0;
+    let mflakes_per_sec = total_m / secs;
+    match target {
+        ImportTarget::NewLedger => {
+            config::write_active_ledger(fluree_dir, ledger)?;
+            println!(
+                "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
+                ledger, total_m, secs, mflakes_per_sec, result.t, result.t
+            );
+        }
+        ImportTarget::Graph(iri) => {
+            let base_t = result.graph.as_ref().map_or(0, |graph| graph.base_t);
+            println!(
+                "\n\nImported {:.1}M flakes into graph <{}> of '{}' in {:.2}s ({:.2} M flakes/s) across {} commits (t={}..{})",
+                total_m,
+                iri,
+                ledger,
+                secs,
+                mflakes_per_sec,
+                result.t - base_t,
+                base_t + 1,
+                result.t
+            );
+        }
+    }
+    if result.duplicates_removed > 0 {
+        println!(
+            "Collapsed {} duplicate statement(s); the index holds {} distinct flakes",
+            format_with_commas(result.duplicates_removed),
+            format_with_commas(result.flake_count - result.duplicates_removed)
+        );
+    }
+
+    if let Some(ref summary) = result.summary {
+        if !summary.top_classes.is_empty() {
+            println!("\n  Top classes:");
+            for (iri, count) in &summary.top_classes {
+                println!("    {:>12}  {}", format_with_commas(*count), iri);
+            }
+        }
+        if !summary.top_properties.is_empty() {
+            println!("\n  Top properties:");
+            for (iri, count) in &summary.top_properties {
+                println!("    {:>12}  {}", format_with_commas(*count), iri);
+            }
+        }
+        if !summary.top_connections.is_empty() {
+            println!("\n  Top connections:");
+            for (src, prop, tgt, count) in &summary.top_connections {
+                println!(
+                    "    {:>12}  {} -> {} -> {}",
+                    format_with_commas(*count),
+                    src,
+                    prop,
+                    tgt
+                );
+            }
+        }
+        println!();
+    }
+
+    // Annotation arena auto-seal pass.
+    //
+    // The bulk-import path writes `IndexRoot.annotation_index = None`
+    // even when the imported dataset contains `f:reifies*` flakes —
+    // `build_indexes_from_commits` doesn't drive the annotation
+    // arena builder, so a freshly-imported ledger always lands in
+    // arena-less / scan-fallback state until a reindex.
+    //
+    // To close the workflow gap, we follow a successful annotation-
+    // bearing import with `Fluree::reindex(...)`, which DOES seal the
+    // arena via the api's `AttachmentEventsProvider`. The cost is one
+    // extra index pass on annotation-bearing imports — the same work
+    // a user would otherwise run manually via `fluree index` as a
+    // second step. Non-annotation imports skip this entirely (the
+    // sticky bit gate on `Fluree::reindex` and the early-return in
+    // the indexer's arena builder both make it cheap to be wrong).
+    if result.has_annotations && matches!(target, ImportTarget::Graph(_)) {
+        // Resealing here would rebuild the whole ledger's index, not just
+        // the graph's, so it is left for the user to schedule.
+        if !quiet {
+            eprintln!(
+                "{} The graph holds statement annotations, so the ledger's annotation arena \
+                 was set aside; quoted-triple queries read by scan until `fluree reindex {ledger}` \
+                 seals it again.",
+                "info:".cyan().bold()
+            );
+        }
+    } else if result.has_annotations {
+        if !quiet {
+            eprintln!(
+                "{} Sealing annotation arena (one-shot reindex pass) — ledger contains `f:reifies*` flakes…",
+                "info:".cyan().bold()
+            );
+        }
+        match fluree
+            .reindex(ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(_) => {
+                // Report what actually landed: the reindex can complete
+                // without sealing anything (no attachment-event coverage),
+                // and an unsealed ledger answers quoted-triple queries
+                // through the slow generic join chain.
+                let sealed = fluree
+                    .ledger(ledger)
+                    .await
+                    .map(|state| state.snapshot.annotation_index.is_some())
+                    .unwrap_or(false);
+                if !quiet {
+                    if sealed {
+                        eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                    } else {
+                        eprintln!(
+                            "{} Annotation arena was not sealed (no attachment events resolved); quoted-triple queries fall back to the generic join chain until `fluree reindex` seals it.",
+                            "warning:".yellow().bold()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Annotation arena seal failed (import succeeded; arena will land on the next `fluree index`): {e}",
+                    "warning:".yellow().bold()
+                );
+            }
+        }
+    }
+
+    // Success: remove the crash breadcrumb so the presence of files in
+    // `<data_dir>/crash/` continues to be a strong signal of *failed/crashed*
+    // runs that need investigation.
+    if let Some(p) = breadcrumb_path {
+        let _ = std::fs::remove_file(p);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Native ledger import (.flpack)
+// ============================================================================
+
+/// Whether this path looks like a `.flpack` ledger archive.
+pub(crate) fn is_flpack_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("flpack"))
+}
+
+/// Import a native ledger pack file (`.flpack`) into the local store.
+///
+/// Streams the archive into `Fluree::restore_ledger`, which creates the ledger,
+/// ingests all CAS objects (verifying each), and finalizes the commit/index
+/// heads from the embedded nameservice manifest — rolling back on any failure.
+async fn run_flpack_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?
+        .len();
+
+    eprintln!(
+        "Importing ledger '{}' from {} ({})...",
+        ledger.cyan(),
+        path.display(),
+        format_human_bytes(file_size),
+    );
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| CliError::Input(format!("failed to open {}: {e}", path.display())))?;
+
+    let result = fluree
+        .restore_ledger(ledger, &mut file)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to restore ledger from .flpack: {e}")))?;
+
+    config::write_active_ledger(dirs.data_dir(), ledger)?;
+
+    let objects = result.commits + result.txn_blobs + result.index_artifacts;
+    println!(
+        "{} Imported '{}' — {} commits, {} txn blobs, {} index artifacts ({} objects)",
+        "✓".green(),
+        result.ledger_id,
+        result.commits,
+        result.txn_blobs,
+        result.index_artifacts,
+        objects,
+    );
+
+    Ok(())
+}
+
+/// Format bytes as a human-readable size.
+fn format_human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1_073_741_824.0;
+    const MIB: f64 = 1_048_576.0;
+    const KIB: f64 = 1_024.0;
+
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.0} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+// ============================================================================
+// Import path detection (single files only)
+// ============================================================================
+
+/// Whether this single-file path should use the import pipeline.
+///
+/// - RDF/JSON-LD formats (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/
+///   `.jsonl`/`.ndjson`, case-insensitive, optionally `.gz`/`.zst`-compressed)
+///   → import
+/// - `.bz2` → error with helpful message
+/// - Everything else (e.g. `.csv`) → detect-based transact path
+///
+/// Note: directories are handled separately in `run()` via `fluree_db_api::scan_directory_format()`.
+fn is_import_path(path: &Path) -> CliResult<bool> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name_lower = name.to_ascii_lowercase();
+
+    // Bulk import handles every supported RDF format. Each may carry an outer
+    // `.gz` or `.zst` suffix — the bulk pipeline decompresses transparently.
+    // `.bz2` is rejected explicitly because the import pipeline doesn't link
+    // a bzip2 decoder.
+    if name_lower.ends_with(".bz2") {
+        return Err(CliError::Input(format!(
+            "bzip2-compressed files are not supported; use .gz or .zst, or \
+             decompress first: {}",
+            path.display()
+        )));
+    }
+    // Single source of truth with the import pipeline's own discovery rules —
+    // a format accepted here is guaranteed to resolve there.
+    Ok(fluree_db_api::is_bulk_import_file(path))
+}
+
+/// Whether `--from` points at CSV input: a single `.csv` file, or a directory
+/// containing at least one `.csv` file.
+fn is_csv_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_csv_extension(&e.path()))
+    } else {
+        has_csv_extension(path)
+    }
+}
+
+fn has_csv_extension(path: &Path) -> bool {
+    fluree_db_api::import_source::has_csv_extension(path)
+}
+
+/// Whether `--from` points at a Cypher script: a single `.cypher`/`.cyp`/`.cql`
+/// file, or a directory containing at least one.
+fn is_cypher_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_cypher_extension(&e.path()))
+    } else {
+        has_cypher_extension(path)
+    }
+}
+
+fn has_cypher_extension(path: &Path) -> bool {
+    fluree_db_api::import_source::has_cypher_extension(path)
+}
+
+/// Convert CSV node/relationship files (neo4j-admin header convention) to
+/// newline-delimited JSON-LD in a temp directory, then load through the existing
+/// **chunked, parallel bulk-import pipeline** (the same path as `--from data/`
+/// of Turtle/JSON-LD). Streaming the `.jsonl` keeps memory flat and gives a
+/// progress bar + chunk-per-commit, instead of one giant in-memory transaction.
+#[allow(clippy::too_many_arguments)]
+async fn run_csv_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    target: ImportTarget<'_>,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::csv_import::CsvImportOptions;
+
+    let opts = CsvImportOptions {
+        edge_policy: import_opts.edge_policy,
+        base_iri: import_opts
+            .base_iri
+            .clone()
+            .unwrap_or_else(|| CsvImportOptions::default().base_iri),
+        ..Default::default()
+    };
+
+    // Stream each CSV → one `.jsonl` shard in a temp dir (cleaned up on drop,
+    // after the import completes). One shard per source file lets the bulk
+    // pipeline parallelize across them.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
+    if !quiet {
+        println!(
+            "Converting CSV → JSON-LD (edge properties: {:?})...",
+            import_opts.edge_policy
+        );
+    }
+    let total_objects = fluree_db_api::import_source::csv_to_shards(path, &opts, tmp.path())
+        .map_err(|e| CliError::Input(e.to_string()))?;
+    if !quiet {
+        println!("Converted {total_objects} object(s); importing...");
+    }
+
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        target,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
+}
+
+/// Convert Cypher scripts (CREATE / MATCH…CREATE statements, the Neo4j /
+/// Memgraph dump convention) to newline-delimited JSON-LD in a temp directory,
+/// then load through the existing **chunked, parallel bulk-import pipeline** —
+/// instead of replaying statements one at a time over the transactional write
+/// path. Three sequential passes over the input (each statement parsed once):
+/// learn match-key property sets, emit nodes, emit edges.
+#[allow(clippy::too_many_arguments)]
+async fn run_cypher_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    target: ImportTarget<'_>,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::cypher_import::CypherImportOptions;
+
+    if !quiet {
+        println!(
+            "Converting Cypher → JSON-LD (edge properties: {:?})...",
+            import_opts.edge_policy
+        );
+    }
+
+    // Shards land in a temp dir (cleaned up on drop, after the import
+    // completes); the shared converter runs the three passes (learn keys,
+    // nodes, edges) so node ids derive identically across files.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
+    let stats = fluree_db_api::import_source::cypher_to_shards(
+        path,
+        CypherImportOptions {
+            edge_policy: import_opts.edge_policy,
+            vocab: import_opts.base_iri.clone(),
+        },
+        tmp.path(),
+    )
+    .map_err(|e| CliError::Input(e.to_string()))?;
+    if !quiet {
+        println!(
+            "Converted {} object(s) ({} nodes, {} edges); importing...",
+            stats.nodes + stats.edges,
+            stats.nodes,
+            stats.edges
+        );
+    }
+    if stats.edges_skipped > 0 {
+        eprintln!(
+            "warning: skipped {} MATCH…CREATE edge(s) whose endpoint node was never created",
+            stats.edges_skipped
+        );
+    }
+
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        target,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
+}
+
+/// Replace non-alphanumeric characters with underscores for safe filenames.
+fn sanitize_for_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+// ============================================================================
+// Memory history import (--memory)
+// ============================================================================
+
+struct GitCommit {
+    sha: String,
+    timestamp: String,
+    message: String,
+}
+
+/// Resolve the repo root for a memory import.
+///
+/// If `path` is `"."`, finds the git root from the current directory.
+/// Otherwise uses the path as-is. Validates that `.fluree-memory/repo.ttl` exists.
+fn resolve_memory_repo(path: &Path) -> CliResult<std::path::PathBuf> {
+    let repo_root = if path == Path::new(".") {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|e| CliError::Config(format!("failed to run git: {e}")))?;
+        if !output.status.success() {
+            return Err(CliError::Usage(
+                "not in a git repository; pass an explicit path to --memory".into(),
+            ));
+        }
+        std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+    } else {
+        path.to_path_buf()
+    };
+
+    let repo_ttl = repo_root.join(".fluree-memory/repo.ttl");
+    if !repo_ttl.exists() {
+        return Err(CliError::Usage(format!(
+            "no memory store found at {}",
+            repo_ttl.display()
+        )));
+    }
+    Ok(repo_root)
+}
+
+/// Get git commits that touched the memory TTL files, oldest first.
+fn git_memory_commits(repo_root: &Path, include_user: bool) -> CliResult<Vec<GitCommit>> {
+    let mut args = vec![
+        "log",
+        "--reverse",
+        "--format=%H\t%aI\t%s",
+        "--diff-filter=AMDR",
+        "--",
+        ".fluree-memory/repo.ttl",
+    ];
+    if include_user {
+        args.push(".fluree-memory/.local/user.ttl");
+    }
+
+    let output = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(&args)
+        .output()
+        .map_err(|e| CliError::Config(format!("failed to run git log: {e}")))?;
+
+    if !output.status.success() {
+        return Err(CliError::Config(
+            "git log failed — is this a git repository?".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commits: Vec<GitCommit> = stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() == 3 {
+                Some(GitCommit {
+                    sha: parts[0].to_string(),
+                    timestamp: parts[1].to_string(),
+                    message: parts[2].to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(commits)
+}
+
+/// Get file content at a specific git commit.
+fn git_show(repo_root: &Path, sha: &str, file: &str) -> CliResult<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["show", &format!("{sha}:{file}")])
+        .output()
+        .map_err(|e| CliError::Config(format!("failed to run git show: {e}")))?;
+
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Import memory history from git into a Fluree ledger with time-travel.
+///
+/// Each git commit that touched `.fluree-memory/repo.ttl` (and optionally
+/// `.local/user.ttl`) becomes a Fluree transaction. The retract-all + insert
+/// pattern at each commit gives a clean snapshot at every `t`.
+pub async fn run_memory_import(
+    ledger: &str,
+    memory_path: &Path,
+    no_user: bool,
+    dirs: &FlureeDir,
+    quiet: bool,
+) -> CliResult<()> {
+    let repo_root = resolve_memory_repo(memory_path)?;
+    let include_user = !no_user;
+    let commits = git_memory_commits(&repo_root, include_user)?;
+
+    let fluree = context::build_fluree(dirs).await?;
+
+    // Create ledger + transact memory schema
+    fluree
+        .create_ledger(ledger)
+        .await
+        .map_err(|e| CliError::Config(format!("failed to create ledger: {e}")))?;
+
+    let schema = fluree_db_memory::schema::memory_schema_jsonld();
+    // Backdate the schema transaction to the first git commit's timestamp:
+    // commit event time is monotonically non-decreasing along the chain, so
+    // stamping the schema with "now" would reject every replayed commit.
+    let graph = fluree.graph(ledger);
+    let mut schema_txn = graph.transact().insert(&schema);
+    if let Some(first) = commits.first() {
+        schema_txn = schema_txn.commit_opts(
+            fluree_db_api::CommitOpts::default().with_timestamp(first.timestamp.clone()),
+        );
+    }
+    schema_txn
+        .commit()
+        .await
+        .map_err(|e| CliError::Config(format!("failed to transact schema: {e}")))?;
+
+    if commits.is_empty() {
+        // No git history — import current file state as a single transaction
+        let repo_ttl = std::fs::read_to_string(repo_root.join(".fluree-memory/repo.ttl"))
+            .map_err(|e| CliError::Input(format!("failed to read repo.ttl: {e}")))?;
+
+        if let Some(data) = fluree_db_memory::turtle_io::parse_and_inject_fulltext(&repo_ttl)
+            .map_err(|e| CliError::Input(format!("failed to parse repo.ttl: {e}")))?
+        {
+            fluree
+                .graph(ledger)
+                .transact()
+                .insert(&data)
+                .commit()
+                .await?;
+        }
+
+        config::write_active_ledger(dirs.data_dir(), ledger)?;
+        println!("Created ledger '{ledger}' from current memory state (no git history found)");
+        return Ok(());
+    }
+
+    if !quiet {
+        eprintln!(
+            "Importing {} commits into ledger '{}'...",
+            commits.len(),
+            ledger
+        );
+    }
+
+    let mut last_t = 1u64; // t=1 is the schema transaction
+                           // Git author dates are not guaranteed monotonic (rebases, merges, clock
+                           // skew), but commit event time must be non-decreasing along the chain.
+                           // Clamp: any date earlier than the previous one is bumped to it.
+    let mut last_event_time: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    for (i, commit) in commits.iter().enumerate() {
+        // Extract TTL content at this commit
+        let repo_ttl = git_show(&repo_root, &commit.sha, ".fluree-memory/repo.ttl")?;
+        let user_ttl = if include_user {
+            git_show(&repo_root, &commit.sha, ".fluree-memory/.local/user.ttl")?
+        } else {
+            String::new()
+        };
+
+        // Parse both files into JSON-LD
+        let repo_data = if repo_ttl.is_empty() {
+            None
+        } else {
+            fluree_db_memory::turtle_io::parse_and_inject_fulltext(&repo_ttl).map_err(|e| {
+                CliError::Input(format!(
+                    "failed to parse repo.ttl at {}: {e}",
+                    &commit.sha[..8]
+                ))
+            })?
+        };
+
+        let user_data = if user_ttl.is_empty() {
+            None
+        } else {
+            fluree_db_memory::turtle_io::parse_and_inject_fulltext(&user_ttl).map_err(|e| {
+                CliError::Input(format!(
+                    "failed to parse user.ttl at {}: {e}",
+                    &commit.sha[..8]
+                ))
+            })?
+        };
+
+        // Merge the @graph arrays from both files into one insert payload
+        let insert_nodes = merge_jsonld_graphs(repo_data, user_data);
+
+        // Build commit metadata from the git commit. f:message is a user
+        // claim — supply it via the txn-meta sidecar (works for update-shape
+        // transactions which have no @graph envelope).
+        let event_time = match chrono::DateTime::parse_from_rfc3339(&commit.timestamp) {
+            Ok(dt) => {
+                let clamped = match last_event_time {
+                    Some(prev) if dt < prev => prev,
+                    _ => dt,
+                };
+                last_event_time = Some(clamped);
+                clamped.to_rfc3339()
+            }
+            // Unparseable git date: reuse the previous event time (keeps the
+            // chain monotonic) or fall back to the raw string for the first
+            // commit and let the commit guard produce the precise error.
+            Err(_) => last_event_time
+                .map(|prev| prev.to_rfc3339())
+                .unwrap_or_else(|| commit.timestamp.clone()),
+        };
+        let commit_opts = fluree_db_api::CommitOpts::default().with_timestamp(event_time);
+
+        // Single transaction: retract all existing memory triples + insert new state.
+        // The WHERE pivots on mem:content to target only memory instances (not schema).
+        // On the first commit the WHERE matches nothing, so DELETE is a no-op.
+        let mut txn = serde_json::json!({
+            "@context": {
+                "mem": "https://ns.flur.ee/memory#",
+                "f": "https://ns.flur.ee/db#"
+            },
+            "where": [
+                { "@id": "?s", "mem:content": "?c" },
+                { "@id": "?s", "?p": "?o" }
+            ],
+            "delete": { "@id": "?s", "?p": "?o" },
+            "txn-meta": {
+                "f:message": format!("git:{} {}", &commit.sha[..8], commit.message)
+            }
+        });
+
+        if let Some(nodes) = &insert_nodes {
+            txn.as_object_mut()
+                .unwrap()
+                .insert("insert".to_string(), nodes.clone());
+        }
+
+        let result = fluree
+            .graph(ledger)
+            .transact()
+            .update(&txn)
+            .commit_opts(commit_opts)
+            .commit()
+            .await?;
+
+        last_t = result.receipt.t.max(0) as u64;
+
+        if !quiet {
+            eprintln!(
+                "  [{}/{}] t={} {} — {}",
+                i + 1,
+                commits.len(),
+                last_t,
+                &commit.sha[..8],
+                commit.message,
+            );
+        }
+    }
+
+    config::write_active_ledger(dirs.data_dir(), ledger)?;
+
+    println!(
+        "Created ledger '{}' with {} commits (t=1..{})",
+        ledger,
+        commits.len(),
+        last_t,
+    );
+    println!(
+        "  Earliest: {} — {}",
+        &commits[0].sha[..8],
+        commits[0].message
+    );
+    println!(
+        "  Latest:   {} — {}",
+        &commits.last().unwrap().sha[..8],
+        commits.last().unwrap().message,
+    );
+    println!();
+    println!("Query with time travel:");
+    println!(
+        "  fluree query {ledger} 'PREFIX mem: <https://ns.flur.ee/memory#> SELECT ?id ?content WHERE {{ ?id a mem:Fact ; mem:content ?content }} LIMIT 5'"
+    );
+    println!(
+        "  fluree query {ledger} --at-t 2 'PREFIX mem: <https://ns.flur.ee/memory#> SELECT ...'   # state at first commit"
+    );
+
+    Ok(())
+}
+
+/// Merge @graph arrays from repo.ttl and user.ttl JSON-LD into a single array.
+fn merge_jsonld_graphs(
+    repo: Option<serde_json::Value>,
+    user: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut nodes = Vec::new();
+
+    for data in [repo, user].into_iter().flatten() {
+        if let Some(graph) = data.get("@graph").and_then(|g| g.as_array()) {
+            nodes.extend(graph.iter().cloned());
+        } else if data.is_object() {
+            // Single node (no @graph wrapper)
+            nodes.push(data);
+        }
+    }
+
+    if nodes.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(nodes))
+    }
+}
+
+/// Format a u64 with comma-separated thousands (e.g. 543_174_590 → "543,174,590").
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
+#[cfg(test)]
+mod is_import_path_tests {
+    use super::is_import_path;
+    use std::path::Path;
+
+    #[test]
+    fn ndjson_jsonl_are_import_paths() {
+        for name in [
+            "data.jsonl",
+            "data.ndjson",
+            "data.jsonl.gz",
+            "data.ndjson.zst",
+        ] {
+            assert!(
+                is_import_path(Path::new(name)).unwrap(),
+                "{name} should route to bulk import"
+            );
+        }
+    }
+
+    #[test]
+    fn rdf_formats_remain_import_paths() {
+        // `.json` is accepted as a JSON-LD filename convention.
+        for name in [
+            "x.ttl", "x.nt", "x.nq", "x.trig", "x.json", "x.jsonld", "x.ttl.gz",
+        ] {
+            assert!(is_import_path(Path::new(name)).unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn non_bulk_inputs_are_not_import_paths() {
+        assert!(!is_import_path(Path::new("x.csv")).unwrap());
+        assert!(!is_import_path(Path::new("x.txt")).unwrap());
+    }
+}

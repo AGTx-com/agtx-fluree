@@ -1,0 +1,2339 @@
+//! Incremental commit resolution for the V6 (FIR6) index root.
+//!
+//! V6-native version of `incremental_resolve.rs`. Loads an `IndexRoot`
+//! instead of `IndexRoot`, builds an `OTypeRegistry`, and produces
+//! `RunRecordV2` output with per-record op bytes.
+//!
+//! The commit chain walking, reconciliation, and remap logic is reused from
+//! the V5 module — those are format-agnostic. The differences are:
+//!
+//! 1. Root type: `IndexRoot` (shared `DictRefs` for dict trees)
+//! 2. Output records: `Vec<RunRecordV2>` + `Vec<u8>` (parallel ops)
+//! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
+
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use futures::stream::StreamExt;
+
+use fluree_db_binary_index::dict::DictTreeReader;
+use fluree_db_binary_index::format::index_root::IndexRoot;
+use fluree_db_binary_index::format::run_record::{cmp_for_order, RunRecord, RunSortOrder};
+use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+use fluree_db_core::content_id::ContentId;
+use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::same_t::op_order;
+use fluree_db_core::storage::ContentStore;
+use fluree_db_core::subject_id::SubjectId;
+use fluree_db_core::value_id::{ObjKey, ObjKind};
+use fluree_db_core::DatatypeDictId;
+
+use crate::run_index::resolve::resolver::{RebuildChunk, ResolverError, SharedResolverState};
+
+async fn fetch_cached_or_get(
+    cs: &dyn ContentStore,
+    cid: &ContentId,
+    cache_dir: Option<&Path>,
+    context: impl Into<String>,
+) -> Result<Vec<u8>, IncrementalResolveError> {
+    let context = context.into();
+    match cache_dir {
+        Some(cache_dir) => {
+            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
+                .await
+                .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}")))
+        }
+        None => cs
+            .get(cid)
+            .await
+            .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}"))),
+    }
+}
+
+// ============================================================================
+// Error type
+// ============================================================================
+
+/// Errors specific to incremental resolution.
+#[derive(Debug)]
+pub enum IncrementalResolveError {
+    /// Root loading or decoding failed.
+    RootLoad(String),
+    /// Dict tree loading failed.
+    DictTreeLoad(String),
+    /// Commit chain walking failed.
+    CommitChain(String),
+    /// Resolution failed.
+    Resolve(ResolverError),
+    /// I/O error.
+    Io(io::Error),
+    /// The window cannot be folded into the base incrementally; a full
+    /// rebuild can.
+    NeedsRebuild(String),
+}
+
+impl std::fmt::Display for IncrementalResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootLoad(msg) => write!(f, "root load: {msg}"),
+            Self::DictTreeLoad(msg) => write!(f, "dict tree load: {msg}"),
+            Self::CommitChain(msg) => write!(f, "commit chain: {msg}"),
+            Self::Resolve(e) => write!(f, "resolve: {e}"),
+            Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::NeedsRebuild(msg) => write!(f, "needs a full rebuild: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IncrementalResolveError {}
+
+/// The custom datatype IRIs in a root's datatype list, which starts with the
+/// reserved ones.
+///
+/// A root that lists more datatypes than a dt id can address cannot come
+/// from a valid index. Building on it would write rows the index cannot
+/// represent, so it is refused.
+fn custom_datatype_iris(datatype_iris: &[String]) -> Result<Vec<String>, IncrementalResolveError> {
+    let max = usize::from(DatatypeDictId::MAX) + 1;
+    if datatype_iris.len() > max {
+        return Err(IncrementalResolveError::RootLoad(format!(
+            "index root lists {} datatypes, but a dt id can address at most {max}",
+            datatype_iris.len()
+        )));
+    }
+    Ok(datatype_iris
+        .iter()
+        .skip(usize::from(DatatypeDictId::RESERVED_COUNT))
+        .cloned()
+        .collect())
+}
+
+impl From<io::Error> for IncrementalResolveError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<ResolverError> for IncrementalResolveError {
+    fn from(e: ResolverError) -> Self {
+        Self::Resolve(e)
+    }
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Configuration for V6 incremental commit resolution.
+pub struct IncrementalResolveConfig {
+    /// The ledger being built, whose system graph IRIs the new root carries:
+    /// a base root another ledger built (a branch's, adopted) names its own.
+    pub ledger_id: String,
+    /// CID of the base FIR6 index root.
+    pub base_root_id: ContentId,
+    /// CID of the head commit (latest commit to include).
+    pub head_commit_id: ContentId,
+    /// Only include commits with `t > from_t` (typically `root.index_t`).
+    pub from_t: i64,
+    /// Optional disk-backed artifact cache directory for remote dict leaves.
+    pub artifact_cache_dir: Option<std::path::PathBuf>,
+    /// Maximum cumulative commit bytes to load during the commit-chain walk.
+    /// If exceeded, incremental resolution aborts so the caller can fall back
+    /// to a full rebuild. `None` means unlimited.
+    pub max_commit_bytes: Option<usize>,
+    /// Configured full-text properties for this incremental run. Seeded into
+    /// `SharedResolverState.fulltext_hook_config` before resolution so the
+    /// hook routes configured plain-string values into BM25 arena building.
+    /// Empty = only the `@fulltext` datatype path collects entries.
+    pub fulltext_configured_properties: Vec<crate::config::ConfiguredFulltextProperty>,
+    /// Pre-discovered commit CIDs (`t`, cid) with `t > from_t`, sorted
+    /// ascending by `t`, from the nameservice commit-CID index. When present
+    /// and validated as gap-free coverage of `(from_t, head_t]`, the
+    /// commit-chain walk skips the serial DAG traversal and fetches bodies in
+    /// parallel. `None` (or invalid) falls back to the serial walk.
+    pub pending_commit_cids: Option<Vec<(i64, ContentId)>>,
+    /// Global bound on in-flight commit-body fetches on the fast path.
+    pub commit_fetch_concurrency: usize,
+}
+
+/// Result of V6 incremental commit resolution.
+///
+/// Contains globally-addressed `RunRecordV2` records sorted by graph+SPOT,
+/// with parallel `ops` array, plus metadata for downstream phases.
+pub struct IncrementalNovelty {
+    /// Globally-addressed RunRecordV2 records, sorted by (g_id, SPOT).
+    pub records: Vec<RunRecordV2>,
+    /// Parallel ops array: 1=assert, 0=retract. Same length as `records`.
+    pub ops: Vec<u8>,
+    /// Events superseded by lifecycle dedup: an identity's intermediate
+    /// steps, dropped from `records`. Routed to the leaf merges, which
+    /// record the ones that were real state transitions as history-sidecar
+    /// entries. Every superseded event's identity has a winner in
+    /// `records`.
+    pub superseded: Vec<RunRecordV2>,
+    /// Parallel ops array for `superseded`: 1=assert, 0=retract.
+    pub superseded_ops: Vec<u8>,
+    /// The decoded base root (needed by downstream phases).
+    pub base_root: IndexRoot,
+    /// Updated resolver state.
+    pub shared: SharedResolverState,
+    /// New subject entries not found in reverse tree.
+    ///
+    /// **Invariant**: sorted by `(ns_code, local_id)` ascending. Within each
+    /// namespace, local_ids are contiguous starting at `watermark + 1`.
+    /// Consumed directly by forward pack builders (no re-sorting needed).
+    pub new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    /// New string entries not found in reverse tree.
+    ///
+    /// **Invariant**: sorted by `string_id` ascending. IDs are contiguous
+    /// starting at `string_watermark + 1`. Consumed directly by forward
+    /// pack builders (no re-sorting needed).
+    pub new_strings: Vec<(u32, Vec<u8>)>,
+    /// Updated subject watermarks.
+    pub updated_watermarks: Vec<u64>,
+    /// Updated string watermark.
+    pub updated_string_watermark: u32,
+    /// Maximum t value across all resolved commits.
+    pub max_t: i64,
+    /// Cumulative commit blob size.
+    pub delta_commit_size: u64,
+    /// Total assertions.
+    pub delta_asserts: u64,
+    /// Total retractions.
+    pub delta_retracts: u64,
+    /// Base vector arena counts per (g_id, p_id) for handle offsetting.
+    pub base_vector_counts: HashMap<(u16, u32), u32>,
+    /// Base numbig arena counts per (g_id, p_id).
+    pub base_numbig_counts: HashMap<(u16, u32), usize>,
+    /// String text bytes for fulltext assertion entries.
+    pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
+    /// The graphs a commit in the window dropped. `base_root` holds nothing
+    /// of them, so they merge as graphs the base never indexed.
+    pub purged_graphs: Vec<u16>,
+    /// Artifacts of the original base root the purge left unreferenced:
+    /// garbage of the root built from this.
+    pub purged_cids: Vec<ContentId>,
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Resolve incremental commits against a V6 (FIR6) index root.
+///
+/// This is the V6-native Phase 1 for the incremental indexing pipeline.
+pub async fn resolve_incremental_commits_v6(
+    cs: Arc<dyn ContentStore>,
+    config: IncrementalResolveConfig,
+    s3_budget: Arc<tokio::sync::Semaphore>,
+) -> Result<IncrementalNovelty, IncrementalResolveError> {
+    let t_start = Instant::now();
+    tracing::debug!(
+        base_root = %config.base_root_id,
+        head = %config.head_commit_id,
+        from_t = config.from_t,
+        "V6 incremental resolve: starting"
+    );
+
+    // 1. Load and decode IndexRoot.
+    let (root_bytes, t_root_load_ms) = {
+        let t0 = Instant::now();
+        let bytes = fetch_cached_or_get(
+            cs.as_ref(),
+            &config.base_root_id,
+            config.artifact_cache_dir.as_deref(),
+            format!("failed to load FIR6 root {}", config.base_root_id),
+        )
+        .await?;
+        (bytes, t0.elapsed().as_millis() as u64)
+    };
+
+    let (root, t_root_decode_ms) = {
+        let t0 = Instant::now();
+        let root = IndexRoot::decode(&root_bytes).map_err(|e| {
+            IncrementalResolveError::RootLoad(format!("failed to decode FIR6: {e}"))
+        })?;
+        (root, t0.elapsed().as_millis() as u64)
+    };
+
+    tracing::debug!(
+        index_t = root.index_t,
+        from_t = config.from_t,
+        head = %config.head_commit_id,
+        "V6 incremental resolve: loaded base root"
+    );
+
+    // 2. Build OTypeRegistry from root's datatype and language metadata.
+    let custom_dt_iris = custom_datatype_iris(&root.datatype_iris)?;
+    let o_type_registry = OTypeRegistry::new(&custom_dt_iris);
+
+    // 3. Load subject + string reverse dict trees (same DictRefs as V5).
+    let (subject_tree, string_tree, t_dict_load_ms) = {
+        let t0 = Instant::now();
+        let subject_tree = DictTreeReader::from_refs(
+            &cs,
+            &root.dict_refs.subject_reverse,
+            None,
+            config.artifact_cache_dir.as_deref(),
+        )
+        .await
+        .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("subject reverse: {e}")))?;
+        let string_tree = DictTreeReader::from_refs(
+            &cs,
+            &root.dict_refs.string_reverse,
+            None,
+            config.artifact_cache_dir.as_deref(),
+        )
+        .await
+        .map_err(|e| IncrementalResolveError::DictTreeLoad(format!("string reverse: {e}")))?;
+        (subject_tree, string_tree, t0.elapsed().as_millis() as u64)
+    };
+
+    // 4. Seed SharedResolverState from V6 root.
+    let mut shared = SharedResolverState::from_index_root(&root, &config.ledger_id)?;
+
+    // Enable spatial hook for non-POINT geometry detection.
+    shared.spatial_hook = Some(crate::spatial_hook::SpatialHook::new());
+    // Enable fulltext hook.
+    shared.fulltext_hook = Some(crate::fulltext_hook::FulltextHook::new());
+
+    // Seed the configured full-text property set so the hook routes
+    // plain-string values on configured properties into BM25 arena building.
+    if !config.fulltext_configured_properties.is_empty() {
+        shared.configure_fulltext_properties(&config.fulltext_configured_properties);
+        tracing::debug!(
+            count = config.fulltext_configured_properties.len(),
+            "fulltext: seeded configured property set for incremental run"
+        );
+    }
+
+    // 4a. Pre-seed numbig arenas + read vector manifests.
+    //
+    // Numbig arenas are loaded fully (cheap; needed regardless of chunk
+    // content). Vector manifests are read for `base_vector_counts` (also
+    // cheap; consumed by the result envelope and the chunk-vs-base sanity
+    // guard further down). Vector arena SHARDS — the expensive part — are
+    // deferred to the conditional load below: they're only worth fetching
+    // when the chunk actually touches vectors. Without this split, ledgers
+    // accumulating vector data pay the full shard-reload cost on every
+    // incremental publish even for non-vector-touching commits.
+    let (base_numbig_counts, base_vector_counts, vector_manifests, t_seed_arenas_ms) = {
+        let t0 = Instant::now();
+
+        let mut base_numbig_counts: HashMap<(u16, u32), usize> = HashMap::new();
+        for ga in &root.graph_arenas {
+            if ga.numbig.is_empty() {
+                continue;
+            }
+            let nb_map = shared.numbigs.entry(ga.g_id).or_default();
+            for (p_id, cid) in &ga.numbig {
+                let bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    cid,
+                    config.artifact_cache_dir.as_deref(),
+                    format!("numbig arena load for g_id={}, p_id={}", ga.g_id, p_id),
+                )
+                .await?;
+                let arena =
+                    fluree_db_binary_index::arena::numbig::read_numbig_arena_from_bytes(&bytes)
+                        .map_err(|e| {
+                            IncrementalResolveError::RootLoad(format!("numbig arena decode: {e}"))
+                        })?;
+                base_numbig_counts.insert((ga.g_id, *p_id), arena.len());
+                nb_map.insert(*p_id, arena);
+            }
+        }
+
+        let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
+        let mut vector_manifests: Vec<(
+            u16,
+            u32,
+            fluree_db_binary_index::arena::vector::VectorManifest,
+        )> = Vec::new();
+        for ga in &root.graph_arenas {
+            for vref in &ga.vectors {
+                let manifest_bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    &vref.manifest,
+                    config.artifact_cache_dir.as_deref(),
+                    format!(
+                        "vector manifest load for g_id={}, p_id={}",
+                        ga.g_id, vref.p_id
+                    ),
+                )
+                .await?;
+                let manifest =
+                    fluree_db_binary_index::arena::vector::read_vector_manifest(&manifest_bytes)
+                        .map_err(|e| {
+                            IncrementalResolveError::RootLoad(format!(
+                                "vector manifest decode: {e}"
+                            ))
+                        })?;
+                base_vector_counts.insert((ga.g_id, vref.p_id), manifest.total_count);
+                vector_manifests.push((ga.g_id, vref.p_id, manifest));
+            }
+        }
+
+        (
+            base_numbig_counts,
+            base_vector_counts,
+            vector_manifests,
+            t0.elapsed().as_millis() as u64,
+        )
+    };
+
+    // 5. Walk commit chain (commit format is version-independent). Moved
+    // ahead of the vector-shard load so we can detect whether the chunk
+    // contains any vector op before deciding to pay that cost.
+    let (walked_commits, t_walk_chain_ms) = {
+        let t0 = Instant::now();
+        let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
+        refuse_base_off_the_line(&commits, &subject_tree)?;
+        (commits, t0.elapsed().as_millis() as u64)
+    };
+
+    // 4b/4c. Vector arena shard load + fact-handle seeding — gated on the
+    // chunk actually containing a vector op (assert or retract).
+    //
+    // 4b's purpose is to make chunk-side `arena.insert_f64` return globally
+    // correct handles by appending to the pre-loaded base arena. 4c's
+    // purpose is to let chunk-side retractions / re-assertions of base
+    // vectors find the matching base handle. Both are pure waste when the
+    // chunk doesn't touch vectors at all — and on a vector-heavy ledger the
+    // unnecessary cost is proportional to the entire base vector dataset
+    // (every shard reloaded, every base SPOT VECTOR row scanned), not the
+    // size of the new chunk.
+    // Tracking three distinct concepts here:
+    //   - `base_has_vectors`: any vector arenas in the base index.
+    //   - `chunk_has_vectors`: any commit in the chunk asserts/retracts a
+    //     vector. Pre-scan is skipped when base has none, since preload
+    //     wouldn't run regardless and the answer is irrelevant.
+    //   - `base_vector_preload_needed`: the actual gate for the expensive
+    //     work — true only when both flags are true.
+    let base_has_vectors = !vector_manifests.is_empty();
+    let chunk_has_vectors = if base_has_vectors {
+        chunk_has_vector_ops(&walked_commits)?
+    } else {
+        false
+    };
+    let base_vector_preload_needed = base_has_vectors && chunk_has_vectors;
+    let t_vector_load_ms = if base_vector_preload_needed {
+        let t0 = Instant::now();
+        for (g_id, p_id, manifest) in &vector_manifests {
+            let mut shards = Vec::with_capacity(manifest.shards.len());
+            for shard_info in &manifest.shards {
+                let cid: ContentId = shard_info.cas.parse().map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!(
+                        "vector shard CID parse for g_id={g_id}, p_id={p_id}: {e}"
+                    ))
+                })?;
+                let bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    &cid,
+                    config.artifact_cache_dir.as_deref(),
+                    format!(
+                        "vector shard load for g_id={g_id}, p_id={p_id}, cid={}",
+                        shard_info.cas
+                    ),
+                )
+                .await?;
+                let shard =
+                    fluree_db_binary_index::arena::vector::read_vector_shard_from_bytes(&bytes)
+                        .map_err(|e| {
+                            IncrementalResolveError::RootLoad(format!(
+                                "vector shard decode for g_id={g_id}, p_id={p_id}: {e}"
+                            ))
+                        })?;
+                shards.push(shard);
+            }
+            let arena =
+                fluree_db_binary_index::arena::vector::load_arena_from_shards(manifest, shards)
+                    .map_err(|e| {
+                        IncrementalResolveError::RootLoad(format!(
+                            "vector arena reassembly for g_id={g_id}, p_id={p_id}: {e}"
+                        ))
+                    })?;
+            shared
+                .vectors
+                .entry(*g_id)
+                .or_default()
+                .insert(*p_id, arena);
+        }
+        if !shared.vectors.is_empty() {
+            seed_vector_fact_handles(
+                Arc::clone(&cs),
+                &root,
+                &mut shared,
+                config.artifact_cache_dir.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                IncrementalResolveError::RootLoad(format!("vector fact-handle seed: {e}"))
+            })?;
+        }
+        t0.elapsed().as_millis() as u64
+    } else {
+        0
+    };
+
+    tracing::debug!(
+        commit_count = walked_commits.len(),
+        root_load_ms = t_root_load_ms,
+        root_decode_ms = t_root_decode_ms,
+        dict_load_ms = t_dict_load_ms,
+        seed_arenas_ms = t_seed_arenas_ms,
+        walk_chain_ms = t_walk_chain_ms,
+        base_has_vectors,
+        chunk_has_vectors,
+        // The pre-scan is skipped when `base_has_vectors == false` (preload
+        // wouldn't run regardless), so `chunk_has_vectors` is hard-coded
+        // false in that branch. This flag disambiguates "chunk has no
+        // vector ops" from "we didn't check."
+        chunk_vector_prescan_skipped = !base_has_vectors,
+        base_vector_preload_needed,
+        vector_load_ms = t_vector_load_ms,
+        avg_walk_ms_per_commit = if walked_commits.is_empty() {
+            0.0
+        } else {
+            t_walk_chain_ms as f64 / walked_commits.len() as f64
+        },
+        "V6 incremental resolve: setup and commit-chain walk finished"
+    );
+
+    // 6. Resolve commits into chunk, leaving out what a drop later in the
+    // window took (see `Commit::graph_drops`).
+    let lifecycles = window_lifecycles(&walked_commits)?;
+    shared.set_graph_floors(graph_floors(&lifecycles, &shared));
+    let (
+        chunk,
+        max_t,
+        delta_commit_size,
+        delta_asserts,
+        delta_retracts,
+        commit_count,
+        t_commit_resolve_ms,
+    ) = {
+        let t0 = Instant::now();
+        let mut chunk = RebuildChunk::new();
+        let mut max_t: i64 = root.index_t;
+        let mut delta_commit_size = 0u64;
+        let mut delta_asserts = 0u64;
+        let mut delta_retracts = 0u64;
+        let mut commit_count = 0usize;
+
+        for walked in &walked_commits {
+            let resolved = shared
+                .resolve_commit_into_chunk(&walked.bytes, &walked.cid.digest_hex(), &mut chunk)
+                .map_err(|e| {
+                    IncrementalResolveError::Resolve(match e {
+                        ResolverError::Unindexable(msg) => {
+                            ResolverError::Unindexable(format!("commit {}: {msg}", walked.cid))
+                        }
+                        e => e,
+                    })
+                })?;
+
+            max_t = max_t.max(walked.t);
+            delta_commit_size += resolved.size;
+            delta_asserts += resolved.asserts as u64;
+            delta_retracts += resolved.retracts as u64;
+            commit_count += 1;
+        }
+
+        (
+            chunk,
+            max_t,
+            delta_commit_size,
+            delta_asserts,
+            delta_retracts,
+            commit_count,
+            t0.elapsed().as_millis() as u64,
+        )
+    };
+
+    tracing::debug!(
+        commit_count,
+        records = chunk.records.len(),
+        max_t,
+        "V6 incremental resolve: commits resolved into chunk"
+    );
+    tracing::debug!(
+        commit_count,
+        chunk_records = chunk.records.len(),
+        max_t,
+        delta_commit_size,
+        delta_asserts,
+        delta_retracts,
+        commit_resolve_ms = t_commit_resolve_ms,
+        avg_resolve_ms_per_commit = if commit_count == 0 {
+            0.0
+        } else {
+            t_commit_resolve_ms as f64 / commit_count as f64
+        },
+        elapsed_since_start_ms = t_start.elapsed().as_millis() as u64,
+        "V6 incremental resolve: commit resolution finished"
+    );
+
+    // 6a. Graph drops in the window: what the base holds of a dropped graph,
+    // and what the window wrote to it before its drop, are gone; the root
+    // records the drops (see `Commit::graph_drops`).
+    let mut root = root;
+    let original_root = root.clone();
+    let purged_graphs = purge_dropped_graphs(&lifecycles, &mut root, &shared)?;
+    let purged_cids = if purged_graphs.is_empty() {
+        Vec::new()
+    } else {
+        // The purged graphs' branches, leaves and sidecars, less any a
+        // remaining graph still references. When the expansion cannot be
+        // read they are left unreleased rather than guessed at.
+        match (
+            fluree_db_binary_index::collect_root_cas_ids_expanded(cs.as_ref(), &original_root)
+                .await,
+            fluree_db_binary_index::collect_root_cas_ids_expanded(cs.as_ref(), &root).await,
+        ) {
+            (Ok(old_ids), Ok(new_ids)) => old_ids.difference(&new_ids).cloned().collect(),
+            _ => Vec::new(),
+        }
+    };
+    drop(original_root);
+
+    // Cache watermarks before potential root move.
+    let base_subject_watermarks = root.subject_watermarks.clone();
+    let base_string_watermark = root.string_watermark;
+
+    if chunk.records.is_empty() {
+        tracing::debug!(
+            root_load_ms = t_root_load_ms,
+            root_decode_ms = t_root_decode_ms,
+            dict_load_ms = t_dict_load_ms,
+            seed_arenas_ms = t_seed_arenas_ms,
+            walk_chain_ms = t_walk_chain_ms,
+            commit_resolve_ms = t_commit_resolve_ms,
+            total_ms = t_start.elapsed().as_millis() as u64,
+            commit_count,
+            "V6 incremental resolve: timings (no records)"
+        );
+        return Ok(IncrementalNovelty {
+            records: Vec::new(),
+            ops: Vec::new(),
+            superseded: Vec::new(),
+            superseded_ops: Vec::new(),
+            base_root: root,
+            shared,
+            updated_watermarks: base_subject_watermarks,
+            updated_string_watermark: base_string_watermark,
+            new_subjects: Vec::new(),
+            new_strings: Vec::new(),
+            max_t,
+            delta_commit_size,
+            delta_asserts,
+            delta_retracts,
+            base_vector_counts,
+            base_numbig_counts,
+            fulltext_string_bytes: HashMap::new(),
+            purged_graphs,
+            purged_cids,
+        });
+    }
+
+    // 6b. Best-effort: prewarm the reverse-tree leaves the sync reconcile will
+    // touch. `reconcile_chunk_to_global` loads each touched leaf one at a time
+    // via a `block_on` S3 fetch; prefetching the distinct touched leaves
+    // concurrently (bounded by the shared S3 budget) means those sync lookups
+    // hit a warm disk cache instead. Prefetch only WARMS the cache — lookup
+    // results, remaps, and downstream encoding are unchanged. Failures are
+    // ignored: the sync path will fetch the leaf the old way.
+    let t_prefetch_ms = {
+        let t0 = Instant::now();
+        prefetch_reconcile_leaves(cs.as_ref(), &chunk, &subject_tree, &string_tree, &s3_budget)
+            .await;
+        t0.elapsed().as_millis() as u64
+    };
+
+    // 7. Reconcile chunk-local IDs to global IDs (same algorithm as V5).
+    let t_reconcile_start = Instant::now();
+    let reconcile = reconcile_chunk_to_global(
+        &chunk,
+        &subject_tree,
+        &string_tree,
+        &base_subject_watermarks,
+        base_string_watermark,
+    )?;
+    let t_reconcile_ms = t_reconcile_start.elapsed().as_millis() as u64;
+
+    // 8. Remap fulltext hook entries.
+    let t0 = Instant::now();
+    let fulltext_string_bytes: HashMap<u32, Vec<u8>> = {
+        let chunk_forward = chunk.strings.forward_entries();
+        if let Some(ref mut ft) = shared.fulltext_hook {
+            let mut map = HashMap::new();
+            for entry in ft.entries_mut() {
+                let local_id = entry.string_id as usize;
+                let global_id = match reconcile.string_remap.get(local_id) {
+                    Some(&id) => id,
+                    None => {
+                        tracing::warn!(local_id, "fulltext entry string_id remap miss; skipping");
+                        entry.is_assert = false;
+                        entry.string_id = u32::MAX;
+                        continue;
+                    }
+                };
+                if entry.is_assert {
+                    if let Some(bytes) = chunk_forward.get(local_id) {
+                        map.entry(global_id).or_insert_with(|| bytes.clone());
+                    }
+                }
+                entry.string_id = global_id;
+            }
+            map
+        } else {
+            HashMap::new()
+        }
+    };
+    let t_remap_fulltext_ms = t0.elapsed().as_millis() as u64;
+
+    // 8b. Remap spatial hook entries' chunk-local subject ids.
+    if let Some(ref mut spatial) = shared.spatial_hook {
+        spatial.retain_mut(|entry| {
+            let local_s = entry.subject_id as usize;
+            match reconcile.subject_remap.get(local_s) {
+                Some(&global_s) => {
+                    entry.subject_id = global_s;
+                    true
+                }
+                None => {
+                    tracing::warn!(local_s, "spatial entry subject_id remap miss; skipping");
+                    false
+                }
+            }
+        });
+    }
+
+    // 9. Remap all V1 records in-place, then convert to V2.
+    let t0 = Instant::now();
+    let mut v1_records = chunk.records;
+    for record in &mut v1_records {
+        remap_record(record, &reconcile.subject_remap, &reconcile.string_remap)?;
+    }
+    let t_remap_records_ms = t0.elapsed().as_millis() as u64;
+
+    // VECTOR_ID handles are already globally-correct: chunk inserts
+    // appended to the pre-loaded base arena (step 4b) so they return
+    // `base_count..base_count+chunk_count` directly, and retractions /
+    // re-assertions resolve to base handles via the pre-populated
+    // `vector_fact_handles` (step 4c). No offset pass needed.
+    //
+    // Sanity guard: every VECTOR_ID record's o_key must be < total arena
+    // count (base + chunk). A regression here would mean a chunk emitted
+    // a handle that doesn't exist in the unified arena.
+    debug_assert!(
+        v1_records.iter().all(|record| {
+            if ObjKind::from_u8(record.o_kind) != ObjKind::VECTOR_ID {
+                return true;
+            }
+            let base_count = base_vector_counts
+                .get(&(record.g_id, record.p_id))
+                .copied()
+                .unwrap_or(0) as u64;
+            let chunk_count = shared
+                .vectors
+                .get(&record.g_id)
+                .and_then(|m| m.get(&record.p_id))
+                .map(|a| a.len() as u64)
+                .unwrap_or(0);
+            // `chunk_count` is base + new (since base was pre-loaded).
+            record.o_key < chunk_count.max(base_count)
+        }),
+        "VECTOR_ID record has out-of-range o_key after pre-loaded incremental resolve"
+    );
+
+    // 10. Sort V1 records by (g_id, SPOT) — needed for the conversion step
+    //     which preserves sort order.
+    let t0 = Instant::now();
+    let spot_cmp = cmp_for_order(RunSortOrder::Spot);
+    v1_records.sort_unstable_by(|a, b| a.g_id.cmp(&b.g_id).then_with(|| spot_cmp(a, b)));
+    let t_sort_ms = t0.elapsed().as_millis() as u64;
+
+    // 10a. Dedup fact lifecycles (RDF set semantics). Commit files are
+    //      event logs of user assertions, not state deltas: the same fact may
+    //      be asserted by several commits in this window, or asserted and
+    //      retracted within it. The leaf merge (`merge_novelty`) consumes at
+    //      most one op per fact identity, so each identity's event sequence
+    //      is resolved to its final state here.
+    let t0 = Instant::now();
+    let event_count = v1_records.len();
+    let (v1_records, v1_superseded) = dedup_fact_lifecycles(v1_records, &o_type_registry);
+    let t_dedup_ms = t0.elapsed().as_millis() as u64;
+    let deduped_count = event_count - v1_records.len();
+    if deduped_count > 0 {
+        tracing::debug!(
+            event_count,
+            deduped_count,
+            superseded_count = v1_superseded.len(),
+            "V6 incremental resolve: deduped fact lifecycles (set semantics)"
+        );
+    }
+
+    // 11. Convert V1 → V2 + extract ops.
+    let t0 = Instant::now();
+    let mut records = Vec::with_capacity(v1_records.len());
+    let mut ops = Vec::with_capacity(v1_records.len());
+    for v1 in &v1_records {
+        records.push(RunRecordV2::from_v1(v1, &o_type_registry));
+        ops.push(v1.op);
+    }
+    let mut superseded = Vec::with_capacity(v1_superseded.len());
+    let mut superseded_ops = Vec::with_capacity(v1_superseded.len());
+    for v1 in &v1_superseded {
+        superseded.push(RunRecordV2::from_v1(v1, &o_type_registry));
+        superseded_ops.push(v1.op);
+    }
+    let t_convert_ms = t0.elapsed().as_millis() as u64;
+
+    tracing::debug!(
+        root_load_ms = t_root_load_ms,
+        root_decode_ms = t_root_decode_ms,
+        dict_load_ms = t_dict_load_ms,
+        seed_arenas_ms = t_seed_arenas_ms,
+        walk_chain_ms = t_walk_chain_ms,
+        commit_resolve_ms = t_commit_resolve_ms,
+        prefetch_ms = t_prefetch_ms,
+        reconcile_ms = t_reconcile_ms,
+        remap_fulltext_ms = t_remap_fulltext_ms,
+        remap_records_ms = t_remap_records_ms,
+        sort_ms = t_sort_ms,
+        dedup_ms = t_dedup_ms,
+        convert_ms = t_convert_ms,
+        total_ms = t_start.elapsed().as_millis() as u64,
+        commit_count,
+        record_count = records.len(),
+        new_subjects = reconcile.new_subjects.len(),
+        new_strings = reconcile.new_strings.len(),
+        "V6 incremental resolve: timings"
+    );
+
+    Ok(IncrementalNovelty {
+        records,
+        ops,
+        superseded,
+        superseded_ops,
+        base_root: root,
+        shared,
+        new_subjects: reconcile.new_subjects,
+        new_strings: reconcile.new_strings,
+        updated_watermarks: reconcile.updated_watermarks,
+        updated_string_watermark: reconcile.updated_string_watermark,
+        max_t,
+        delta_commit_size,
+        delta_asserts,
+        delta_retracts,
+        base_vector_counts,
+        base_numbig_counts,
+        fulltext_string_bytes,
+        purged_graphs,
+        purged_cids,
+    })
+}
+
+// ============================================================================
+// Internal: Fact lifecycle dedup
+// ============================================================================
+
+/// True when two records agree on every field the `(g_id, SPOT)` comparator
+/// orders by, other than `dt`, `t`, and `op`. Records with the same prefix
+/// are adjacent in a sorted stream (`dt` sorts immediately after the prefix,
+/// so all `dt` variants of one value are contiguous). Fact identity is
+/// resolved within the group; see [`dedup_fact_lifecycles`].
+fn same_sort_prefix(a: &RunRecord, b: &RunRecord) -> bool {
+    a.g_id == b.g_id
+        && a.s_id == b.s_id
+        && a.p_id == b.p_id
+        && a.o_kind == b.o_kind
+        && a.o_key == b.o_key
+}
+
+/// Resolved V2 fact identity within a sort-prefix group: `(o_type, o_i)` —
+/// the identity `merge_novelty`, replay, and the query overlay compare by.
+type ResolvedIdentity = (u16, u32);
+
+/// Resolve each fact's event sequence within the commit window to a single
+/// final op, so the updated index materializes the same state the in-memory
+/// novelty view resolves:
+///
+/// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
+///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
+/// - Every other op becomes the identity's winner: a retract after an assert,
+///   an assert after a retract (at a later `t` or the same one: a same-`t`
+///   pair holds the assert, [`fluree_db_core::same_t`]), and a repeat retract
+///   at higher `t`.
+///
+/// Fact identity is the resolved V2 identity `(o_type, o_i)` within the
+/// sort-prefix group — the identity `merge_novelty`, replay, and the query
+/// overlay all compare by. `OTypeRegistry::resolve` collapses `dt` for 1:1
+/// object kinds (a boolean is `xsd:boolean` whatever datatype IRI the commit
+/// carried) and consults `lang_id` only for `rdf:langString` (folded into
+/// `o_type`), so `dt`/`lang` variants of one fact dedup together while
+/// distinct language tags and list positions stay distinct.
+///
+/// Input must be sorted by `(g_id, SPOT)`; winner output preserves that
+/// order. Compacts in place behind a write cursor — winners are always a
+/// subset of already-read input, so the stream-dominant case (every group a
+/// single event) copies nothing and allocates nothing.
+///
+/// Superseded events — a winner replaced by a later op of the same identity —
+/// are returned as **transition superseded** (`op` embedded in each record,
+/// per identity in chronological order). They carry the intermediate
+/// lifecycle steps the winner stream collapses away; `merge_novelty` turns
+/// the ones that were real state transitions into history-sidecar entries so
+/// index-served time travel can see states a fact held only within this
+/// window. A same-`t` pair's retraction is superseded like any other
+/// replaced winner, so the merge walks the same events a full rebuild does
+/// and writes the same row and sidecar. No-op re-asserts are discarded
+/// outright: they transition nothing anywhere.
+pub(crate) fn dedup_fact_lifecycles(
+    mut records: Vec<RunRecord>,
+    o_types: &OTypeRegistry,
+) -> (Vec<RunRecord>, Vec<RunRecord>) {
+    let len = records.len();
+    let mut write = 0;
+    let mut start = 0;
+    let mut superseded: Vec<RunRecord> = Vec::new();
+    // Scratch for multi-record groups, reused across groups.
+    let mut keyed: Vec<(ResolvedIdentity, RunRecord)> = Vec::new();
+
+    while start < len {
+        let mut end = start + 1;
+        while end < len && same_sort_prefix(&records[start], &records[end]) {
+            end += 1;
+        }
+
+        if end - start == 1 {
+            // Overwhelmingly common: a single event needs no identity
+            // resolution and, absent earlier compaction, no copy.
+            if write != start {
+                records[write] = records[start];
+            }
+            write += 1;
+        } else {
+            dedup_group(&records[start..end], o_types, &mut keyed, &mut superseded);
+            for &(_, winner) in &keyed {
+                records[write] = winner;
+                write += 1;
+            }
+        }
+        start = end;
+    }
+
+    records.truncate(write);
+    (records, superseded)
+}
+
+/// Dedup one multi-record sort-prefix group, leaving the per-identity winners
+/// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
+/// events to `superseded`.
+///
+/// The group is keyed by resolved V2 identity and sorted by identity, then
+/// [`op_order`]: the incoming `(g_id, SPOT)` order interleaves `dt` before
+/// `t`, so events of one identity spread across `dt` variants would
+/// otherwise arrive out of chronological order.
+fn dedup_group(
+    group: &[RunRecord],
+    o_types: &OTypeRegistry,
+    keyed: &mut Vec<(ResolvedIdentity, RunRecord)>,
+    superseded: &mut Vec<RunRecord>,
+) {
+    keyed.clear();
+    keyed.extend(group.iter().map(|&rec| {
+        let o_type = o_types
+            .resolve(
+                rec.obj_kind(),
+                DatatypeDictId::from_u16(rec.dt),
+                rec.lang_id,
+            )
+            .as_u16();
+        ((o_type, rec.i), rec)
+    }));
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(op_order(a.1.t, a.1.op == 1).cmp(&op_order(b.1.t, b.1.op == 1)))
+    });
+
+    // Compact each identity run to its winner, in place. Replaced winners
+    // are the identity's intermediate lifecycle steps → superseded. Walked in
+    // `op_order`, every event replaces the current winner (a same-`t` assert
+    // included) except a re-assert of an asserted fact.
+    let mut w = 0;
+    for r in 1..keyed.len() {
+        if keyed[r].0 != keyed[w].0 {
+            // First event of a new identity always counts.
+            w += 1;
+            keyed[w] = keyed[r];
+            continue;
+        }
+        let rec = keyed[r].1;
+        let winner = &mut keyed[w].1;
+        let noop_reassert = rec.op == 1 && winner.op == 1;
+        if !noop_reassert {
+            superseded.push(*winner);
+            *winner = rec;
+        }
+    }
+    keyed.truncate(w + 1);
+
+    keyed.sort_unstable_by(|a, b| {
+        a.1.dt
+            .cmp(&b.1.dt)
+            .then(a.1.t.cmp(&b.1.t))
+            .then(a.1.op.cmp(&b.1.op))
+    });
+}
+
+// ============================================================================
+// Internal: Graph lifecycles (`Commit::graph_drops`)
+// ============================================================================
+
+use fluree_db_core::CommitGraphLifecycle as CommitLifecycle;
+
+/// The graph lifecycles of `walked_commits`, read from their envelopes, in
+/// their order (oldest first).
+fn window_lifecycles(
+    walked_commits: &[WalkedCommit],
+) -> Result<Vec<CommitLifecycle>, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+
+    walked_commits
+        .iter()
+        .map(|walked| {
+            let envelope = read_commit_envelope(&walked.bytes).map_err(|e| {
+                IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", walked.cid))
+            })?;
+            Ok(CommitLifecycle {
+                t: walked.t,
+                drops: envelope.graph_drops,
+                written: envelope.graph_delta.into_values().collect(),
+            })
+        })
+        .collect()
+}
+
+/// Each graph's latest drop among `lifecycles`, by graph IRI: what
+/// [`SharedResolverState::set_graph_floors`] takes. A record naming what
+/// `shared` holds as a system graph drops nothing.
+pub(crate) fn graph_floors(
+    lifecycles: &[CommitLifecycle],
+    shared: &SharedResolverState,
+) -> HashMap<String, i64> {
+    let mut floors = HashMap::new();
+    for lifecycle in lifecycles {
+        let t = lifecycle.t;
+        for iri in lifecycle
+            .drops
+            .iter()
+            .filter(|iri| !names_system_graph(iri, shared))
+        {
+            let floor = floors.entry(iri.clone()).or_insert(t);
+            *floor = (*floor).max(t);
+        }
+    }
+    floors
+}
+
+/// Whether `shared` holds the graph `iri` names as a system graph, which a
+/// drop record never drops, whichever IRI it names it by: another ledger's
+/// config graph IRI, or the ledger's own from a branch that held it as an
+/// ordinary graph ([`fluree_db_core::graph_registry::drop_may_take`]).
+fn names_system_graph(iri: &str, shared: &SharedResolverState) -> bool {
+    iri != fluree_db_core::DEFAULT_GRAPH_IRI
+        && shared
+            .graphs
+            .graph_dict_id(iri)
+            .and_then(|id| u16::try_from(id + 1).ok())
+            .is_some_and(|g_id| !fluree_db_core::graph_registry::drop_may_take(g_id))
+}
+
+/// The drop records `drops` (by this run's graph ids) become once
+/// `lifecycles` apply, oldest first, by the rule a registry applies them by
+/// ([`fluree_db_core::graph_registry::record_graph_drops`]): each commit's
+/// drops, then the dropped graphs it writes again.
+pub(crate) fn apply_lifecycles(
+    drops: &mut std::collections::BTreeMap<u16, fluree_db_core::GraphDrop>,
+    lifecycles: &[CommitLifecycle],
+    shared: &SharedResolverState,
+) {
+    let graph_of = |iri: &str| -> Option<u16> {
+        if iri == fluree_db_core::DEFAULT_GRAPH_IRI {
+            Some(fluree_db_core::DEFAULT_GRAPH_ID)
+        } else {
+            shared
+                .graphs
+                .graph_dict_id(iri)
+                .and_then(|id| u16::try_from(id + 1).ok())
+        }
+    };
+    for lifecycle in lifecycles {
+        let dropped = lifecycle.drops.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_drops(drops, dropped, lifecycle.t);
+        let written = lifecycle.written.iter().filter_map(|iri| graph_of(iri));
+        fluree_db_core::graph_registry::record_graph_writes(drops, written, lifecycle.t);
+    }
+}
+
+/// Apply the window's graph lifecycles (`Commit::graph_drops`) to the base
+/// it merges into, and return the graphs whose index a drop in the window
+/// took.
+///
+/// The root's drop records follow the window's drops and revivals. A graph
+/// whose latest drop is in the window keeps nothing from before that drop
+/// — not the base's routing, statistics or full-text and spatial arenas; the
+/// resolver already left out what the window wrote to it earlier
+/// ([`SharedResolverState::set_graph_floors`]) — so it merges as a graph the
+/// base never held. Its numeric and vector arenas stay: records address them
+/// by position, and values nothing references are harmless.
+///
+/// The ledger-wide class/property hierarchy is not per graph, so a dropped
+/// graph that may have contributed to it needs a full rebuild.
+fn purge_dropped_graphs(
+    lifecycles: &[CommitLifecycle],
+    root: &mut IndexRoot,
+    shared: &SharedResolverState,
+) -> Result<Vec<u16>, IncrementalResolveError> {
+    if root.graph_drops.is_empty()
+        && lifecycles
+            .iter()
+            .all(|lifecycle| lifecycle.drops.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let mut drops: std::collections::BTreeMap<u16, fluree_db_core::GraphDrop> =
+        root.graph_drops.iter().copied().collect();
+    apply_lifecycles(&mut drops, lifecycles, shared);
+    let mut purged: Vec<u16> = drops
+        .iter()
+        .filter(|(_, drop)| drop.floor > root.index_t)
+        .map(|(g_id, _)| *g_id)
+        .collect();
+    root.graph_drops = drops.into_iter().collect();
+    if purged.is_empty() {
+        return Ok(purged);
+    }
+
+    if let Some(g_id) = purged
+        .iter()
+        .copied()
+        .find(|g_id| graph_may_hold_schema(root, *g_id))
+    {
+        return Err(IncrementalResolveError::NeedsRebuild(format!(
+            "dropped graph {g_id} may have contributed to the class/property hierarchy"
+        )));
+    }
+
+    purged.sort_unstable();
+    if purged.contains(&0) {
+        root.default_graph_orders.clear();
+    }
+    root.named_graphs.retain(|ng| !purged.contains(&ng.g_id));
+    for arenas in &mut root.graph_arenas {
+        if purged.contains(&arenas.g_id) {
+            arenas.fulltext.clear();
+            arenas.spatial.clear();
+        }
+    }
+    root.graph_arenas.retain(|arenas| {
+        !(arenas.numbig.is_empty()
+            && arenas.vectors.is_empty()
+            && arenas.spatial.is_empty()
+            && arenas.fulltext.is_empty())
+    });
+    if let Some(stats) = root.stats.as_mut() {
+        if let Some(graphs) = stats.graphs.as_mut() {
+            let (mut flakes, mut size) = (0u64, 0u64);
+            graphs.retain(|graph| {
+                let dropped = purged.contains(&graph.g_id);
+                if dropped {
+                    flakes += graph.flakes;
+                    size += graph.size;
+                }
+                !dropped
+            });
+            stats.flakes = stats.flakes.saturating_sub(flakes);
+            stats.size = stats.size.saturating_sub(size);
+        }
+    }
+    Ok(purged)
+}
+
+/// Whether graph `g_id` of `root` may hold `rdfs:subClassOf` or
+/// `rdfs:subPropertyOf` facts, which feed the ledger-wide hierarchy. Its
+/// statistics say; without them, any hierarchy at all might be its.
+fn graph_may_hold_schema(root: &IndexRoot, g_id: u16) -> bool {
+    let indexed = if g_id == 0 {
+        !root.default_graph_orders.is_empty()
+    } else {
+        root.named_graphs.iter().any(|ng| ng.g_id == g_id)
+    };
+    if !indexed {
+        return false;
+    }
+    let schema_p_ids: Vec<u32> = root
+        .predicate_sids
+        .iter()
+        .enumerate()
+        .filter(|(_, (ns, name))| {
+            *ns == fluree_vocab::namespaces::RDFS
+                && (name == "subClassOf" || name == "subPropertyOf")
+        })
+        .map(|(p_id, _)| p_id as u32)
+        .collect();
+    if schema_p_ids.is_empty() {
+        return false;
+    }
+    let graph_stats = root
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.graphs.as_ref())
+        .and_then(|graphs| graphs.iter().find(|graph| graph.g_id == g_id));
+    match graph_stats {
+        Some(graph) => graph
+            .properties
+            .iter()
+            .any(|prop| schema_p_ids.contains(&prop.p_id) && prop.count > 0),
+        None => root.schema.is_some(),
+    }
+}
+
+// ============================================================================
+// Internal: Vector-op pre-scan
+// ============================================================================
+
+/// Detect whether any commit in the new chunk asserts or retracts a vector
+/// flake. Used to gate the expensive vector arena pre-load and SPOT-scan
+/// fact-handle seeding on incremental publish — when the chunk doesn't
+/// touch vectors, both are wasted work, scaling with base size rather
+/// than chunk size.
+///
+/// Stops scanning at the first commit that contains a vector op. Within a
+/// commit, `for_each_op` is a single linear pass over the ops buffer, so
+/// finishing one commit's iteration after the flag is set is essentially
+/// free relative to the work we save.
+fn chunk_has_vector_ops(walked_commits: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::load_commit_ops;
+    use fluree_db_core::commit::codec::raw_reader::RawObject;
+
+    for walked in walked_commits {
+        let commit_ops = load_commit_ops(&walked.bytes).map_err(|e| {
+            IncrementalResolveError::RootLoad(format!(
+                "vector-op pre-scan: load_commit_ops for {}: {e}",
+                walked.cid
+            ))
+        })?;
+
+        let mut found = false;
+        commit_ops
+            .for_each_op(|raw_op| {
+                if matches!(raw_op.o, RawObject::Vector(_)) {
+                    found = true;
+                }
+                Ok(())
+            })
+            .map_err(|e| {
+                IncrementalResolveError::RootLoad(format!(
+                    "vector-op pre-scan: for_each_op for {}: {e}",
+                    walked.cid
+                ))
+            })?;
+
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ============================================================================
+// Internal: Commit Chain Walking
+// ============================================================================
+
+struct WalkedCommit {
+    cid: ContentId,
+    t: i64,
+    bytes: Vec<u8>,
+}
+
+/// SPOT-scan the base index for every `o_kind = VECTOR_ID` row and
+/// pre-populate `shared.vector_fact_handles` with
+/// `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits) → handle` so chunk
+/// retractions of base-asserted vectors find their handle (and chunk
+/// re-assertions dedup against the base entry).
+///
+/// Reuses the public `BinaryIndexStore::load_from_root_v6` for the SPOT
+/// cursor + dict decoding. The duplicate arena loading is bounded; if it
+/// becomes a hot path we can add a slimmer "scan-only" loader.
+async fn seed_vector_fact_handles(
+    cs: Arc<dyn ContentStore>,
+    root: &fluree_db_binary_index::format::index_root::IndexRoot,
+    shared: &mut SharedResolverState,
+    cache_dir: Option<&std::path::Path>,
+) -> io::Result<()> {
+    use fluree_db_binary_index::format::run_record::RunSortOrder;
+    use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+    use fluree_db_core::o_type::OType;
+
+    let cache_dir = cache_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
+    );
+
+    // Walk every graph that has vector arenas; for each, scan SPOT for
+    // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
+    // handle into the shared fact map.
+    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    for g_id in graphs_with_vectors {
+        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
+            Some(b) => Arc::clone(b),
+            None => continue,
+        };
+        let arena_map = match shared.vectors.get(&g_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let filter = BinaryFilter {
+            o_type: Some(OType::VECTOR.as_u16()),
+            ..Default::default()
+        };
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&store),
+            RunSortOrder::Spot,
+            branch,
+            filter,
+            projection,
+        );
+        let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.o_type.get_or(i, 0) != OType::VECTOR.as_u16() {
+                    continue;
+                }
+                let s_id = batch.s_id.get(i);
+                let p_id = batch.p_id.get(i);
+                let handle = batch.o_key.get(i) as u32;
+                let o_i = batch.o_i.get_or(i, u32::MAX);
+                let (ns_code, name) = match store.resolve_subject_parts(s_id) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        tracing::warn!(
+                            g_id,
+                            s_id,
+                            error = %e,
+                            "vector fact-handle seed: subject decode failed; skipping row"
+                        );
+                        continue;
+                    }
+                };
+                let arena = match arena_map.get(&p_id) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let f32_bits: Vec<u32> = match arena.get_f32(handle) {
+                    Some(slice) => slice.iter().map(|&x| x.to_bits()).collect(),
+                    None => {
+                        tracing::warn!(
+                            g_id,
+                            p_id,
+                            handle,
+                            "vector fact-handle seed: arena handle out of range; skipping"
+                        );
+                        continue;
+                    }
+                };
+                fact_map.insert(
+                    (
+                        ns_code,
+                        std::sync::Arc::<str>::from(name.as_str()),
+                        p_id,
+                        o_i,
+                        f32_bits,
+                    ),
+                    handle,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetch one commit blob, honoring the optional artifact cache.
+async fn fetch_commit_bytes(
+    cs: &dyn ContentStore,
+    cid: &ContentId,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, IncrementalResolveError> {
+    match cache_dir {
+        Some(cache_dir) => {
+            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
+                .await
+                .map_err(|e| {
+                    IncrementalResolveError::CommitChain(format!(
+                        "failed to load commit {cid}: {e}"
+                    ))
+                })
+        }
+        None => cs.get(cid).await.map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+        }),
+    }
+}
+
+/// Validate that `pending` is the exact, gap-free set of commits in
+/// `(from_t, head_t]` and that its tip CID is `head_id`. The pending list is
+/// already sorted ascending by `t` and deduped by the nameservice, so coverage
+/// is gap-free iff each `t` is exactly one greater than its predecessor and the
+/// first entry is `from_t + 1`. A failure here is never a correctness hazard —
+/// it just declines the fast path.
+fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &ContentId) -> bool {
+    let Some((_, tip_cid)) = pending.last() else {
+        return false;
+    };
+    if tip_cid != head_id {
+        return false;
+    }
+    // Contiguous from `from_t + 1` (gap-free coverage up to the tip's t).
+    (from_t + 1..)
+        .zip(pending.iter())
+        .all(|(expected, (t, _))| *t == expected)
+}
+
+/// Refuse to extend a base index that does not hold the commit the walk
+/// starts after: the head's line at the base's `t`. An index of a line a
+/// rebase replaced does not, and extending it would mix the two lines. The
+/// build falls back to a full rebuild, which reads the head's line alone.
+fn refuse_base_off_the_line(
+    walked: &[WalkedCommit],
+    subject_tree: &DictTreeReader,
+) -> Result<(), IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    let Some(oldest) = walked.first() else {
+        return Ok(());
+    };
+    let envelope = read_commit_envelope(&oldest.bytes).map_err(|e| {
+        IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", oldest.cid))
+    })?;
+    let Some(base) = envelope.parents.first() else {
+        return Ok(());
+    };
+    let key = subject_reverse_key(
+        fluree_vocab::namespaces::FLUREE_COMMIT,
+        base.digest_hex().as_bytes(),
+    );
+    match subject_tree.reverse_lookup(&key) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(IncrementalResolveError::CommitChain(format!(
+            "the base index does not hold commit {base}, which the head's line has at \
+             its t: it indexes another line"
+        ))),
+        Err(e) => Err(IncrementalResolveError::Io(e)),
+    }
+}
+
+/// Whether each commit's first parent is the commit before it. The
+/// commit-CID index can hold entries a rebase replaced below its new head, so
+/// a range that covers every `t` up to the head is not yet the head's line.
+fn first_parent_linked(walked: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::read_commit_envelope;
+    for pair in walked.windows(2) {
+        let envelope = read_commit_envelope(&pair[1].bytes).map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("envelope of {}: {e}", pair[1].cid))
+        })?;
+        if envelope.parents.first() != Some(&pair[0].cid) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn walk_commit_chain_since(
+    cs: &dyn ContentStore,
+    config: &IncrementalResolveConfig,
+) -> Result<Vec<WalkedCommit>, IncrementalResolveError> {
+    let head_id = &config.head_commit_id;
+    let from_t = config.from_t;
+    let max_commit_bytes = config.max_commit_bytes;
+    let cache_dir = config.artifact_cache_dir.as_deref();
+    let pending_commit_cids = config.pending_commit_cids.as_deref();
+    let fetch_concurrency = config.commit_fetch_concurrency;
+    let walk_started = Instant::now();
+
+    // Fast path: the nameservice commit-CID index already told us the chain.
+    // Validate coverage before trusting it; on any mismatch fall through to the
+    // serial DAG walk so correctness never depends on the index.
+    if let Some(pending) = pending_commit_cids {
+        if pending_covers_range(pending, from_t, head_id) {
+            let k = fetch_concurrency.max(1);
+            let fetch_started = Instant::now();
+            // Order-preserving `buffered(k)`: results arrive in t-ascending
+            // order, so the byte-budget check below aborts deterministically
+            // (over-reading up to k-1 in-flight before the abort is fine).
+            // Fetch via the async `cs.get` (NOT `fetch_cached_bytes_cid`): for local
+            // FileStorage the cache's `resolve_local_path` shortcut is a blocking
+            // `std::fs::read`, which serializes under `buffered` on a single task.
+            // `cs.get` is `tokio::fs::read` (local) / async network (S3) — both overlap
+            // under `buffered(k)`. Commit bodies are read once per fold then GC'd, so
+            // skipping the artifact cache here costs nothing. (cache_dir is still
+            // used by the serial fallback path below.)
+            let mut stream = futures::stream::iter(pending.iter().cloned())
+                .map(|(t, cid)| async move {
+                    let bytes = cs.get(&cid).await.map_err(|e| {
+                        IncrementalResolveError::CommitChain(format!(
+                            "failed to load commit {cid}: {e}"
+                        ))
+                    })?;
+                    Ok::<_, IncrementalResolveError>(WalkedCommit { cid, t, bytes })
+                })
+                .buffered(k);
+
+            let mut commits = Vec::with_capacity(pending.len());
+            let mut cumulative_bytes: usize = 0;
+            while let Some(walked) = stream.next().await {
+                let walked = walked?;
+                if let Some(budget) = max_commit_bytes {
+                    if cumulative_bytes >= budget {
+                        tracing::info!(
+                            cumulative_bytes,
+                            budget,
+                            commits_so_far = commits.len(),
+                            "V6 incremental resolve: commit-chain walk exceeded byte budget, aborting"
+                        );
+                        return Err(IncrementalResolveError::CommitChain(format!(
+                            "commit chain bytes ({cumulative_bytes}) exceeded budget ({budget}); \
+                             falling back to full rebuild"
+                        )));
+                    }
+                }
+                cumulative_bytes += walked.bytes.len();
+                commits.push(walked);
+            }
+
+            tracing::debug!(
+                commits = commits.len(),
+                index_cids = pending.len(),
+                cumulative_bytes,
+                from_t,
+                head = %head_id,
+                fetch_concurrency = k,
+                parallel_fetch_ms = fetch_started.elapsed().as_millis() as u64,
+                elapsed_ms = walk_started.elapsed().as_millis() as u64,
+                "V6 incremental resolve: commit-chain walk complete (fast path: commit-index)"
+            );
+            if first_parent_linked(&commits)? {
+                return Ok(commits);
+            }
+            tracing::debug!(
+                from_t,
+                head = %head_id,
+                "commit-index entries are not one first-parent line; falling back to serial DAG walk"
+            );
+        }
+
+        tracing::debug!(
+            from_t,
+            head = %head_id,
+            index_cids = pending.len(),
+            "commit-index did not cover the range; falling back to serial DAG walk"
+        );
+    }
+
+    // Fallback: serial first-parent traversal. One envelope round-trip per
+    // commit to chase the parent pointer. A merge commit already carries its
+    // folded delta, so the merged branch's own commits are not visited.
+    let dag = fluree_db_core::collect_first_parent_cids(cs, head_id, from_t)
+        .await
+        .map_err(|e| IncrementalResolveError::CommitChain(e.to_string()))?;
+    let dag_collect_ms = walk_started.elapsed().as_millis() as u64;
+
+    // collect_first_parent_cids returns (t, cid) newest first; reverse for
+    // chronological order.
+    let mut commits = Vec::with_capacity(dag.len());
+    let mut cumulative_bytes: usize = 0;
+    let fetch_started = Instant::now();
+
+    for (t, cid) in dag.into_iter().rev() {
+        // Check byte budget before loading the next commit.
+        if let Some(budget) = max_commit_bytes {
+            if cumulative_bytes >= budget {
+                tracing::info!(
+                    cumulative_bytes,
+                    budget,
+                    commits_so_far = commits.len(),
+                    "V6 incremental resolve: commit-chain walk exceeded byte budget, aborting"
+                );
+                return Err(IncrementalResolveError::CommitChain(format!(
+                    "commit chain bytes ({cumulative_bytes}) exceeded budget ({budget}); \
+                     falling back to full rebuild"
+                )));
+            }
+        }
+
+        let bytes = fetch_commit_bytes(cs, &cid, cache_dir).await?;
+        cumulative_bytes += bytes.len();
+        commits.push(WalkedCommit { cid, t, bytes });
+    }
+
+    tracing::debug!(
+        commits = commits.len(),
+        cumulative_bytes,
+        from_t,
+        head = %head_id,
+        dag_collect_ms,
+        fetch_loop_ms = fetch_started.elapsed().as_millis() as u64,
+        elapsed_ms = walk_started.elapsed().as_millis() as u64,
+        "V6 incremental resolve: commit-chain walk complete (fallback: serial walk)"
+    );
+    Ok(commits)
+}
+
+// ============================================================================
+// Internal: Reconciliation (reused from V5 — same algorithm)
+// ============================================================================
+
+use fluree_db_binary_index::dict::reverse_leaf::subject_reverse_key;
+
+struct ReconcileResult {
+    subject_remap: Vec<u64>,
+    string_remap: Vec<u32>,
+    new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    new_strings: Vec<(u32, Vec<u8>)>,
+    updated_watermarks: Vec<u64>,
+    updated_string_watermark: u32,
+}
+
+/// Reverse-tree lookup keys derived from a chunk, in chunk-local-id order.
+///
+/// Returns the exact keys [`reconcile_chunk_to_global`] looks up: subject
+/// reverse keys (`ns_code` + name) and raw string value bytes (borrowed from
+/// the chunk). This is the single source of truth for the derivation so the
+/// async prefetch and the sync reconcile stay in lockstep.
+fn derive_reconcile_keys(chunk: &RebuildChunk) -> (Vec<Vec<u8>>, Vec<&[u8]>) {
+    let subject_keys: Vec<Vec<u8>> = chunk
+        .subjects
+        .forward_entries()
+        .iter()
+        .map(|(ns_code, name_bytes)| subject_reverse_key(*ns_code, name_bytes))
+        .collect();
+    let string_keys: Vec<&[u8]> = chunk
+        .strings
+        .forward_entries()
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    (subject_keys, string_keys)
+}
+
+/// Best-effort concurrent prewarm of the reverse-tree leaves the sync reconcile
+/// will touch. Computes the distinct remote leaf CIDs (subject ∪ string) and
+/// fetches them into each reader's disk artifact cache so `load_leaf` hits a
+/// warm cache instead of a serial `block_on` S3 fetch per leaf.
+///
+/// Correctness: this only writes leaf bytes into the same disk cache dir the
+/// readers already read from. It never changes lookup results. Any per-leaf
+/// failure is ignored — the sync path fetches that leaf the old way.
+///
+/// Bounded: every fetch acquires a permit from the shared `s3_budget` (the one
+/// global in-flight S3 cap for the whole fold) and the stream width is capped at
+/// the budget, so there is no second budget and no unbounded fan-out.
+async fn prefetch_reconcile_leaves(
+    cs: &dyn ContentStore,
+    chunk: &RebuildChunk,
+    subject_tree: &DictTreeReader,
+    string_tree: &DictTreeReader,
+    s3_budget: &Arc<tokio::sync::Semaphore>,
+) {
+    let (subject_keys, string_keys) = derive_reconcile_keys(chunk);
+
+    // Distinct (cache_dir, cid) pairs to prewarm, deduped by cid string across
+    // both trees. Only remote leaves with a configured disk cache dir qualify;
+    // local/in-memory readers and readers without a disk cache are skipped
+    // (the prefetch cannot warm what `load_leaf` does not read from disk).
+    let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut targets: Vec<(std::path::PathBuf, ContentId)> = Vec::new();
+
+    let mut collect = |tree: &DictTreeReader, keys: Vec<&[u8]>| {
+        let Some(cache_dir) = tree.disk_cache_dir().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        for address in tree.touched_leaf_addresses(keys) {
+            if let Some(cid) = tree.remote_leaf_cid(address) {
+                if seen_cids.insert(cid.to_string()) {
+                    targets.push((cache_dir.clone(), cid.clone()));
+                }
+            }
+        }
+    };
+    collect(
+        subject_tree,
+        subject_keys.iter().map(Vec::as_slice).collect(),
+    );
+    collect(string_tree, string_keys);
+
+    if targets.is_empty() {
+        return;
+    }
+
+    // Stream width capped at the shared budget; the per-fetch permit is the hard
+    // in-flight cap. `available_permits()` here equals the configured budget
+    // (the prefetch runs before any Phase 2 task takes a permit).
+    let width = s3_budget.available_permits().max(1);
+    let target_count = targets.len();
+
+    futures::stream::iter(targets)
+        .for_each_concurrent(width, |(cache_dir, cid)| {
+            let s3_budget = Arc::clone(s3_budget);
+            async move {
+                let Ok(_permit) = s3_budget.acquire().await else {
+                    return;
+                };
+                if let Err(e) =
+                    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                        cs, &cid, &cache_dir,
+                    )
+                    .await
+                {
+                    tracing::debug!(%cid, error = %e, "reconcile leaf prefetch failed; continuing");
+                }
+            }
+        })
+        .await;
+
+    tracing::debug!(
+        leaves = target_count,
+        width,
+        "V6 incremental resolve: reconcile leaf prefetch complete"
+    );
+}
+
+fn reconcile_chunk_to_global(
+    chunk: &RebuildChunk,
+    subject_tree: &DictTreeReader,
+    string_tree: &DictTreeReader,
+    subject_watermarks: &[u64],
+    string_watermark: u32,
+) -> Result<ReconcileResult, IncrementalResolveError> {
+    let (subject_reverse_keys, string_keys) = derive_reconcile_keys(chunk);
+
+    // Subject reconciliation.
+    let subject_entries = chunk.subjects.forward_entries();
+    let subject_started = Instant::now();
+    let subject_reads_before = subject_tree.disk_reads();
+    let subject_local_file_reads_before = subject_tree.local_file_reads();
+    let subject_remote_fetches_before = subject_tree.remote_fetches();
+    let subject_hits_before = subject_tree.cache_hits();
+    let subject_cache_misses_before = subject_tree.cache_misses();
+    let mut subject_remap = vec![0u64; subject_entries.len()];
+    let mut new_subjects = Vec::new();
+    let mut ns_next_local: HashMap<u16, u64> = HashMap::new();
+    let mut updated_watermarks = subject_watermarks.to_vec();
+    let mut subject_existing = 0usize;
+    let mut subject_new = 0usize;
+    tracing::debug!(
+        subject_entries = subject_entries.len(),
+        subject_tree_entries = subject_tree.total_entries(),
+        subject_tree_source = subject_tree.source_kind(),
+        subject_tree_leaf_count = subject_tree.leaf_count(),
+        subject_tree_local_file_count = subject_tree.local_file_count(),
+        subject_tree_remote_cid_count = subject_tree.remote_cid_count(),
+        subject_tree_has_global_cache = subject_tree.has_global_cache(),
+        subject_tree_disk_reads = subject_reads_before,
+        subject_tree_local_file_reads = subject_tree.local_file_reads(),
+        subject_tree_remote_fetches = subject_tree.remote_fetches(),
+        subject_tree_cache_hits = subject_hits_before,
+        subject_tree_cache_misses = subject_tree.cache_misses(),
+        "V6 incremental resolve: subject reconciliation starting"
+    );
+
+    let subject_existing_ids = subject_tree
+        .reverse_lookup_many(subject_reverse_keys.iter().map(Vec::as_slice))
+        .map_err(IncrementalResolveError::Io)?;
+
+    for (chunk_local_id, ((ns_code, name_bytes), existing_id)) in
+        subject_entries.iter().zip(subject_existing_ids).enumerate()
+    {
+        let global_sid64 = match existing_id {
+            Some(sid64) => {
+                subject_existing += 1;
+                sid64
+            }
+            None => {
+                subject_new += 1;
+                let wm = if (*ns_code as usize) < updated_watermarks.len() {
+                    updated_watermarks[*ns_code as usize]
+                } else {
+                    updated_watermarks.resize(*ns_code as usize + 1, 0);
+                    0
+                };
+                let next = ns_next_local.entry(*ns_code).or_insert(wm + 1);
+                let local_id = *next;
+                *next += 1;
+                updated_watermarks[*ns_code as usize] = local_id;
+                let sid64 = SubjectId::new(*ns_code, local_id).as_u64();
+                new_subjects.push((*ns_code, local_id, name_bytes.clone()));
+                sid64
+            }
+        };
+        subject_remap[chunk_local_id] = global_sid64;
+    }
+
+    tracing::debug!(
+        subject_entries = subject_entries.len(),
+        existing = subject_existing,
+        new = subject_new,
+        disk_reads = subject_tree
+            .disk_reads()
+            .saturating_sub(subject_reads_before),
+        local_file_reads = subject_tree
+            .local_file_reads()
+            .saturating_sub(subject_local_file_reads_before),
+        remote_fetches = subject_tree
+            .remote_fetches()
+            .saturating_sub(subject_remote_fetches_before),
+        cache_hits = subject_tree
+            .cache_hits()
+            .saturating_sub(subject_hits_before),
+        cache_misses = subject_tree
+            .cache_misses()
+            .saturating_sub(subject_cache_misses_before),
+        elapsed_ms = subject_started.elapsed().as_millis() as u64,
+        "V6 incremental resolve: subject reconciliation complete"
+    );
+
+    // String reconciliation.
+    let string_entries = chunk.strings.forward_entries();
+    let string_started = Instant::now();
+    let string_reads_before = string_tree.disk_reads();
+    let string_local_file_reads_before = string_tree.local_file_reads();
+    let string_remote_fetches_before = string_tree.remote_fetches();
+    let string_hits_before = string_tree.cache_hits();
+    let string_cache_misses_before = string_tree.cache_misses();
+    let mut string_remap = vec![0u32; string_entries.len()];
+    let mut new_strings = Vec::new();
+    let mut next_string_id = string_watermark + 1;
+    let mut string_existing = 0usize;
+    let mut string_new = 0usize;
+    tracing::debug!(
+        string_entries = string_entries.len(),
+        string_tree_entries = string_tree.total_entries(),
+        string_tree_source = string_tree.source_kind(),
+        string_tree_leaf_count = string_tree.leaf_count(),
+        string_tree_local_file_count = string_tree.local_file_count(),
+        string_tree_remote_cid_count = string_tree.remote_cid_count(),
+        string_tree_has_global_cache = string_tree.has_global_cache(),
+        string_tree_disk_reads = string_reads_before,
+        string_tree_local_file_reads = string_tree.local_file_reads(),
+        string_tree_remote_fetches = string_tree.remote_fetches(),
+        string_tree_cache_hits = string_hits_before,
+        string_tree_cache_misses = string_tree.cache_misses(),
+        "V6 incremental resolve: string reconciliation starting"
+    );
+
+    let string_existing_ids = string_tree
+        .reverse_lookup_many(string_keys.iter().copied())
+        .map_err(IncrementalResolveError::Io)?;
+
+    for (chunk_local_id, (value_bytes, existing_id)) in
+        string_entries.iter().zip(string_existing_ids).enumerate()
+    {
+        let global_str_id = match existing_id {
+            Some(id) => {
+                string_existing += 1;
+                id as u32
+            }
+            None => {
+                string_new += 1;
+                let id = next_string_id;
+                next_string_id += 1;
+                new_strings.push((id, value_bytes.clone()));
+                id
+            }
+        };
+        string_remap[chunk_local_id] = global_str_id;
+    }
+
+    tracing::debug!(
+        string_entries = string_entries.len(),
+        existing = string_existing,
+        new = string_new,
+        disk_reads = string_tree.disk_reads().saturating_sub(string_reads_before),
+        local_file_reads = string_tree
+            .local_file_reads()
+            .saturating_sub(string_local_file_reads_before),
+        remote_fetches = string_tree
+            .remote_fetches()
+            .saturating_sub(string_remote_fetches_before),
+        cache_hits = string_tree.cache_hits().saturating_sub(string_hits_before),
+        cache_misses = string_tree
+            .cache_misses()
+            .saturating_sub(string_cache_misses_before),
+        elapsed_ms = string_started.elapsed().as_millis() as u64,
+        "V6 incremental resolve: string reconciliation complete"
+    );
+
+    let updated_string_watermark = if next_string_id > string_watermark + 1 {
+        next_string_id - 1
+    } else {
+        string_watermark
+    };
+
+    // Enforce sort invariants for downstream consumers (forward pack builders).
+    // Strings are already sorted (sequential IDs from watermark+1).
+    debug_assert!(
+        new_strings.windows(2).all(|w| w[0].0 < w[1].0),
+        "new_strings must be sorted by string_id ascending"
+    );
+    // Subjects may be interleaved across namespaces; sort by (ns_code, local_id).
+    new_subjects.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    Ok(ReconcileResult {
+        subject_remap,
+        string_remap,
+        new_subjects,
+        new_strings,
+        updated_watermarks,
+        updated_string_watermark,
+    })
+}
+
+// ============================================================================
+// Internal: Record remap
+// ============================================================================
+
+fn remap_record(
+    record: &mut RunRecord,
+    subject_remap: &[u64],
+    string_remap: &[u32],
+) -> Result<(), IncrementalResolveError> {
+    let local_s = record.s_id.as_u64() as usize;
+    let global_s = *subject_remap.get(local_s).ok_or_else(|| {
+        IncrementalResolveError::Resolve(ResolverError::Resolve(format!(
+            "subject remap out of range: local_id={}, remap_len={}",
+            local_s,
+            subject_remap.len()
+        )))
+    })?;
+    record.s_id = SubjectId::from_u64(global_s);
+
+    let o_kind = ObjKind::from_u8(record.o_kind);
+    if o_kind == ObjKind::REF_ID {
+        let local_o = record.o_key as usize;
+        let global_o = *subject_remap.get(local_o).ok_or_else(|| {
+            IncrementalResolveError::Resolve(ResolverError::Resolve(format!(
+                "ref object remap out of range: local_id={}, remap_len={}",
+                local_o,
+                subject_remap.len()
+            )))
+        })?;
+        record.o_key = global_o;
+    } else if o_kind == ObjKind::LEX_ID || o_kind == ObjKind::JSON_ID {
+        let local_str = ObjKey::from_u64(record.o_key).decode_u32_id() as usize;
+        let global_str = *string_remap.get(local_str).ok_or_else(|| {
+            IncrementalResolveError::Resolve(ResolverError::Resolve(format!(
+                "string remap out of range: local_id={}, remap_len={}",
+                local_str,
+                string_remap.len()
+            )))
+        })?;
+        record.o_key = ObjKey::encode_u32_id(global_str).as_u64();
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::subject_id::SubjectId;
+
+    /// A drop record naming what this run holds as a system graph drops
+    /// nothing: another ledger's config graph IRI, or the ledger's own system
+    /// graph IRIs, which a record made where they named ordinary graphs can
+    /// carry. A root that held another ledger's config graph IRI as an
+    /// ordinary graph keeps dropping it there.
+    #[test]
+    fn a_drop_record_never_drops_a_system_graph() {
+        use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+        use fluree_db_core::DEFAULT_GRAPH_IRI;
+
+        let g = "http://example.org/g";
+        let source = config_graph_iri("a:main");
+        let lifecycles = vec![CommitLifecycle {
+            t: 5,
+            drops: vec![
+                DEFAULT_GRAPH_IRI.to_string(),
+                source.clone(),
+                config_graph_iri("b:main"),
+                txn_meta_graph_iri("b:main"),
+                g.to_string(),
+            ],
+            written: Vec::new(),
+        }];
+        let dropped = |shared: &SharedResolverState| {
+            let mut floors: Vec<String> = graph_floors(&lifecycles, shared).into_keys().collect();
+            floors.sort();
+            let mut drops = std::collections::BTreeMap::new();
+            apply_lifecycles(&mut drops, &lifecycles, shared);
+            (floors, drops.into_keys().collect::<Vec<u16>>())
+        };
+
+        let mut shared = SharedResolverState::new_for_ledger("b:main");
+        let g_id = u16::try_from(shared.graphs.get_or_insert(g) + 1).unwrap();
+        assert_eq!(
+            dropped(&shared),
+            (
+                vec![g.to_string(), DEFAULT_GRAPH_IRI.to_string()],
+                vec![0, g_id]
+            )
+        );
+
+        let mut legacy = SharedResolverState::new_for_ledger("b:main");
+        let source_id = u16::try_from(legacy.graphs.get_or_insert(&source) + 1).unwrap();
+        let g_id = u16::try_from(legacy.graphs.get_or_insert(g) + 1).unwrap();
+        let mut floors = vec![g.to_string(), source.clone(), DEFAULT_GRAPH_IRI.to_string()];
+        floors.sort();
+        assert_eq!(dropped(&legacy), (floors, vec![0, source_id, g_id]));
+    }
+
+    #[test]
+    fn custom_datatype_iris_refuses_a_root_past_the_dt_id_width() {
+        let reserved = usize::from(DatatypeDictId::RESERVED_COUNT);
+        let full = usize::from(DatatypeDictId::MAX) + 1;
+        let iris = |n: usize| {
+            (0..n)
+                .map(|i| format!("http://example.org/U{i}"))
+                .collect::<Vec<_>>()
+        };
+
+        let custom = custom_datatype_iris(&iris(full)).expect("a full root is valid");
+        assert_eq!(custom.len(), full - reserved);
+        assert_eq!(custom[0], format!("http://example.org/U{reserved}"));
+
+        assert!(matches!(
+            custom_datatype_iris(&iris(full + 1)),
+            Err(IncrementalResolveError::RootLoad(_))
+        ));
+    }
+
+    const OP_RETRACT: u8 = 0;
+    const OP_ASSERT: u8 = 1;
+
+    /// Integer-valued record in the default graph, no list index, no language.
+    fn rec(s_id: u64, p_id: u32, o_key: u64, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            s_id: SubjectId::from_u64(s_id),
+            o_key,
+            p_id,
+            t,
+            i: u32::MAX,
+            g_id: 0,
+            dt: 0,
+            lang_id: 0,
+            o_kind: 1,
+            op,
+        }
+    }
+
+    /// `rdf:langString` record: `lang_id` folds into the resolved `o_type`,
+    /// so distinct language tags are distinct fact identities.
+    fn lang_rec(s_id: u64, p_id: u32, o_key: u64, lang_id: u16, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            o_kind: ObjKind::LEX_ID.as_u8(),
+            dt: DatatypeDictId::LANG_STRING.as_u16(),
+            lang_id,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    /// Boolean record with an explicit datatype dict id: `resolve` ignores
+    /// `dt` for 1:1 object kinds, so `dt` variants share one fact identity.
+    fn bool_rec(s_id: u64, p_id: u32, o_key: u64, dt: u16, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            o_kind: ObjKind::BOOL.as_u8(),
+            dt,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    fn list_rec(s_id: u64, p_id: u32, o_key: u64, i: u32, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            i,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    fn dedup(records: Vec<RunRecord>) -> Vec<RunRecord> {
+        dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only()).0
+    }
+
+    fn dedup_with_superseded(records: Vec<RunRecord>) -> (Vec<RunRecord>, Vec<RunRecord>) {
+        dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only())
+    }
+
+    /// Field projection for assertions (`RunRecord` has no `Debug`).
+    type RecordKey = (u64, u32, u64, u16, u32, u16, u32, u8);
+
+    fn key(r: &RunRecord) -> RecordKey {
+        (
+            r.s_id.as_u64(),
+            r.p_id,
+            r.o_key,
+            r.dt,
+            r.i,
+            r.lang_id,
+            r.t,
+            r.op,
+        )
+    }
+
+    fn keys(records: &[RunRecord]) -> Vec<RecordKey> {
+        records.iter().map(key).collect()
+    }
+
+    /// Issue #1412: the same fact asserted by two commits in one window must
+    /// dedup to the first assert (the later one is a no-op re-assert), so
+    /// the leaf merge sees each identity at most once.
+    #[test]
+    fn duplicate_asserts_dedup_to_first_assert() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_ASSERT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    /// Assert-then-retract of a new fact within one window resolves to the
+    /// retract; without the dedup the leaf merge emits the assert as a row
+    /// and only logs the retract, leaving a ghost row.
+    #[test]
+    fn assert_then_retract_dedups_to_retract() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    #[test]
+    fn reassert_after_retract_survives_with_reassert_t() {
+        let records = vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    #[test]
+    fn repeat_retract_keeps_highest_t() {
+        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    /// A same-`t` pair holds the assert ([`fluree_db_core::same_t`]), as
+    /// `resolve_overlay_ops`, `NoveltyFactState` and the full rebuild resolve
+    /// it, whatever the input's order. The losing retract is superseded, so
+    /// the merge walks both events, as a rebuild does.
+    #[test]
+    fn same_t_assert_beats_retract() {
+        for records in [
+            vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)],
+            vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 5, OP_RETRACT)],
+        ] {
+            let (out, superseded) = dedup_with_superseded(records);
+            assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+            assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+        }
+    }
+
+    /// Distinct language tags on `rdf:langString` values are distinct fact
+    /// identities (the tag folds into the resolved `o_type`), so records
+    /// differing only in language must not dedup into each other.
+    #[test]
+    fn distinct_lang_ids_do_not_dedup() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 1, 6, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// V2 identity collapses `dt` for 1:1 object kinds: the same boolean
+    /// value asserted under two datatype IRIs is one fact, and the second
+    /// assert is a no-op re-assert even though the records differ in `dt`.
+    #[test]
+    fn datatype_iri_variants_of_one_value_dedup() {
+        let records = vec![
+            bool_rec(1, 1, 10, 5, 5, OP_ASSERT), // dt slot 5
+            bool_rec(1, 1, 10, 9, 6, OP_ASSERT), // dt slot 9, same V2 identity
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[bool_rec(1, 1, 10, 5, 5, OP_ASSERT)]));
+    }
+
+    /// A lifecycle can span `dt` variants, and the input sort interleaves
+    /// `dt` before `t`, so the events arrive out of chronological order: the
+    /// retract@6 (dt 2) sorts before the assert@5 (dt 9). The lifecycle must
+    /// still resolve chronologically to the final retract.
+    #[test]
+    fn lifecycle_spans_datatype_variants_out_of_t_order() {
+        let records = vec![
+            bool_rec(1, 1, 10, 2, 6, OP_RETRACT),
+            bool_rec(1, 1, 10, 9, 5, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[bool_rec(1, 1, 10, 2, 6, OP_RETRACT)]));
+    }
+
+    /// A stray `lang_id` on a non-langString record does not split identity:
+    /// `resolve` consults `lang_id` only for `rdf:langString`, matching
+    /// `FactKey::from_run_record`'s normalization.
+    #[test]
+    fn stray_lang_on_non_lang_string_does_not_split_identity() {
+        let stray = RunRecord {
+            lang_id: 3,
+            ..rec(1, 1, 10, 5, OP_ASSERT)
+        };
+        let records = vec![stray, rec(1, 1, 10, 6, OP_ASSERT)];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[stray]),
+            "first assert wins; lang ignored"
+        );
+    }
+
+    /// Superseded lifecycle steps come back as transition superseded in
+    /// chronological order; discarded no-ops do not.
+    #[test]
+    fn superseded_events_are_surfaced() {
+        // assert@3 superseded by retract@4, superseded by assert@5.
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert_eq!(
+            keys(&superseded),
+            keys(&[rec(1, 1, 10, 3, OP_ASSERT), rec(1, 1, 10, 4, OP_RETRACT)])
+        );
+    }
+
+    /// No-op re-asserts are discarded outright, not surfaced as superseded:
+    /// they transition nothing in any base state.
+    #[test]
+    fn noop_reasserts_are_discarded() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 10, 6, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert!(superseded.is_empty());
+    }
+
+    /// A superseded repeat retract is surfaced: whether it or the winner
+    /// was the real transition into absence depends on base state, which the
+    /// leaf merge resolves.
+    #[test]
+    fn superseded_repeat_retract_is_surfaced() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_RETRACT),
+            rec(1, 1, 10, 6, OP_RETRACT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+        assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    }
+
+    /// In-place compaction: records after a collapsed group shift backward
+    /// behind the write cursor without loss or reordering.
+    #[test]
+    fn records_after_a_collapsed_group_shift_back_intact() {
+        let records = vec![
+            bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+            bool_rec(1, 1, 10, 9, 6, OP_ASSERT), // collapses into the above
+            rec(2, 1, 20, 7, OP_ASSERT),
+            rec(3, 1, 30, 8, OP_RETRACT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+                rec(2, 1, 20, 7, OP_ASSERT),
+                rec(3, 1, 30, 8, OP_RETRACT),
+            ])
+        );
+    }
+
+    /// The list index `i` is part of fact identity but not of the sort
+    /// comparator: the same value at different list positions must not dedup.
+    #[test]
+    fn distinct_list_indices_do_not_dedup() {
+        let records = vec![
+            list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 0, 6, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+                list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// Distinct facts pass through untouched, in input order.
+    #[test]
+    fn distinct_facts_are_preserved_in_order() {
+        let records = vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 20, 5, OP_ASSERT),
+            rec(2, 1, 10, 6, OP_RETRACT),
+            rec(3, 2, 30, 7, OP_ASSERT),
+        ];
+        let expected = keys(&records);
+        let out = dedup(records);
+        assert_eq!(keys(&out), expected);
+    }
+
+    /// Winners within one sort-prefix group are emitted in `(t, op)` order so
+    /// the output stays sorted for the V1→V2 conversion and leaf slicing.
+    #[test]
+    fn group_winners_stay_sorted_by_t() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 3, OP_ASSERT),  // lang 1: survives at t=3
+            lang_rec(1, 1, 10, 2, 4, OP_ASSERT),  // lang 2: superseded below
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),  // lang 1: no-op re-assert
+            lang_rec(1, 1, 10, 2, 6, OP_RETRACT), // lang 2: winner at t=6
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 3, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 6, OP_RETRACT),
+            ])
+        );
+    }
+}

@@ -1,0 +1,477 @@
+//! R2RML loader module
+//!
+//! This module provides format-agnostic R2RML loading. The core loader operates
+//! on the internal Graph IR, with format-specific parsing delegated to optional
+//! parser integrations:
+//!
+//! - **Turtle**: Enable with `features = ["turtle"]`
+//! - **JSON-LD**: Future support via separate feature
+//!
+//! For custom parsers, use `R2rmlLoader::from_graph()` directly with a pre-parsed Graph.
+
+mod extractor;
+
+pub use extractor::MappingExtractor;
+
+use fluree_graph_ir::Graph;
+#[cfg(feature = "turtle")]
+use fluree_graph_ir::GraphCollectorSink;
+#[cfg(feature = "turtle")]
+use fluree_graph_turtle::parse as parse_turtle;
+
+use crate::error::{R2rmlError, R2rmlResult};
+use crate::mapping::CompiledR2rmlMapping;
+
+/// R2RML mapping loader
+///
+/// Provides format-agnostic loading of R2RML mappings. The loader first
+/// parses the mapping document into a Graph IR, then extracts TriplesMap
+/// definitions from the graph.
+///
+/// Use `from_turtle()` (requires the `turtle` feature) or `from_graph()` to
+/// create a loader, then call `compile()` to extract and index the mappings.
+pub struct R2rmlLoader {
+    /// The parsed graph IR
+    graph: Graph,
+}
+
+impl R2rmlLoader {
+    /// Load R2RML from a Graph IR
+    ///
+    /// Use this if you already have a parsed graph.
+    pub fn from_graph(graph: Graph) -> Self {
+        Self { graph }
+    }
+
+    /// Load R2RML from Turtle format
+    ///
+    /// Parses the Turtle document and prepares for extraction.
+    ///
+    /// Requires the `turtle` feature to be enabled.
+    #[cfg(feature = "turtle")]
+    pub fn from_turtle(content: &str) -> R2rmlResult<Self> {
+        let mut sink = GraphCollectorSink::new();
+        parse_turtle(content, &mut sink).map_err(|e| R2rmlError::Parse(e.to_string()))?;
+        let graph = sink.into_graph();
+        // The collector accepts RDF 1.2 reifiers and records them as
+        // `Graph::reifications` for the Turtle-to-JSON-LD adapter. Nothing in
+        // R2RML reads them, so a mapping file containing `~ r` or `{| … |}`
+        // would load with its attachments silently discarded. Refuse instead:
+        // a mapping that quietly means something other than what it says is
+        // worse than one that fails to load.
+        if let Some(r) = graph.reifications().first() {
+            return Err(R2rmlError::Unsupported(format!(
+                "RDF 1.2 reifier attachments are not supported in R2RML mapping files \
+                 (found one on <{}>); remove the annotation syntax from the mapping",
+                r.reifier
+            )));
+        }
+        Ok(Self { graph })
+    }
+
+    /// Load R2RML from JSON-LD format
+    ///
+    /// TODO: Implement when json-ld integration is needed
+    pub fn from_jsonld(_content: &str) -> R2rmlResult<Self> {
+        Err(R2rmlError::Unsupported(
+            "JSON-LD R2RML loading not yet implemented".to_string(),
+        ))
+    }
+
+    /// Get a reference to the underlying graph
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Compile the loaded mapping into an optimized structure
+    ///
+    /// This extracts all TriplesMap definitions from the graph and builds
+    /// indexes for efficient lookup during query execution.
+    pub fn compile(self) -> R2rmlResult<CompiledR2rmlMapping> {
+        let extractor = MappingExtractor::new(&self.graph);
+        let triples_maps = extractor.extract_all()?;
+        Ok(CompiledR2rmlMapping::new(triples_maps))
+    }
+}
+
+/// Serialization format of an R2RML mapping document.
+///
+/// Resolving the format once — from an optional media-type hint plus the
+/// mapping source identifier — and using the result at every compile site keeps
+/// registration-time and query-time format selection provably identical. This
+/// is the single source of truth that fixes the asymmetric default in
+/// <https://github.com/fluree/db/issues/1397>, where registration defaulted a
+/// missing media type to Turtle but the query path defaulted it to JSON-LD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingFormat {
+    /// Turtle (`text/turtle`) — the only format the loader supports today.
+    Turtle,
+    /// JSON-LD (`application/ld+json`) — recognized but not yet implemented.
+    JsonLd,
+}
+
+impl MappingFormat {
+    /// Resolve the mapping format from an optional media type and the mapping
+    /// `source` (a filename, storage address, or content-addressed CID).
+    ///
+    /// Precedence: an explicit, recognized `media_type` wins; otherwise the
+    /// `source` extension decides (`.jsonld`/`.json` → JSON-LD); otherwise the
+    /// format defaults to [`MappingFormat::Turtle`]. An unrecognized media type
+    /// falls through to the extension/default rules rather than erroring.
+    ///
+    /// Turtle is the sole supported format, so defaulting an unknown input to
+    /// Turtle only ever turns a guaranteed failure into a working mapping — a
+    /// genuine JSON-LD document (recognized media type or `.jsonld`/`.json`
+    /// extension) still resolves to [`MappingFormat::JsonLd`] and errors clearly
+    /// at the call site. A CID or extensionless address therefore resolves to
+    /// Turtle, which is what registration always assumed.
+    pub fn resolve(media_type: Option<&str>, source: &str) -> Self {
+        if let Some(mt) = media_type {
+            let mt = mt.to_ascii_lowercase();
+            if mt.contains("turtle") {
+                return Self::Turtle;
+            }
+            if mt.contains("json") {
+                return Self::JsonLd;
+            }
+            // Unrecognized media type: fall through to extension inference.
+        }
+
+        let source = source.to_ascii_lowercase();
+        if source.ends_with(".jsonld") || source.ends_with(".json") {
+            Self::JsonLd
+        } else {
+            Self::Turtle
+        }
+    }
+
+    /// The canonical IANA media type for this format.
+    ///
+    /// Persisting this concrete value on a registered graph source keeps stored
+    /// configs self-describing, so the query path reuses the resolved format
+    /// instead of re-defaulting a `null` media type.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Turtle => "text/turtle",
+            Self::JsonLd => "application/ld+json",
+        }
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::MappingFormat;
+
+    #[test]
+    fn resolve_defaults_to_turtle_for_no_media_type_and_no_extension() {
+        // Regression guard for #1397: a CAS CID (no extension) and no media type
+        // must resolve to Turtle, not JSON-LD.
+        assert_eq!(
+            MappingFormat::resolve(None, "bagiibqexamplecidwithnoextension"),
+            MappingFormat::Turtle
+        );
+        assert_eq!(MappingFormat::resolve(None, ""), MappingFormat::Turtle);
+    }
+
+    #[test]
+    fn resolve_infers_format_from_source_extension() {
+        assert_eq!(
+            MappingFormat::resolve(None, "mapping.ttl"),
+            MappingFormat::Turtle
+        );
+        assert_eq!(
+            MappingFormat::resolve(None, "mapping.turtle"),
+            MappingFormat::Turtle
+        );
+        assert_eq!(
+            MappingFormat::resolve(None, "mapping.jsonld"),
+            MappingFormat::JsonLd
+        );
+        assert_eq!(
+            MappingFormat::resolve(None, "mapping.json"),
+            MappingFormat::JsonLd
+        );
+        // Extension matching is case-insensitive.
+        assert_eq!(
+            MappingFormat::resolve(None, "MAPPING.JSONLD"),
+            MappingFormat::JsonLd
+        );
+    }
+
+    #[test]
+    fn resolve_explicit_media_type_overrides_extension() {
+        // Explicit media type beats a conflicting extension in both directions.
+        assert_eq!(
+            MappingFormat::resolve(Some("application/ld+json"), "mapping.ttl"),
+            MappingFormat::JsonLd
+        );
+        assert_eq!(
+            MappingFormat::resolve(Some("text/turtle"), "mapping.jsonld"),
+            MappingFormat::Turtle
+        );
+        // Media type comparison is case-insensitive.
+        assert_eq!(
+            MappingFormat::resolve(Some("Text/Turtle"), "mapping.jsonld"),
+            MappingFormat::Turtle
+        );
+    }
+
+    #[test]
+    fn resolve_unrecognized_media_type_falls_back_to_extension_then_turtle() {
+        assert_eq!(
+            MappingFormat::resolve(Some("application/octet-stream"), "mapping.jsonld"),
+            MappingFormat::JsonLd
+        );
+        assert_eq!(
+            MappingFormat::resolve(Some("application/octet-stream"), "cid-no-ext"),
+            MappingFormat::Turtle
+        );
+    }
+
+    #[test]
+    fn media_type_returns_canonical_strings() {
+        assert_eq!(MappingFormat::Turtle.media_type(), "text/turtle");
+        assert_eq!(MappingFormat::JsonLd.media_type(), "application/ld+json");
+    }
+}
+
+#[cfg(all(test, feature = "turtle"))]
+mod tests {
+    use super::*;
+
+    const SIMPLE_MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#AirlineMapping> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "airlines" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/airline/{id}" ;
+                rr:class ex:Airline
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:name ;
+                rr:objectMap [ rr:column "name" ]
+            ] .
+    "#;
+
+    #[test]
+    fn test_from_turtle() {
+        let loader = R2rmlLoader::from_turtle(SIMPLE_MAPPING).unwrap();
+        assert!(!loader.graph().is_empty());
+    }
+
+    #[test]
+    fn test_compile() {
+        let loader = R2rmlLoader::from_turtle(SIMPLE_MAPPING).unwrap();
+        let mapping = loader.compile().unwrap();
+
+        assert_eq!(mapping.len(), 1);
+        assert!(mapping
+            .get("http://example.org/mapping#AirlineMapping")
+            .is_some());
+    }
+}
+
+#[cfg(all(test, feature = "turtle"))]
+mod sql_query_tests {
+    use super::R2rmlLoader;
+    use crate::mapping::LogicalTable;
+
+    const MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/m#Orders> a rr:TriplesMap ;
+            rr:logicalTable [ rr:sqlQuery """SELECT id, total FROM sales.orders WHERE status = 'open'""" ] ;
+            rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+            rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] .
+
+        <http://example.org/m#Customers> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.customers" ] ;
+            rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#;
+
+    /// A table whose name begins with the alias prefix would be read as an
+    /// `rr:sqlQuery` map's alias by every reader, so the loader refuses it.
+    #[test]
+    fn a_table_name_with_the_alias_prefix_is_refused() {
+        let ttl = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sqlQuery:0123456789abcdef" ] ;
+                rr:subjectMap [ rr:template "http://example.org/t/{id}" ] .
+        "#;
+        let err = R2rmlLoader::from_turtle(ttl)
+            .unwrap()
+            .compile()
+            .expect_err("the alias prefix is reserved");
+        let message = err.to_string();
+        assert!(
+            message.contains("rr:tableName") && message.contains("reserved"),
+            "{message}"
+        );
+        // Not a prefix of the name: an ordinary table.
+        let ok = ttl.replace("\"sqlQuery:0123456789abcdef\"", "\"crm.sqlQuery:x\"");
+        R2rmlLoader::from_turtle(&ok)
+            .unwrap()
+            .compile()
+            .expect("an ordinary table");
+    }
+
+    #[test]
+    fn sql_query_compiles_to_a_stable_alias_that_resolves_back_to_the_query() {
+        let compiled = R2rmlLoader::from_turtle(MAPPING)
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert!(compiled.has_sql_queries());
+
+        let orders = compiled
+            .get("http://example.org/m#Orders")
+            .expect("orders map");
+        let alias = orders
+            .table_name()
+            .expect("alias stands in for the table name");
+        assert!(LogicalTable::is_sql_query_alias(alias), "{alias}");
+        assert_eq!(
+            compiled.sql_query_for_table(alias),
+            Some("SELECT id, total FROM sales.orders WHERE status = 'open'")
+        );
+        assert_eq!(compiled.sql_query_for_table("sales.customers"), None);
+
+        // Same query text → same alias, so caches keyed on the name are stable.
+        let again = R2rmlLoader::from_turtle(MAPPING)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let alias_again = again
+            .triples_maps
+            .values()
+            .find(|tm| tm.iri.ends_with("#Orders"))
+            .and_then(|tm| tm.table_name())
+            .unwrap();
+        assert_eq!(alias, alias_again);
+
+        // Both maps are reachable by table name.
+        assert_eq!(compiled.find_maps_for_table(alias).len(), 1);
+        assert_eq!(compiled.find_maps_for_table("sales.customers").len(), 1);
+    }
+
+    #[test]
+    fn empty_sql_query_is_rejected() {
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "  " ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] .
+        "#;
+        let err = R2rmlLoader::from_turtle(mapping)
+            .unwrap()
+            .compile()
+            .unwrap_err();
+        assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+    }
+
+    #[test]
+    fn a_reifier_attachment_in_a_mapping_is_refused_rather_than_dropped() {
+        // The shared Turtle collector accepts RDF 1.2 reifiers so the
+        // Turtle-to-JSON-LD adapter can re-emit them. R2RML never reads that
+        // list, so without this check the mapping below would load as though
+        // the annotation had not been written.
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "orders" ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] .
+            ex:a ex:b ex:c {| ex:note "dropped" |} .
+        "#;
+        let err = match R2rmlLoader::from_turtle(mapping) {
+            Err(e) => e,
+            Ok(_) => panic!("a mapping carrying an attachment must not load silently"),
+        };
+        assert!(
+            err.to_string()
+                .contains("reifier attachments are not supported"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "turtle"))]
+mod document_order_tests {
+    use super::R2rmlLoader;
+
+    /// Sixteen maps of one class, written in an order that is neither sorted
+    /// nor any hash order a run is likely to produce (16! orders).
+    const NAMES: [&str; 16] = [
+        "Pear",
+        "Fig",
+        "Apple",
+        "Quince",
+        "Lime",
+        "Date",
+        "Kiwi",
+        "Banana",
+        "Mango",
+        "Cherry",
+        "Olive",
+        "Grape",
+        "Nectarine",
+        "Elder",
+        "Jujube",
+        "Hazel",
+    ];
+
+    fn mapping() -> String {
+        let mut m = String::from(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n",
+        );
+        for name in NAMES {
+            m.push_str(&format!(
+                "<http://example.org/m#{name}> a rr:TriplesMap ;\n\
+                 rr:logicalTable [ rr:tableName \"fruit.{name}\" ] ;\n\
+                 rr:subjectMap [ rr:template \"http://example.org/{name}/{{id}}\" ; rr:class ex:Fruit ] ;\n\
+                 rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ] .\n"
+            ));
+        }
+        m
+    }
+
+    fn expected() -> Vec<String> {
+        NAMES
+            .iter()
+            .map(|n| format!("http://example.org/m#{n}"))
+            .collect()
+    }
+
+    /// A pattern several maps answer scans them in `triples_maps` order, so that
+    /// order must be the document's, the same in every process, and survive the
+    /// serialized form a compiled mapping is cached in.
+    #[test]
+    fn triples_maps_iterate_in_document_order() {
+        let compiled = R2rmlLoader::from_turtle(&mapping())
+            .unwrap()
+            .compile()
+            .unwrap();
+        let order: Vec<String> = compiled.triples_maps.keys().cloned().collect();
+        assert_eq!(order, expected(), "maps in document order");
+        let by_class: Vec<String> = compiled
+            .find_maps_for_class("http://example.org/Fruit")
+            .into_iter()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(by_class, expected(), "class lookup in document order");
+
+        let json = serde_json::to_string(&compiled).unwrap();
+        let back: crate::mapping::CompiledR2rmlMapping = serde_json::from_str(&json).unwrap();
+        let order: Vec<String> = back
+            .triples_maps
+            .values()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(order, expected(), "order survives a serde round trip");
+    }
+}

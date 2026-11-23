@@ -1,0 +1,647 @@
+# R2RML (Relational to RDF Mapping)
+
+R2RML (RDB to RDF Mapping Language) is a W3C standard for mapping tabular data into RDF triples. In Fluree, R2RML mappings are used to expose **Iceberg tables** as RDF graph sources, enabling you to query data lake tables using SPARQL or JSON-LD Query.
+
+## What is R2RML?
+
+R2RML defines how to map:
+- Database tables to RDF classes
+- Table columns to RDF properties
+- Rows to RDF resources
+- Foreign keys to RDF relationships
+
+In Fluree, this enables querying Iceberg tables as if they were RDF graphs.
+
+## Configuration
+
+### Create R2RML Graph Source (Iceberg-backed)
+
+Use `R2rmlCreateConfig` to register a graph source that combines:
+
+- an Iceberg table (REST catalog, Direct S3, AWS Glue Data Catalog, or AWS S3 Tables — see [Catalog Modes](iceberg.md#catalog-modes)), and
+- an R2RML mapping (Turtle) that materializes table rows into RDF triples.
+
+If you use **Direct S3** mode, Fluree resolves the current Iceberg metadata by reading `metadata/version-hint.text` under the configured `table_location`, then loading the metadata file referenced by the hint. The Iceberg table layout must already exist at that location.
+
+```rust
+use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
+
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
+
+let config = R2rmlCreateConfig::new_direct(
+    "airlines-rdf",
+    "s3://bucket/warehouse/openflights/airlines",
+    "fluree:file://mappings/airlines.ttl",
+)
+.with_s3_region("us-east-1")
+.with_s3_path_style(true)
+.with_mapping_media_type("text/turtle");
+
+fluree.create_r2rml_graph_source(config).await?;
+```
+
+## R2RML Mapping
+
+### Basic Mapping
+
+Map a table to RDF class:
+
+```turtle
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+
+<#CustomerMapping>
+  a rr:TriplesMap ;
+  
+  rr:logicalTable [
+    rr:tableName "customers"
+  ] ;
+  
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{id}" ;
+    rr:class schema:Person
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate schema:name ;
+    rr:objectMap [ rr:column "name" ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate schema:email ;
+    rr:objectMap [ rr:column "email" ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:customerId ;
+    rr:objectMap [ rr:column "id" ]
+  ] .
+```
+
+This maps the `customers` table:
+
+```sql
+CREATE TABLE customers (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255),
+  email VARCHAR(255)
+);
+```
+
+To RDF triples:
+
+```turtle
+<http://example.org/customer/1>
+  a schema:Person ;
+  schema:name "Alice" ;
+  schema:email "alice@example.org" ;
+  ex:customerId "1" .
+```
+
+A `rr:column` with no `rr:datatype` reads as the `xsd:string` of its rendered
+value, whatever the column's type: `ex:customerId "1"` above is a string, so it
+groups, orders and compares as text (`"10"` sorts before `"9"`), and comparing
+it with a number (`FILTER(?id < 5)`) matches no row. Add an `rr:datatype`
+(`xsd:integer`, `xsd:decimal`, `xsd:date`, `xsd:dateTime`, …) to group, order
+and compare a column by value. This holds for every R2RML source: Iceberg,
+Delta and SQL.
+
+### Foreign Key Mapping
+
+Map relationships:
+
+```turtle
+<#OrderMapping>
+  a rr:TriplesMap ;
+  
+  rr:logicalTable [
+    rr:tableName "orders"
+  ] ;
+  
+  rr:subjectMap [
+    rr:template "http://example.org/order/{id}" ;
+    rr:class ex:Order
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:orderId ;
+    rr:objectMap [ rr:column "id" ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:customer ;
+    rr:objectMap [
+      rr:parentTriplesMap <#CustomerMapping> ;
+      rr:joinCondition [
+        rr:child "customer_id" ;
+        rr:parent "id"
+      ]
+    ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:total ;
+    rr:objectMap [ rr:column "total" ]
+  ] .
+```
+
+Maps foreign key `customer_id` to RDF object property linking to customer resource.
+
+The join links a child row to every parent row whose `rr:parent` columns equal its `rr:child` columns, and the graph holds one triple per distinct parent subject. So when the parent's join columns are not unique, a child row links to each distinct subject the matching rows mint: rows that mint the same subject (several versions of one customer, say) give one triple, and rows minting different subjects give one triple each. A null in a join column joins nothing.
+
+### Declaring a Table's Keys (`f:key`)
+
+An R2RML graph source answers over the set of triples its mapping defines, so
+two rows that mint the same triple yield it once, as a native ledger loaded
+with those triples would. A table is a bag of rows: a history table holds
+several versions of one customer, and a fact table can hold an exact
+duplicate row. Unless Fluree can prove that no two rows of a map mint the
+same subject, queries over the map remove repeated solutions as they read.
+A key proves it, and a query over a map whose subject is proven unique reads
+its rows straight through.
+
+Declare a key with `f:key` (`https://ns.flur.ee/db#key`) on the logical
+table: a list of the columns no two rows agree on.
+
+```turtle
+@prefix f: <https://ns.flur.ee/db#> .
+
+<#CurrentCustomers>
+  a rr:TriplesMap ;
+  rr:logicalTable [
+    rr:tableName "sales.customers_current" ;
+    f:key ( "customer_id" )
+  ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{customer_id}" ;
+    rr:class ex:Customer
+  ] .
+```
+
+- A composite key is one list: `f:key ( "customer_id" "valid_from" )`.
+  Repeat `f:key` for each alternative key: `f:key ( "customer_id" ), ( "email" )`.
+- It means: no two rows with no NULL in the key columns agree on all of them.
+  Fluree trusts it and does not check the data. A key the data breaks makes
+  queries return the repeated solutions it promised were not there.
+- It describes the logical table's rows, so it applies to every triples map
+  that reads the same `rr:tableName`. On an `rr:sqlQuery` it describes the
+  query's rows only, so a key that holds only for the rows a filter keeps
+  (`customer_id` among `WHERE is_current = 1` rows of a history table) is
+  declared there:
+
+  ```turtle
+  rr:logicalTable [
+    rr:sqlQuery "SELECT * FROM sales.customers_history WHERE is_current = 1" ;
+    f:key ( "customer_id" )
+  ] ;
+  ```
+
+  A key on an Iceberg `rr:sqlQuery` can name only columns its select list
+  selects (any column, for `SELECT *`); one that names another column is
+  refused when the source is mapped. The table's identifier fields hold for
+  any subset of its rows, so they also count as a key of a query over the
+  table, when the query selects their columns.
+
+A key makes a map's subjects unique only when the subject is built from it:
+
+- an `rr:column` subject over a column that is a key by itself, or
+- an `rr:template` subject whose placeholders include every column of a key,
+  and that keeps their values apart. Each value is percent-encoded into the
+  IRI (see [the percent-encoding contract](#bound-subject-key-pushdown)), and
+  letters, digits, `- . _ ~ ! $ & ' ( ) * + , ; = : @` and `%` itself can
+  appear in an encoded value. So the text between two adjacent placeholders
+  must hold a character outside that set, such as `/`, `#`, `?` or a space:
+  `.../{customer_id}/{region}` qualifies, while `.../{customer_id}-{region}`
+  and `.../{customer_id}{region}` do not (`("1-2", "3")` and `("1", "2-3")`
+  mint one IRI).
+
+Two triples maps' subjects count as overlapping unless their templates provably
+mint apart: an `rr:column` subject, or two templates whose constant text before
+the first placeholder can be one a prefix of the other, overlap. Overlap matters
+for deduplication (a subject both maps mint is deduplicated across them) and for
+class-targeted view policies, which decide a row over every class its subject
+could hold (see
+[Iceberg → Class policies over subjects several rows mint](iceberg.md#class-policies-over-subjects-several-rows-mint)).
+
+A history table's natural key, `( "customer_id" "valid_from" )`, does not make
+a subject minted from `customer_id` alone unique, and queries over it still
+remove repeated solutions. Two things are deduplicated whatever the keys say:
+a triple one row can mint twice (two predicate-object maps for one predicate,
+or an `rr:class` beside an `rdf:type` map naming the same class), and a
+subject two triples maps can both mint (a current table and a history table
+minting customers from the same template).
+
+An Iceberg table's identifier fields (`identifier-field-ids` in its schema)
+count as a key without being declared, for tables of format version 1 to 3;
+format version 4 replaces them with table constraints, and Fluree does not
+read those yet. Delta sources report no key, so declare one there. A SQL
+source's keys come from its registration probe (see
+[SQL → Repeated rows and subject keys](sql.md#repeated-rows-and-subject-keys))
+or a declaration.
+
+**Keys are trusted, not verified.** Fluree does not check a key against the
+data, whichever way it was learned: an `f:key`, an Iceberg table's
+identifier fields, or a SQL source's registration probe. Iceberg does not
+enforce identifier fields either; an append can write a row that repeats
+one. Over a table that breaks its key, queries return the repeated
+solutions the key ruled out, as bag answers, and a count read from table
+metadata (a fused `COUNT`, `/info`'s per-class counts) is presented as exact
+when it is not. A check of each Iceberg snapshot's keys against its data is
+planned; until then, declare a key only where the table's writer keeps it.
+
+`f:key` is checked when the mapping loads. Refused with
+`Failed to compile R2RML mapping: …`: an `f:key` that is not a list, an empty
+list, a list item that is not a plain string, a column named twice in one
+key, an `f:key` anywhere but on a logical table, and any other term in the
+`f:` namespace on a logical table (so a misspelled `f:keys` cannot leave the
+table silently keyless). Over an Iceberg source, a query is refused with HTTP
+`400` `err:db/InvalidQuery` when a declared key names a column the queried
+snapshot does not have (casing included), or a column whose values cannot
+identify a row: floating-point (NaN is unequal to itself, so a column declared
+unique can hold two NaNs that mint one subject), nested, or of a type values
+are not read from. `POST /iceberg/r2rml/validate` reports the same columns
+before you save the mapping (see
+[Iceberg → Schema Mismatch](iceberg.md#schema-mismatch)).
+
+### Complex Queries
+
+A [SQL source](sql.md#rrsqlquery) hands an `rr:sqlQuery` logical table to its engine, so a joined or aggregated view like the one below works there. An Iceberg source has no engine; it accepts only a row filter over one table (`SELECT * FROM t WHERE <column> <op> <literal> [AND ...]`), evaluated exactly. See [Iceberg → Row filters](iceberg.md#row-filters-rrsqlquery).
+
+Use SQL views for complex mappings:
+
+```turtle
+<#SalesReportMapping>
+  a rr:TriplesMap ;
+  
+  rr:logicalTable [
+    rr:sqlQuery """
+      SELECT
+        c.id as customer_id,
+        c.name as customer_name,
+        SUM(o.total) as total_spent,
+        COUNT(o.id) as order_count
+      FROM customers c
+      JOIN orders o ON o.customer_id = c.id
+      WHERE o.order_date >= '2024-01-01'
+      GROUP BY c.id, c.name
+    """
+  ] ;
+  
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{customer_id}" ;
+    rr:class ex:Customer
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate schema:name ;
+    rr:objectMap [ rr:column "customer_name" ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:totalSpent ;
+    rr:objectMap [ rr:column "total_spent" ; rr:datatype xsd:decimal ]
+  ] ;
+  
+  rr:predicateObjectMap [
+    rr:predicate ex:orderCount ;
+    rr:objectMap [ rr:column "order_count" ; rr:datatype xsd:integer ]
+  ] .
+```
+
+## Querying R2RML Graph Sources
+
+R2RML graph sources are queried using standard SPARQL and JSON-LD query syntax — no special query language is needed. In the Rust API, graph source resolution is wired into the lazy query builders:
+
+- `fluree.graph("my-gs:main").query()` for a single target that may be either a native ledger or a mapped graph source
+- `fluree.query_from()` when the query body specifies the dataset (`"from"` / `FROM`) or combines multiple sources
+
+The raw materialized snapshot path (`fluree.db(&alias)` → `fluree.query(&view, ...)`) is still the wrong abstraction for graph source aliases because it assumes a native ledger snapshot has already been loaded.
+
+Graph sources can be:
+- **Queried directly** as the target: `fluree query my-gs 'SELECT * WHERE { ?s ?p ?o }'`
+- **Referenced in FROM clauses**: `SELECT * FROM <my-gs:main> WHERE { ... }`
+- **Referenced in GRAPH patterns**: `SELECT * WHERE { GRAPH <my-gs:main> { ... } }` (useful for joining with ledger data)
+
+### Basic Query
+
+```json
+{
+  "@context": {
+    "schema": "http://schema.org/",
+    "ex": "http://example.org/ns/"
+  },
+  "from": "warehouse-customers:main",
+  "select": ["?name", "?email"],
+  "where": [
+    { "@id": "?customer", "@type": "schema:Person" },
+    { "@id": "?customer", "schema:name": "?name" },
+    { "@id": "?customer", "schema:email": "?email" }
+  ]
+}
+```
+
+The mapping controls how subjects and predicate/object values are produced from the scanned table columns.
+
+### SPARQL Query
+
+```sparql
+PREFIX schema: <http://schema.org/>
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?email
+FROM <warehouse-customers:main>
+WHERE {
+  ?customer a schema:Person .
+  ?customer schema:name ?name .
+  ?customer schema:email ?email .
+}
+```
+
+### Filters
+
+```json
+{
+  "from": "warehouse-customers:main",
+  "select": ["?name", "?email"],
+  "where": [
+    { "@id": "?customer", "schema:name": "?name" },
+    { "@id": "?customer", "schema:email": "?email" },
+    { "@id": "?customer", "ex:status": "?status" }
+  ],
+  "filter": "?status == 'active'"
+}
+```
+
+### Joins
+
+```json
+{
+  "from": "warehouse-orders:main",
+  "select": ["?customerName", "?orderTotal"],
+  "where": [
+    { "@id": "?customer", "schema:name": "?customerName" },
+    { "@id": "?order", "ex:customer": "?customer" },
+    { "@id": "?order", "ex:total": "?orderTotal" }
+  ]
+}
+```
+
+## Combining with Fluree Data
+
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
+
+```json
+{
+  "from": "products:main",
+  "fromNamed": "warehouse-inventory:main",
+  "select": ["?productName", "?stockLevel"],
+  "where": [
+    { "@id": "?product", "schema:name": "?productName" },
+    { "@id": "?product", "ex:sku": "?sku" },
+    ["graph", "warehouse-inventory:main", {
+      "@id": "?inventory",
+      "ex:sku": "?sku",
+      "ex:stockLevel": "?stockLevel"
+    }]
+  ]
+}
+```
+
+Combines product data from Fluree with inventory from an Iceberg-backed R2RML graph source.
+
+## Performance
+
+R2RML graph sources execute by scanning the underlying Iceberg table and materializing RDF terms according to the mapping.
+
+### Best Practices
+
+1. **Filter Early:** Filters are pushed down to Iceberg for partition pruning.
+   ```json
+   {
+     "where": [...],
+     "filter": "?date >= '2024-01-01'"
+   }
+   ```
+
+2. **Limit Results:**
+   ```json
+   {
+     "where": [...],
+     "limit": 100
+   }
+   ```
+
+3. **Project Only Needed Columns:** Only columns referenced in the query and mapping are read from Parquet files.
+
+4. **Partition by Common Filters:** Partition your Iceberg tables by columns frequently used in filters (e.g., date).
+
+### Bound-subject key pushdown
+
+A query that names a specific subject IRI — e.g. `<http://example.org/store/5> ex:name ?n` — can be answered without scanning the whole table. Fluree reverses the subject template (`rr:subjectMap rr:template "http://example.org/store/{store_key}"`) to recover the key value (`store_key = 5`) and pushes it to the Iceberg scan as an equality predicate, so the reader can prune to the matching rows. The mapping's subject equality is always re-checked in-engine, so this only ever affects *which rows the scan returns*, never the result.
+
+This is **on by default**. It shares the Iceberg predicate-pushdown kill-switch, `FLUREE_ICEBERG_PREDICATE_PUSHDOWN=0` (see [Configuration](../operations/configuration.md)); with pushdown off, bound-subject queries are still answered correctly — just by scanning and filtering in-engine instead of pruning.
+
+**The percent-encoding contract.** R2RML builds subject IRIs by substituting column values into the template and percent-encoding each value per RFC 3987 (letters, digits, and `- . _ ~ ! $ & ' ( ) * + , ; = : @` are left literal; everything else — including `/`, `#`, `?`, space, and non-ASCII — becomes `%XX`). Reversal is the exact inverse. **For the pushdown to engage, a query's subject IRI must use this same encoding.** For example, a `store_key` of `west/5` is stored in the IRI as `http://example.org/store/west%2F5` — query it with the `%2F`, not a literal `/`.
+
+If a query IRI is encoded differently, it simply matches no generated subject — and it does so *identically* whether pushdown is on or off (both return no rows). A mis-encoded IRI is therefore a query-authoring issue, never a case where pushdown and a full scan disagree.
+
+**What is pushed.** Pushdown engages only for templates that reverse unambiguously and key columns whose physical type is supported:
+
+- **Template shape:** a single trailing placeholder (`.../{key}`) always qualifies; multi-placeholder templates (`.../{a}/{b}`) qualify only when the separators between placeholders are characters that are always percent-encoded (like `/`). Ambiguous shapes such as `.../{a};{b}` (`;` is left literal) are skipped and fall back to a full scan.
+- **Key column type:** `string` keys, and integer-valued keys on `int`, `long`, or `decimal` columns. A `decimal` column of *any* scale qualifies — the recovered key is pushed as an integer literal (the Arrow reader casts it to the column's decimal type), and a key that is not integer-valued fails the parse and falls back to a full scan. Other physical types (dates, floats) are not pushed yet. The pushdown never affects correctness regardless: the operator always re-enforces the subject equality.
+
+## Use Cases
+
+### Data Lake Analytics
+
+Query Iceberg tables containing large-scale analytical data alongside Fluree ledgers:
+
+```json
+{
+  "from": ["products:main", "warehouse-sales:main"],
+  "select": ["?productName", "?totalSold"],
+  "where": [
+    { "@id": "?product", "schema:name": "?productName" },
+    { "@id": "?product", "ex:productId": "?pid" },
+    { "@id": "?sale", "ex:productId": "?pid" },
+    { "@id": "?sale", "ex:quantity": "?totalSold" }
+  ]
+}
+```
+
+### Multi-Table Mapping
+
+A single R2RML mapping file can define multiple `TriplesMap` entries, each targeting a different Iceberg table or logical view. This enables querying across related tables through a single graph source.
+
+## Materializing a Native Twin
+
+An R2RML graph source is *virtual* — every query re-reads the underlying tables. To snapshot it into a native, fully-indexed Fluree ledger (a *twin*), use [`fluree materialize`](../cli/materialize.md). The twin bulk-materializes every triple the mapping produces (foreign keys resolved into RDF references), stamps the mapping hash and per-table Iceberg watermark into its final commit, and verifies itself against the source before it is announced. See [Iceberg → Materializing a native twin](iceberg.md#materializing-a-native-twin) for the stamp/watermark contract and verification modes.
+
+## Limitations
+
+1. **Read-Only:** R2RML graph sources are read-only (no writes via Fluree)
+2. **Performance:** Complex joins across Fluree + Iceberg may be slow
+3. **Schema Changes:** Requires mapping updates when referenced columns change
+4. **No index-walking query patterns (fail-closed):** Property-path quantifiers
+   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` cannot be evaluated over a mapped source — it has no native
+   index for them to walk. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   result it would otherwise produce as a success. Fixed-length patterns
+   (`p`, `p/p`, …) and unquantified `a|b` / `^p` lower to table scans and run
+   normally. See [Graph Sources Overview → Query Patterns a Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate) for
+   the bounded workaround, or materialize a native twin (below) for unbounded
+   traversal.
+
+   Sub-selects run: their bodies lower to table scans like the rest of the
+   scope. Over a SQL source, a sub-`SELECT` the
+   [pushdown lane](sql.md#the-pushdown-lane-one-statement-per-block) admits
+   runs as a derived table of the block's statement, and one it does not take
+   runs on the per-scan lane. A sliced JSON-LD sub-select correlated with the
+   outer rows reads its tables once per outer row, and a sub-select outside
+   every `GRAPH` block whose body reads the default view is refused; see
+   [Sub-selects over a Graph Source](overview.md#sub-selects-over-a-graph-source).
+   An `EXISTS` in the `WHERE` clause scans the tables too, while one in the
+   query's own `HAVING` or `ORDER BY` is refused; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source).
+5. **One object map per predicate on a projected scan:** when a query names a
+   predicate, the scan reads the first `rr:predicateObjectMap` of the triples
+   map that carries it. A second predicate-object map for the same predicate
+   on the same map is not materialized there; give it its own triples map
+   (same table and subject template) if both values must come back.
+6. **Named-graph routing is a subset of R2RML, refused outside it:** a subject
+   map may carry one `rr:graph <iri>`, or one `rr:graphMap` with exactly one of
+   `rr:template`, `rr:column` or `rr:constant`; `rr:defaultGraph` names the
+   default graph, as in the spec. A mapping outside that subset fails to load
+   with an error naming the construct, rather than placing rows in the default
+   graph unannounced: several graph maps on one term map (cumulative in R2RML),
+   a graph map on a predicate-object map, a graph that is not an IRI, a graph
+   map with no value source or more than one, or an `rr:termType` other than
+   `rr:IRI`. Only
+   [materialization into a native ledger](iceberg.md#materialization-into-a-native-ledger)
+   honors the graph map today. The
+   [native twin](iceberg.md#materializing-a-native-twin) builder refuses a
+   mapping that carries one, since it would place every triple in the default
+   graph and its parity gate would not notice; the virtual query path still
+   reads everything from the default graph (tracked in #1607).
+
+## Troubleshooting
+
+### Connection Errors
+
+An R2RML graph source reads its tables through its Iceberg catalog, so its connection errors are those of the catalog mode it uses (`rest`, `direct`, `glue` or `s3tables`). [Iceberg → Connection Issues](iceberg.md#connection-issues) lists them with their causes, and [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify) checks a connection's credentials before you query. The ones seen most often:
+
+- `Catalog denied access to table '…': …` (HTTP `403`, `err:catalog/AccessDenied`): the catalog refused the token or AWS identity the source uses for that table.
+- `Catalog … authorized the table but vended no storage credentials; …` (HTTP `403`, `err:catalog/CredentialsNotVended`): a REST catalog answered without the storage credentials the source requires. Fix the catalog's credential vending, or turn vended credentials off to read with the server's own AWS identity.
+- `Storage access denied for s3://…` (HTTP `403`, `err:storage/AccessDenied`): the catalog answered, but the credentials cannot read the table's files.
+- `Failed to read version-hint.text at …` (`direct` mode): `table_location` is not the root of an Iceberg table, or the identity cannot read its `metadata/` directory.
+
+### Mapping Errors
+
+A mapping that does not parse or compile is refused when the source is mapped, with HTTP `400` (`fluree iceberg map` reports the same message):
+
+- `Failed to parse R2RML Turtle: …`: the Turtle itself is malformed.
+- `Failed to compile R2RML mapping: …`: the Turtle parsed, but is not a mapping Fluree can load. The reason names the problem, for example `Missing required property: rr:tableName in logical table`, `Invalid value for …: …`, or `Unsupported feature: …` (see [Limitations](#limitations)).
+- `R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`
+- `Failed to compile R2RML mapping: Invalid value for f:key: …`: a declared key
+  is malformed or misplaced; see [Declaring a Table's Keys](#declaring-a-tables-keys-fkey).
+- At query time, `Graph source '…': Invalid value for f:key: on the logical table "…", a key names column "…", …`
+  (HTTP `400`): a declared key names a column the table does not have, or one
+  that cannot identify a row. Fix the key, or remove it.
+
+Table and column names are not checked when the source is mapped. A table or column the mapping names but the catalog does not have shows up at query time, as described in [Iceberg → Schema Mismatch](iceberg.md#schema-mismatch), which also covers `POST /iceberg/r2rml/validate`, the read-only check of a mapping's tables, columns, join key types and subject keys against the live catalog.
+
+### Slow Queries
+
+#### A map with no key (most likely after an upgrade)
+
+**Symptom.** After upgrading to a version that answers over the set of
+triples a mapping defines, queries over a graph source got slower or heavier:
+
+- a `COUNT`, `SUM`, `AVG` or `GROUP BY` reads the table where it used to
+  answer from table metadata or fold rows directly;
+- a same-subject star (`?s ex:name ?n ; ex:city ?c`) runs as one scan per
+  predicate joined on the subject, where it used to read each row once;
+- an `ORDER BY … LIMIT` reads every data file where it used to stop early;
+- the query's memory use grows with the number of distinct solutions it has
+  seen, and a query that ran close to the
+  [query memory budget](../api/errors.md#507-insufficient-storage) now fails
+  with `MemoryBudgetExceeded` (HTTP `507`).
+
+**Cause.** No key proves the map's subjects unique, so its queries remove
+repeated solutions as they read (see
+[Declaring a Table's Keys](#declaring-a-tables-keys-fkey)). That is what
+makes their answers right where rows repeat: before, each row that repeated
+a triple returned it again. A mapping written or generated without `f:key`,
+over an Iceberg table whose writer set no identifier fields, has no key, so
+most maps take this path after the upgrade, including maps over tables whose
+rows never repeat.
+
+**Which maps.** Mapping a source reports each such map: the response to
+`POST /iceberg/map`, `POST /delta/map` and `POST /sql/map` (and to
+`fluree iceberg map`, `fluree delta map`, `fluree sql map` and
+`fluree sql check`) carries an advisory per map, and so do the dry runs
+(`POST /iceberg/r2rml/validate`, `fluree delta validate`) and the mapping
+generators:
+
+```text
+advisory: sales.customers: TriplesMap <http://example.org/mapping#Customer>: no key of its logical table 'sales.customers' lies within its subject's columns (customer_id), and it has no known key, so queries over it remove repeated solutions as they run. … If customer_id identifies a row, declare `f:key ( "customer_id" )` on its logical table, or make it the table's identifier field.
+```
+
+In JSON the advisory is `{"severity": "advisory", "code": "keylessMap", "table": …, "message": …}`.
+It is informational: the source is registered and answers correctly.
+
+**Which lane a query took.** Each R2RML scan stamps the routing decision
+`r2rml_scan_proven_distinct` on the `fluree::fastpath` tracing target:
+`proceed` when every map it reads is proven unique (no deduplication),
+`fallback:gate_declined` when it deduplicates, and `fallback:kill_switch`
+when fast paths are disabled (`FLUREE_DISABLE_QUERY_FAST_PATHS`, which
+deduplicates everything). A fused aggregate that deduplicates stamps
+`fused_r2rml_aggregate_dedupe`. To see them, run the server with
+`RUST_LOG=info,fluree::fastpath=debug`, or the CLI with
+`RUST_LOG=fluree::fastpath=debug fluree --verbose query …`:
+
+```text
+DEBUG fluree::fastpath: fast-path outcome site="r2rml_scan_proven_distinct" outcome="fallback:gate_declined"
+```
+
+With `fluree_db_query=debug` as well, each deduplication set reports its
+size and memory when it is released (`R2RML scan: deduplication set
+released`, with `solutions`, `charged_bytes` and `peak_bytes`).
+
+**Fix.** If the columns the subject is built from identify a row, say so:
+declare `f:key ( "customer_id" )` on the map's logical table, or, on an
+Iceberg table of format version 1 to 3, make those columns its identifier
+fields. The map then reads its rows straight through again, as fast as
+before. On a history table whose key holds only for the current rows,
+declare it on an `rr:sqlQuery` that selects them. A SQL source's
+registration probe records a key it verified (`fluree sql check` re-runs
+it). Declare only a key the table's writer keeps: Fluree trusts it and does
+not check the data. If the rows do repeat the map's triples, the
+deduplication is what makes the answer right; narrow the query, or raise
+the query memory budget.
+
+#### Other causes
+
+**Causes:**
+- Large result sets (many Parquet files scanned)
+- No partition pruning
+- Complex joins across Fluree + Iceberg
+
+**Solutions:**
+- Add date/partition filters to enable Iceberg partition pruning
+- Use LIMIT clause
+- Optimize R2RML mapping to project only needed columns
+- Partition Iceberg tables by common filter columns
+
+## Related Documentation
+
+- [Graph Sources Overview](overview.md) - Graph source concepts
+- [Iceberg](iceberg.md) - Data lake integration
+- [materialize](../cli/materialize.md) - Build a native twin ledger from a mapping
+- [Query Datasets](../query/datasets.md) - Multi-graph queries

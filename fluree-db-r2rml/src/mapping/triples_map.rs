@@ -1,0 +1,834 @@
+//! R2RML TriplesMap structure
+//!
+//! A TriplesMap is the top-level mapping unit in R2RML, defining how
+//! rows from a logical table are transformed into RDF triples.
+
+use serde::{Deserialize, Serialize};
+
+use super::{PredicateObjectMap, TableKeys, TermType};
+
+/// A compiled R2RML TriplesMap
+///
+/// A TriplesMap defines:
+/// 1. A logical table (source of tabular data)
+/// 2. A subject map (how to generate subject IRIs/blank nodes)
+/// 3. Zero or more predicate-object maps (properties to generate)
+///
+/// # Example R2RML
+///
+/// ```turtle
+/// <#AirlineMapping> a rr:TriplesMap ;
+///     rr:logicalTable [ rr:tableName "openflights.airlines" ] ;
+///     rr:subjectMap [
+///         rr:template "http://example.org/airline/{id}" ;
+///         rr:class ex:Airline
+///     ] ;
+///     rr:predicateObjectMap [
+///         rr:predicate ex:name ;
+///         rr:objectMap [ rr:column "name" ]
+///     ] .
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriplesMap {
+    /// IRI identifying this TriplesMap in the mapping document
+    pub iri: String,
+    /// Logical table source
+    pub logical_table: LogicalTable,
+    /// Subject map (generates subject IRIs/blank nodes)
+    pub subject_map: SubjectMap,
+    /// Zero or more predicate-object maps
+    pub predicate_object_maps: Vec<PredicateObjectMap>,
+    /// The keys the mapping declares on this map's logical table (`f:key`).
+    ///
+    /// Skipped when empty, so a mapping that declares none serializes, and
+    /// hashes for its materialized twin, exactly as it did before keys could be
+    /// declared.
+    #[serde(default, skip_serializing_if = "TableKeys::is_empty")]
+    pub declared_keys: TableKeys,
+}
+
+impl TriplesMap {
+    /// Create a new TriplesMap with the given IRI and table name
+    pub fn new(iri: impl Into<String>, table_name: impl Into<String>) -> Self {
+        Self {
+            iri: iri.into(),
+            logical_table: LogicalTable::TableName(table_name.into()),
+            subject_map: SubjectMap::default(),
+            predicate_object_maps: Vec::new(),
+            declared_keys: TableKeys::none(),
+        }
+    }
+
+    /// Declare a key of the logical table: columns no two rows agree on.
+    pub fn with_declared_key<S: Into<String>>(
+        mut self,
+        columns: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.declared_keys = std::mem::take(&mut self.declared_keys)
+            .union([columns.into_iter().map(Into::into).collect::<Vec<String>>()]);
+        self
+    }
+
+    /// Set the subject map template, and the columns it reads
+    /// ([`SubjectMap::template_columns`]), as the loader does.
+    pub fn with_subject_template(mut self, template: impl Into<String>) -> Self {
+        let template = template.into();
+        self.subject_map.template_columns = extract_template_columns(&template);
+        self.subject_map.template = Some(template);
+        self
+    }
+
+    /// Add a class to the subject map
+    pub fn with_class(mut self, class_iri: impl Into<String>) -> Self {
+        self.subject_map.classes.push(class_iri.into());
+        self
+    }
+
+    /// Add a predicate-object map
+    pub fn with_predicate_object(mut self, pom: PredicateObjectMap) -> Self {
+        self.predicate_object_maps.push(pom);
+        self
+    }
+
+    /// The logical table's name: the `rr:tableName`, or for an `rr:sqlQuery`
+    /// its deterministic alias — so every consumer keyed on table names (the
+    /// scan operator, provider caches, `find_maps_for_table`) treats a query
+    /// exactly like a table. A provider that can run SQL resolves the alias
+    /// back to the query text through [`Self::sql_query`].
+    pub fn table_name(&self) -> Option<&str> {
+        self.logical_table.name()
+    }
+
+    /// The `rr:sqlQuery` text, when this map is query-backed.
+    pub fn sql_query(&self) -> Option<&str> {
+        self.logical_table.sql_query_text()
+    }
+
+    /// Get all columns referenced by this TriplesMap
+    ///
+    /// Every column a row must carry for the map to produce what it describes:
+    /// the subject (template or `rr:column`), the graph map when there is one,
+    /// and every predicate-object map. A scan projected to this set reads
+    /// nothing the map does not use, and a schema check over it catches a
+    /// column the map names but the table lacks.
+    pub fn referenced_columns(&self) -> Vec<&str> {
+        let mut columns: Vec<&str> = Vec::new();
+
+        // Subject template columns, or the rr:column subject
+        columns.extend(
+            self.subject_map
+                .template_columns
+                .iter()
+                .map(std::string::String::as_str),
+        );
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+
+        // Graph map columns: a graph template with a column the table lacks
+        // would route every row to the default graph, with nothing to say so.
+        if let Some(gm) = &self.subject_map.graph_map {
+            columns.extend(gm.template_columns.iter().map(std::string::String::as_str));
+            if let Some(ref col) = gm.column {
+                columns.push(col.as_str());
+            }
+        }
+
+        // Predicate-object map columns
+        for pom in &self.predicate_object_maps {
+            columns.extend(pom.predicate_map.referenced_columns());
+            columns.extend(pom.object_map.referenced_columns());
+        }
+
+        // Deduplicate
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    /// Get classes generated by the subject map
+    pub fn classes(&self) -> &[String] {
+        &self.subject_map.classes
+    }
+
+    /// Find a predicate-object map by predicate IRI
+    pub fn find_predicate_object_map(&self, predicate_iri: &str) -> Option<&PredicateObjectMap> {
+        self.predicate_object_maps
+            .iter()
+            .find(|pom| pom.predicate_map.as_constant() == Some(predicate_iri))
+    }
+
+    /// Get columns referenced for a specific predicate filter.
+    ///
+    /// When `predicate_filter` is `Some`, only returns columns needed for:
+    /// - Subject generation (template columns)
+    /// - The specific POM matching the predicate
+    ///
+    /// When `predicate_filter` is `None`, returns all referenced columns.
+    ///
+    /// This enables projection pushdown to reduce I/O by reading only
+    /// the columns needed for the current query.
+    pub fn columns_for_predicate(&self, predicate_filter: Option<&str>) -> Vec<&str> {
+        let mut columns: Vec<&str> = Vec::new();
+
+        // Subject template columns are always needed
+        columns.extend(
+            self.subject_map
+                .template_columns
+                .iter()
+                .map(std::string::String::as_str),
+        );
+
+        // Also include subject column if using rr:column instead of template
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+
+        match predicate_filter {
+            Some(pred) => {
+                // Only include columns from the matching POM
+                if let Some(pom) = self.find_predicate_object_map(pred) {
+                    columns.extend(pom.predicate_map.referenced_columns());
+                    columns.extend(pom.object_map.referenced_columns());
+                }
+            }
+            None => {
+                // No filter - include all POM columns (fallback to original behavior)
+                for pom in &self.predicate_object_maps {
+                    columns.extend(pom.predicate_map.referenced_columns());
+                    columns.extend(pom.object_map.referenced_columns());
+                }
+            }
+        }
+
+        // Deduplicate
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    /// Columns needed to materialize only the subject IRI (subject template
+    /// columns plus an `rr:column` subject, if any).
+    ///
+    /// An `rdf:type`/subject-only triple pattern derives solely from the subject
+    /// map — no predicate-object map or RefObjectMap parent participates — so
+    /// reading any POM or parent column for it is wasted I/O. Use this instead of
+    /// `columns_for_predicate(None)` (which projects every POM column) when the
+    /// pattern has no object variable.
+    /// Whether `other` reads the same rows and mints the same subject from
+    /// them: the same logical table and the same subject template, column
+    /// or constant (its classes aside).
+    pub fn same_source_row(&self, other: &TriplesMap) -> bool {
+        let (a, b) = (&self.subject_map, &other.subject_map);
+        self.logical_table == other.logical_table
+            && a.template == b.template
+            && a.template_columns == b.template_columns
+            && a.column == b.column
+            && a.constant == b.constant
+            && a.term_type == b.term_type
+    }
+
+    /// The object map of the first predicate-object map naming `predicate`
+    /// as a constant — the one the projection path materializes under a
+    /// predicate filter (`columns_for_predicate`); a second map for the same
+    /// predicate is not read there either.
+    pub fn object_map_for(&self, predicate: &str) -> Option<&super::term_map::ObjectMap> {
+        self.predicate_object_maps
+            .iter()
+            .find(|pom| pom.predicate_map.as_constant() == Some(predicate))
+            .map(|pom| &pom.object_map)
+    }
+
+    /// Whether the two maps mint `predicate` alike — from the same rows,
+    /// the same subject and the same object map — and so the same triples,
+    /// which an RDF graph holds once.
+    pub fn mints_alike(&self, other: &TriplesMap, predicate: &str) -> bool {
+        self.same_source_row(other)
+            && matches!(
+                (self.object_map_for(predicate), other.object_map_for(predicate)),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+
+    pub fn subject_columns(&self) -> Vec<&str> {
+        let mut columns: Vec<&str> = self
+            .subject_map
+            .template_columns
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
+    /// Get columns that must be non-null to produce triples for a pattern.
+    ///
+    /// This method returns the minimal set of columns where a NULL value would
+    /// prevent any triple from being generated. Use this for safe NOT NULL
+    /// filter pushdown.
+    ///
+    /// # Rules
+    ///
+    /// - **Subject columns are always required**: if subject can't be materialized,
+    ///   no triples can be produced from that row.
+    /// - **Object columns are only required for the specific POM**: when
+    ///   `predicate_filter` is `Some`, include object/join columns for that predicate.
+    ///   When `None`, we cannot safely push NOT NULL for any object columns.
+    ///
+    /// # Arguments
+    ///
+    /// * `predicate_filter` - If `Some`, include object columns for that predicate.
+    ///   If `None`, only subject columns are returned (safe for any pattern).
+    ///
+    /// # Template NULL handling
+    ///
+    /// R2RML semantics: if ANY column in a template is NULL, the term is not
+    /// produced. E.g., `http://ex.org/{a}/{b}` with `a=NULL, b="foo"` produces
+    /// nothing (not `http://ex.org//foo`).
+    pub fn required_not_null_columns(&self, predicate_filter: Option<&str>) -> Vec<&str> {
+        let mut columns: Vec<&str> = Vec::new();
+
+        // Subject columns are ALWAYS required - without a subject, no triples at all
+        columns.extend(
+            self.subject_map
+                .template_columns
+                .iter()
+                .map(std::string::String::as_str),
+        );
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+
+        // Object/join columns only when we know the specific predicate
+        if let Some(pred) = predicate_filter {
+            if let Some(pom) = self.find_predicate_object_map(pred) {
+                match &pom.object_map {
+                    super::ObjectMap::Column { column, .. } => {
+                        columns.push(column.as_str());
+                    }
+                    super::ObjectMap::Template {
+                        columns: tmpl_cols, ..
+                    } => {
+                        columns.extend(tmpl_cols.iter().map(std::string::String::as_str));
+                    }
+                    super::ObjectMap::RefObjectMap(rom) => {
+                        // Child join columns are required
+                        columns.extend(rom.child_columns());
+                    }
+                    super::ObjectMap::Constant { .. } => {
+                        // Constant objects don't require any columns
+                    }
+                }
+            }
+        }
+        // When predicate_filter is None, we can't safely include object columns
+        // because different POMs have different requirements
+
+        // Deduplicate
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+}
+
+/// Logical table source
+///
+/// Defines where the tabular data comes from.
+/// Iceberg graph sources accept only table names; SQL graph sources also
+/// accept `rr:sqlQuery`, which is scanned as a derived table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LogicalTable {
+    /// `rr:tableName` - direct table reference
+    ///
+    /// Table names are normalized to dot notation: "namespace.table"
+    TableName(String),
+    /// `rr:sqlQuery` - a SQL SELECT used as the logical table. `alias` is a
+    /// deterministic name derived from the query text, used wherever a table
+    /// name is expected.
+    SqlQuery { sql: String, alias: String },
+}
+
+/// Prefix of every `rr:sqlQuery` alias, so a provider without SQL support can
+/// recognize and refuse one.
+pub const SQL_QUERY_ALIAS_PREFIX: &str = "sqlQuery:";
+
+impl LogicalTable {
+    /// Create a table name logical table
+    pub fn table(name: impl Into<String>) -> Self {
+        LogicalTable::TableName(name.into())
+    }
+
+    /// Create a query-backed logical table.
+    pub fn sql_query(sql: impl Into<String>) -> Self {
+        let sql = sql.into();
+        let alias = Self::alias_for_query(&sql);
+        LogicalTable::SqlQuery { sql, alias }
+    }
+
+    fn alias_for_query(sql: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sql.trim().hash(&mut h);
+        format!("{SQL_QUERY_ALIAS_PREFIX}{:016x}", h.finish())
+    }
+
+    /// Whether `name` is an `rr:sqlQuery` alias rather than a real table.
+    pub fn is_sql_query_alias(name: &str) -> bool {
+        name.starts_with(SQL_QUERY_ALIAS_PREFIX)
+    }
+
+    /// The table name or query alias.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            LogicalTable::TableName(name) => Some(name),
+            LogicalTable::SqlQuery { alias, .. } => Some(alias),
+        }
+    }
+
+    /// The query text for a query-backed logical table.
+    pub fn sql_query_text(&self) -> Option<&str> {
+        match self {
+            LogicalTable::TableName(_) => None,
+            LogicalTable::SqlQuery { sql, .. } => Some(sql),
+        }
+    }
+
+    /// The `rr:tableName`, or `None` for a query-backed logical table.
+    pub fn as_table_name(&self) -> Option<&str> {
+        match self {
+            LogicalTable::TableName(name) => Some(name),
+            LogicalTable::SqlQuery { .. } => None,
+        }
+    }
+
+    /// Normalize table name (convert `/` to `.` for Iceberg)
+    pub fn normalize_table_name(name: &str) -> String {
+        name.replace('/', ".")
+    }
+}
+
+/// Subject map
+///
+/// Defines how subject IRIs or blank nodes are generated from table rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubjectMap {
+    /// `rr:template` - Template for generating subject IRI
+    ///
+    /// Example: `"http://example.org/airline/{id}"`
+    pub template: Option<String>,
+
+    /// Column names referenced in the template
+    ///
+    /// Extracted from template placeholders like `{id}`, `{name}`
+    pub template_columns: Vec<String>,
+
+    /// `rr:constant` - Constant subject IRI (alternative to template)
+    ///
+    /// Used when all rows should have the same subject (rare)
+    pub constant: Option<String>,
+
+    /// `rr:column` - Column containing subject IRI (alternative to template)
+    ///
+    /// The column value is used directly as the subject IRI
+    pub column: Option<String>,
+
+    /// `rr:class` - RDF type(s) for generated subjects
+    ///
+    /// Generates `?s rdf:type <class>` triples for each class
+    pub classes: Vec<String>,
+
+    /// `rr:termType` - Term type (IRI or BlankNode)
+    ///
+    /// Default is IRI. BlankNode generates blank node subjects.
+    pub term_type: TermType,
+
+    /// `rr:graph` / `rr:graphMap` - the named graph this triples map's triples
+    /// are placed in (a subject-map-level graph map applies to every triple the
+    /// map generates). `None` = the default graph (the common case). A per-row
+    /// graph map (template/column) routes each row into a row-specific named
+    /// graph — e.g. one graph per tenant/user — so the same subject IRI can hold
+    /// independent per-graph statements without cross-graph clobbering.
+    pub graph_map: Option<GraphMap>,
+}
+
+/// A graph map: how the named graph for a triples map's triples is generated
+/// from a row (R2RML `rr:graphMap`, or the `rr:graph` constant shortcut).
+///
+/// A graph term is always an IRI (R2RML forbids literal/blank-node graphs), so
+/// unlike a subject map there is no term-type — just the value source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphMap {
+    /// `rr:template` - template for the graph IRI, e.g.
+    /// `"https://ex.org/graph/tenant/{tenant_id}/user/{user_id}"`.
+    pub template: Option<String>,
+
+    /// Column names referenced in the template (`{col}` placeholders).
+    pub template_columns: Vec<String>,
+
+    /// `rr:column` - column whose value is used directly as the graph IRI.
+    pub column: Option<String>,
+
+    /// `rr:constant` / `rr:graph` - a constant graph IRI for every row.
+    pub constant: Option<String>,
+}
+
+impl GraphMap {
+    /// Create a constant graph map (from `rr:graph` or `rr:graphMap [ rr:constant ]`).
+    pub fn constant(iri: impl Into<String>) -> Self {
+        Self {
+            constant: Some(iri.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a template-based graph map (per-row graph IRI).
+    pub fn template(template: impl Into<String>) -> Self {
+        let template_str = template.into();
+        let columns = extract_template_columns(&template_str);
+        Self {
+            template: Some(template_str),
+            template_columns: columns,
+            ..Default::default()
+        }
+    }
+
+    /// Create a column-based graph map.
+    pub fn column(col: impl Into<String>) -> Self {
+        Self {
+            column: Some(col.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this graph map carries no value source (parsed nothing usable).
+    pub fn is_empty(&self) -> bool {
+        self.template.is_none() && self.column.is_none() && self.constant.is_none()
+    }
+}
+
+impl SubjectMap {
+    /// Create a template-based subject map
+    pub fn template(template: impl Into<String>) -> Self {
+        let template_str = template.into();
+        let columns = extract_template_columns(&template_str);
+        Self {
+            template: Some(template_str),
+            template_columns: columns,
+            ..Default::default()
+        }
+    }
+
+    /// Create a constant subject map
+    pub fn constant(iri: impl Into<String>) -> Self {
+        Self {
+            constant: Some(iri.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a column-based subject map
+    pub fn column(col: impl Into<String>) -> Self {
+        Self {
+            column: Some(col.into()),
+            term_type: TermType::Iri,
+            ..Default::default()
+        }
+    }
+
+    /// Add a class
+    pub fn with_class(mut self, class_iri: impl Into<String>) -> Self {
+        self.classes.push(class_iri.into());
+        self
+    }
+
+    /// Set term type to blank node
+    pub fn as_blank_node(mut self) -> Self {
+        self.term_type = TermType::BlankNode;
+        self
+    }
+
+    /// Check if this subject map generates IRIs
+    pub fn generates_iri(&self) -> bool {
+        self.term_type.is_iri()
+    }
+
+    /// Check if this subject map generates blank nodes
+    pub fn generates_blank_node(&self) -> bool {
+        self.term_type.is_blank_node()
+    }
+}
+
+/// Extract column names from a template string
+///
+/// Finds all `{column_name}` placeholders and returns the column names.
+/// For example, `"http://example.org/{namespace}/{id}"` returns `["namespace", "id"]`.
+pub fn extract_template_columns(template: &str) -> Vec<String> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+
+    PLACEHOLDER_RE
+        .captures_iter(template)
+        .map(|cap| cap[1].to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_template_columns() {
+        let cols = extract_template_columns("http://example.org/{id}");
+        assert_eq!(cols, vec!["id"]);
+
+        let cols = extract_template_columns("http://example.org/{namespace}/{id}");
+        assert_eq!(cols, vec!["namespace", "id"]);
+
+        let cols = extract_template_columns("no placeholders");
+        assert!(cols.is_empty());
+
+        let cols = extract_template_columns("{a}{b}{c}");
+        assert_eq!(cols, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn mints_alike_needs_same_rows_subject_and_object_map() {
+        use super::super::{ObjectMap, PredicateMap, RefObjectMap};
+        const LABEL: &str = "http://example.org/label";
+        let pom = |om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(LABEL),
+            object_map: om,
+        };
+        let base = || {
+            TriplesMap::new("<#A>", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/A")
+        };
+        let a = base().with_predicate_object(pom(ObjectMap::column("name")));
+
+        // Classes aside, the same rows, subject and object map.
+        let b = TriplesMap::new("<#B>", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/B")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(a.mints_alike(&b, LABEL));
+        assert!(b.mints_alike(&a, LABEL));
+
+        // Another column, a datatype, a template or a reference derive the
+        // value differently.
+        for om in [
+            ObjectMap::column("nickname"),
+            ObjectMap::column_typed("name", "http://www.w3.org/2001/XMLSchema#string"),
+            ObjectMap::template("{name}", vec!["name".into()]),
+            ObjectMap::RefObjectMap(RefObjectMap::new("<#Parent>", "name", "id")),
+        ] {
+            assert!(!a.mints_alike(&base().with_predicate_object(pom(om)), LABEL));
+        }
+        // Other rows or another subject.
+        let other_table = TriplesMap::new("<#C>", "profiles")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_table, LABEL));
+        let other_subject = base()
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_subject, LABEL));
+        // A predicate one side lacks.
+        assert!(!a.mints_alike(&base(), LABEL));
+        assert!(!a.mints_alike(&b, "http://example.org/other"));
+    }
+
+    #[test]
+    fn test_triples_map_new() {
+        let tm = TriplesMap::new("<#AirlineMapping>", "openflights.airlines")
+            .with_subject_template("http://example.org/airline/{id}")
+            .with_class("http://example.org/Airline");
+
+        assert_eq!(tm.iri, "<#AirlineMapping>");
+        assert_eq!(tm.table_name(), Some("openflights.airlines"));
+        assert_eq!(
+            tm.subject_map.template,
+            Some("http://example.org/airline/{id}".to_string())
+        );
+        assert_eq!(tm.subject_map.classes, vec!["http://example.org/Airline"]);
+    }
+
+    #[test]
+    fn test_logical_table_normalize() {
+        assert_eq!(
+            LogicalTable::normalize_table_name("openflights/airlines"),
+            "openflights.airlines"
+        );
+        assert_eq!(
+            LogicalTable::normalize_table_name("openflights.airlines"),
+            "openflights.airlines"
+        );
+    }
+
+    #[test]
+    fn test_subject_map_template() {
+        let sm = SubjectMap::template("http://example.org/{namespace}/{id}");
+        assert_eq!(
+            sm.template,
+            Some("http://example.org/{namespace}/{id}".to_string())
+        );
+        assert_eq!(sm.template_columns, vec!["namespace", "id"]);
+    }
+
+    #[test]
+    fn the_builder_records_a_subject_templates_columns() {
+        let tm = TriplesMap::new("#T", "t").with_subject_template("http://ex/t/{a}/{b}");
+        assert_eq!(tm.subject_map.template_columns, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_referenced_columns() {
+        use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::template("http://example.org/{id}");
+        tm.predicate_object_maps = vec![
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/name"),
+                object_map: ObjectMap::column("name"),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/code"),
+                object_map: ObjectMap::column("code"),
+            },
+        ];
+
+        let cols = tm.referenced_columns();
+        assert_eq!(cols, vec!["code", "id", "name"]);
+    }
+
+    #[test]
+    fn referenced_columns_covers_subject_column_and_graph_map() {
+        use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        // An rr:column subject and a graph template: a scan projected to
+        // `referenced_columns()` must read both, or the subject is skipped and
+        // the row routes to the default graph.
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::column("uri");
+        tm.subject_map.graph_map =
+            Some(GraphMap::template("http://example.org/g/{tenant}/{region}"));
+        tm.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://example.org/name"),
+            object_map: ObjectMap::column("name"),
+        }];
+        assert_eq!(
+            tm.referenced_columns(),
+            vec!["name", "region", "tenant", "uri"]
+        );
+
+        tm.subject_map.graph_map = Some(GraphMap::column("graph_iri"));
+        assert_eq!(tm.referenced_columns(), vec!["graph_iri", "name", "uri"]);
+
+        // A constant graph reads no column.
+        tm.subject_map.graph_map = Some(GraphMap::constant("http://example.org/g"));
+        assert_eq!(tm.referenced_columns(), vec!["name", "uri"]);
+    }
+
+    #[test]
+    fn test_columns_for_predicate() {
+        use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::template("http://example.org/{id}");
+        tm.predicate_object_maps = vec![
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/name"),
+                object_map: ObjectMap::column("name"),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/code"),
+                object_map: ObjectMap::column("code"),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/country"),
+                object_map: ObjectMap::column("country"),
+            },
+        ];
+
+        // No filter: all columns
+        let cols = tm.columns_for_predicate(None);
+        assert_eq!(cols, vec!["code", "country", "id", "name"]);
+
+        // Filter to specific predicate: only subject + that predicate's columns
+        let cols = tm.columns_for_predicate(Some("http://example.org/name"));
+        assert_eq!(cols, vec!["id", "name"]);
+
+        let cols = tm.columns_for_predicate(Some("http://example.org/code"));
+        assert_eq!(cols, vec!["code", "id"]);
+
+        // Non-existent predicate: only subject columns
+        let cols = tm.columns_for_predicate(Some("http://example.org/nonexistent"));
+        assert_eq!(cols, vec!["id"]);
+    }
+
+    #[test]
+    fn test_required_not_null_columns() {
+        use super::super::{
+            JoinCondition, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+        };
+
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::template("http://example.org/{ns}/{id}");
+        tm.predicate_object_maps = vec![
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/name"),
+                object_map: ObjectMap::column("name"),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/label"),
+                object_map: ObjectMap::template("label-{code}", vec!["code".to_string()]),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/parent"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap {
+                    parent_triples_map: "<#Parent>".to_string(),
+                    join_conditions: vec![JoinCondition {
+                        child_column: "parent_id".to_string(),
+                        parent_column: "id".to_string(),
+                    }],
+                }),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/type"),
+                object_map: ObjectMap::constant_iri("http://example.org/Thing"),
+            },
+        ];
+
+        // No filter: only subject columns (safe for any pattern)
+        let cols = tm.required_not_null_columns(None);
+        assert_eq!(cols, vec!["id", "ns"]);
+
+        // Filter to column predicate: subject + that column
+        let cols = tm.required_not_null_columns(Some("http://example.org/name"));
+        assert_eq!(cols, vec!["id", "name", "ns"]);
+
+        // Filter to template predicate: subject + template columns
+        let cols = tm.required_not_null_columns(Some("http://example.org/label"));
+        assert_eq!(cols, vec!["code", "id", "ns"]);
+
+        // Filter to RefObjectMap predicate: subject + child join columns
+        let cols = tm.required_not_null_columns(Some("http://example.org/parent"));
+        assert_eq!(cols, vec!["id", "ns", "parent_id"]);
+
+        // Filter to constant predicate: only subject columns (constant always produces)
+        let cols = tm.required_not_null_columns(Some("http://example.org/type"));
+        assert_eq!(cols, vec!["id", "ns"]);
+
+        // Non-existent predicate: only subject columns
+        let cols = tm.required_not_null_columns(Some("http://example.org/nonexistent"));
+        assert_eq!(cols, vec!["id", "ns"]);
+    }
+}

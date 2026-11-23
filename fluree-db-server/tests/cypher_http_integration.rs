@@ -1,0 +1,602 @@
+//! HTTP-layer coverage for the openCypher routes: `Content-Type:
+//! application/cypher` on `POST /v1/fluree/query/<ledger>` (read) and
+//! `POST /v1/fluree/update/<ledger>` (write). v1 is local execution with
+//! JSON-LD output; the connection-scoped routes reject Cypher (no ledger).
+
+use axum::body::Body;
+use fluree_db_server::routes::build_router;
+use fluree_db_server::{AppState, ServerConfig, TelemetryConfig};
+use http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::json;
+use std::sync::Arc;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+async fn server_state() -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState"));
+    (tmp, state)
+}
+
+async fn create_ledger(state: &Arc<AppState>, ledger: &str) {
+    let resp = build_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "ledger": ledger }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "create {ledger}");
+}
+
+async fn insert(state: &Arc<AppState>, ledger: &str, body: serde_json::Value) {
+    let resp = build_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/insert/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "insert into {ledger}");
+}
+
+/// POST a Cypher body to a route and return `(status, body_text)`.
+async fn post_cypher(state: &Arc<AppState>, uri: &str, cypher: &str) -> (StatusCode, String) {
+    let resp = build_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/cypher")
+                .body(Body::from(cypher.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// POST a Cypher write carrying an `Idempotency-Key` header.
+async fn post_cypher_with_key(
+    state: &Arc<AppState>,
+    uri: &str,
+    cypher: &str,
+    idempotency_key: &str,
+) -> (StatusCode, String) {
+    let resp = build_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/cypher")
+                .header("Idempotency-Key", idempotency_key)
+                .body(Body::from(cypher.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tokio::test]
+async fn cypher_http_read_write_round_trip() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherhttp").await;
+    insert(
+        &state,
+        "cypherhttp",
+        json!({
+            "@context": {},
+            "@id": "alice", "@type": "Person", "name": "Alice", "age": 30
+        }),
+    )
+    .await;
+
+    // Read via Cypher.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherhttp",
+        "MATCH (n:Person) RETURN n.name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cypher read status; body={body}");
+    assert!(body.contains("Alice"), "cypher read body: {body}");
+
+    // Write via Cypher (MATCH … SET).
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherhttp",
+        r#"MATCH (n:Person {name: "Alice"}) SET n.age = 42"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "cypher write status={status}; body={body}"
+    );
+
+    // The new value is visible.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherhttp",
+        "MATCH (n:Person) WHERE n.age > 40 RETURN n.name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Alice"), "post-SET read body: {body}");
+
+    // Write via Cypher CREATE.
+    let (status, _body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherhttp",
+        r#"CREATE (n:Person {name: "Carol"})"#,
+    )
+    .await;
+    assert!(status.is_success(), "cypher create status={status}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherhttp",
+        "MATCH (n:Person) RETURN n.name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Carol"), "after-create read body: {body}");
+}
+
+/// Regression (M2): Cypher writes go through consensus, so a retried submission
+/// carrying the same `Idempotency-Key` is deduplicated — it commits once, not
+/// twice. Before this routing the Cypher path staged directly and ignored the
+/// key, so a client retry double-committed (here: two `Dave` nodes).
+#[tokio::test]
+async fn cypher_http_write_is_idempotent() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypheridem").await;
+
+    let create = r#"CREATE (n:Person {name: "Dave"})"#;
+    let (s1, b1) = post_cypher_with_key(
+        &state,
+        "/v1/fluree/update/cypheridem",
+        create,
+        "fixed-key-123",
+    )
+    .await;
+    let (s2, b2) = post_cypher_with_key(
+        &state,
+        "/v1/fluree/update/cypheridem",
+        create,
+        "fixed-key-123",
+    )
+    .await;
+    assert!(s1.is_success() && s2.is_success(), "{b1}\n{b2}");
+
+    // The idempotent replay echoes the original commit (same `t`), rather than
+    // advancing the ledger with a second commit.
+    let commit_t = |b: &str| {
+        serde_json::from_str::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.get("t").and_then(serde_json::Value::as_i64))
+    };
+    assert_eq!(
+        commit_t(&b1),
+        commit_t(&b2),
+        "retry must echo the original commit t:\n{b1}\n{b2}"
+    );
+
+    // And the node was created exactly once (a non-idempotent retry would make a
+    // second, distinct `Dave` node since CREATE always inserts).
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypheridem",
+        "MATCH (n:Person) RETURN n.name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("Dave").count(),
+        1,
+        "exactly one Dave node expected; body={body}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_http_json_envelope_with_params() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherparams").await;
+    insert(
+        &state,
+        "cypherparams",
+        json!({
+            "@context": {},
+            "@graph": [
+                {"@id": "alice", "@type": "Person", "name": "Alice"},
+                {"@id": "bob",   "@type": "Person", "name": "Bob"},
+            ]
+        }),
+    )
+    .await;
+
+    // Parameterized write via the {cypher, params} envelope.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherparams",
+        &json!({
+            "cypher": "CREATE (n:Person {name: $name})",
+            "params": {"name": "Carol"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "param write status={status}; body={body}"
+    );
+
+    // Parameterized read via the envelope.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherparams",
+        &json!({
+            "cypher": "MATCH (n:Person {name: $name}) RETURN n.name",
+            "params": {"name": "Carol"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "param read; body={body}");
+    assert!(body.contains("Carol"), "param read body: {body}");
+}
+
+#[tokio::test]
+async fn cypher_tx_id_reflects_parameters() {
+    // Same statement, different params → distinct tx-ids (the tx-id hashes the
+    // full envelope, not just the statement text).
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyphertxid").await;
+
+    let tx_id = |body: &str| -> String {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("tx-id").and_then(|t| t.as_str()).map(String::from))
+            .unwrap_or_default()
+    };
+
+    let (s1, b1) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyphertxid",
+        &json!({"cypher": "CREATE (n:Person {name: $name})", "params": {"name": "A"}}).to_string(),
+    )
+    .await;
+    let (s2, b2) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyphertxid",
+        &json!({"cypher": "CREATE (n:Person {name: $name})", "params": {"name": "B"}}).to_string(),
+    )
+    .await;
+    assert!(s1.is_success() && s2.is_success(), "{b1}\n{b2}");
+    let (id1, id2) = (tx_id(&b1), tx_id(&b2));
+    assert!(
+        !id1.is_empty() && !id2.is_empty(),
+        "tx-id present: {b1}\n{b2}"
+    );
+    assert_ne!(id1, id2, "different params must yield different tx-ids");
+}
+
+#[tokio::test]
+async fn cypher_http_merge_on_match_set_conditional() {
+    // The conditional write (MERGE … ON MATCH SET) must resolve over the
+    // server's cached-handle path: ON CREATE on the first POST, ON MATCH on
+    // the second.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyphermerge").await;
+
+    let stmt = r#"MERGE (n:Person {name: "Alice"})
+                  ON CREATE SET n.origin = "created"
+                  ON MATCH  SET n.origin = "matched""#;
+
+    let (s1, b1) = post_cypher(&state, "/v1/fluree/update/cyphermerge", stmt).await;
+    assert!(s1.is_success(), "first merge: {s1} {b1}");
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyphermerge",
+        r#"MATCH (n:Person {origin: "created"}) RETURN n.name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Alice"), "ON CREATE applied: {body}");
+
+    let (s2, b2) = post_cypher(&state, "/v1/fluree/update/cyphermerge", stmt).await;
+    assert!(s2.is_success(), "second merge: {s2} {b2}");
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyphermerge",
+        r#"MATCH (n:Person {origin: "matched"}) RETURN n.name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Alice"),
+        "ON MATCH applied on second run: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_http_per_row_rel_merge_on_match_set() {
+    // Per-row relationship MERGE … ON MATCH SET over the server's consensus
+    // (locked) write path: the ON MATCH and create branches stage into one
+    // commit under the write lock.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherperrow").await;
+
+    // Seed Alice, Bob, Carol + an existing Alice-KNOWS->Bob edge.
+    let (s, b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherperrow",
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                  (c:Person {name: "Carol"})"#,
+    )
+    .await;
+    assert!(s.is_success(), "seed: {s} {b}");
+
+    let (s2, b2) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherperrow",
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person) WHERE b.name <> "Alice"
+           MERGE (a)-[:KNOWS]->(b)
+           ON CREATE SET b.tag = "created"
+           ON MATCH  SET b.tag = "matched""#,
+    )
+    .await;
+    assert!(s2.is_success(), "per-row merge: {s2} {b2}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherperrow",
+        r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+           RETURN b.name AS name, b.tag AS tag ORDER BY name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Bob") && body.contains("matched"),
+        "ON MATCH tagged the pre-existing edge's endpoint: {body}"
+    );
+    assert!(
+        body.contains("Carol") && body.contains("created"),
+        "ON CREATE tagged the newly-created edge's endpoint: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_parse_error_is_client_error() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherbad").await;
+    let (status, _body) =
+        post_cypher(&state, "/v1/fluree/query/cypherbad", "NOT VALID CYPHER {{").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "parse error → 400");
+}
+
+#[tokio::test]
+async fn connection_scoped_cypher_is_rejected() {
+    let (_tmp, state) = server_state().await;
+    // No ledger in the path → 400 with a pointer to the ledger-scoped route.
+    let (status, body) = post_cypher(&state, "/v1/fluree/query", "MATCH (n:Person) RETURN n").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    let (status, _body) = post_cypher(
+        &state,
+        "/v1/fluree/update",
+        r#"CREATE (n:Person {name: "X"})"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A trailing RETURN on a write answers with the created entities as a
+/// Cypher-JSON envelope (single vertex / single edge write round trips).
+#[tokio::test]
+async fn cypher_http_write_with_return() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherwriteret").await;
+
+    // Node create with RETURN.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 4112}) RETURN n",
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["n"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .is_some_and(|s| s.starts_with("_:fdb-")),
+        "{body}"
+    );
+
+    // Edge create with RETURN (anchored MATCH).
+    let (status, _b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 5721})",
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "MATCH (a:UserTemp {id: 4112}), (b:UserTemp {id: 5721})
+           CREATE (a)-[e:Temp]->(b) RETURN e",
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["e"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert!(
+        data[0]["row"][0]
+            .as_str()
+            .is_some_and(|s| s.ends_with("--cyre")),
+        "{body}"
+    );
+
+    // A no-RETURN write still answers with the commit receipt.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherwriteret",
+        "CREATE (n:UserTemp {id: 9})",
+    )
+    .await;
+    assert!(status.is_success());
+    assert!(body.contains("commit"), "receipt shape unchanged: {body}");
+}
+
+#[tokio::test]
+async fn cypher_http_multi_clause_merge_chain() {
+    // Multi-clause MERGE composition over HTTP: the sequential driver stages
+    // clause-by-clause into one commit through the consensus committer.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqhttp").await;
+
+    let stmt = r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Paris"}) MERGE (a)-[:LIVES_IN]->(b)"#;
+    let (status, body) = post_cypher(&state, "/v1/fluree/update/cyseqhttp", stmt).await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    assert!(body.contains("commit"), "receipt shape: {body}");
+
+    // Everything landed in one commit; re-running is a no-op.
+    let (status, body) = post_cypher(&state, "/v1/fluree/update/cyseqhttp", stmt).await;
+    assert!(
+        status.is_success(),
+        "idempotent: status={status}; body={body}"
+    );
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqhttp",
+        "MATCH (a:Person)-[r:LIVES_IN]->(b:City) RETURN count(r)",
+    )
+    .await;
+    assert!(status.is_success(), "read back: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(1), "{body}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqhttp",
+        "MATCH (n:Person) RETURN count(n)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn cypher_http_multi_clause_merge_with_return() {
+    // The trailing RETURN of a sequential write answers from the driver's
+    // final row table (matched bindings included) via the receipt channel.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqret").await;
+    let (status, _b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyseqret",
+        r#"CREATE (a:Person {name: "Alice", age: 42})"#,
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyseqret",
+        r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Rome"}) MERGE (a)-[:LIVES_IN]->(b) RETURN a.age AS age, b"#,
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["age", "b"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert_eq!(
+        data[0]["row"][0],
+        json!(42),
+        "a.age reads the MATCHED node: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_http_unwind_batch_merge_chain() {
+    // The canonical loading idiom via the params envelope.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqbatch").await;
+
+    let envelope = json!({
+        "cypher": "UNWIND $rows AS row MERGE (a:P {id: row.src}) MERGE (b:P {id: row.dst}) MERGE (a)-[:KNOWS]->(b)",
+        "params": {"rows": [
+            {"src": 1, "dst": 2},
+            {"src": 1, "dst": 3},
+            {"src": 2, "dst": 3},
+        ]}
+    });
+    let resp = build_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/cyseqbatch")
+                .header("content-type", "application/cypher")
+                .body(Body::from(envelope.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    assert!(status.is_success(), "status={status}; body={body}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqbatch",
+        "MATCH (n:P) RETURN count(n)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(
+        json["results"][0]["data"][0]["row"][0],
+        json!(3),
+        "three distinct endpoints: {body}"
+    );
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqbatch",
+        "MATCH (:P)-[r:KNOWS]->(:P) RETURN count(r)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(3), "{body}");
+}

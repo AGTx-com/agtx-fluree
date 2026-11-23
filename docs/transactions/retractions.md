@@ -1,0 +1,613 @@
+# Retractions
+
+Retractions remove data from Fluree. While data is never truly deleted (it remains in history), retractions mark triples as no longer current.
+
+## What is a Retraction?
+
+A **retraction** removes a triple from the current state:
+- The triple existed at some point (was asserted)
+- The retraction marks it as no longer true
+- Historical queries can still see the triple
+- Current queries don't see the triple
+
+## Basic Retraction
+
+Remove a specific triple:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "where": [
+    { "@id": "ex:alice", "schema:age": "?age" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:age": "?age" }
+  ]
+}
+```
+
+This removes the age property from ex:alice.
+
+## Retract Specific Property
+
+Remove a specific property value:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": {
+      "ex": "http://example.org/ns/",
+      "schema": "http://schema.org/"
+    },
+    "where": [
+      { "@id": "ex:alice", "schema:email": "alice.old@example.org" }
+    ],
+    "delete": [
+      { "@id": "ex:alice", "schema:email": "alice.old@example.org" }
+    ]
+  }'
+```
+
+## Retract All Values of a Property
+
+Remove all values for a property:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "schema:telephone": "?phone" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:telephone": "?phone" }
+  ]
+}
+```
+
+If ex:alice has multiple phone numbers, this removes them all.
+
+## Retract Multiple Properties
+
+Remove several properties at once:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "schema:email": "?email" },
+    { "@id": "ex:alice", "schema:telephone": "?phone" },
+    { "@id": "ex:alice", "ex:preferences": "?prefs" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:email": "?email" },
+    { "@id": "ex:alice", "schema:telephone": "?phone" },
+    { "@id": "ex:alice", "ex:preferences": "?prefs" }
+  ]
+}
+```
+
+## Retract Entire Entity
+
+Remove all triples for an entity:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "?predicate": "?value" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "?predicate": "?value" }
+  ]
+}
+```
+
+This finds all triples where ex:alice is the subject and retracts them all.
+
+**Result:** Entity is "deleted" from current state (but remains in history).
+
+## Conditional Retractions
+
+Retract only if conditions are met:
+
+```json
+{
+  "where": [
+    { "@id": "?user", "@type": "schema:Person" },
+    { "@id": "?user", "ex:lastLogin": "?lastLogin" },
+    { "@id": "?user", "ex:status": "?status" }
+  ],
+  "filter": "?lastLogin < '2023-01-01' && ?status == 'inactive'",
+  "delete": [
+    { "@id": "?user", "?predicate": "?value" }
+  ],
+  "where": [
+    { "@id": "?user", "?predicate": "?value" }
+  ]
+}
+```
+
+Removes all inactive users who haven't logged in since 2023.
+
+## Retract Relationships
+
+### Remove Single Relationship
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "schema:knows": "ex:bob" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:knows": "ex:bob" }
+  ]
+}
+```
+
+### Remove All Relationships of a Type
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "schema:knows": "?person" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:knows": "?person" }
+  ]
+}
+```
+
+### Bidirectional Relationship Removal
+
+Remove relationship in both directions:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "schema:knows": "ex:bob" },
+    { "@id": "ex:bob", "schema:knows": "ex:alice" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "schema:knows": "ex:bob" },
+    { "@id": "ex:bob", "schema:knows": "ex:alice" }
+  ]
+}
+```
+
+## Cascading Retractions
+
+Retract an entity and all related entities:
+
+```json
+{
+  "where": [
+    { "@id": "ex:order-123", "ex:items": "?item" },
+    { "@id": "?item", "?itemPred": "?itemVal" },
+    { "@id": "ex:order-123", "?orderPred": "?orderVal" }
+  ],
+  "delete": [
+    { "@id": "?item", "?itemPred": "?itemVal" },
+    { "@id": "ex:order-123", "?orderPred": "?orderVal" }
+  ]
+}
+```
+
+Deletes order and all its items.
+
+## Edge-Annotation Cascade
+
+When a transaction retracts a base edge that has annotations attached (see [Insert: Edge Annotations](insert.md#edge-annotations)), the transactor automatically retracts the link that attaches each annotation to that edge. Without this cascade, retracted edges would still surface their annotations through `@reifies` queries.
+
+**Base-edge retract** — fires on every annotated retract:
+
+- The attachment linking each currently-asserted annotation to the edge is retracted in the same transaction.
+- Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the attachment is gone.
+- Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches the property-graph relationship lifecycle.
+
+**The annotation form of a *delete* is a base-edge retract.** `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` — and the bare `~ :claim1` tail with no block — expand to include the base triple, because RDF 1.2 annotation syntax both reifies *and asserts* the triple it annotates. They therefore fire the cascade above against **every** claim on that edge, not only the one named, and a sibling claim is left with its body intact but nothing to attach to. An `upsert` that changes an annotated edge's object does the same thing, with no delete written at all. See [Which spelling does what](../concepts/edge-annotations.md#which-spelling-does-what) for the full table, including the two spellings that withdraw or detach a single claim.
+
+**Metadata-only retract** — fires when the user retracts every body fact of an annotation subject without touching the base edge:
+
+- The attachment is also retracted, so the annotation is fully disposed of and inline `@annotation` queries no longer surface it.
+- Same-transaction replacements (delete one body fact, insert another on the same annotation in a single update) keep the attachment — the post-transaction metadata set is non-empty, so the cascade reads "the user is updating, not removing."
+- Partial retracts (some body facts gone, others still asserted) keep the attachment — the annotation is still meaningful.
+
+The cascade is graph-aware: named-graph annotations are retracted in the same named graph as the edge they reify, never by mismatched-graph retracts.
+
+Manage annotation lifecycle through `@annotation` and the cascade above — the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations can't be written by hand on any surface.
+
+## Soft Delete vs Hard Retraction
+
+### Soft Delete (Recommended)
+
+Mark as deleted without retracting:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "ex:status": "?status" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "ex:status": "?status" }
+  ],
+  "insert": [
+    { "@id": "ex:alice", "ex:status": "deleted" },
+    { "@id": "ex:alice", "ex:deletedAt": "2024-01-22T10:30:00Z" }
+  ]
+}
+```
+
+**Benefits:**
+- Easy to "undelete"
+- Audit trail of deletion
+- Can query deleted entities
+- Less impact on indexes
+
+### Hard Retraction
+
+Retract all data:
+
+```json
+{
+  "where": [
+    { "@id": "ex:alice", "?predicate": "?value" }
+  ],
+  "delete": [
+    { "@id": "ex:alice", "?predicate": "?value" }
+  ]
+}
+```
+
+**When to use:**
+- Legal requirement to remove data
+- Sensitive data that must be removed
+- Test data cleanup
+
+**Note:** Data still exists in history. For true deletion, see data purging operations.
+
+## Pattern-Based Retractions
+
+### Retract by Type
+
+Remove all entities of a type:
+
+```json
+{
+  "where": [
+    { "@id": "?entity", "@type": "ex:TempData" },
+    { "@id": "?entity", "?predicate": "?value" }
+  ],
+  "delete": [
+    { "@id": "?entity", "?predicate": "?value" }
+  ]
+}
+```
+
+### Retract by Property Value
+
+Remove entities with specific property:
+
+```json
+{
+  "where": [
+    { "@id": "?entity", "ex:expired": true },
+    { "@id": "?entity", "?predicate": "?value" }
+  ],
+  "delete": [
+    { "@id": "?entity", "?predicate": "?value" }
+  ]
+}
+```
+
+## Retraction Semantics
+
+### Idempotent
+
+Retracting a triple that is not stored is a no-op, and a transaction that
+retracts nothing else commits nothing:
+
+```text
+t=1: No triple exists
+t=2: DELETE DATA { ex:alice schema:age 30 }
+     Result: nothing is committed; the ledger stays at t=1
+```
+
+The same holds in a named graph the ledger does not have: a DELETE that
+names one (`DELETE DATA { GRAPH <g> { … } }`, `WITH <g>`, a `GRAPH ?g` bound
+to it) retracts nothing there and does not create the graph. An INSERT into
+a new graph, a sync, or `CREATE GRAPH` creates it.
+
+A DELETE names RDF terms exactly. The datatype must match the stored one
+(`30` is `xsd:integer`, so it does not retract `"30"^^xsd:int`); a language
+tag matches case-insensitively (`"a"@EN` retracts a stored `"a"@en`). A
+`DELETE`/`INSERT` of a triple that is not stored therefore inserts it — the
+retraction names nothing, so it cannot cancel the insertion (SPARQL 1.1
+Update's `(DS − D) ∪ I`):
+
+```sparql
+DELETE { ex:alice schema:age 30 } INSERT { ex:alice schema:age 30 } WHERE {}
+```
+
+stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
+was present.
+
+The same holds when the `WHERE` has several solutions and the templates are
+instantiated once for each: a triple that any solution inserts is kept,
+however many solutions delete it, and a stored triple that solutions both
+delete and insert is not committed at all.
+
+An integer too large for 64 bits is matched by its value, not by the XSD
+subtype it was written with, since the index keeps no such subtype. A DELETE
+naming the same big integer under another integer datatype retracts it,
+whether it is indexed yet or not. Storage holds such an integer as one
+fact per value, so when a transaction retracts one and
+inserts the same value, the two cancel whatever subtype the insert names:
+`DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
+that is present, and neither does a write that retracts it and inserts it
+under another subtype.
+
+### Lists
+
+A delete reaches a list's members as values of the property that holds the
+list. Deleting a value deletes every entry of a list that holds it, and the
+value where it is also stored beside the list. With
+`{"@id": "ex:s", "ex:items": {"@list": [1, 2, 1, 3]}}` stored, this leaves
+`ex:items` as the list `(2 3)`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": 1 }
+}
+```
+
+To remove one entry of a list that repeats a value, or to replace a list,
+upsert the list. SPARQL deletes behave the same way: see
+[Writing lists](../query/sparql.md#writing-lists).
+
+### No Cascading by Default
+
+Retracting an entity doesn't automatically retract references to it:
+
+```text
+t=1: ex:alice schema:worksFor ex:company-a
+     ex:company-a schema:name "Acme"
+
+t=2: DELETE all triples for ex:company-a
+
+Result:
+- ex:company-a properties are gone
+- ex:alice schema:worksFor ex:company-a REMAINS
+- Reference is now "dangling"
+```
+
+To cascade, explicitly match and delete references.
+
+## Time Travel and Retractions
+
+### Historical Queries See Retracted Data
+
+```bash
+# Current query (after retraction at t=5)
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -d '{"from": "mydb:main", "select": ["?name"], ...}'
+# Returns: [] (no results)
+
+# Historical query (before retraction)
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -d '{"from": "mydb:main@t:3", "select": ["?name"], ...}'
+# Returns: [{"name": "Alice"}] (data visible)
+```
+
+### History Shows Retractions
+
+Query the history to see both assertions and retractions:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query \
+  -d '{
+    "@context": { "schema": "http://schema.org/" },
+    "from": "mydb:main@t:1",
+    "to": "mydb:main@t:latest",
+    "select": ["?name", "?t", "?op"],
+    "where": [
+      { "@id": "ex:alice", "schema:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }
+    ],
+    "orderBy": "?t"
+  }'
+```
+
+Response:
+```json
+[
+  ["Alice", 1, true],
+  ["Alice", 5, false]
+]
+```
+
+The `@t` annotation captures the transaction time and `@op` binds a boolean — `true` for assertions, `false` for retractions (mirroring `Flake.op` on disk).
+
+## Error Handling
+
+### Common Errors
+
+**No Match (Not an Error):**
+```json
+{
+  "where": [{ "@id": "ex:nonexistent", "schema:name": "?name" }],
+  "delete": [{ "@id": "ex:nonexistent", "schema:name": "?name" }]
+}
+```
+Result: No changes, no error.
+
+**Invalid Pattern:**
+```json
+{
+  "error": "QueryError",
+  "message": "Invalid WHERE pattern",
+  "code": "INVALID_PATTERN"
+}
+```
+
+## Performance Considerations
+
+### Index Updates
+
+Retractions update all indexes:
+- Each retracted triple updates SPOT, POST, OPST, PSOT
+- Large retractions can impact performance
+- Consider batch size for bulk deletions
+
+### Indexing Lag
+
+Large retractions may increase indexing lag:
+- Monitor `commit_t - index_t`
+- Allow time for indexing between large retractions
+- Consider scheduling during low-traffic periods
+
+### Vacuum/Compaction
+
+Eventually, consider compaction to reclaim space from retracted data (implementation-specific).
+
+## Best Practices
+
+### 1. Use Soft Deletes
+
+Prefer marking as deleted:
+
+Good:
+```json
+{
+  "insert": [{ "@id": "ex:alice", "ex:status": "deleted" }]
+}
+```
+
+Over:
+```json
+{
+  "delete": [{ "@id": "ex:alice", "?pred": "?val" }]
+}
+```
+
+### 2. Add Audit Metadata
+
+Include deletion metadata:
+
+```json
+{
+  "insert": [
+    { "@id": "ex:alice", "ex:status": "deleted" },
+    { "@id": "ex:alice", "ex:deletedAt": "2024-01-22T10:30:00Z" },
+    { "@id": "ex:alice", "ex:deletedBy": "user-admin" },
+    { "@id": "ex:alice", "ex:deleteReason": "User request" }
+  ]
+}
+```
+
+### 3. Be Specific in WHERE
+
+Avoid accidentally retracting too much:
+
+Good:
+```json
+{
+  "where": [{ "@id": "ex:alice", "schema:age": "?age" }],
+  "delete": [{ "@id": "ex:alice", "schema:age": "?age" }]
+}
+```
+
+Dangerous:
+```json
+{
+  "where": [{ "@id": "?entity", "schema:age": "?age" }],
+  "delete": [{ "@id": "?entity", "?pred": "?val" }]
+}
+```
+
+### 4. Test Retractions
+
+Test on development data:
+
+```javascript
+// Count before
+const countBefore = await query('SELECT (COUNT(?e) as ?count) WHERE { ... }');
+
+// Retract
+await transact(retractionQuery);
+
+// Count after
+const countAfter = await query('SELECT (COUNT(?e) as ?count) WHERE { ... }');
+
+console.log(`Retracted ${countBefore - countAfter} entities`);
+```
+
+### 5. Handle Cascading Explicitly
+
+Don't rely on cascading—make it explicit:
+
+```json
+{
+  "where": [
+    { "@id": "ex:order-123", "?pred": "?val" },
+    { "@id": "?item", "ex:orderId": "ex:order-123" },
+    { "@id": "?item", "?itemPred": "?itemVal" }
+  ],
+  "delete": [
+    { "@id": "ex:order-123", "?pred": "?val" },
+    { "@id": "?item", "?itemPred": "?itemVal" }
+  ]
+}
+```
+
+### 6. Document Deletion Logic
+
+Comment deletion logic:
+
+```javascript
+// Hard delete expired sessions older than 30 days
+// - Finds all sessions with expired=true and oldDate
+// - Retracts all properties
+// - Logs count of deleted sessions
+await retractExpiredSessions();
+```
+
+### 7. Monitor Impact
+
+Track retraction metrics:
+- Count of retractions
+- Entities affected
+- Indexing lag after large retractions
+- Query performance impact
+
+## Data Privacy Compliance
+
+### GDPR "Right to be Forgotten"
+
+For compliance, consider:
+
+1. **Soft delete first** (marks as deleted)
+2. **Schedule purge** (actual removal from history)
+3. **Anonymize references** (replace with pseudonymous ID)
+
+Example:
+```json
+{
+  "where": [{ "@id": "ex:user-123", "?pred": "?val" }],
+  "delete": [{ "@id": "ex:user-123", "?pred": "?val" }],
+  "insert": [{
+    "@id": "ex:user-123",
+    "ex:anonymized": true,
+    "ex:anonymizedAt": "2024-01-22T10:30:00Z"
+  }]
+}
+```
+
+Note: True purging from history requires administrative operations beyond standard retractions.
+
+## Related Documentation
+
+- [Insert](insert.md) - Adding data
+- [Update](update-where-delete-insert.md) - Updating data
+- [Time Travel](../concepts/time-travel.md) - Historical queries
+- [History Queries](../query/jsonld-query.md) - Viewing changes over time

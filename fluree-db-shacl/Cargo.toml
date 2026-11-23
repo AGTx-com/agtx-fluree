@@ -1,0 +1,26 @@
+[package]
+name = "fluree-db-shacl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SHACL validation engine for Fluree DB"
+
+[dependencies]
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-query = { path = "../fluree-db-query" }
+fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-vocab = { path = "../fluree-vocab" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+# Builds an `R2rmlError` for the classifier's table test; already in the graph
+# through fluree-db-query.
+fluree-db-r2rml = { path = "../fluree-db-r2rml" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

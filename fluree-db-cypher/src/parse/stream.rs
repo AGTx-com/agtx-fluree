@@ -1,0 +1,210 @@
+//! Token stream wrapper with peek/eat/expect helpers.
+
+use crate::diag::{DiagCode, Diagnostic, Severity};
+use crate::lex::{Token, TokenKind};
+use crate::span::SourceSpan;
+
+/// Maximum parser recursion depth. The recursive-descent parser (and the
+/// AST walkers that later recurse over its output) descend one frame per level
+/// of expression/statement nesting; without a bound, hostile input such as
+/// `RETURN ((((…50k…))))` overflows the thread stack, which aborts the whole
+/// process (a Rust stack overflow is not catchable). Capping the AST depth here
+/// also bounds the depth of every downstream walker (lowering, param
+/// substitution). 256 is far beyond any real query yet leaves ample stack
+/// headroom even with the ~12-frame precedence chain per level.
+///
+/// This counter is not directly comparable to the 128 used by the SPARQL,
+/// JSON-LD, and Turtle front-ends: the constants differ but the effective
+/// user-visible ceilings agree. One level of expression nesting routes through
+/// two unconditional guards here — `parse_or` and `parse_not` both call
+/// `enter_recursion` on every level (`parse_not` guards before it even checks
+/// for a `NOT` token) — so the counter ticks ~twice per user-visible level, and
+/// 256 counter-units ≈ 128 nesting levels. SPARQL, by contrast, increments once
+/// per level (a bare parenthesis skips its unary guard), so its 128 is also
+/// ~128 levels. The bound is a per-parser stack-safety limit sized to each
+/// parser's own guard cadence; align the raw numbers only by first equalizing
+/// that cadence, or the user-facing limits will diverge.
+const MAX_PARSE_DEPTH: u32 = 256;
+
+pub struct TokenStream {
+    tokens: Vec<Token>,
+    /// Original statement text, for recovering the as-written form of
+    /// keyword tokens in identifier position (`{end: 1}`, `YIELD count`) —
+    /// a token's `Display` is its canonical uppercase keyword, not what the
+    /// user typed.
+    src: String,
+    pos: usize,
+    depth: u32,
+}
+
+/// A backtrack point: token position plus recursion depth, captured by
+/// [`TokenStream::mark`] and restored by [`TokenStream::reset`].
+#[derive(Clone, Copy)]
+pub struct Mark {
+    pos: usize,
+    depth: u32,
+}
+
+impl TokenStream {
+    pub fn new(tokens: Vec<Token>, src: impl Into<String>) -> Self {
+        Self {
+            tokens,
+            src: src.into(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// The original source text under `span`, when the span is a valid slice.
+    pub fn source_slice(&self, span: SourceSpan) -> Option<&str> {
+        self.src.get(span.start..span.end)
+    }
+
+    /// If the current token can stand in as an identifier — a real `Ident` or a
+    /// keyword used in name position — return its **as-written** text (the
+    /// source slice, so `end` is not canonicalized to `END`). Returns `None`
+    /// for punctuation, literals, and EOF. Does not advance.
+    ///
+    /// Keyword tokens all `Display` as their all-alphabetic uppercase form; no
+    /// literal or punctuation token does, so that shape is a sound classifier.
+    pub fn peek_ident_text(&self) -> Option<String> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => Some(name.clone()),
+            other => {
+                let display = format!("{other}");
+                if !display.is_empty()
+                    && display.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+                {
+                    Some(
+                        self.source_slice(self.peek_span())
+                            .map(str::to_string)
+                            .unwrap_or(display),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Enter one level of recursion, erroring (rather than overflowing the
+    /// stack) past [`MAX_PARSE_DEPTH`]. Every successful `enter_recursion` MUST
+    /// be paired with a [`Self::leave_recursion`] on the success path; the
+    /// counter is incremented only when the limit is not exceeded, so an error
+    /// return (which aborts the whole parse) need not unwind it.
+    pub fn enter_recursion(&mut self) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.error(
+                DiagCode::NestingTooDeep,
+                format!("query nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Leave one level of recursion. Pairs with [`Self::enter_recursion`].
+    pub fn leave_recursion(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    pub fn peek(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+
+    /// Snapshot the current position AND recursion depth for speculative
+    /// parsing. Both must be restored together on backtrack: a speculative parse
+    /// that calls `enter_recursion` and then fails via `?` returns before its
+    /// paired `leave_recursion`, leaking depth. Capturing depth here and rewinding
+    /// it in [`Self::reset`] keeps the swallowed-error path from spuriously
+    /// tripping the [`MAX_PARSE_DEPTH`] guard.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            pos: self.pos,
+            depth: self.depth,
+        }
+    }
+
+    /// Restore a position and depth captured by [`Self::mark`] (backtracking).
+    pub fn reset(&mut self, mark: Mark) {
+        self.pos = mark.pos;
+        self.depth = mark.depth;
+    }
+
+    pub fn peek_kind(&self) -> &TokenKind {
+        &self.tokens[self.pos].kind
+    }
+
+    pub fn peek_at(&self, offset: usize) -> &TokenKind {
+        let idx = self.pos + offset;
+        if idx < self.tokens.len() {
+            &self.tokens[idx].kind
+        } else {
+            &self.tokens[self.tokens.len() - 1].kind
+        }
+    }
+
+    pub fn peek_span(&self) -> SourceSpan {
+        self.tokens[self.pos].span
+    }
+
+    pub fn is_eof(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Eof)
+    }
+
+    pub fn advance(&mut self) -> Token {
+        let tok = self.tokens[self.pos].clone();
+        if self.pos < self.tokens.len() - 1 {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    /// If the current token's kind matches `expected` (by discriminant),
+    /// consume and return its span. Otherwise return None.
+    pub fn eat(&mut self, expected: &TokenKind) -> Option<SourceSpan> {
+        if std::mem::discriminant(self.peek_kind()) == std::mem::discriminant(expected) {
+            let span = self.peek_span();
+            self.advance();
+            Some(span)
+        } else {
+            None
+        }
+    }
+
+    pub fn expect(&mut self, expected: &TokenKind) -> Result<SourceSpan, Diagnostic> {
+        if let Some(s) = self.eat(expected) {
+            Ok(s)
+        } else {
+            Err(self.error(
+                DiagCode::UnexpectedToken,
+                format!("expected `{}` but got `{}`", expected, self.peek_kind()),
+            ))
+        }
+    }
+
+    pub fn error(&self, code: DiagCode, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            code,
+            severity: Severity::Error,
+            message: message.into(),
+            span: self.peek_span(),
+            help: None,
+        }
+    }
+
+    pub fn error_at(
+        &self,
+        code: DiagCode,
+        message: impl Into<String>,
+        span: SourceSpan,
+    ) -> Diagnostic {
+        Diagnostic {
+            code,
+            severity: Severity::Error,
+            message: message.into(),
+            span,
+            help: None,
+        }
+    }
+}

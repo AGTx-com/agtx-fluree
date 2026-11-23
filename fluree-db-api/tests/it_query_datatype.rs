@@ -1,0 +1,2011 @@
+//! Datatype-focused query integration tests
+//!
+//! Always uses explicit `@context` and JSON inputs.
+//!
+//! NOTE:
+//! - @json datatype is supported (insert + query + datatype() binding + filter).
+//! - Binding @type to a variable inside a value-object is supported.
+//! - Transaction @t bindings are supported.
+//! - Numeric datatype normalization (xsd:int family -> xsd:integer) is an intentional divergence.
+
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
+use fluree_db_api::{FlureeBuilder, QueryInput};
+use serde_json::{json, Value as JsonValue};
+
+fn ctx_datatype() -> JsonValue {
+    json!({
+        "schema": "http://schema.org/",
+        "ex": "http://example.org/ns/",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    })
+}
+
+async fn seed_people_for_datatype(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id":"ex:homer","ex:name":"Homer","ex:age":36},
+            {"@id":"ex:marge","ex:name":"Marge","ex:age":{"@value":36,"@type":"xsd:int"}},
+            {"@id":"ex:bart","ex:name":"Bart","ex:age":"forever 10"}
+        ]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger
+}
+
+#[tokio::test]
+async fn mixed_datatypes_query_matches_only_requested_type() {
+    // Scenario: mixed-datatypes-test (adapted to analytical select; avoids subject crawl)
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "ledger/datatype:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id":"ex:coco","@type":"schema:Person","schema:name":"Coco"},
+            {"@id":"ex:halie","@type":"schema:Person","schema:name":"Halie"},
+            {"@id":"ex:john","@type":"schema:Person","schema:name":3}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q1 = json!({
+        "@context": ctx,
+        "select": ["?u","?name"],
+        "where": [{"@id":"?u","schema:name":"Halie"},{"@id":"?u","schema:name":"?name"}]
+    });
+    let r1 = support::query_jsonld(&fluree, &ledger, &q1)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(r1, json!([["ex:halie", "Halie"]]));
+
+    let q2 = json!({
+        "@context": ctx,
+        "select": ["?u"],
+        "where": {"@id":"?u","schema:name":"a"}
+    });
+    let r2 = support::query_jsonld(&fluree, &ledger, &q2)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(r2, json!([]));
+
+    let q3 = json!({
+        "@context": ctx,
+        "select": ["?u","?name"],
+        "where": [{"@id":"?u","schema:name":3},{"@id":"?u","schema:name":"?name"}]
+    });
+    let r3 = support::query_jsonld(&fluree, &ledger, &q3)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(r3, json!([["ex:john", 3]]));
+}
+
+#[tokio::test]
+async fn datatype_query_explicit_typed_value_object_matches() {
+    // Scenario: datatype-test / "specifying an explicit data type (compatible)"
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": "?name",
+        "where": {"ex:name":"?name","ex:age":{"@value":36,"@type":"xsd:integer"}}
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    // A typed constant matches its own datatype only: Homer's untyped 36 is
+    // `xsd:integer`; Marge's 36 is `xsd:int`, a different term (#1737).
+    assert_eq!(normalize_rows(&rows), normalize_rows(&json!(["Homer"])));
+}
+
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn custom_datatype_equality_matches_indexed_and_novelty_rows_after_reindex() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "people:custom-datatype-overlay";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx = ctx_datatype();
+
+    let base_insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:s1",
+                "ex:label": {"@value": "Abcdefg", "@type": "ex:mystring"}
+            }
+        ]
+    });
+    let _ledger1 = fluree
+        .insert(ledger0, &base_insert)
+        .await
+        .expect("insert base custom datatype")
+        .ledger;
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed ledger");
+    assert!(
+        indexed.snapshot.range_provider.is_some(),
+        "expected binary range provider after reindex"
+    );
+
+    let novelty_insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:s2",
+                "ex:label": {"@value": "Abcdefg", "@type": "ex:mystring"}
+            }
+        ]
+    });
+    let ledger2 = fluree
+        .insert_with_opts(
+            indexed,
+            &novelty_insert,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .expect("insert novelty custom datatype")
+        .ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": "?s",
+        "where": {
+            "@id": "?s",
+            "ex:label": {"@value": "Abcdefg", "@type": "ex:mystring"}
+        }
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger2, &q)
+        .await
+        .expect("query custom datatype equality")
+        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .await
+        .expect("format custom datatype equality");
+
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!(["ex:s1", "ex:s2"])),
+        "custom typed-string equality should match both indexed and novelty rows"
+    );
+}
+
+#[tokio::test]
+async fn datatype_bind_datatype_function_includes_dt_in_results() {
+    // Scenario: datatype-test / datatype() bound to variable and returned
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name","?age","?dt"],
+        "where": [
+            {"ex:name":"?name","ex:age":"?age"},
+            ["bind","?dt",["expr",["datatype","?age"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    // Marge's age was inserted with xsd:int - preserved for data fidelity
+    // Non-default datatypes are wrapped in value objects per JSON-LD spec
+    // Homer's age was inserted as untyped integer → stored as xsd:integer (default, no wrapper)
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([
+            ["Bart","forever 10","xsd:string"],
+            ["Homer",36,"xsd:integer"],
+            ["Marge",{"@value":36,"@type":"xsd:int"},"xsd:int"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn datatype_filter_with_datatype_function() {
+    // Scenario: datatype-test / filtered with the datatype function
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name","?age","?dt"],
+        "where": [
+            {"ex:name":"?name","ex:age":"?age"},
+            ["bind","?dt",["expr",["datatype","?age"]]],
+            // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so the
+            // filter compares against the xsd:integer IRI, not a compact string.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/2001/XMLSchema#integer\"))"]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["Homer", 36, "xsd:integer"]]));
+}
+
+/// Regression: `FILTER(DATATYPE(?v) = xsd:decimal)` in SPARQL must match
+/// decimal-typed literals. SPARQL 1.1 §17.4.2.3 requires DATATYPE to return the
+/// datatype *IRI*, so the comparison is IRI-vs-IRI. Previously DATATYPE returned
+/// a compact string (`"xsd:decimal"`) and this filter matched nothing.
+#[tokio::test]
+async fn datatype_function_compares_against_xsd_iri_in_sparql() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "dt-iri:main");
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx_datatype(),
+                "@graph": [
+                    {"@id":"ex:a","ex:price":{"@value":"1.50","@type":"xsd:decimal"}},
+                    {"@id":"ex:b","ex:price":{"@value":"2.75","@type":"xsd:decimal"}},
+                    {"@id":"ex:c","ex:price":{"@value":42,"@type":"xsd:integer"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let db = fluree.db("dt-iri:main").await.expect("indexed view");
+    let q = "PREFIX ex: <http://example.org/ns/>\n\
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+             SELECT ?s WHERE { ?s ex:price ?v FILTER(DATATYPE(?v) = xsd:decimal) } ORDER BY ?s";
+    let rows = fluree
+        .query(&db, QueryInput::Sparql(q))
+        .await
+        .expect("sparql query")
+        .to_jsonld(&db.snapshot)
+        .expect("to_jsonld");
+    // Only the two xsd:decimal subjects match; the xsd:integer one does not.
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
+    );
+}
+
+#[tokio::test]
+async fn datatype_query_incompatible_type_returns_no_matches() {
+    // Incompatible @value/@type should throw a type coercion error.
+    // e.g., {"@value": 36, "@type": "xsd:string"} - number cannot be coerced to string.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name"],
+        "where": {"ex:name":"?name","ex:age":{"@value":36,"@type":"xsd:string"}}
+    });
+
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("TypeCoercion") || msg.contains("coerce"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn datatype_filter_value_object_by_type_constant() {
+    // Scenario: datatype-test / "filtered in value maps (explicit type IRIs)"
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name","?age"],
+        "where": {"ex:name":"?name","ex:age":{"@value":"?age","@type":"xsd:string"}}
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["Bart", "forever 10"]]));
+}
+
+#[tokio::test]
+async fn language_binding_lang_function() {
+    // Scenario: language-binding-test / LANG(?val)
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "lang-test:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id":"ex:greeting","ex:hello":{"@value":"Hello","@language":"en"}},
+            {"@id":"ex:salutation","ex:hello":{"@value":"Bonjour","@language":"fr"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id","?val","?lang"],
+        "where": [
+            {"@id":"?id","ex:hello":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let set: std::collections::HashSet<Vec<JsonValue>> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap().clone())
+        .collect();
+    // Note: JSON-LD formatter represents language-tagged strings as value objects.
+    assert_eq!(
+        set,
+        std::collections::HashSet::from([
+            vec![
+                json!("ex:greeting"),
+                json!({"@value":"Hello","@language":"en"}),
+                json!("en")
+            ],
+            vec![
+                json!("ex:salutation"),
+                json!({"@value":"Bonjour","@language":"fr"}),
+                json!("fr")
+            ]
+        ])
+    );
+}
+
+#[tokio::test]
+async fn language_binding_value_object_language_variable() {
+    // Test binding @language to a variable: {"@value": "?val", "@language": "?lang"}
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "lang-test:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id":"ex:greeting","ex:hello":{"@value":"Hello","@language":"en"}},
+            {"@id":"ex:salutation","ex:hello":{"@value":"Bonjour","@language":"fr"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id","?val","?lang"],
+        "where": [{"@id":"?id","ex:hello":{"@value":"?val","@language":"?lang"}}]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let set: std::collections::HashSet<Vec<JsonValue>> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap().clone())
+        .collect();
+    // Note: JSON-LD formatter represents language-tagged strings as value objects.
+    assert_eq!(
+        set,
+        std::collections::HashSet::from([
+            vec![
+                json!("ex:greeting"),
+                json!({"@value":"Hello","@language":"en"}),
+                json!("en")
+            ],
+            vec![
+                json!("ex:salutation"),
+                json!({"@value":"Bonjour","@language":"fr"}),
+                json!("fr")
+            ]
+        ])
+    );
+}
+
+/// Issue #1273: a subject with several language-tagged values where two
+/// variants share the same `@value` but differ in `@language` ("animal"@en vs
+/// "animal"@fr) must keep all variants. Exercises the genesis / overlay-only
+/// read path (`range::remove_stale_flakes`), whose fact key must include the
+/// language tag.
+#[tokio::test]
+async fn langstring_same_value_different_tags_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "langbug:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@id": "ex:animal", "@type": "ex:Concept",
+        "ex:prefLabel": [
+            {"@language":"en","@value":"animal"},
+            {"@language":"es","@value":"animales"},
+            {"@language":"fr","@value":"animal"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from(["en".to_string(), "es".to_string(), "fr".to_string()]),
+        "expected en/es/fr to all survive, got {langs:?}"
+    );
+}
+
+/// Issue #1273, indexed variant: the same scenario but with the langStrings
+/// landing in novelty *over a persisted binary index* whose language dict does
+/// not yet contain the new tags. Exercises the binary-overlay encode path
+/// (`value_to_otype_okey`), which must not collapse novelty-only tags to a
+/// single fallback lang_id.
+#[tokio::test]
+async fn langstring_same_value_different_tags_indexed_overlay() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "langbug:indexed";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx = ctx_datatype();
+
+    // Base insert with an indexed langString (populates persisted lang dict with "de").
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:base", "ex:prefLabel": {"@language":"de","@value":"Tier"}
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+    assert!(indexed.snapshot.range_provider.is_some());
+
+    // Novelty insert mixing a PERSISTED tag ("de", already indexed → encoded
+    // overlay path) with BRAND-NEW tags (en/fr/es not yet in persisted dict →
+    // raw-flake path) on the same subject/predicate, stressing the merge of
+    // encoded ops and raw flakes. en and fr share the value "animal".
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"de","@value":"Tier"},
+            {"@language":"en","@value":"animal"},
+            {"@language":"es","@value":"animales"},
+            {"@language":"fr","@value":"animal"}
+        ]
+    });
+    let ledger2 = fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger2, &q)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from([
+            "de".to_string(),
+            "en".to_string(),
+            "es".to_string(),
+            "fr".to_string()
+        ]),
+        "indexed-overlay: expected de/en/es/fr to all survive, got {langs:?}"
+    );
+}
+
+/// Issue #1273, export variant: a langString that lives in novelty over an
+/// indexed ledger (its BCP-47 tag not yet persisted) is encoded via the
+/// raw-flake path; the RDF export must still emit it (and its language tag),
+/// not silently drop it.
+#[tokio::test]
+async fn langstring_novelty_only_tag_exported() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    // File-backed (production-like: leaflet cache loads full column projection,
+    // matching how export runs in deployment).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "langbug/export:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let ctx = ctx_datatype();
+
+    // Index a plain-string base so the ledger is indexed (export requires it).
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:base", "ex:name": "Base"
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty langStrings with brand-new tags fr/es (share value "animal").
+    // Neither tag is in the persisted lang dict, so both route through the
+    // raw-flake overlay path.
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"fr","@value":"animal"},
+            {"@language":"es","@value":"animal"}
+        ]
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    // N-Triples / Turtle: language tag in `"value"@lang` syntax.
+    for fmt in [ExportFormat::NTriples, ExportFormat::Turtle] {
+        let mut buf: Vec<u8> = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(fmt)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {fmt:?} failed: {e}"));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"animal\"@fr"),
+            "{fmt:?} export must contain @fr langString; got:\n{out}"
+        );
+        assert!(
+            out.contains("\"animal\"@es"),
+            "{fmt:?} export must contain @es langString; got:\n{out}"
+        );
+    }
+
+    // JSON-LD: language tag in a value object.
+    let mut buf: Vec<u8> = Vec::new();
+    fluree
+        .export(ledger_id)
+        .format(ExportFormat::JsonLd)
+        .write_to(&mut buf)
+        .await
+        .expect("export jsonld");
+    let out = String::from_utf8(buf).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&out).expect("valid JSON-LD");
+    let blob = parsed.to_string();
+    assert!(
+        blob.contains("\"@language\":\"fr\"") && blob.contains("\"@language\":\"es\""),
+        "JSON-LD export must contain @fr and @es language tags; got:\n{out}"
+    );
+}
+
+/// Guards the export path against the namespace edge raised in review: when
+/// novelty introduces a BRAND-NEW namespace (never persisted at index time),
+/// export must still resolve its subject/predicate IRIs. This works because
+/// `fluree.ledger()` loads a store synced with the snapshot's commit-chain
+/// namespaces (`sync_store_and_snapshot_ns`) before export — covering both the
+/// encoded cursor path (integer) and the raw-flake path (novelty-only langString).
+#[tokio::test]
+async fn langstring_brand_new_namespace_exported() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "langbug/newns:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    // Index a base under the `ex:` namespace only.
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:base", "ex:name": "Base"
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty under a BRAND-NEW namespace `zz:` covering both export paths:
+    // a novelty-only langString (raw path) and a plain integer (encoded path).
+    let novelty = json!({
+        "@context": {"zz": "http://zz.example/ns/"},
+        "@id": "zz:thing",
+        "zz:label": {"@language":"qq","@value":"hello"},
+        "zz:count": 5
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    fluree
+        .export(ledger_id)
+        .format(ExportFormat::NTriples)
+        .write_to(&mut buf)
+        .await
+        .expect("export ntriples");
+    let out = String::from_utf8(buf).unwrap();
+    // Raw path (langString) and encoded path (integer) under the new namespace.
+    assert!(
+        out.contains("\"hello\"@qq"),
+        "export must contain the brand-new-namespace langString (raw path); got:\n{out}"
+    );
+    assert!(
+        out.contains("zz.example/ns/count"),
+        "export must contain the brand-new-namespace integer (encoded path); got:\n{out}"
+    );
+}
+
+/// Issue #1445: RDF export must emit `xsd:double` values in the W3C canonical
+/// lexical form (`1.0E6`), not Rust `{:E}` form (`1E6`, missing the mantissa
+/// dot). Covers both export lanes: the indexed/encoded path (pre-reindex
+/// insert) and the novelty raw-flake path (post-reindex insert).
+#[tokio::test]
+async fn double_export_uses_canonical_lexical_form() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "doublecanon/export:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let ctx = ctx_datatype();
+
+    // Indexed double (encoded path after reindex).
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:indexed",
+        "ex:score": {"@type": "xsd:double", "@value": 1_000_000.0}
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty double (raw-flake path over the indexed base).
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:novel",
+        "ex:score": {"@type": "xsd:double", "@value": 0.001}
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    for fmt in [ExportFormat::NTriples, ExportFormat::Turtle] {
+        let mut buf: Vec<u8> = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(fmt)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {fmt:?} failed: {e}"));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"1.0E6\""),
+            "{fmt:?} export must render the indexed double canonically; got:\n{out}"
+        );
+        assert!(
+            out.contains("\"1.0E-3\""),
+            "{fmt:?} export must render the novelty double canonically; got:\n{out}"
+        );
+        assert!(
+            !out.contains("\"1E6\""),
+            "{fmt:?} export must not use the dotless {{:E}} form; got:\n{out}"
+        );
+    }
+}
+
+/// Issue #1273 follow-up: deleting one language variant must retract exactly
+/// that variant and leave the others — confirming the retraction flake carries
+/// the language tag in `m` and that `remove_stale_flakes`' `m`-aware fact key
+/// scopes cancellation per language tag.
+#[tokio::test]
+async fn langstring_delete_one_variant_keeps_others() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "langbug:delete");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"en","@value":"animal"},
+            {"@language":"fr","@value":"animal"},
+            {"@language":"es","@value":"animales"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Delete only the en variant (same value "animal" as fr).
+    let delete = json!({
+        "@context": ctx,
+        "delete": {"@id":"ex:animal","ex:prefLabel":{"@language":"en","@value":"animal"}},
+        "where": {"@id":"ex:animal","ex:prefLabel":{"@language":"en","@value":"animal"}}
+    });
+    let ledger = fluree.update(ledger, &delete).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from(["es".to_string(), "fr".to_string()]),
+        "deleting @en must leave @fr (same value) and @es, got {langs:?}"
+    );
+}
+
+#[tokio::test]
+async fn language_binding_rejects_type_and_language_conflict() {
+    // Per JSON-LD §9.5 / RDF 1.1, a value object cannot have both @type (non-langString)
+    // and @language. E.g. {"@value": "?val", "@type": "xsd:integer", "@language": "en"}
+    // must be rejected at parse time.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "lang-conflict:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id":"ex:greeting","ex:hello":{"@value":"Hello","@language":"en"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val"],
+        "where": [{"@id":"?id","ex:hello":{"@value":"?val","@type":"xsd:integer","@language":"en"}}]
+    });
+
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot have both @type and @language"),
+        "expected @type/@language conflict error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn json_datatype_insert_query_and_filter() {
+    // Test @json datatype: store arbitrary JSON, deserialize on query
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "json-test:main");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:doc1",
+                "ex:name": "Document 1",
+                "ex:data": {"@value": {"name": "John", "age": 30}, "@type": "@json"}
+            },
+            {
+                "@id": "ex:doc2",
+                "ex:name": "Document 2",
+                "ex:data": "plain string data"
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query with datatype() function to verify both records
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name", "?data", "?dt"],
+        "where": [
+            {"ex:name": "?name", "ex:data": "?data"},
+            ["bind", "?dt", ["expr", ["datatype", "?data"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let rows_arr = rows.as_array().unwrap();
+    assert_eq!(rows_arr.len(), 2, "should return both documents");
+
+    // Check that doc1 has @json datatype and deserialized JSON object
+    let doc1_row = rows_arr
+        .iter()
+        .find(|r| r.as_array().unwrap()[0] == "Document 1")
+        .expect("Document 1 should be in results");
+    let doc1_data = &doc1_row.as_array().unwrap()[1];
+    let doc1_dt = &doc1_row.as_array().unwrap()[2];
+    assert_eq!(
+        doc1_data,
+        &json!({"age": 30, "name": "John"}),
+        "should deserialize JSON object"
+    );
+    // @json can be represented as "@json" or the full IRI
+    let dt_str = doc1_dt.as_str().unwrap();
+    assert!(
+        dt_str == "@json" || dt_str.contains("JSON") || dt_str.contains("json"),
+        "should have @json datatype, got: {dt_str}"
+    );
+
+    // Check that doc2 has xsd:string datatype
+    let doc2_row = rows_arr
+        .iter()
+        .find(|r| r.as_array().unwrap()[0] == "Document 2")
+        .expect("Document 2 should be in results");
+    let doc2_data = &doc2_row.as_array().unwrap()[1];
+    let doc2_dt = &doc2_row.as_array().unwrap()[2];
+    assert_eq!(doc2_data, "plain string data");
+    let dt2_str = doc2_dt.as_str().unwrap();
+    assert!(
+        dt2_str == "xsd:string" || dt2_str.contains("string"),
+        "should have xsd:string datatype, got: {dt2_str}"
+    );
+
+    let q2 = json!({
+        "@context": ctx,
+        "select": ["?name", "?data"],
+        "where": [
+            {"ex:name": "?name", "ex:data": "?data"},
+            ["bind", "?dt", ["expr", ["datatype", "?data"]]],
+            // DATATYPE returns the datatype IRI; @json is rdf:JSON.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON\"))"]
+        ]
+    });
+    let rows2 = support::query_jsonld(&fluree, &ledger, &q2)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows2,
+        json!([["Document 1", {"age": 30, "name": "John"}]]),
+        "should return only document with @json datatype"
+    );
+}
+
+#[tokio::test]
+async fn value_type_binding_variable_in_value_object() {
+    // Test binding @type to a variable: {"@value": "?val", "@type": "?type"}
+    // This should work similarly to other language-tag tests
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
+    let ctx = ctx_datatype();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name","?age","?ageType"],
+        "where": [{"ex:name":"?name","ex:age":{"@value":"?age","@type":"?ageType"}}]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+
+    // Convert to set for order-insensitive comparison
+    let set: std::collections::HashSet<Vec<JsonValue>> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap().clone())
+        .collect();
+
+    // Marge's age was inserted with xsd:int - preserved for data fidelity
+    // Non-default datatypes are wrapped in value objects per JSON-LD spec
+    // Homer's age was inserted as untyped integer → stored as xsd:integer (default, no wrapper)
+    assert_eq!(
+        set,
+        std::collections::HashSet::from([
+            vec![json!("Bart"), json!("forever 10"), json!("xsd:string")],
+            vec![json!("Homer"), json!(36), json!("xsd:integer")],
+            vec![
+                json!("Marge"),
+                json!({"@value":36,"@type":"xsd:int"}),
+                json!("xsd:int")
+            ],
+        ])
+    );
+}
+
+#[tokio::test]
+async fn transaction_binding_at_t_variable() {
+    // Test @t binding: {"@value": "?val", "@t": "?txn"} binds the transaction time
+    // This is a Fluree-specific extension to JSON-LD query syntax.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "t-binding-test:main");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    // First transaction: insert initial data at t=1
+    let insert1 = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:alice", "ex:name": "Alice", "ex:age": 30}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert1).await.unwrap().ledger;
+
+    // Second transaction: add more data at t=2
+    let insert2 = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:age": 25}
+        ]
+    });
+    let ledger2 = fluree.insert(ledger1, &insert2).await.unwrap().ledger;
+
+    // Query with @t binding to get transaction times for each person's age
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name", "?age", "?txn"],
+        "where": [
+            {"@id": "?person", "ex:name": "?name"},
+            {"@id": "?person", "ex:age": {"@value": "?age", "@t": "?txn"}}
+        ],
+        "orderBy": "?name"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger2, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger2.snapshot)
+        .unwrap();
+    let arr = rows.as_array().expect("Should be an array");
+
+    assert_eq!(arr.len(), 2, "Should have two results (Alice and Bob)");
+
+    // Alice was inserted at t=1, Bob at t=2
+    // Note: t values are negative in Fluree's convention (more negative = earlier)
+    // t=1 is represented as -1, t=2 as -2, etc.
+    let alice_row = &arr[0];
+    let bob_row = &arr[1];
+
+    assert_eq!(alice_row[0], "Alice", "First row should be Alice");
+    assert_eq!(alice_row[1], 30, "Alice's age should be 30");
+    let alice_t = alice_row[2].as_i64().expect("Alice's txn should be i64");
+
+    assert_eq!(bob_row[0], "Bob", "Second row should be Bob");
+    assert_eq!(bob_row[1], 25, "Bob's age should be 25");
+    let bob_t = bob_row[2].as_i64().expect("Bob's txn should be i64");
+
+    // Verify they have different transaction times, and Alice's is "earlier"
+    assert_ne!(
+        alice_t, bob_t,
+        "Alice and Bob should have different transaction times"
+    );
+
+    // In Fluree Rust, t values are positive with t=1 being the genesis transaction.
+    // Alice (first insert after genesis) should have a smaller t than Bob (second insert)
+    assert!(
+        alice_t < bob_t,
+        "Alice's t should be less than Bob's t since she was inserted first. alice_t={alice_t}, bob_t={bob_t}"
+    );
+}
+
+// =============================================================================
+// xsd:decimal tests - comprehensive coverage
+// =============================================================================
+
+#[tokio::test]
+async fn decimal_string_input_becomes_bigdecimal_preserves_precision() {
+    // String input with xsd:decimal → BigDecimal with precision preserved
+    // This tests the datatype-aware deserialization from storage
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:precision");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    // Insert decimal values as strings with explicit xsd:decimal type
+    // These should be stored as BigDecimal and preserve full precision
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:item1",
+                "ex:price": {"@value": "123.456789012345678901234567890", "@type": "xsd:decimal"}
+            },
+            {
+                "@id": "ex:item2",
+                "ex:price": {"@value": "0.1", "@type": "xsd:decimal"}
+            },
+            {
+                "@id": "ex:item3",
+                "ex:price": {"@value": "999999999999999999999999999.999", "@type": "xsd:decimal"}
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query and verify precision is preserved
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id", "?price"],
+        "where": {"@id": "?id", "ex:price": "?price"},
+        "orderBy": "?id"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // String decimals should preserve precision exactly
+    // Note: JSON-LD serialization of BigDecimal should use string representation
+    assert_eq!(arr.len(), 3);
+
+    // Verify item1's high-precision decimal
+    let item1 = &arr[0];
+    assert_eq!(item1[0], "ex:item1");
+    // BigDecimal serializes as string to preserve precision
+    let price1 = &item1[1];
+    // Could be {"@value": "123.456...", "@type": "xsd:decimal"} or just the string
+    if let Some(s) = price1.as_str() {
+        assert!(
+            s.starts_with("123.45678901234567"),
+            "Should preserve precision: {s}"
+        );
+    } else if let Some(obj) = price1.as_object() {
+        let val = obj.get("@value").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            val.starts_with("123.45678901234567"),
+            "Should preserve precision: {val}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn decimal_json_number_input_is_exact() {
+    // JSON number input with xsd:decimal → exact BigDecimal. The written
+    // lexical is recovered via the shortest round-trip f64 representation,
+    // so 3.13 stores as the exact decimal 3.13, not the nearest binary
+    // double.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:json-number");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    // Insert decimal as JSON number (not string) with xsd:decimal type
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:item1",
+                "ex:value": {"@value": 3.13, "@type": "xsd:decimal"}
+            },
+            {
+                "@id": "ex:item2",
+                // Integer JSON number with xsd:decimal → exact decimal 42
+                "ex:value": {"@value": 42, "@type": "xsd:decimal"}
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id", "?value", "?dt"],
+        "where": [
+            {"@id": "?id", "ex:value": "?value"},
+            ["bind", "?dt", ["expr", ["datatype", "?value"]]]
+        ],
+        "orderBy": "?id"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // BigDecimal serializes via string to preserve precision; accept either
+    // the bare string or the {"@value": ...} object form.
+    fn decimal_lexical(v: &serde_json::Value) -> String {
+        if let Some(s) = v.as_str() {
+            s.to_string()
+        } else if let Some(obj) = v.as_object() {
+            obj.get("@value")
+                .and_then(|v| v.as_str())
+                .expect("@value string")
+                .to_string()
+        } else {
+            panic!("expected exact decimal rendering, got: {v}");
+        }
+    }
+
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0][0], "ex:item1");
+    assert_eq!(
+        decimal_lexical(&arr[0][1]),
+        "3.13",
+        "item1 value should be the exact decimal 3.13"
+    );
+
+    assert_eq!(arr[1][0], "ex:item2");
+    assert_eq!(
+        decimal_lexical(&arr[1][1]),
+        "42",
+        "item2 value should be the exact decimal 42"
+    );
+
+    // Verify explicit datatype xsd:decimal is preserved even when value is Double
+    let dt1 = arr[0][2].as_str().unwrap();
+    let dt2 = arr[1][2].as_str().unwrap();
+    assert!(
+        dt1.ends_with("#decimal") || dt1 == "xsd:decimal",
+        "3.13 should preserve xsd:decimal datatype, got: {dt1}"
+    );
+    assert!(
+        dt2.ends_with("#decimal") || dt2 == "xsd:decimal",
+        "42 should preserve xsd:decimal datatype, got: {dt2}"
+    );
+}
+
+#[tokio::test]
+async fn decimal_sort_order_with_mixed_numeric_types() {
+    // Test sort order works correctly across Long, Double, and BigDecimal
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:sort");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:a", "ex:score": 1},  // Long
+            {"@id": "ex:b", "ex:score": {"@value": "2.5", "@type": "xsd:decimal"}},  // BigDecimal
+            {"@id": "ex:c", "ex:score": 3.0},  // Double
+            {"@id": "ex:d", "ex:score": {"@value": "1.5", "@type": "xsd:decimal"}},  // BigDecimal
+            {"@id": "ex:e", "ex:score": 2}   // Long
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Order by score ascending - should work across types
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id", "?score"],
+        "where": {"@id": "?id", "ex:score": "?score"},
+        "orderBy": "?score"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // Expected order: 1, 1.5, 2, 2.5, 3.0
+    assert_eq!(arr.len(), 5);
+
+    // Collect actual order for debugging
+    let actual_ids: Vec<&str> = arr.iter().map(|r| r[0].as_str().unwrap()).collect();
+
+    assert_eq!(
+        actual_ids[0], "ex:a",
+        "First should be ex:a (score 1), got {actual_ids:?}"
+    );
+    assert_eq!(
+        actual_ids[1], "ex:d",
+        "Second should be ex:d (score 1.5), got {actual_ids:?}"
+    );
+    assert_eq!(
+        actual_ids[2], "ex:e",
+        "Third should be ex:e (score 2), got {actual_ids:?}"
+    );
+    assert_eq!(
+        actual_ids[3], "ex:b",
+        "Fourth should be ex:b (score 2.5), got {actual_ids:?}"
+    );
+    assert_eq!(
+        actual_ids[4], "ex:c",
+        "Fifth should be ex:c (score 3.0), got {actual_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn decimal_equality_across_types() {
+    // Test that querying for 3 (Long) matches 3.0 (Double) and "3.00" (BigDecimal)
+    // This works because:
+    // - FlakeValue::Ord uses numeric_cmp for cross-type comparison
+    // - Range scans use this ordering, so Long(3), Double(3.0), BigDecimal(3) are adjacent
+    // - trim_to_range includes all flakes where cmp(flake, bound) == Equal
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:equality");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:long", "ex:value": 3},
+            {"@id": "ex:double", "ex:value": 3.0},
+            {"@id": "ex:decimal", "ex:value": {"@value": "3.00", "@type": "xsd:decimal"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query for value = 3 (Long) - ideally should match all mathematically equal values
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": {"@id": "?id", "ex:value": 3}
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().expect("Result should be an array");
+
+    // Extract IDs - result format is [["ex:long"], ["ex:double"], ...]
+    let ids: std::collections::HashSet<String> = arr
+        .iter()
+        .filter_map(|r| {
+            if let Some(inner) = r.as_array() {
+                inner
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string)
+            } else {
+                r.as_str().map(std::string::ToString::to_string)
+            }
+        })
+        .collect();
+
+    // All three should match since they're mathematically equal
+    assert!(
+        ids.contains("ex:long"),
+        "Long(3) should match, got: {ids:?}"
+    );
+    assert!(
+        ids.contains("ex:double"),
+        "Double(3.0) should match, got: {ids:?}"
+    );
+    assert!(
+        ids.contains("ex:decimal"),
+        "Decimal(3.00) should match, got: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn decimal_filter_comparison_across_types() {
+    // Test filter comparisons work across Long, Double, BigDecimal
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:filter");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:a", "ex:amount": 100},  // Long
+            {"@id": "ex:b", "ex:amount": 150.5},  // Double
+            {"@id": "ex:c", "ex:amount": {"@value": "200.00", "@type": "xsd:decimal"}},  // BigDecimal
+            {"@id": "ex:d", "ex:amount": {"@value": "75.25", "@type": "xsd:decimal"}}  // BigDecimal
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Filter: amount > 100 (Long comparison against mixed types)
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id", "?amount"],
+        "where": [
+            {"@id": "?id", "ex:amount": "?amount"},
+            ["filter", [">", "?amount", 100]]
+        ],
+        "orderBy": "?amount"
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // Should return: 150.5, 200.00 (not 100 or 75.25)
+    assert_eq!(arr.len(), 2, "Should have 2 results, got: {arr:?}");
+
+    // Collect IDs for verification
+    let ids: std::collections::HashSet<&str> = arr.iter().map(|r| r[0].as_str().unwrap()).collect();
+
+    assert!(ids.contains("ex:b"), "Should contain ex:b (150.5)");
+    assert!(ids.contains("ex:c"), "Should contain ex:c (200.00)");
+}
+
+#[tokio::test]
+async fn decimal_invalid_string_should_error() {
+    // Invalid string for xsd:decimal should error during query coercion
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:invalid");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item", "ex:value": 42}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query with invalid decimal string
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": {"@id": "?id", "ex:value": {"@value": "not-a-number", "@type": "xsd:decimal"}}
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &q).await;
+    assert!(result.is_err(), "Should error on invalid decimal string");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("coerce") || err_msg.contains("Coercion") || err_msg.contains("parse"),
+        "Error should mention coercion or parsing: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn decimal_non_integral_to_integer_should_error() {
+    // Non-integral value with xsd:integer should error
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:non-integral");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item", "ex:value": 42}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query with non-integral double as xsd:integer
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": {"@id": "?id", "ex:value": {"@value": 3.13, "@type": "xsd:integer"}}
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &q).await;
+    assert!(
+        result.is_err(),
+        "Should error on non-integral double to integer"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("non-integer")
+            || err_msg.contains("Coercion")
+            || err_msg.contains("whole number"),
+        "Error should mention non-integer: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn decimal_number_to_boolean_should_error() {
+    // Number with xsd:boolean should error
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "decimal-test:num-to-bool");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item", "ex:flag": true}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query with number as xsd:boolean
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": {"@id": "?id", "ex:flag": {"@value": 1, "@type": "xsd:boolean"}}
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &q).await;
+    assert!(result.is_err(), "Should error on number to boolean");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("coerce") || err_msg.contains("Coercion") || err_msg.contains("boolean"),
+        "Error should mention coercion: {err_msg}"
+    );
+}
+
+// =============================================================================
+// VALUES clause typed literal coercion tests
+// =============================================================================
+
+#[tokio::test]
+async fn values_typed_literal_string_to_integer_coercion() {
+    // VALUES clause should apply the same coercion as WHERE patterns
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "values-test:coerce");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item1", "ex:score": 42},
+            {"@id": "ex:item2", "ex:score": 100}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Use VALUES with typed literal - string "42" with xsd:integer should coerce to Long(42)
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": [
+            ["values", ["?score", [{"@value": "42", "@type": "xsd:integer"}]]],
+            {"@id": "?id", "ex:score": "?score"}
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &q).await;
+    let rows = result.unwrap().to_jsonld(&ledger.snapshot).unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // Should match ex:item1 because "42" coerced to Long(42)
+    // Note: single-column results may be flattened to ["ex:item1"] not [["ex:item1"]]
+    assert_eq!(arr.len(), 1, "Should find one match, got: {arr:?}");
+    let first = &arr[0];
+    let id = if let Some(inner) = first.as_array() {
+        inner[0].as_str()
+    } else {
+        first.as_str()
+    };
+    assert_eq!(id, Some("ex:item1"), "Should match ex:item1, got: {arr:?}");
+}
+
+#[tokio::test]
+async fn values_incompatible_type_returns_no_matches() {
+    // VALUES clause with incompatible @value/@type should throw a type coercion error.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "values-test:no-match");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item1", "ex:name": "test"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // VALUES with number → xsd:string should return no matches
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": [
+            ["values", ["?name", [{"@value": 42, "@type": "xsd:string"}]]],
+            {"@id": "?id", "ex:name": "?name"}
+        ]
+    });
+
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("TypeCoercion") || msg.contains("coerce"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn values_decimal_string_becomes_bigdecimal() {
+    // VALUES with string + xsd:decimal should create BigDecimal
+    // Both transaction and query now coerce string decimals to BigDecimal
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "values-test:decimal");
+    let ctx = json!({
+        "ex": "http://example.org/ns/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:item1", "ex:price": {"@value": "19.99", "@type": "xsd:decimal"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Query using VALUES with same decimal value
+    let q = json!({
+        "@context": ctx,
+        "select": ["?id"],
+        "where": [
+            ["values", ["?price", [{"@value": "19.99", "@type": "xsd:decimal"}]]],
+            {"@id": "?id", "ex:price": "?price"}
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let arr = rows.as_array().unwrap();
+
+    // Should match because both are BigDecimal("19.99")
+    assert_eq!(arr.len(), 1, "Should find one match, got: {arr:?}");
+    let first = &arr[0];
+    let id = if let Some(inner) = first.as_array() {
+        inner[0].as_str()
+    } else {
+        first.as_str()
+    };
+    assert_eq!(id, Some("ex:item1"), "Should match ex:item1, got: {arr:?}");
+}
+
+/// Regression test for fluree/db-r#142: JSON integer values with xsd:float or
+/// xsd:double @type were stored as NUM_INT (integer encoding) but decoded as
+/// F64 after indexing, producing garbage subnormal floats.
+#[tokio::test]
+async fn float_typed_integer_values_survive_indexing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_str().unwrap();
+
+    let fluree = FlureeBuilder::file(path).build().expect("build");
+    let ledger0 = fluree.create_ledger("test:floats").await.expect("create");
+
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {
+                "@id": "ex:campaign1",
+                "@type": "ex:Campaign",
+                "ex:name": "Alpha",
+                "ex:budget": {"@type": "xsd:float", "@value": 1_350_000},
+                "ex:revenue": {"@type": "xsd:double", "@value": 5_000_000}
+            },
+            {
+                "@id": "ex:campaign2",
+                "@type": "ex:Campaign",
+                "ex:name": "Beta",
+                "ex:budget": {"@type": "xsd:float", "@value": 750_000.50},
+                "ex:revenue": {"@type": "xsd:double", "@value": 2_500_000.75}
+            }
+        ]
+    });
+
+    let receipt = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    // Query before indexing — values are in novelty, should be correct.
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name", "?budget", "?revenue"],
+        "where": {
+            "@id": "?c",
+            "@type": "ex:Campaign",
+            "ex:name": "?name",
+            "ex:budget": "?budget",
+            "ex:revenue": "?revenue"
+        },
+        "orderBy": "?name"
+    });
+
+    let pre_index = support::query_jsonld(&fluree, &receipt.ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&receipt.ledger.snapshot)
+        .unwrap();
+
+    // Force indexing so values are read from the binary index.
+    fluree
+        .reindex("test:floats", fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // Re-load ledger state after indexing.
+    let ledger_post = fluree.ledger("test:floats").await.expect("reload ledger");
+
+    let post_index = support::query_jsonld(&fluree, &ledger_post, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger_post.snapshot)
+        .unwrap();
+
+    // Both should return the same values.
+    assert_eq!(
+        pre_index, post_index,
+        "Float values changed after indexing!\n  pre:  {pre_index}\n  post: {post_index}",
+    );
+
+    // Verify the actual values are correct (not garbage subnormals).
+    let rows = post_index.as_array().expect("array");
+    assert_eq!(rows.len(), 2, "expected 2 campaigns");
+
+    // Helper: extract f64 from either a bare number or {"@value": n, "@type": ...}
+    let extract_f64 = |v: &JsonValue| -> f64 {
+        v.as_f64()
+            .or_else(|| v.get("@value").and_then(serde_json::Value::as_f64))
+            .unwrap_or_else(|| panic!("expected a number, got: {v}"))
+    };
+
+    // Rows ordered by name: Alpha (campaign1) first, Beta (campaign2) second.
+    // campaign1: budget=1350000, revenue=5000000 (JSON integers → should be floats)
+    let budget1 = extract_f64(&rows[0][1]);
+    let revenue1 = extract_f64(&rows[0][2]);
+    assert!(
+        (budget1 - 1_350_000.0).abs() < 0.01,
+        "budget1 should be 1350000, got {budget1}"
+    );
+    assert!(
+        (revenue1 - 5_000_000.0).abs() < 0.01,
+        "revenue1 should be 5000000, got {revenue1}"
+    );
+
+    // campaign2: budget=750000.50, revenue=2500000.75 (JSON floats → should be fine)
+    let budget2 = extract_f64(&rows[1][1]);
+    let revenue2 = extract_f64(&rows[1][2]);
+    assert!(
+        (budget2 - 750_000.5).abs() < 0.01,
+        "budget2 should be 750000.5, got {budget2}"
+    );
+    assert!(
+        (revenue2 - 2_500_000.75).abs() < 0.01,
+        "revenue2 should be 2500000.75, got {revenue2}"
+    );
+}
+
+/// Inline `xsd:integer` / `xsd:double` objects are emitted as
+/// `EncodedLit(NUM_INT/NUM_F64)` on the binary-scan path (commit 2f45f10f3),
+/// not materialized `Lit`. This test drives the INDEXED path (so the
+/// binary-scan / batched-join decode runs, not the novelty path) and checks the
+/// encoded values still round-trip through projection, DISTINCT (dedup), numeric
+/// FILTER, SUM, and DATATYPE.
+#[tokio::test]
+async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "nums:main");
+    let ctx = ctx_datatype();
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id":"ex:a","ex:age":10,"ex:score":1.5},
+                    {"@id":"ex:b","ex:age":10,"ex:score":2.5},
+                    {"@id":"ex:c","ex:age":20,"ex:score":1.5},
+                    {"@id":"ex:d","ex:age":30,"ex:score":3.5}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+    // Build + publish the binary index, then open the indexed view so queries
+    // take the binary-scan path rather than pure novelty.
+    support::rebuild_and_publish_index(&fluree, "nums:main").await;
+    let view = fluree.db("nums:main").await.expect("indexed view");
+
+    async fn rows(
+        fluree: &MemoryFluree,
+        view: &fluree_db_api::GraphDb,
+        sparql: &str,
+    ) -> Vec<JsonValue> {
+        let res = fluree
+            .query(view, QueryInput::Sparql(sparql))
+            .await
+            .expect("sparql query");
+        normalize_rows(&res.to_jsonld(&view.snapshot).expect("to_jsonld"))
+    }
+    const P: &str = "PREFIX ex: <http://example.org/ns/>\n";
+
+    // Projection: integer values decode correctly (with the duplicate present).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT ?age WHERE {{ ?s ex:age ?age }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[10], [10], [20], [30]]))
+    );
+    // DISTINCT dedups the duplicate integer (EncodedLit hash/eq on o_key).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT ?age WHERE {{ ?s ex:age ?age }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[10], [20], [30]]))
+    );
+    // Numeric FILTER over the encoded value.
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT ?age WHERE {{ ?s ex:age ?age FILTER(?age > 15) }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[20], [30]]))
+    );
+    // SUM aggregate (10 + 10 + 20 + 30).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT (SUM(?age) AS ?t) WHERE {{ ?s ex:age ?age }}")
+        )
+        .await,
+        normalize_rows(&json!([[70]]))
+    );
+    // DATATYPE round-trips to the xsd:integer IRI (dt_id resolves back to the
+    // o_type). No xsd prefix is in scope for this serialization, so it renders
+    // as the full datatype IRI.
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT (DATATYPE(?age) AS ?dt) WHERE {{ ?s ex:age ?age }}")
+        )
+        .await,
+        normalize_rows(&json!([["http://www.w3.org/2001/XMLSchema#integer"]]))
+    );
+    // Inline doubles encode (NUM_F64) and DISTINCT-dedup too.
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT ?score WHERE {{ ?s ex:score ?score }} ORDER BY ?score")
+        )
+        .await,
+        normalize_rows(&json!([[1.5], [2.5], [3.5]]))
+    );
+}
+
+/// `DATATYPE(?x)` of a VALUES literal joined against `DATATYPE(STRDT(..))` of
+/// the same literal plans one way whether the datatype's namespace is
+/// registered or not, and over a registered datatype the join finds its row.
+/// So a different answer for the unseen datatype is a difference in the two
+/// terms, not in the plan (#1765). Unindexed and indexed.
+#[tokio::test]
+async fn datatype_values_join_plans_alike_for_registered_and_unseen_datatypes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "query/datatype:values-join-plan";
+    let ledger = genesis_ledger(&fluree, id);
+    fluree
+        .insert(
+            ledger,
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:s", "ex:p": "a"}),
+        )
+        .await
+        .expect("seed");
+    let join = |dt: &str| {
+        format!(
+            r#"PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+               SELECT ?a WHERE {{ VALUES ?x {{ "a"^^{dt} }} BIND(DATATYPE(?x) AS ?d)
+                 {{ SELECT ?d ?a WHERE {{ BIND(DATATYPE(STRDT("a", {dt})) AS ?d) BIND(1 AS ?a) }} }} }}"#
+        )
+    };
+    let registered = join("xsd:token");
+    let unseen = join("<http://nowhere.example/T>");
+
+    for phase in ["novelty", "indexed"] {
+        if phase == "indexed" {
+            fluree
+                .reindex(id, fluree_db_api::ReindexOptions::default())
+                .await
+                .expect("reindex");
+        }
+        let ledger = fluree.ledger(id).await.expect("ledger");
+        assert_eq!(
+            ledger.snapshot.range_provider.is_some(),
+            phase == "indexed",
+            "{phase}: setup"
+        );
+        assert_eq!(
+            support::query_sparql_formatted(&fluree, &ledger, &registered)
+                .await
+                .expect("registered"),
+            json!([[1]]),
+            "{phase}: the join over a registered datatype"
+        );
+        let db = support::graphdb_from_ledger(&ledger);
+        let mut plans = Vec::new();
+        for q in [&unseen, &registered] {
+            let plan = fluree.explain_sparql(&db, q).await.expect("explain");
+            plans.push(plan["plan"]["physical"].to_string());
+        }
+        assert_eq!(plans[0], plans[1], "{phase}: the two joins plan alike");
+    }
+}

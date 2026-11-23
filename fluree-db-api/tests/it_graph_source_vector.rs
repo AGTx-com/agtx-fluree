@@ -1,0 +1,1212 @@
+#![cfg(feature = "vector")]
+//! Integration tests for vector similarity search graph sources.
+//!
+//! These tests verify the end-to-end vector index lifecycle:
+//! - create_vector_index
+//! - load_vector_index / load_vector_index_at
+//! - sync_vector_index / resync_vector_index
+//! - check_vector_staleness
+//! - drop_vector_index
+//! - VectorIndexProvider search integration
+
+mod support;
+
+use fluree_db_api::{FlureeBuilder, FlureeIndexProvider, VectorCreateConfig};
+use fluree_db_query::vector::DistanceMetric;
+use serde_json::json;
+
+/// Minimal end-to-end check that create_vector_index actually indexes documents
+/// (not just publishes an empty snapshot).
+#[tokio::test]
+async fn vector_create_index_indexes_docs_and_is_loadable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Seed a small ledger with embeddings (3-dimensional for simplicity)
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication of array elements
+    let ledger_id = "vector/docs:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:title":"Hello world",
+                "ex:embedding": { "@value": [0.1, 0.2, 0.3], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:title":"Hello rust",
+                "ex:embedding": { "@value": [0.4, 0.5, 0.6], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Indexing query: root var is ?x (so execute_indexing_query can populate top-level @id)
+    // Note: Don't bind embedding to a variable in WHERE - arrays would create multiple rows
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("vector-search", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert!(
+        created.vector_count > 0,
+        "expected index to include documents"
+    );
+    assert_eq!(created.vector_count, 2, "expected 2 vectors");
+    assert!(created.index_id.is_some(), "expected persisted index id");
+
+    // Load the index back via nameservice+storage
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 2, "loaded index should include 2 vectors");
+}
+
+/// Test that vector search returns scored results with correct ordering
+#[tokio::test]
+async fn vector_search_returns_scored_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Seed ledger with documents - using 3D vectors for simplicity
+    // doc1 and doc2 are similar (both have high first component)
+    // doc3 is different (high third component)
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/search:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:title":"First document",
+                "ex:embedding": { "@value": [0.9, 0.1, 0.05], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:title":"Second document",
+                "ex:embedding": { "@value": [0.8, 0.2, 0.1], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc3",
+                "@type":"ex:Doc",
+                "ex:title":"Third document",
+                "ex:embedding": { "@value": [0.1, 0.1, 0.9], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create vector index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("search-test", ledger_id, query, "ex:embedding", 3)
+        .with_metric(DistanceMetric::Cosine);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert_eq!(created.vector_count, 3);
+
+    // Load and search - query vector similar to doc1/doc2
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let query_vector = [0.85, 0.15, 0.05];
+    let results = idx.search(&query_vector, 10).unwrap();
+
+    assert_eq!(results.len(), 3, "expected 3 results");
+
+    // doc1 and doc2 should rank before doc3 (more similar to query)
+    let ids: Vec<_> = results.iter().map(|r| r.iri.as_ref()).collect();
+
+    let doc1_pos = ids.iter().position(|id| id.contains("doc1"));
+    let doc2_pos = ids.iter().position(|id| id.contains("doc2"));
+    let doc3_pos = ids.iter().position(|id| id.contains("doc3"));
+
+    assert!(
+        doc1_pos.is_some() && doc2_pos.is_some() && doc3_pos.is_some(),
+        "expected all docs in results, got: {ids:?}"
+    );
+
+    // doc1 should rank first (most similar to query)
+    assert_eq!(doc1_pos.unwrap(), 0, "expected doc1 to rank first");
+
+    // doc3 should rank last (least similar)
+    assert_eq!(doc3_pos.unwrap(), 2, "expected doc3 to rank last");
+}
+
+/// Test vector sync indexes new documents after initial creation
+#[tokio::test]
+async fn vector_sync_indexes_new_documents() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create initial ledger with one doc
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/sync:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:title":"Initial document",
+                "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    // Create vector index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("sync-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert_eq!(created.vector_count, 1, "expected 1 vector initially");
+
+    // Add more documents
+    let tx2 = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:title":"Second document",
+                "ex:embedding": { "@value": [0.3, 0.3, 0.4], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc3",
+                "@type":"ex:Doc",
+                "ex:title":"Third document",
+                "ex:embedding": { "@value": [0.1, 0.1, 0.8], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    // Check staleness
+    let staleness = fluree
+        .check_vector_staleness(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        staleness.is_stale,
+        "index should be stale after new commits"
+    );
+    assert!(staleness.lag > 0, "staleness lag should be > 0");
+
+    // Sync the index
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync || synced.new_watermark >= synced.old_watermark,
+        "sync should update watermark"
+    );
+
+    // Verify by loading the index and checking vector count
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 3, "loaded index should have 3 vectors");
+}
+
+/// Test vector index sync updates head snapshot (head-only, no time-travel)
+#[tokio::test]
+async fn vector_sync_updates_head_snapshot() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with initial doc
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/headonly:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [1.0, 0.0, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+    let t1 = ledger1.t();
+
+    // Create vector index at t1
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("headonly-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert_eq!(created.vector_count, 1);
+    assert_eq!(created.index_t, t1);
+
+    // Load head — should have 1 vector
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 1, "head index should have 1 vector after create");
+
+    // Add more documents
+    let tx2 = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.0, 1.0, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+    let t2 = ledger2.t();
+
+    // Sync to update head
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(synced.new_watermark, t2);
+
+    // Load head again — should now have 2 vectors
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 2, "head index should have 2 vectors after sync");
+}
+
+/// Test drop_vector_index marks graph source as retracted
+#[tokio::test]
+async fn vector_drop_index_marks_as_retracted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create a minimal index
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/drop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("drop-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    // Drop the index
+    let dropped = fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!dropped.was_already_retracted);
+
+    // Trying to sync should fail
+    let sync_result = fluree.sync_vector_index(&created.graph_source_id).await;
+    assert!(sync_result.is_err(), "sync should fail on dropped index");
+
+    // Dropping again should indicate already retracted
+    let dropped_again = fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(dropped_again.was_already_retracted);
+}
+
+/// Test that documents with missing embeddings are skipped
+#[tokio::test]
+async fn vector_skips_documents_without_embeddings() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with some docs having embeddings and some without
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/skip:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:title":"Has embedding",
+                "ex:embedding": { "@value": [0.1, 0.2, 0.3], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:title":"No embedding"
+                // Note: no ex:embedding property
+            },
+            {
+                "@id":"ex:doc3",
+                "@type":"ex:Doc",
+                "ex:title":"Also has embedding",
+                "ex:embedding": { "@value": [0.4, 0.5, 0.6], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create index - should only index docs with embeddings
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("skip-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    // Should have 2 vectors (doc1 and doc3), skipped 1 (doc2)
+    assert_eq!(created.vector_count, 2, "expected 2 vectors indexed");
+    assert_eq!(created.skipped_count, 1, "expected 1 document skipped");
+}
+
+/// Test different distance metrics
+#[tokio::test]
+async fn vector_supports_different_metrics() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/metrics:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [1.0, 0.0, 0.0], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.0, 1.0, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    // Test with Dot product metric
+    let cfg = VectorCreateConfig::new("metrics-dot", ledger_id, query.clone(), "ex:embedding", 3)
+        .with_metric(DistanceMetric::Dot);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert_eq!(created.vector_count, 2);
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.metadata.metric, DistanceMetric::Dot);
+
+    // Test with Euclidean metric
+    let cfg2 = VectorCreateConfig::new(
+        "metrics-euclidean",
+        ledger_id,
+        query.clone(),
+        "ex:embedding",
+        3,
+    )
+    .with_metric(DistanceMetric::Euclidean);
+    let created2 = fluree.create_vector_index(cfg2).await.unwrap();
+    assert_eq!(created2.vector_count, 2);
+
+    let idx2 = fluree
+        .load_vector_index(&created2.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx2.metadata.metric, DistanceMetric::Euclidean);
+}
+
+/// Test that FlureeIndexProvider implements VectorIndexProvider for query integration
+#[tokio::test]
+async fn vector_provider_integration() {
+    use fluree_db_query::vector::{VectorIndexProvider, VectorSearchParams};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with vectors
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/provider:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.9, 0.1, 0.05], "@type": "@vector" }
+            },
+            {
+                "@id":"ex:doc2",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.1, 0.9, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create vector index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("provider-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    // Use FlureeIndexProvider to search
+    let provider = FlureeIndexProvider::new(&fluree);
+    let query_vector = [0.85, 0.15, 0.0];
+
+    // Vector indexes are head-only (no time-travel), so as_of_t must be None
+    let params = VectorSearchParams::new(&query_vector, DistanceMetric::Cosine, 10);
+
+    let results = provider
+        .search(&created.graph_source_id, params)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    // doc1 should rank first (more similar to query)
+    assert!(
+        results[0].iri.contains("doc1"),
+        "expected doc1 first, got: {:?}",
+        results[0].iri
+    );
+}
+
+/// Test collection_exists check
+#[tokio::test]
+async fn vector_collection_exists() {
+    use fluree_db_query::vector::VectorIndexProvider;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create a ledger and index
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/exists:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex":"http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id":"ex:doc1",
+                "@type":"ex:Doc",
+                "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new("exists-test", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+
+    // Should exist
+    let exists = provider
+        .collection_exists(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(exists, "collection should exist");
+
+    // Non-existent should return false
+    let not_exists = provider
+        .collection_exists("nonexistent:main")
+        .await
+        .unwrap();
+    assert!(!not_exists, "non-existent collection should not exist");
+
+    // Drop and check again
+    fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let after_drop = provider
+        .collection_exists(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!after_drop, "dropped collection should not exist");
+}
+
+/// A dropped vector index stays as a tombstone, and its snapshots are kept,
+/// but a search no longer resolves it.
+#[tokio::test]
+async fn vector_search_after_drop_is_not_found() {
+    use fluree_db_query::vector::{VectorIndexProvider, VectorSearchParams};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.9, 0.1, 0.0], "@type": "@vector" } },
+            { "@id":"ex:doc2", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.1, 0.9, 0.0], "@type": "@vector" } }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.unwrap();
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let cfg = VectorCreateConfig::new("dropped-vectors", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let query_vector = [1.0_f32, 0.0, 0.0];
+    let search = || {
+        provider.search(
+            &created.graph_source_id,
+            VectorSearchParams::new(&query_vector, DistanceMetric::Cosine, 10),
+        )
+    };
+    assert_eq!(search().await.expect("search before drop").len(), 2);
+
+    fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let err = search().await.expect_err("search after drop");
+    assert!(
+        err.to_string().contains("Graph source not found"),
+        "search after drop: {err}"
+    );
+}
+
+/// End-to-end test for f:queryVector query syntax through the query pipeline.
+///
+/// This test verifies that vector search patterns in queries work correctly:
+/// - Query parsing recognizes f:queryVector patterns
+/// - VectorSearchOperator executes against the vector index
+/// - Results include IDs and scores
+#[tokio::test]
+async fn vector_idx_query_syntax_e2e() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with vector embeddings
+    // NOTE: Embeddings must use @type: @vector to avoid RDF deduplication
+    let ledger_id = "vector/query-e2e:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:doc1",
+                "@type": "ex:Doc",
+                "ex:title": "Machine learning basics",
+                "ex:embedding": { "@value": [0.9, 0.1, 0.05], "@type": "@vector" }
+            },
+            {
+                "@id": "ex:doc2",
+                "@type": "ex:Doc",
+                "ex:title": "Database fundamentals",
+                "ex:embedding": { "@value": [0.1, 0.9, 0.1], "@type": "@vector" }
+            },
+            {
+                "@id": "ex:doc3",
+                "@type": "ex:Doc",
+                "ex:title": "Deep learning advanced",
+                "ex:embedding": { "@value": [0.85, 0.15, 0.0], "@type": "@vector" }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create vector index
+    let indexing_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+
+    let cfg = VectorCreateConfig::new(
+        "query-e2e-idx",
+        ledger_id,
+        indexing_query,
+        "ex:embedding",
+        3,
+    );
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+    assert_eq!(created.vector_count, 3, "expected 3 vectors indexed");
+
+    // Execute a query using f:queryVector syntax
+    // Query for vectors similar to [0.85, 0.1, 0.05] - should match doc1 and doc3 best
+    let search_query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [
+            {
+                "f:graphSource": created.graph_source_id,
+                "f:queryVector": [0.85, 0.1, 0.05],
+                "f:distanceMetric": "cosine",
+                "f:searchLimit": 10,
+                "f:searchResult": {
+                    "f:resultId": "?doc",
+                    "f:resultScore": "?score"
+                }
+            }
+        ],
+        "select": ["?doc", "?score"]
+    });
+
+    let result = fluree
+        .query_connection_with_bm25(&search_query)
+        .await
+        .unwrap();
+    let formatted = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .unwrap();
+
+    // Parse and verify results
+    let results: Vec<serde_json::Value> = serde_json::from_value(formatted).unwrap();
+    assert!(!results.is_empty(), "expected vector search results");
+
+    // Results should be ordered by similarity score (highest first)
+    // doc1 [0.9, 0.1, 0.05] and doc3 [0.85, 0.15, 0.0] should be most similar to query [0.85, 0.1, 0.05]
+    // doc2 [0.1, 0.9, 0.1] should be least similar
+
+    // Verify we have scores and IDs
+    for (i, row) in results.iter().enumerate() {
+        let row_arr = row.as_array().expect("result row should be array");
+        assert_eq!(row_arr.len(), 2, "expected [doc, score] tuple");
+
+        let doc = row_arr[0].as_str().expect("doc should be string");
+        let score = row_arr[1].as_f64().expect("score should be number");
+
+        assert!(doc.contains("doc"), "doc should contain 'doc': {doc}");
+        // Cosine similarity can be in [-1, 1] (not [0, 1])
+        // -1 = opposite, 0 = orthogonal, 1 = identical
+        assert!(
+            (-1.0..=1.0).contains(&score),
+            "cosine score should be in [-1,1]: {score}"
+        );
+
+        // Log for debugging
+        eprintln!("Result {i}: doc={doc}, score={score:.4}");
+    }
+
+    // Verify ordering: doc2 should be last (least similar)
+    let last_row = results.last().unwrap().as_array().unwrap();
+    let last_doc = last_row[0].as_str().unwrap();
+    assert!(
+        last_doc.contains("doc2"),
+        "doc2 should be least similar (last), got: {last_doc}"
+    );
+}
+
+/// A non-root view policy must hide inline vector search hits whose embedded
+/// content the identity cannot view. Regression: VectorSearchOperator emitted
+/// matched subjects from the index with no per-flake policy filtering.
+#[tokio::test]
+async fn vector_search_enforces_view_policy_on_embedding_flake() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:doc1", "@type": "ex:Doc", "ex:author": "Alice",
+              "ex:embedding": { "@value": [0.9, 0.1, 0.05], "@type": "@vector" } },
+            { "@id": "ex:doc2", "@type": "ex:Doc", "ex:author": "Bob",
+              "ex:embedding": { "@value": [0.8, 0.2, 0.1], "@type": "@vector" } }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &tx).await.expect("insert");
+
+    let indexing_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let cfg = VectorCreateConfig::new(
+        "policy-vec-idx",
+        ledger_id,
+        indexing_query,
+        "ex:embedding",
+        3,
+    );
+    let created = fluree.create_vector_index(cfg).await.expect("create index");
+
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:queryVector": [0.85, 0.1, 0.05],
+        "f:distanceMetric": "cosine",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy => both docs match.
+    let control = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": search_where.clone(),
+        "select": ["?doc"]
+    });
+    let control_total: usize = fluree
+        .query_connection_with_bm25(&control)
+        .await
+        .expect("control query")
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both docs should match");
+
+    // Policy: ex:embedding viewable only for Alice-authored docs (doc1).
+    let policy = json!([{
+        "@id": "ex:embPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/embedding" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let policy_query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "opts": { "policy": policy, "default-allow": false },
+        "where": search_where,
+        "select": ["?doc"]
+    });
+    let result = fluree
+        .query_connection_with_bm25(&policy_query)
+        .await
+        .expect("policy query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rendered = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .to_string();
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable embedding) must remain; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden embedding) must not leak through vector search; got {rendered}"
+    );
+}
+
+/// A commit that touches NO indexed property must advance the watermark, not
+/// rebuild the index. The vector twin of the BM25 test of the same name: the
+/// sync path is a copy, and a vector rebuild is dearer still because a resync
+/// re-embeds every document.
+///
+/// As there, the fixture must touch no dependent predicate at all — this
+/// query's deps are `rdf:type` and `ex:embedding`, so the new subject carries
+/// neither a type nor an embedding — and `was_full_resync` is the only
+/// observable that separates the two paths.
+#[tokio::test]
+async fn vector_sync_without_indexed_changes_advances_watermark_without_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/noop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "noop-test",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:note1", "ex:reading":"42" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        !synced.was_full_resync,
+        "a commit touching no indexed property must NOT re-embed the corpus"
+    );
+    assert_eq!(synced.upserted, 0);
+    assert_eq!(synced.new_watermark, ledger2.t());
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 1, "an untouched index must keep its vectors");
+}
+
+/// A wildcard select cannot be tracked incrementally, so the sync must decline
+/// to the full rebuild rather than trust an empty change set. The embedding
+/// property is always tracked, which is why the index is correct on either
+/// path here — the routing is the assertion.
+#[tokio::test]
+async fn vector_sync_with_wildcard_select_always_rebuilds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/wildcard:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document",
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["*"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "wildcard",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    // A property the wildcard covers and no explicit dependency names.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"Renamed" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a wildcard select cannot be tracked incrementally; the sync must rebuild"
+    );
+    assert_eq!(synced.new_watermark, ledger2.t());
+}
+
+/// A pattern on a second subject decides membership, and the flake that
+/// changes it is not on the document. Incremental sync would attribute the
+/// change to the author, re-run the query for the author, find no rows, and
+/// leave the document in place. The sync must rebuild instead, and the index
+/// must shrink.
+#[tokio::test]
+async fn vector_sync_with_nested_pattern_rebuilds_when_membership_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/nested:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:author": { "@id":"ex:author1", "ex:active": true },
+            "ex:embedding": { "@value": [0.5, 0.5, 0.0], "@type": "@vector" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{
+            "@id":"?x", "@type":"ex:Doc",
+            "ex:author": { "@id":"?a", "ex:active": true }
+        }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "nested",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    // Deactivate the author: the document no longer matches the query.
+    let update = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where":  { "@id":"ex:author1", "ex:active":"?was" },
+        "delete": { "@id":"ex:author1", "ex:active":"?was" },
+        "insert": { "@id":"ex:author1", "ex:active": false }
+    });
+    let _ledger2 = fluree.update(ledger1, &update).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a pattern on another subject cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.len(),
+        0,
+        "the document no longer matches the indexing query and must be gone"
+    );
+}
+
+/// A drop names graphs, not the facts it took, so the commit walk finds
+/// nothing to remove: the sync after a drop of the graph the index reads
+/// rebuilds it from what the ledger still holds, keeping what was written
+/// since.
+#[tokio::test]
+async fn vector_sync_after_a_drop_rebuilds_from_what_the_ledger_holds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/drop:main";
+    let doc = |id: &str, embedding: [f64; 3]| {
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [ {
+                "@id": id, "@type":"ex:Doc",
+                "ex:embedding": { "@value": embedding, "@type": "@vector" }
+            } ]
+        })
+    };
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(ledger0, &doc("ex:doc1", [0.5, 0.5, 0.0]))
+        .await
+        .unwrap();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "drop-test",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update("DROP DEFAULT")
+        .commit()
+        .await
+        .unwrap();
+    let written = doc("ex:doc2", [0.0, 0.5, 0.5]);
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert(&written)
+        .commit()
+        .await
+        .unwrap();
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(synced.was_full_resync, "a drop takes the full rebuild");
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 1);
+    assert!(idx.contains(ledger_id, "http://example.org/doc2"));
+    assert!(!idx.contains(ledger_id, "http://example.org/doc1"));
+}
+
+/// A vector index has no triples: named as the dataset it is refused, naming
+/// the `f:graphSource` form, not read as an empty graph.
+#[tokio::test]
+async fn a_vector_index_is_refused_as_a_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/notagraph:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:embedding": { "@value": [0.1, 0.2, 0.3], "@type": "@vector" }
+        }]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let gs = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "vector-notagraph",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap()
+        .graph_source_id;
+
+    for (route, result) in [
+        (
+            "SPARQL FROM",
+            fluree
+                .query_from()
+                .sparql(&format!("SELECT * FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+                .execute_formatted()
+                .await,
+        ),
+        (
+            "JSON-LD from",
+            fluree
+                .query_from()
+                .jsonld(&json!({
+                    "from": gs, "select": ["?s"], "where": {"@id": "?s", "?p": "?o"}
+                }))
+                .execute_formatted()
+                .await,
+        ),
+    ] {
+        let err = result.expect_err(route);
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceNotAGraph",
+            "{route}: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "graph source '{gs}' is a vector index, not a graph: query it with an \
+                 f:graphSource pattern"
+            )),
+            "{route}: {err}"
+        );
+    }
+}

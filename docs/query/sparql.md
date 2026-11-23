@@ -1,0 +1,1547 @@
+# SPARQL
+
+Fluree provides full support for SPARQL 1.1, the W3C standard query language for RDF, plus the RDF 1.2 / SPARQL 1.2 edge-annotation subset (see [Edge annotations](#edge-annotations-sparql-12--rdf-12) below). SPARQL enables compatibility with existing RDF tools, knowledge graphs, and semantic web applications.
+
+## Overview
+
+SPARQL (SPARQL Protocol and RDF Query Language) is the industry standard for querying RDF data. Fluree implements SPARQL 1.1, providing full compatibility with SPARQL endpoints and tools.
+
+### Basic SPARQL Query
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?age
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+}
+```
+
+### Default Prefixes
+
+When querying via the **CLI**, a ledger's [default context](../concepts/iri-and-context.md#default-context) prefix mappings are injected into SPARQL queries that have no explicit `PREFIX` declarations. The HTTP API defaults this behavior off; pass `?default-context=true` on ledger-scoped query requests to opt in. For example, if the default context includes `{"ex": "http://example.org/ns/"}`, this query works without a `PREFIX` line when default-context injection is enabled:
+
+```sparql
+SELECT ?name ?age
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+}
+```
+
+If a query includes any `PREFIX` declarations, the default context is not used — you must declare every prefix you need. To explicitly opt out of the default context without defining any real prefix, use `PREFIX : <>`. See [opting out of the default context](../concepts/iri-and-context.md#opting-out-of-the-default-context) for details.
+
+> **Note:** When using `fluree-db-api` directly (embedded), queries must declare their own `PREFIX` declarations. The default context is not injected automatically by the core API. Use `db_with_default_context()` or `GraphDb::with_default_context()` to opt in. See [Default Context](../concepts/iri-and-context.md#default-context) for details.
+
+You can view and manage the default context with `fluree context get/set` or `GET/PUT /v1/fluree/context/{ledger...}`.
+
+## Query Forms
+
+### SELECT Queries
+
+Return variable bindings:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?email
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:email ?email .
+}
+```
+
+**DISTINCT Results:**
+
+```sparql
+SELECT DISTINCT ?name
+WHERE {
+  ?person ex:name ?name .
+}
+```
+
+**Reduced Results:**
+
+```sparql
+SELECT REDUCED ?name
+WHERE {
+  ?person ex:name ?name .
+}
+```
+
+### CONSTRUCT Queries
+
+Generate RDF graphs from query results:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+CONSTRUCT {
+  ?person ex:displayName ?name .
+}
+WHERE {
+  ?person ex:name ?name .
+}
+```
+
+A `GRAPH` block in the template writes into a named graph, and annotation syntax attaches reifiers to template triples. See [CONSTRUCT Queries](construct.md) for details.
+
+### ASK Queries
+
+Return boolean indicating if query matches:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+ASK {
+  ?person ex:name "Alice" .
+}
+```
+
+ASK is `true` when a solution remains after its solution modifiers and a trailing `VALUES` clause: `GROUP BY` / `HAVING` count the groups that pass, `OFFSET 1` needs a second solution, and `LIMIT 0` is always `false`. `ORDER BY` cannot change the answer.
+
+### DESCRIBE Queries
+
+Return RDF description of resources:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DESCRIBE ex:alice
+```
+
+Fluree’s DESCRIBE returns **outgoing triples** for each described resource (equivalent to `CONSTRUCT { ?r ?p ?o } WHERE { VALUES ?r { ... } . ?r ?p ?o }`), plus the outgoing triples of each blank node it points to, and of every cell of a list it points to that is [stored as its triples](#writing-lists). It writes each [list](#lists) the resource holds as a list.
+
+## Basic Graph Patterns
+
+### Triple Patterns
+
+Match RDF triples:
+
+```sparql
+?person ex:name ?name .
+```
+
+### Multiple Patterns
+
+Combine patterns with AND semantics:
+
+```sparql
+?person ex:name ?name .
+?person ex:age ?age .
+?person ex:email ?email .
+```
+
+### Property Paths
+
+SPARQL property paths allow complex traversal patterns in the predicate position of a triple pattern.
+
+#### Supported Operators
+
+| Syntax | Name | Description |
+|--------|------|-------------|
+| `p+` | One or more | Transitive closure (follows `p` one or more hops) |
+| `p*` | Zero or more | Reflexive transitive closure (includes self) |
+| `p?` | Zero or one | Optional step — the node itself plus a single `p` hop |
+| `^p` | Inverse | Traverses `p` in reverse direction |
+| `p\|q` | Alternative | Matches either `p` or `q` (UNION semantics) |
+| `p/q` | Sequence | Follows `p` then `q` (property chain) |
+| `!p`, `!(p\|q)`, `!(^p)` | Negated property set | Matches any predicate **not** in the set |
+
+**One or More (`+`):**
+
+```sparql
+?person ex:parent+ ?ancestor .
+```
+
+**Zero or More (`*`):**
+
+```sparql
+?person ex:parent* ?ancestorOrSelf .
+```
+
+**Zero or One (`?`):**
+
+```sparql
+?person ex:parent? ?parentOrSelf .
+```
+
+Matches `?person` itself (zero-length) plus its direct `ex:parent` neighbors — no transitive closure beyond one hop. Works with an alternation of simple predicates (`(ex:a|ex:b)?`) and inverse (`^ex:p?`).
+
+**Negated Property Sets (`!`):**
+
+```sparql
+?s !ex:knows ?o .          -- any predicate except ex:knows
+?s !(ex:a|ex:b) ?o .       -- any predicate not in {ex:a, ex:b}
+?s !(^ex:parent) ?o .      -- any inverse edge except ex:parent
+?s !(ex:a|^ex:b) ?o .      -- forward not-a OR inverse not-b
+```
+
+A negated set matches any predicate **not** listed. Forward members (`ex:a`) constrain forward edges; inverse members (`^ex:b`) constrain reverse edges. A set with members in both directions is the union of a forward branch and a reverse branch; a single-direction set matches only that direction. Internally this lowers to a triple over a fresh predicate variable plus a `FILTER` excluding the listed predicates.
+
+**Nested modifiers** collapse algebraically: `((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, and `(ex:p?)?` ≡ `ex:p?`.
+
+**Transitive over a sequence (`(p1/p2/…)+`):**
+
+```sparql
+?person (ex:parent/ex:knows)+ ?reached .
+```
+
+A `+`, `*`, or `?` modifier can be applied to a sequence: each hop follows the entire sub-path. `(ex:p/ex:q)+` repeatedly follows `ex:p` then `ex:q`; `*` adds the zero-length start, `?` is the start plus exactly one composite hop. Sequence steps may be alternations of simple predicates (`(ex:a/(ex:b|ex:c))+`) and may be inverted (`(^ex:p/ex:q)+`, where the first step runs backward).
+
+**Inverse (`^`):**
+
+```sparql
+?child ^ex:parent ?parent .
+```
+
+This is equivalent to `?parent ex:parent ?child` — it reverses the traversal direction.
+
+Inverse can also be applied to complex paths (sequences and alternatives):
+
+```sparql
+?s ^(ex:friend/ex:name) ?o .   -- inverse of a sequence
+?s ^(ex:name|ex:nick) ?o .     -- inverse of an alternative
+```
+
+- `^(ex:friend/ex:name)` reverses the step order and inverts each step: `(^ex:name)/(^ex:friend)`
+- `^(ex:name|ex:nick)` distributes inverse into each branch: `(^ex:name)|(^ex:nick)`
+- Double inverse cancels: `^(^ex:p)` simplifies to `ex:p`
+- An inverse can also carry a modifier: `(^ex:p)+` is equivalent to `^ex:p+` (and `(^(ex:a/ex:b))+` to the reversed composite walk)
+
+**Alternative (`|`):**
+
+```sparql
+?person ex:friend|ex:colleague ?related .
+```
+
+This produces UNION semantics: results from both `ex:friend` and `ex:colleague` are combined (bag semantics, so duplicates are preserved).
+
+Three-way and inverse alternatives are supported:
+
+```sparql
+?s ex:a|ex:b|ex:c ?o .
+?s ex:friend|^ex:colleague ?related .
+```
+
+Alternative branches can also be sequence chains. For example, to get the name via either the friend or colleague path:
+
+```sparql
+?s (ex:friend/ex:name)|(ex:colleague/ex:name) ?name .
+```
+
+Branches can freely mix simple predicates, inverse predicates, and sequence chains:
+
+```sparql
+?s ex:name|(ex:friend/ex:name)|^ex:colleague ?val .
+```
+
+**Sequence (`/`) — Property Chains:**
+
+```sparql
+?person ex:friend/ex:name ?friendName .
+```
+
+This follows `ex:friend` then `ex:name`, expanding into a chain of triple patterns joined by internal variables. Multi-step chains are supported:
+
+```sparql
+?person ex:friend/ex:friend/ex:name ?fofName .
+```
+
+Sequence steps can include inverse predicates:
+
+```sparql
+?person ^ex:friend/ex:name ?name .
+```
+
+This traverses `ex:friend` backwards (finding who links to `?person`), then follows `ex:name` forward.
+
+Sequence steps can also be alternatives. For example, `ex:friend/(ex:name|ex:nick)` distributes the alternative into a union of chains (`ex:friend/ex:name` and `ex:friend/ex:nick`):
+
+```sparql
+?person ex:friend/(ex:name|ex:nick) ?label .
+```
+
+Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4 chains. A safety limit of 64 expanded chains is enforced to prevent combinatorial explosion.
+
+**Rules:**
+
+- A transitive path with both endpoints constant — e.g. `:a :p+ :b` — is evaluated as a reachability test: it yields one solution if a path exists between them, none otherwise.
+- Sequence (`/`) steps may be simple predicates (`ex:p`), inverse simple predicates (`^ex:p`), alternatives of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`, and their inverses such as `^ex:p+`). A modifier applied to a parenthesized composite (e.g. `(ex:a/ex:b)+`) is the composite-transitive form described above, not a sequence step.
+- Variable names starting with `?__` are reserved for internal use and will not appear in `SELECT *` (wildcard) output.
+
+#### Not Yet Supported
+
+A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
+
+### Lists
+
+A list (Turtle `( … )`, JSON-LD `{"@list": [...]}`) is stored in order under the subject and property that hold it. SPARQL reads its members as values of that property, as a JSON-LD query does:
+
+```sparql
+# data: ex:s ex:items (ex:a ex:b ex:a) .
+
+SELECT ?x WHERE { ex:s ex:items ?x }                  # ex:a, ex:b, ex:a
+SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
+```
+
+- A member that occurs twice in a list is a value twice.
+- A solution carries no position. A JSON-LD crawl, [export](../cli/export.md) and the Graph Store `GET` return each list in order.
+- A CONSTRUCT template triple that repeats a triple pattern of its WHERE (including one inside an OPTIONAL) writes the list entries it reads as the list, in order: `( … )` in Turtle, `{"@list": [...]}` in JSON-LD. DESCRIBE does too. A value stands for every entry holding it, so over the data above, `CONSTRUCT { ex:s ex:items ?x } WHERE { ex:s ex:items ?x FILTER(?x != ex:b) }` writes `ex:s ex:items ( ex:a ex:a )`, and a `LIMIT` keeping one `ex:a` writes both. A value the owner also holds outside the list is written beside it as well, so the output reads back as the data it came from.
+- A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
+- A list's `rdf:first`/`rdf:rest` cells are not triples SPARQL can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it.
+- A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
+
+## Query Modifiers
+
+### FILTER
+
+Filter results with conditions:
+
+```sparql
+SELECT ?name ?age
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+  FILTER (?age > 18)
+}
+```
+
+**Multiple Filters:**
+
+```sparql
+FILTER (?age > 18 && ?age < 65)
+FILTER (regex(?name, "^A"))
+```
+
+### OPTIONAL
+
+Match optional patterns:
+
+```sparql
+SELECT ?name ?email
+WHERE {
+  ?person ex:name ?name .
+  OPTIONAL { ?person ex:email ?email . }
+}
+```
+
+**Multiple Optionals:**
+
+```sparql
+SELECT ?name ?email ?phone
+WHERE {
+  ?person ex:name ?name .
+  OPTIONAL { ?person ex:email ?email . }
+  OPTIONAL { ?person ex:phone ?phone . }
+}
+```
+
+### UNION
+
+Match alternative patterns:
+
+```sparql
+SELECT ?name
+WHERE {
+  { ?person ex:name ?name . }
+  UNION
+  { ?person ex:alias ?name . }
+}
+```
+
+### MINUS
+
+Exclude matching patterns:
+
+```sparql
+SELECT ?person
+WHERE {
+  ?person ex:type ex:User .
+  MINUS { ?person ex:status ex:Inactive . }
+}
+```
+
+### BIND
+
+Compute values:
+
+```sparql
+SELECT ?name ?nextAge
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+  BIND (?age + 1 AS ?nextAge)
+}
+```
+
+**Expression errors leave the variable unbound.** Per SPARQL 1.1 §18.5, when a
+`BIND` expression raises a *value* error — arithmetic on operands that have no
+operator between them, an out-of-range comparison — the row is kept and the
+target variable is simply not bound. The query does not fail and no diagnostic
+is emitted, so an unexpectedly empty column is worth reading as "this expression
+had no answer for this row", not necessarily as missing data. Use `BOUND(?var)`
+to distinguish the two.
+
+### VALUES
+
+Provide initial bindings:
+
+```sparql
+SELECT ?person ?name
+WHERE {
+  VALUES ?name { "Alice" "Bob" "Carol" }
+  ?person ex:name ?name .
+}
+```
+
+### Parameters
+
+A query or update can take parameters: values bound to variables by name.
+Embedded Fluree (the Rust API and the Python package) takes them with the
+request; over HTTP, a query takes one `$name` request parameter per variable,
+the convention other SPARQL servers share (see the
+[query endpoint](../api/endpoints.md#post-query)). A parameter
+replaces its variable — written `?name` or `$name`, which SPARQL treats as the
+same variable — everywhere in the request before it is planned, so
+`SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
+exactly as `SELECT ?person WHERE { ?person ex:name "Alice" }`. Unlike a
+`VALUES` block, the value is visible inside every `FILTER`, `OPTIONAL` and
+subquery.
+
+- A projected parameter (`SELECT $name ?age`) is still a column, holding the
+  value; `SELECT *` does not list it.
+- A parameter that the request never mentions is an error, since a misspelt
+  variable would otherwise be unbound and match everything. So is a parameter
+  the request assigns itself (`BIND`, `VALUES`, `AS`), and one used inside a
+  remote `SERVICE`, whose body is sent to the endpoint as written.
+- `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
+  `INSERT { ... } WHERE { ... }`.
+
+Embedded, a value is written as in JSON-LD: a JSON string, number or boolean;
+`{"@id": iri}` for an IRI; `{"@value": v, "@type": datatype}` for a typed
+literal; or `{"@value": s, "@language": tag}`. Over HTTP, a value is one RDF
+term, as N-Triples or Turtle write it: `<http://example.org/le-guin>` for an
+IRI, `"Alice"`, `"chat"@fr`, `"5"^^<http://www.w3.org/2001/XMLSchema#int>`, or
+a bare `5`, `5.5`, `5e0`, `true` or `false`, which keep the datatype they would
+have written in the query. Either way IRIs are full IRIs: no prefix applies.
+
+```bash
+curl -G http://localhost:8090/v1/fluree/query/books:main \
+  --data-urlencode 'query=PREFIX ex: <http://example.org/>
+    SELECT ?book WHERE { ?book ex:author $author ; ex:year $year }' \
+  --data-urlencode '$author=<http://example.org/le-guin>' \
+  --data-urlencode '$year=1969'
+```
+
+## Aggregation
+
+### GROUP BY
+
+Group results by variable:
+
+```sparql
+SELECT ?category (COUNT(?product) AS ?count)
+WHERE {
+  ?product ex:category ?category .
+}
+GROUP BY ?category
+```
+
+**Expression-based GROUP BY:**
+
+Group by a computed expression using `(expr AS ?alias)` syntax:
+
+```sparql
+SELECT ?initial (COUNT(?name) AS ?count)
+WHERE {
+  ?person ex:name ?name .
+}
+GROUP BY (SUBSTR(?name, 1, 1) AS ?initial)
+```
+
+The expression is evaluated per row and bound to the alias variable before grouping. Any SPARQL expression is supported, including function calls, arithmetic, and type casts.
+
+**SELECT expressions in a grouped query** are evaluated once per group, after aggregation, in SELECT order (SPARQL 1.1 §18.2.4.4); the ones `HAVING` reads run before it, the rest after it. They may read GROUP BY keys, aggregate results and earlier SELECT aliases:
+
+```sparql
+SELECT (IF(?area = "Net", "network", "other") AS ?segment) (COUNT(?e) AS ?n)
+WHERE { ?e ex:area ?area }
+GROUP BY ?area
+```
+
+returns one row per `?area`. A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY; `SELECT *` of such a query projects its GROUP BY keys (none, without a `GROUP BY`). An aggregate cannot read an alias of the same SELECT clause (it is bound after aggregation): aggregate the expression itself, e.g. `COUNT(IF(…))`.
+
+### HAVING
+
+Filter grouped results:
+
+```sparql
+SELECT ?category (COUNT(?product) AS ?count)
+WHERE {
+  ?product ex:category ?category .
+}
+GROUP BY ?category
+HAVING (COUNT(?product) > 10)
+```
+
+`HAVING` can read the SELECT clause's aliases: an aggregate's alias, such as `?count` above, and an expression's alias (`(COUNT(?product) + 1 AS ?n) … HAVING (?n > 10)`), whose expression is evaluated once, before `HAVING`. SPARQL 1.1 evaluates SELECT expressions after `HAVING`, which leaves such an alias unbound there; reading it is a Fluree extension that many engines share (see [compatibility](../reference/compatibility.md)). In `HAVING` and `ORDER BY`, a variable that is neither a GROUP BY key nor inside an aggregate means `SAMPLE(?v)`, an arbitrary value from the group (§18.2.4.1). On a query that does not group, `HAVING` filters the solutions (§18.2.4.2).
+
+### Aggregation Functions
+
+- `COUNT(?var)` - Count non-null values
+- `SUM(?var)` - Sum numeric values
+- `AVG(?var)` - Average numeric values
+- `MIN(?var)` - Minimum value
+- `MAX(?var)` - Maximum value
+- `SAMPLE(?var)` - Arbitrary value from group
+- `GROUP_CONCAT(?var; separator=",")` - Concatenate values
+
+All aggregate functions support the `DISTINCT` modifier, which eliminates duplicate values before aggregation:
+
+```sparql
+SELECT ?category (COUNT(DISTINCT ?customer) AS ?unique_buyers)
+                 (SUM(DISTINCT ?price) AS ?unique_price_total)
+WHERE {
+  ?order ex:category ?category .
+  ?order ex:customer ?customer .
+  ?order ex:price ?price .
+}
+GROUP BY ?category
+```
+
+**Aggregate result types:** COUNT and SUM of integers return `xsd:integer`. SUM of mixed numeric types and AVG return `xsd:double`.
+
+## Sorting and Limiting
+
+### ORDER BY
+
+Sort results:
+
+```sparql
+SELECT ?name ?age
+WHERE {
+  ?person ex:name ?name .
+  ?person ex:age ?age .
+}
+ORDER BY ?name
+```
+
+**Descending:**
+
+```sparql
+ORDER BY DESC(?age)
+```
+
+**Multiple Sort Keys:**
+
+```sparql
+ORDER BY ?last ASC(?first) DESC(?age)
+```
+
+### LIMIT
+
+Limit number of results:
+
+```sparql
+SELECT ?name
+WHERE {
+  ?person ex:name ?name .
+}
+LIMIT 10
+```
+
+### OFFSET
+
+Skip results:
+
+```sparql
+SELECT ?name
+WHERE {
+  ?person ex:name ?name .
+}
+OFFSET 20
+LIMIT 10
+```
+
+## Datasets
+
+### FROM
+
+Specify default graph:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name
+FROM <mydb:main>
+WHERE {
+  ?person ex:name ?name .
+}
+```
+
+**Multiple Default Graphs:**
+
+```sparql
+SELECT ?name
+FROM <mydb:main>
+FROM <otherdb:main>
+WHERE {
+  ?person ex:name ?name .
+}
+```
+
+### FROM NAMED
+
+Specify named graphs:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?graph ?name
+FROM NAMED <mydb:main>
+FROM NAMED <otherdb:main>
+WHERE {
+  GRAPH ?graph {
+    ?person ex:name ?name .
+  }
+}
+```
+
+Fluree also exposes a built-in named graph inside each ledger for transaction / commit metadata:
+- `FROM <mydb:main#txn-meta>` (txn-meta as the default graph), or
+- `FROM NAMED <mydb:main#txn-meta>` and `GRAPH <mydb:main#txn-meta> { ... }`
+
+See [Datasets](datasets.md) for details.
+
+### GRAPH patterns without `FROM NAMED`
+
+On the ledger-scoped query endpoint (`POST /query/{ledger}`), `GRAPH` patterns
+resolve the ledger's registered named graphs by default — no `FROM NAMED` is
+required:
+
+```sparql
+# Returns the named graph's triples even with no FROM NAMED
+SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
+
+# Discovers every user-registered named graph
+SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
+```
+
+An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
+binds `?g` to each user-registered named graph and never to the default
+graph. The default graph remains explicitly addressable by the ledger's own
+address in any spelling (`GRAPH <mydb:main> { ... }`, `GRAPH <mydb> { ... }`)
+when named directly or bound from another pattern — it just isn't
+enumerated. `GRAPH <mydb:main#http://example.org/g>` addresses the graph
+`http://example.org/g`, and a graph an earlier version registered under the
+address is listed, and read, as
+`<mydb:main#mydb:main>` (see [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)).
+
+Only user-registered named graphs are exposed this way; the reserved system
+graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
+`FROM NAMED`. Supplying `FROM NAMED` still narrows `GRAPH` resolution to exactly
+the graphs listed.
+
+## SPARQL Functions
+
+### String Functions
+
+- `STR(?x)` - String value
+- `LANG(?x)` - Language tag
+- `LANGMATCHES(?lang, ?pattern)` - Language match
+- `REGEX(?str, ?pattern)` - Regular expression
+- `REPLACE(?str, ?pattern, ?replacement)` - Replace
+- `SUBSTR(?str, ?start, ?length)` - Substring
+- `STRLEN(?str)` - String length
+- `UCASE(?str)` - Uppercase
+- `LCASE(?str)` - Lowercase
+- `ENCODE_FOR_URI(?str)` - URI encode
+- `CONCAT(?str1, ?str2, ...)` - Concatenate
+
+### Numeric Functions
+
+- `ABS(?x)` - Absolute value
+- `ROUND(?x)` - Round
+- `CEIL(?x)` - Ceiling
+- `FLOOR(?x)` - Floor
+- `RAND()` - Random number
+
+### Date/Time Functions
+
+- `NOW()` - Current timestamp
+- `YEAR(?date)` - Year
+- `MONTH(?date)` - Month
+- `DAY(?date)` - Day
+- `HOURS(?time)` - Hours
+- `MINUTES(?time)` - Minutes
+- `SECONDS(?time)` - Seconds
+- `TZ(?dateTime)` - Timezone as a plain string. **Always `"Z"`** — see below.
+- `TIMEZONE(?dateTime)` - Timezone as an `xsd:dayTimeDuration`. **Always `"PT0S"`.**
+
+> **Timezones are normalized, not preserved.** Fluree stores temporal values as
+> UTC instants and does not keep the offset the literal was written with, so
+> `"2010-12-21T15:38:02-08:00"` and `"2010-12-21T23:38:02Z"` are the same stored
+> value. `TZ` and `TIMEZONE` therefore report UTC for everything rather than the
+> source offset, which SPARQL 1.1 §17.4.5.8-9 would expect.
+>
+> This is deliberate: the offset is only recoverable before a value is indexed,
+> so reporting it would mean the same query returned a different answer once a
+> background reindex ran — with no write in between. A constant answer is the
+> only one that does not change underneath you.
+>
+> Ordering, comparison and range queries are unaffected; they use the normalized
+> instant. If you need a wall-clock offset, store it as its own property.
+
+### Date/Time Arithmetic
+
+Subtracting one temporal value from another yields the elapsed time as an
+`xsd:dayTimeDuration`:
+
+```sparql
+SELECT ?event ?elapsed WHERE {
+  ?event ex:start ?start ;
+         ex:end   ?end .
+  BIND(?end - ?start AS ?elapsed)     # e.g. "P1DT2H30M"^^xsd:dayTimeDuration
+}
+```
+
+Defined for three operand pairs, matching the XPath operators of the same names:
+
+**Differences** — subtracting two values of the same kind gives the elapsed time:
+
+| Expression | XPath operator | Result |
+| --- | --- | --- |
+| `?dateTime - ?dateTime` | `op:subtract-dateTimes` | `xsd:dayTimeDuration` |
+| `?date - ?date` | `op:subtract-dates` | `xsd:dayTimeDuration` |
+| `?time - ?time` | `op:subtract-times` | `xsd:dayTimeDuration` |
+
+**Shifts** — adding or subtracting a duration gives back the left operand's kind:
+
+| Expression | Result |
+| --- | --- |
+| `?dateTime ± ?dayTimeDuration` | `xsd:dateTime` |
+| `?dateTime ± ?yearMonthDuration` | `xsd:dateTime` |
+| `?date ± ?dayTimeDuration` | `xsd:date` |
+| `?date ± ?yearMonthDuration` | `xsd:date` |
+| `?time ± ?dayTimeDuration` | `xsd:time` |
+| `?dayTimeDuration ± ?dayTimeDuration` | `xsd:dayTimeDuration` |
+| `?yearMonthDuration ± ?yearMonthDuration` | `xsd:yearMonthDuration` |
+
+```sparql
+BIND(?start + "P1M"^^xsd:yearMonthDuration AS ?renewal)
+BIND(?deadline - "PT48H"^^xsd:dayTimeDuration AS ?reminder)
+```
+
+Shifting is calendar-aware, with three behaviours worth knowing:
+
+- **Month arithmetic clamps to the end of the month.** `2026-01-31 + P1M` is
+  `2026-02-28`, not March 3rd — and `2028-01-31 + P1M` is `2028-02-29`, since
+  2028 is a leap year.
+- **`xsd:time` wraps within the day**, having no date to carry into:
+  `23:00:00Z + PT2H` is `01:00:00Z`.
+- **`xsd:date ± dayTimeDuration` keeps only the date part**, so a sub-day
+  duration moves nothing: `2026-01-01 + PT5H` is still `2026-01-01`.
+
+The two duration families never mix — `?dayTimeDuration + ?yearMonthDuration` is
+a type error, because months have no fixed length. So is `?time ± ?yearMonthDuration`,
+since a time carries no months. Computed values render in the canonical form of
+their kind: a `dateTime` in UTC with a `Z`, a `date` or `time` with no timezone
+designator.
+
+
+**Semantics:**
+
+- **Signed.** `?end - ?start` is negative when the end precedes the start, e.g.
+  `-P1D`. It is an elapsed difference, not an absolute magnitude.
+- **`xsd:dateTime` is an instant.** A dateTime is UTC from the moment it is
+  parsed, so `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` —
+  the same instant written two ways — not the three hours the wall-clock
+  readings differ by. A lexical form with no timezone is read as UTC.
+- **`xsd:date` and `xsd:time` carry no offset** (deviation, see below). Fluree
+  does not support timezone offsets: on a `date` or `time` the designator is
+  validated and discarded, not applied, so `"2026-01-01+05:00"` *is*
+  `"2026-01-01"` and `"17:00:00-06:00"` *is* `"17:00:00"`. Arithmetic therefore
+  subtracts calendar dates and wall clocks: `"2026-01-01+05:00" - "2026-01-01Z"`
+  is `PT0S` rather than the `-PT5H` XPath gives. Full statement under
+  [Timezone offsets are not supported](../reference/compatibility.md). Store an
+  offset you need to keep as its own property.
+- **Subtraction only.** `+`, `*`, `/` and `%` are not defined over temporal
+  operands, and neither are mixed pairs such as `?dateTime - ?date`. These are
+  type errors, which inside `BIND` means the variable is left **unbound** rather
+  than raising — see [Expression errors](#bind).
+
+> **Beyond the standard.** SPARQL 1.1 maps `-` only over numeric operands, and
+> the SPARQL 1.2 draft does not extend it either — a conformant processor is
+> free to answer a type error here. Fluree follows
+> [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md),
+> the community proposal that specifies these operators, and matches its XPath
+> semantics wherever an offset is not in play — that is, for every
+> `xsd:dateTime` operand, and for `xsd:date`/`xsd:time` operands written without
+> one. Where an `xsd:date` or `xsd:time` is written with an offset, the bullet
+> above applies and the answers differ; XPath's own `op:subtract-times` example
+> (`"17:00:00-06:00" - "08:00:00+09:00"` = `P1D`) is one such case, and Fluree
+> answers `PT9H`. Queries relying on any of this are not portable to processors
+> that implement only the published spec.
+
+Also supported from SEP-0002: ordering and equality over `xsd:date`,
+`xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration` (`<`, `>`, `=`),
+and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS` accessors over
+`xsd:date` and `xsd:time`.
+
+`ADJUST()` is **not supported and not planned**. SEP-0002 adds it (SPARQL 1.1
+and the 1.2 draft define no such function), but its whole purpose is to set or
+change a value's timezone offset — the one property Fluree deliberately does not
+keep. A result whose only distinguishing feature is an offset would be discarded
+on write and reported as `Z` on read, so supporting it would suggest offsets are
+preserved when they are not. Calling it is a parse error. To render an instant
+in a particular zone, do it in the application, or store the offset as its own
+property.
+
+### Type Conversion
+
+- `STRDT(?str, ?datatype)` - String to typed literal
+- `STRLANG(?str, ?lang)` - String with language
+- `DATATYPE(?literal)` - Datatype IRI of a literal (per W3C SPARQL 1.1 §17.4.2.3, an IRI term — e.g. the `xsd:decimal` IRI, **not** the string `"xsd:decimal"`). Compare it against a datatype IRI directly, e.g. `FILTER(DATATYPE(?v) = xsd:decimal)`. SPARQL results render it as the full IRI; JSON-LD results compact it against the active `@context`.
+- `IRI(?str)` - IRI from string
+- `URI(?str)` - URI from string
+- `BNODE(?str)` - Blank node
+
+### XSD Datatype Constructors (Casts)
+
+Per W3C SPARQL 1.1 §17.5, XSD constructor functions cast values between datatypes. Invalid casts produce unbound (no binding), not errors.
+
+- `xsd:boolean(?x)` - Cast to boolean (`"true"`, `"1"` → true; `"false"`, `"0"` → false; numeric 0 → false, non-zero → true)
+- `xsd:integer(?x)` - Cast to integer (truncates doubles, parses strings)
+- `xsd:float(?x)` - Cast to single-precision float
+- `xsd:double(?x)` - Cast to double-precision float
+- `xsd:decimal(?x)` - Cast to decimal (rejects scientific notation strings)
+- `xsd:string(?x)` - Cast to string (canonical form for decimals)
+
+### Logical Functions
+
+- `BOUND(?var)` - Variable is bound
+- `IF(?condition, ?then, ?else)` - Conditional
+- `COALESCE(?x, ?y, ...)` - First non-null value
+- `ISIRI(?x)` - Is IRI
+- `ISURI(?x)` - Is URI
+- `ISBLANK(?x)` - Is blank node
+- `ISLITERAL(?x)` - Is literal
+- `ISNUMERIC(?x)` - Is numeric
+
+### Search and Similarity Functions
+
+Fluree extensions that score values for ranking, used in `BIND`:
+
+- `fulltext(?text, "query")` - BM25 relevance of a full-text value to a query string; `0` when no query term occurs. Also written `f:fulltext(...)`. See [Inline Fulltext Search](../indexing-and-search/fulltext.md).
+- `dotProduct(?v1, ?v2)` - Dot product of two vectors
+- `cosineSimilarity(?v1, ?v2)` - Cosine similarity of two vectors
+- `euclideanDistance(?v1, ?v2)` - Euclidean (L2) distance between two vectors
+
+Vectors are `f:embeddingVector` literals (`"[0.1, 0.2]"^^f:embeddingVector`); see [Vector Search](../indexing-and-search/vector-search.md). Names are case-insensitive and accept underscores (`cosine_similarity`).
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f:  <https://ns.flur.ee/db#>
+
+SELECT ?doc ?text ?similar WHERE {
+  VALUES ?q { "[0.88, 0.12, 0.08]"^^f:embeddingVector }
+  ?doc ex:body ?body ;
+       ex:embedding ?vec .
+  BIND(fulltext(?body, "graph databases") AS ?text)
+  BIND(cosineSimilarity(?vec, ?q) AS ?similar)
+  FILTER(?text > 0 || ?similar > 0.8)
+}
+ORDER BY DESC(0.6 * ?text + 0.4 * ?similar)
+LIMIT 10
+```
+
+## Subqueries
+
+Nest queries:
+
+```sparql
+SELECT ?person ?name
+WHERE {
+  ?person ex:name ?name .
+  {
+    SELECT ?person
+    WHERE {
+      ?person ex:age ?age .
+      FILTER (?age > 18)
+    }
+  }
+}
+```
+
+## Service Queries
+
+SERVICE enables cross-ledger queries within Fluree. You can execute patterns against different ledgers within the same query using the `fluree:ledger:` URI scheme.
+
+### Basic Cross-Ledger Query
+
+Query data from another ledger in your dataset:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?customer ?name ?total
+FROM <customers:main>
+FROM NAMED <orders:main>
+WHERE {
+  ?customer ex:name ?name .
+  SERVICE <fluree:ledger:orders:main> {
+    ?order ex:customer ?customer ;
+           ex:total ?total .
+  }
+}
+```
+
+### Endpoint URI Format
+
+For local Fluree ledger queries, use the `fluree:ledger:` scheme:
+
+| Format | Description | Matches dataset ledger ID |
+|--------|-------------|----------------------|
+| `fluree:ledger:<name>` | Query ledger with default branch (main) | `<name>:main` |
+| `fluree:ledger:<name>:<branch>` | Query specific branch | `<name>:<branch>` |
+| `fluree:ledger:urn:fluree:<name>:<branch>` | The same, in the URN spelling | `<name>:<branch>` |
+
+Where:
+- `<name>` is the ledger name **without** the branch (e.g., `orders`, `acme/people`)
+- `<branch>` is the branch name (e.g., `main`, `dev`)
+- The full dataset ledger ID is always `<name>:<branch>` (e.g., `orders:main`, `acme/people:dev`)
+
+The endpoint must name a ledger that is **in the query's dataset** (a `FROM` or
+`FROM NAMED` member), or, for a query with no dataset clause, the ledger the
+query runs on. An endpoint naming any other ledger is refused with a 400
+("… not in this query's dataset; add it with FROM NAMED to query it"), and under
+`SERVICE SILENT` it contributes no rows. A SERVICE endpoint never loads a ledger
+on its own. The endpoint names a whole ledger, so it takes no time pin
+(`@t:…`) and no graph (`#…`): the member's time and graphs come from the
+dataset.
+
+**Examples:**
+
+```sparql
+SERVICE <fluree:ledger:orders> { ... }         # matches orders:main
+SERVICE <fluree:ledger:orders:main> { ... }    # matches orders:main (explicit)
+SERVICE <fluree:ledger:orders:dev> { ... }     # matches orders:dev
+```
+
+### SERVICE SILENT
+
+Use `SERVICE SILENT` to return empty results instead of failing if the service errors or is unavailable:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?order
+WHERE {
+  ?person ex:name ?name .
+  SERVICE SILENT <fluree:ledger:orders:main> {
+    ?order ex:customer ?person .
+  }
+}
+```
+
+If the `orders` ledger is not in the dataset or encounters an error, the SERVICE block contributes no rows instead of failing the query.
+
+### Variable Endpoints
+
+SERVICE supports variable endpoints that iterate over available ledgers:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?ledger ?person ?name
+FROM NAMED <db1:main>
+FROM NAMED <db2:main>
+WHERE {
+  SERVICE ?ledger {
+    ?person ex:name ?name .
+  }
+}
+```
+
+This queries all named ledgers in the dataset.
+
+### Cross-Ledger Join Example
+
+Join customer data from one ledger with their orders from another:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?customerName ?productName ?quantity
+FROM <customers:main>
+FROM NAMED <orders:main>
+FROM NAMED <products:main>
+WHERE {
+  # Get customer from default graph (customers ledger)
+  ?customer ex:name ?customerName .
+
+  # Get orders for this customer from orders ledger
+  SERVICE <fluree:ledger:orders:main> {
+    ?order ex:customer ?customer ;
+           ex:product ?product ;
+           ex:quantity ?quantity .
+  }
+
+  # Get product details from products ledger
+  SERVICE <fluree:ledger:products:main> {
+    ?product ex:name ?productName .
+  }
+}
+```
+
+### Requirements
+
+- The target ledger must be included in the dataset (via `FROM` or `FROM NAMED` clauses)
+- Results are joined with the outer query on shared variables
+- SERVICE patterns are executed as correlated subqueries (like EXISTS)
+
+### Remote Fluree Federation
+
+SERVICE supports querying ledgers on **remote Fluree instances** using the `fluree:remote:` scheme. This enables cross-server federation — a single SPARQL query can join data from local ledgers with data from ledgers on other Fluree servers.
+
+#### Remote Endpoint Format
+
+| Format | Description |
+|--------|-------------|
+| `fluree:remote:<connection>/<ledger>` | Query a ledger on a registered remote server |
+
+Where:
+- `<connection>` is a named remote connection registered at build time (maps to a server URL + bearer token)
+- `<ledger>` is the ledger ID on the remote server (e.g., `customers:main`, `acme/people:main`)
+
+#### Example: Cross-Server Join
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?localName ?remoteEmail
+WHERE {
+  ?person ex:name ?localName .
+  SERVICE <fluree:remote:acme/customers:main> {
+    ?person ex:email ?remoteEmail .
+  }
+}
+```
+
+This queries `?person ex:name` from the local ledger and joins with `?person ex:email` from the `customers:main` ledger on the remote server named `acme`.
+
+#### Multiple Ledgers on the Same Remote Server
+
+A single remote connection gives access to any ledger the bearer token is authorized for:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?customer ?orderId ?productName
+WHERE {
+  SERVICE <fluree:remote:acme/customers:main> {
+    ?customer ex:name ?name .
+    ?customer ex:id ?customerId .
+  }
+  SERVICE <fluree:remote:acme/orders:main> {
+    ?order ex:customerId ?customerId .
+    ?order ex:orderId ?orderId .
+    ?order ex:product ?product .
+  }
+  SERVICE <fluree:remote:acme/products:main> {
+    ?product ex:name ?productName .
+  }
+}
+```
+
+#### SILENT with Remote Endpoints
+
+`SERVICE SILENT` works with remote endpoints. If the remote server is unreachable, the connection is not registered, or the bearer token is rejected, the SERVICE block returns empty results instead of failing the query:
+
+```sparql
+SERVICE SILENT <fluree:remote:partner/inventory:main> {
+  ?item ex:sku ?sku .
+}
+```
+
+#### Registering Remote Connections
+
+Remote connections are registered at connection build time via the Rust API or server configuration. See [Configuration: Remote connections](../operations/configuration.md#remote-connections) and [Rust API: Remote federation](../getting-started/rust-api.md#remote-federation) for setup details.
+
+#### Datatype Handling
+
+Remote query results preserve their original datatypes. Values returned from a remote server are parsed into the same rich type system used for local data — `xsd:dateTime`, `xsd:date`, `xsd:decimal`, `xsd:integer`, etc. are all stored with their proper typed representations. Custom datatypes (e.g., `http://example.org/myType`) are also preserved: the value is kept as a string with the original datatype IRI retained, so round-tripping and downstream FILTER comparisons on shared custom types work correctly.
+
+#### Limitations (v1)
+
+- **Uncorrelated execution only.** The SERVICE body is sent to the remote server as a standalone query. Parent-row bindings are not injected as VALUES (bound-join). This means a SERVICE block that references variables bound in the outer query will not push those constraints to the remote server — the remote returns all matching rows, and the join happens locally.
+- **SPARQL queries only.** Remote SERVICE is available in SPARQL queries. JSON-LD queries do not currently support the `fluree:remote:` scheme.
+- **No query cancellation propagation.** If the local query is cancelled, in-flight remote HTTP requests are not aborted.
+- **Policy is local only.** The remote server enforces its own policy based on the bearer token. The local server's policy engine does not filter rows returned from a remote SERVICE.
+
+### External SPARQL Endpoints
+
+Federated queries to non-Fluree SPARQL endpoints (e.g., Wikidata, DBpedia) are not yet supported. Only the `fluree:ledger:` (local) and `fluree:remote:` (remote Fluree) schemes are currently available.
+
+## Time Travel
+
+### Point-in-Time Queries
+
+Query data as it existed at a specific time using time specifiers in the `FROM` clause:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name ?age
+FROM <ledger:main@t:100>
+WHERE {
+  ?person ex:name ?name ;
+          ex:age ?age .
+}
+```
+
+Time specifiers:
+- `@t:100` - Transaction number
+- `@time:2024-01-15T10:30:00Z` - ISO 8601 datetime
+- `@commit:bafybeig...` - Commit ContentId
+- `@t:latest` - Current/latest state
+
+### History Queries
+
+Query all changes (assertions and retractions) within a time range using `FROM...TO` with RDF-star syntax:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?age ?t ?op
+FROM <ledger:main@t:1>
+TO <ledger:main@t:latest>
+WHERE {
+  << ex:alice ex:age ?age >> f:t ?t .
+  << ex:alice ex:age ?age >> f:op ?op .
+}
+ORDER BY ?t
+```
+
+The `<< subject predicate object >>` syntax (RDF-star) treats the triple as an entity that can have metadata:
+- `f:t` - Transaction time (integer) when the fact was asserted or retracted.
+- `f:op` - Operation type as a boolean: `true` for assertions, `false` for retractions. Mirrors `Flake.op` on disk.
+
+**Filter by operation type:**
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?age ?t
+FROM <ledger:main@t:1>
+TO <ledger:main@t:latest>
+WHERE {
+  << ex:alice ex:age ?age >> f:t ?t .
+  << ex:alice ex:age ?age >> f:op ?op .
+  FILTER(?op = false)
+}
+```
+
+**History with ISO datetime range:**
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?name ?t ?op
+FROM <ledger:main@time:2024-01-01T00:00:00Z>
+TO <ledger:main@time:2024-12-31T23:59:59Z>
+WHERE {
+  << ex:alice ex:name ?name >> f:t ?t .
+  << ex:alice ex:name ?name >> f:op ?op .
+}
+```
+
+## Edge annotations (SPARQL 1.2 / RDF 1.2)
+
+In addition to SPARQL 1.1, Fluree supports the RDF 1.2 / SPARQL 1.2 **edge-annotation** subset — the annotation tail `{| ... |}`, the `~` reifier, and `rdf:reifies` with `<<( ... )>>` triple terms — on both the query and UPDATE surfaces. The mandated `VERSION "1.2"` prologue declaration is accepted (lexed and skipped), so conformant 1.2 clients parse normally. This is the standards-based way to attach metadata to a specific edge `(subject, predicate, object)`. For the full model, output shape, and lifecycle, see **[Edge annotations](../concepts/edge-annotations.md)**.
+
+### Querying annotations
+
+Match an edge's annotation metadata with an annotation tail in `WHERE`:
+
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?role WHERE {
+  ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
+}
+```
+
+Walk from an annotation subject back to the edge it reifies with `rdf:reifies` and a triple term:
+
+```sparql
+PREFIX ex:  <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?ann ?role WHERE {
+  ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> ;
+       ex:role ?role .
+}
+```
+
+A triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The bare (parenthesis-free) `<< s p o >>` form is a separate, Fluree-specific construct for `f:t` / `f:op` flake-metadata extraction (see [Time Travel](#history-queries) above) — the two do not compose.
+
+### Updating with annotations
+
+The reifier can be named (`~ <iri>`), a variable (`~ ?v`, templates only), blank (`~ _:b`), or anonymous (a bare `{| ... |}`):
+
+```sparql
+PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme ~ ex:emp1 {| ex:role "Engineer" |} .
+}
+```
+
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates, and in `CONSTRUCT` templates, where they carry reifiers into every result format (see [CONSTRUCT](construct.md#edge-annotations-in-the-template)). Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+
+### Boundaries (rejected at parse / lowering time)
+
+- **Default graph only.** An annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — SPARQL UPDATE annotations target the default graph. Use the JSON-LD `@annotation` surface to annotate an edge inside a named graph.
+- **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
+- **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
+- **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
+- **`CONSTRUCT` template annotation blocks take simple predicates only**, and a template triple term cannot nest.
+- **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
+
+## SPARQL UPDATE
+
+Fluree supports SPARQL 1.1 Update for modifying data using standard SPARQL syntax, plus the RDF 1.2 annotation tail described in [Edge annotations](#edge-annotations-sparql-12--rdf-12) above. SPARQL UPDATE requests use the `application/sparql-update` content type and are sent to the update endpoints.
+
+### INSERT DATA
+
+Insert ground triples (no variables):
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA {
+  ex:alice ex:name "Alice" .
+  ex:alice ex:age 30 .
+  ex:alice ex:email "alice@example.org" .
+}
+```
+
+**HTTP Request:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/update/mydb:main \
+  -H "Content-Type: application/sparql-update" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+      INSERT DATA { ex:alice ex:name "Alice" }'
+```
+
+### DELETE DATA
+
+Delete specific ground triples:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE DATA {
+  ex:alice ex:email "alice@example.org" .
+}
+```
+
+### DELETE WHERE
+
+Delete triples matching a pattern:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE WHERE {
+  ex:alice ex:age ?age .
+}
+```
+
+This finds all `ex:age` values for `ex:alice` and deletes them.
+
+### DELETE/INSERT (Modify)
+
+The most powerful form combines WHERE, DELETE, and INSERT clauses:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE {
+  ?person ex:age ?oldAge .
+}
+INSERT {
+  ?person ex:age ?newAge .
+}
+WHERE {
+  ?person ex:name "Alice" .
+  ?person ex:age ?oldAge .
+  BIND(?oldAge + 1 AS ?newAge)
+}
+```
+
+**Update multiple properties:**
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE {
+  ?person ex:name ?oldName .
+  ?person ex:status ?oldStatus .
+}
+INSERT {
+  ?person ex:name "Alicia" .
+  ?person ex:status ex:Active .
+}
+WHERE {
+  ?person ex:name "Alice" .
+  OPTIONAL { ?person ex:name ?oldName }
+  OPTIONAL { ?person ex:status ?oldStatus }
+}
+```
+
+### Dataset scoping for MODIFY (`WITH` / `USING` / `USING NAMED`)
+
+SPARQL UPDATE `MODIFY` supports dataset scoping for named graphs:
+
+- **`WITH <iri>`**: sets the default graph for INSERT/DELETE templates that don’t use an explicit `GRAPH <iri> { ... }` block. With no `USING` or `USING NAMED` clause, it also sets the default graph for `WHERE` evaluation. A graph that doesn’t exist reads as empty, so the `WHERE` matches nothing; it never falls back to the ledger’s default graph.
+- **`USING <iri>`**: scopes the default graph(s) for `WHERE` evaluation. Repeated `USING` clauses are evaluated as a **merged default graph**. A graph that doesn’t exist contributes nothing, so a lone `USING` of an unknown graph gives the `WHERE` an empty default graph.
+- **`USING NAMED <iri>`**: scopes which named graphs are visible to `WHERE` `GRAPH <iri> { ... }` patterns. Repeated `USING NAMED` clauses allow multiple named graphs. With `USING NAMED` and no `USING`, the `WHERE`’s default graph is empty.
+
+Each `USING`, `USING NAMED` or `WITH` IRI resolves in the ledger being updated,
+the same way a query's `FROM` does: the ledger's own address (`mydb`,
+`mydb:main`, `urn:fluree:mydb:main`) names its default graph, `mydb:main#config`
+or its URN names the config graph, and a registered graph IRI names that graph.
+A graph the ledger does not have contributes nothing, so `WHERE` over it binds
+nothing and the update changes nothing (SPARQL 1.1 Update §3.1.3). That
+includes an IRI that also reads as another ledger's address (`urn:g1`,
+`other:main`). An address that can only name another ledger (`other`,
+`other@t:1`), or an address with a time pin, is refused with a 400.
+
+A `GRAPH <iri>` block in the `WHERE` or in a template, and an `INSERT DATA` /
+`DELETE DATA` quad, read the address the same way: `mydb:main` is the default
+graph, so `WITH <mydb:main>` and `GRAPH <mydb:main> { … }` read and write it and
+never create a named graph called `mydb:main`, and `mydb:main#<graph IRI>` is
+that graph. See [the ledger's own address in a graph
+position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)
+for the full table, and for a graph an earlier version registered under the
+address. The reserved graphs keep their own IRIs, such as
+`urn:fluree:mydb:main#config`, and `mydb:main#config` names the config graph
+in these positions too: it writes the config graph, and `mydb:main#txn-meta`
+is refused as a write target like any name of `#txn-meta`.
+
+`urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, names the default graph in every clause that reads a graph: `USING`, `USING NAMED`, `WITH`, and `GRAPH <urn:default>` in the `WHERE`. `WITH <urn:default>` also writes the default graph. The default graph is not a named graph, so a write that names one by it (a `GRAPH <urn:default>` template or `INSERT DATA` quad, `CREATE GRAPH`, or a `CLEAR`/`DROP`/`ADD`/`COPY`/`MOVE` operand) is refused with a `400`; leave out `GRAPH`, or write `DEFAULT` in graph management.
+
+### Graph variables in templates
+
+A `GRAPH ?g { ... }` block in an INSERT or DELETE template writes to whichever graph `?g` names in each `WHERE` solution. This rewrites every match in the graph it was found in:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+DELETE { GRAPH ?g { ?s ex:status "old" } }
+INSERT { GRAPH ?g { ?s ex:status "new" } }
+WHERE  { GRAPH ?g { ?s ex:status "old" } }
+```
+
+`DELETE WHERE { GRAPH ?g { ... } }` works the same way.
+
+- In `WHERE`, `GRAPH ?g` ranges over the ledger's user named graphs. The default graph and the reserved `#config` and `#txn-meta` graphs are not enumerated; `#config` remains readable as `GRAPH <urn:fluree:<ledger>#config>` or `GRAPH <<ledger>#config>`.
+- The template writes the graph `?g` names in the ledger (see [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)), which is the graph the `WHERE` read: a `?g` bound to the ledger's own address writes the default graph.
+- `?g` may name a graph that does not exist yet, for example one built with `BIND(IRI(...) AS ?g)`. The commit registers it.
+- A solution that leaves `?g` unbound writes nothing for that block. A `?g` bound to a literal or a blank node is an error, as is a `?g` that names `#txn-meta`.
+
+### Blank Nodes in INSERT
+
+Blank nodes can be used in INSERT templates to create new entities:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA {
+  _:newPerson ex:name "Bob" .
+  _:newPerson ex:age 25 .
+}
+```
+
+### Writing lists
+
+A `( … )` in a template writes a list, stored as a JSON-LD `@list` is. An update reads a list's members as values, as a [query](#lists) does, so a write naming a member reaches it:
+
+```sparql
+# data: ex:s ex:items (1 2 1 3) .
+
+DELETE DATA { ex:s ex:items 1 }                        # ex:s ex:items (2 3)
+INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
+```
+
+- Deleting a value deletes every entry of a list that holds it, and the value where it is also stored beside the list, however the delete is written.
+- To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
+- `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
+- A list whose cells something else names, or that carries other triples, is stored as its triples, and so is a second list on one subject and property, including one `ADD` brings into a graph that holds a list there.
+- Under a policy, a change to the cells of a list stored as its triples is judged as a change to its owner's property.
+
+### Typed Literals
+
+Specify datatypes explicitly:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+INSERT DATA {
+  ex:alice ex:birthDate "1990-05-15"^^xsd:date .
+  ex:alice ex:salary "75000.00"^^xsd:decimal .
+  ex:alice ex:active "true"^^xsd:boolean .
+}
+```
+
+### Language-Tagged Strings
+
+Insert strings with language tags:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA {
+  ex:alice ex:name "Alice"@en .
+  ex:alice ex:name "Alicia"@es .
+  ex:alice ex:name "アリス"@ja .
+}
+```
+
+### Multi-operation requests
+
+A single request may contain multiple operations separated by `;`. Operations
+execute **sequentially** — each operation's `WHERE` observes the graph-store
+state left by the previous one (SPARQL 1.1 Update §3.1) — and the whole
+request commits as **one atomic transaction**: one commit, one `t`, and a
+failure anywhere aborts the entire request with no partial effects.
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA { ex:s ex:p "first" } ;
+INSERT { ?s ex:q "second" } WHERE { ?s ex:p "first" }
+```
+
+Validation (policy, SHACL, uniqueness) runs **per operation** against the
+sequential state, not once against the final state. A request that is
+transiently invalid but finally valid — say, an operation that duplicates a
+unique property value that a later operation would free up — aborts at the
+offending operation. Ordered uniqueness checking requires this; for SHACL it
+is a deliberate choice (every intermediate state must satisfy the shapes,
+like a database without deferred constraints).
+
+What is enforced is read once, from the state before the request: the ledger
+config, the shapes and the uniqueness constraints. Shapes from another ledger
+(a cross-ledger `f:shapesSource`) are read at the head the request first reads
+that ledger at. An operation that turns
+SHACL or uniqueness off, or removes a shape or a constraint, does not relax
+the checks on a later operation in the same request, and one that turns them
+on does not apply them to the request, as in a single transaction. The config
+checks (a setting group split across graphs, a second value for a
+single-valued setting) run once, on the request's result.
+
+### SPARQL UPDATE Restrictions
+
+Current restrictions / boundaries:
+
+- **Graph management operations**: `CREATE`, `CLEAR`, `DROP`, `ADD`, `MOVE` and `COPY` are supported, and `CLEAR`/`DROP` accept `GRAPH <iri>`, `DEFAULT`, `NAMED` and `ALL`. These operations refuse the reserved `#config` and `#txn-meta` graphs, and read a graph named through the ledger's address, `<ledger>#<g>`, as the graph `<g>`. Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op.
+- **`CLEAR` and `DROP`**: `CLEAR` retracts what the graph holds; the graph remains, and a query as of an earlier `t` still sees its facts. `DROP` takes the graph out of the ledger with its history: nothing it held is queryable at the head, and a query naming it as of a `t` before the drop is refused. `DROP DEFAULT` leaves an empty default graph without its history. A drop retracts nothing, so it costs the same for any size of graph. Writing to a dropped graph starts it afresh. Only an identity without a restricting policy may drop. `DROP GRAPH` of a graph that does not exist is an error unless `SILENT`. The commits keep what a drop took, so a branch created at a `t` before the drop still has it: a drop is not a deletion.
+- **`COPY` and `MOVE`**: both clear the destination first, keeping its history; `MOVE` then drops its source. A copy or move of a graph onto itself does nothing.
+- **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
+- **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
+- **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
+
+### Endpoint Usage
+
+SPARQL UPDATE uses the update endpoints with `Content-Type: application/sparql-update`:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/fluree/update` | Connection-scoped, requires `Fluree-Ledger` header |
+| `POST /v1/fluree/update/<ledger...>` | Ledger-scoped, ledger from URL path |
+
+**Examples:**
+
+```bash
+# Ledger-scoped (recommended)
+curl -X POST http://localhost:8090/v1/fluree/update/mydb:main \
+  -H "Content-Type: application/sparql-update" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+      INSERT DATA { ex:alice ex:name "Alice" }'
+
+# Connection-scoped with header
+curl -X POST http://localhost:8090/v1/fluree/update \
+  -H "Content-Type: application/sparql-update" \
+  -H "Fluree-Ledger: mydb:main" \
+  -d 'PREFIX ex: <http://example.org/ns/>
+      INSERT DATA { ex:alice ex:name "Alice" }'
+```
+
+## Request options (`# PRAGMA`)
+
+A SPARQL request carries Fluree options in comments of the form `# PRAGMA name: value`. They are the SPARQL counterpart of a JSON-LD request's `opts` block and of the `fluree-*` [request headers](../api/headers.md#fluree-request-headers), and because they are comments, the text stays valid SPARQL for any other tool.
+
+```sparql
+# PRAGMA max-fuel: 5000
+# PRAGMA meta: fuel, time
+# PRAGMA policy-class: ex:EmployeeClass
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+| Pragma | Value | Applies to | JSON-LD `opts` | Header |
+|--------|-------|------------|----------------|--------|
+| `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
+| `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
+| `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
+| `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
+| `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
+| `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |
+| `meta` | `true`, `false`, or a list of `time`, `fuel`, `policy` | queries and updates | `meta` | `fluree-track-*` |
+| `max-fuel` | number | queries and updates | `max-fuel` | `fluree-max-fuel` |
+| `identity` | IRI | queries and updates | `identity` | `fluree-identity` |
+| `policy-class` | IRI list | queries and updates | `policy-class` | `fluree-policy-class` |
+| `policy-values` | one-line JSON object | queries and updates | `policy-values` | `fluree-policy-values` |
+| `default-allow` | `true` / `false` | queries and updates | `default-allow` | `fluree-default-allow` |
+| `event-time` | RFC 3339 timestamp | updates | `eventTime` | — |
+| `validation-mode` | `warn` / `reject` | updates | `validationMode` | — |
+| `unique-properties` | IRI list | updates | `uniqueProperties` | — |
+
+Rules:
+
+- **A comment whose first word is `PRAGMA` is a directive.** The name is case-insensitive, the `:` is optional, and list values are separated by commas or spaces. A pragma may sit anywhere a comment can, including after the query. When one repeats, the last wins.
+- **Errors are never silent.** An unknown name, a malformed value, or a pragma that does not apply to the request (`min-t` on an update, `event-time` on a query) fails the request with a `400` (diagnostic `F012`), rather than running it without the option it asked for.
+- **IRIs** may be written `<…>` or as a prefixed name the request declares with `PREFIX`; anything else (a DID, a URN) is taken as written.
+- **A pragma wins over the header** that names the same option, as a JSON-LD body's `opts` do, with three exceptions:
+  - **`meta` adds tracking.** The request reports what the pragma asks for and what the `fluree-track-*` headers ask for; a pragma cannot switch off tracking a header requested.
+  - **`max-fuel` is a cap.** The request runs under the smaller of the pragma and the `fluree-max-fuel` header, so a pragma can lower a limit but never raise it.
+  - **On an authenticated request, policy pragmas cannot change the headers' policy selection.** When a request carries a bearer token or a signature and its headers select policy (`fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values` or `fluree-default-allow`), a policy pragma may repeat that selection or narrow `default-allow` to `false`. Any other policy pragma is refused with a `403`, including one that names an option the headers left unset. This lets an application that forwards its users' SPARQL pin policy with headers. When the headers select nothing, the pragmas select.
+- **Policy pragmas are held to the caller's credential exactly as headers are.** A selection the credential does not permit is refused with a `403`. The inline policy document has no pragma; send it with the `fluree-policy` header. See [Policy in queries](../security/policy-in-queries.md#sparql-queries).
+- **In a multi-query envelope**, a SPARQL alias's pragmas act as its body `opts`, so they win over the alias's and the envelope's `opts`. The same exceptions apply: a pragma's `meta` adds to the alias's `opts.meta`, its `max-fuel` cannot raise the alias's `opts.max-fuel`, and on an authenticated request a policy pragma may only repeat the selection that the envelope and alias `opts` make.
+- **The MCP `sparql_query` tool** refuses policy and `min-t` pragmas: the connection's identity selects policy, and the tool's `t` argument pins the snapshot.
+
+## Best Practices
+
+1. **Use PREFIX Declarations**: Makes queries readable
+2. **Automatic Pattern Optimization**: The query planner automatically reorders patterns for efficient execution using statistics-driven cardinality estimates
+3. **Flexible FILTER Placement**: Filters, including `FILTER EXISTS` and `FILTER NOT EXISTS`, can be placed anywhere in their group — the query engine applies each one to the whole group, as soon as every variable it reads has its final value. A variable that an `OPTIONAL` or an `UNDEF` in `VALUES` leaves unbound on some rows waits for any later pattern that fills it in
+4. **Limit Results**: Use LIMIT for large result sets
+5. **Avoid Cartesian Products**: Structure queries to avoid large joins
+
+## Related Documentation
+
+- [JSON-LD Query](jsonld-query.md): Fluree's native query language
+- [Edge annotations](../concepts/edge-annotations.md): RDF 1.2 / SPARQL 1.2 edge metadata (annotation tail, `~` reifier, `rdf:reifies`)
+- [CONSTRUCT Queries](construct.md): Generating RDF graphs
+- [Datasets](datasets.md): Multi-graph queries
+- [Output Formats](output-formats.md): Query result formats
+- [Transactions](../transactions/overview.md): JSON-LD transaction format

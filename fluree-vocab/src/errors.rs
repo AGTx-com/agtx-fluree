@@ -1,0 +1,414 @@
+//! Error type compact IRIs
+//!
+//! These compact IRI strings identify error types in API responses.
+//! They follow the pattern: `err:category/ErrorName`
+//!
+//! The `err:` prefix maps to `https://ns.flur.ee/errors#` in the full JSON-LD context.
+//!
+//! # Example Usage
+//!
+//! ```json
+//! {
+//!   "error": "Invalid query: missing WHERE clause",
+//!   "status": 400,
+//!   "@type": "err:db/InvalidQuery"
+//! }
+//! ```
+//!
+//! Full expansion (for documentation):
+//! ```json
+//! {
+//!   "@context": {
+//!     "err": "https://ns.flur.ee/errors#"
+//!   },
+//!   "error": "Invalid query: missing WHERE clause",
+//!   "status": 400,
+//!   "@type": "err:db/InvalidQuery"
+//! }
+//! ```
+
+/// Error namespace prefix
+pub const ERR_PREFIX: &str = "err:";
+
+// =============================================================================
+// Database Errors (db)
+// =============================================================================
+
+/// Invalid query error (malformed syntax, missing clauses, etc.)
+pub const INVALID_QUERY: &str = "err:db/InvalidQuery";
+
+/// Invalid transaction error
+pub const INVALID_TRANSACTION: &str = "err:db/InvalidTransaction";
+
+/// Query execution error
+pub const QUERY_EXECUTION: &str = "err:db/QueryExecution";
+
+/// Query was cancelled by a timeout monitor, caller, or disconnected client.
+pub const QUERY_CANCELLED: &str = "err:db/QueryCancelled";
+
+/// Query read-after-write freshness wait timed out before requested t was visible.
+pub const READ_AFTER_WRITE_TIMEOUT: &str = "err:db/ReadAfterWriteTimeout";
+
+/// Transaction execution error
+pub const TRANSACTION_EXECUTION: &str = "err:db/TransactionExecution";
+
+/// Ledger not found
+pub const LEDGER_NOT_FOUND: &str = "err:db/LedgerNotFound";
+
+/// Ledger already exists
+pub const LEDGER_EXISTS: &str = "err:db/LedgerExists";
+
+/// Novelty at maximum size (backpressure)
+pub const NOVELTY_AT_MAX: &str = "err:db/NoveltyAtMax";
+
+/// A single transaction's delta alone meets or exceeds `reindex_max_bytes`,
+/// so it can never be accepted by waiting for the indexer to drain novelty.
+///
+/// Distinct from [`NOVELTY_AT_MAX`] (retryable backpressure, HTTP 503 +
+/// `Retry-After`): this is a permanent refusal of this transaction at this
+/// configuration, surfaced as HTTP 413 with no `Retry-After` — split the
+/// transaction into smaller pieces or raise `reindex_max_bytes`.
+pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
+
+/// The HTTP request body exceeds the server's configured body-size limit
+/// (`--body-limit`), refused before any parsing or staging.
+///
+/// The other 413 this server emits: distinct from
+/// [`NOVELTY_DELTA_TOO_LARGE`], which means the *parsed transaction's
+/// novelty delta* alone meets or exceeds `reindex_max_bytes`. Clients must
+/// branch on `@type`, not the 413 status — the remedies differ (raise the
+/// HTTP body limit / send a smaller request here, vs. split the transaction
+/// or raise `reindex_max_bytes` there).
+pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
+
+/// The write would bring the ledger past the number of distinct datatypes
+/// its index can store.
+///
+/// A permanent refusal, surfaced as HTTP 422 with no `Retry-After`.
+/// Datatype IDs are never released, so neither retrying nor waiting for the
+/// indexer admits the write. The ledger is left unchanged.
+pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
+
+/// Commit conflict (concurrent modification)
+pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
+
+/// Every commit attempt the server made lost its race with other writers to
+/// the same ledger.
+///
+/// Retryable contention, surfaced as HTTP 503 with `Retry-After`: nothing was
+/// committed, and the same request can succeed once the other writers ease
+/// off. Distinct from [`COMMIT_CONFLICT`], which the server returns without
+/// having retried.
+pub const COMMIT_CONTENTION: &str = "err:db/CommitContention";
+
+/// The server has not loaded the ledger's index: it failed to load, or the
+/// one the server holds is older than the ledger's.
+///
+/// Retryable, surfaced as HTTP 503 with `Retry-After`: the write was refused
+/// before it read or committed anything, and the same request can succeed
+/// once the index loads.
+pub const INDEX_NOT_LOADED: &str = "err:db/IndexNotLoaded";
+
+/// Empty transaction (no flakes)
+pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
+
+/// Graph source not found
+pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
+
+/// The graph source was dropped, so it can no longer be synced (HTTP 409)
+pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
+
+/// The graph source has no R2RML mapping, so it has nothing to answer a query
+/// from (HTTP 409). Registering it again with a mapping clears it.
+pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
+
+/// The graph source is of a family this build was compiled without (an
+/// Iceberg / R2RML source without the `iceberg` feature, SQL without `sql`,
+/// Delta without `delta`), so nothing here can read it (HTTP 501).
+pub const GRAPH_SOURCE_UNSUPPORTED: &str = "err:db/GraphSourceUnsupported";
+
+/// The graph source is an index (BM25, vector, geo), which has no triples, named
+/// where a graph is read: as the query target, in `FROM` / `FROM NAMED`, or in
+/// `GRAPH` (HTTP 400). Its searches name it in their own pattern instead.
+pub const GRAPH_SOURCE_NOT_A_GRAPH: &str = "err:db/GraphSourceNotAGraph";
+
+/// A graph the target ledger does not have
+pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
+
+/// A commit reference that names no commit of the ledger
+pub const COMMIT_NOT_FOUND: &str = "err:db/CommitNotFound";
+
+/// Graph source index stale
+pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
+
+// =============================================================================
+// API Errors (api)
+// =============================================================================
+
+/// Missing required parameter
+pub const MISSING_PARAMETER: &str = "err:api/MissingParameter";
+
+/// Invalid header value
+pub const INVALID_HEADER: &str = "err:api/InvalidHeader";
+
+/// Missing ledger alias
+pub const MISSING_LEDGER: &str = "err:api/MissingLedger";
+
+/// Bad request (generic)
+pub const BAD_REQUEST: &str = "err:api/BadRequest";
+
+/// Not implemented
+pub const NOT_IMPLEMENTED: &str = "err:api/NotImplemented";
+
+/// Not found (generic resource not found)
+pub const NOT_FOUND: &str = "err:api/NotFound";
+
+/// Not acceptable (content negotiation failure)
+pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
+
+/// Unsupported media type (request body format not accepted)
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
+
+/// A graph source's connection, auth or storage-identity input was refused
+/// before anything was built (HTTP 400): an unknown field, auth given two ways
+/// or only partly, flat and structured fields mixed, or a secret the surface
+/// may not name. The message names the field, never its value.
+pub const INVALID_GRAPH_SOURCE_CONFIG: &str = "err:api/InvalidGraphSourceConfig";
+
+// =============================================================================
+// Parsing Errors (parse)
+// =============================================================================
+
+/// JSON parsing error
+pub const JSON_PARSE: &str = "err:parse/JsonParse";
+
+/// JSON-LD parsing error
+pub const JSONLD_PARSE: &str = "err:parse/JsonLdParse";
+
+/// SPARQL parsing error
+pub const SPARQL_PARSE: &str = "err:parse/SparqlParse";
+
+/// SPARQL lowering error
+pub const SPARQL_LOWER: &str = "err:parse/SparqlLower";
+
+/// Cypher parsing error
+pub const CYPHER_PARSE: &str = "err:parse/CypherParse";
+
+/// Cypher lowering error
+pub const CYPHER_LOWER: &str = "err:parse/CypherLower";
+
+/// Turtle parsing error
+pub const TURTLE_PARSE: &str = "err:parse/TurtleParse";
+
+/// Type coercion error (incompatible @value/@type combination)
+pub const TYPE_COERCION: &str = "err:parse/TypeCoercion";
+
+// =============================================================================
+// Storage Errors (storage)
+// =============================================================================
+
+/// Storage read failure
+pub const STORAGE_READ: &str = "err:storage/ReadFailure";
+
+/// Storage write failure
+pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
+
+/// Object storage denied a read (S3 403 / `AccessDenied`).
+///
+/// Distinct from the policy-layer [`ACCESS_DENIED`]: this is the external
+/// object store (S3/GCS) refusing a read of an Iceberg data/metadata/manifest
+/// file, not a Fluree policy decision. Because S3 also returns `AccessDenied`
+/// for a missing object when the caller lacks `s3:ListBucket`, this means the
+/// credentials lack access **or** the object was moved/removed.
+pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
+
+/// A graph source's storage identity was asked to read a path whose scheme it
+/// does not serve (HTTP 400): `gs://` on an AWS identity without a GCS interop
+/// endpoint, `s3://` on a Google identity. The identity is decided by the
+/// source's `io.storage_auth`, never by the path, so this is refused rather
+/// than read with whatever client accepts the scheme.
+pub const STORAGE_SCHEME_NOT_SERVED: &str = "err:storage/SchemeNotServed";
+
+/// The catalog authorized the table but vended no storage credentials while the
+/// source is configured to require them (`vended_credentials = true`).
+///
+/// Fail-closed signal: the query/preview is refused rather than silently
+/// downgrading to ambient (process-default) AWS credentials.
+pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
+/// A catalog refused access to a table (HTTP 401/403 from the catalog), e.g. a
+/// Unity Catalog principal lacking `SELECT` or `EXTERNAL USE SCHEMA`.
+///
+/// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
+/// and from the policy-layer [`ACCESS_DENIED`].
+pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
+
+/// A Google catalog refused the request because it names no quota project
+/// (`USER_PROJECT_DENIED`, or BigLake's "missing `x-goog-user-project`
+/// header"): BigLake bills every request, whatever the identity, to the
+/// project the request names. The fix is the source's `quota_project`, not a
+/// broader grant.
+pub const CATALOG_QUOTA_PROJECT_REQUIRED: &str = "err:catalog/QuotaProjectRequired";
+
+/// Connection error
+pub const CONNECTION: &str = "err:storage/ConnectionError";
+
+// =============================================================================
+// R2RML / virtual-dataset Errors (r2rml)
+// =============================================================================
+
+/// A syntactically valid query used a pattern shape the R2RML rewrite cannot
+/// convert to a table scan on a virtual (graph-source) dataset — currently a
+/// VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` / `?s ?p "x"`), or
+/// a top-level VALUES clause on a subgraph crawl.
+///
+/// Distinct from the generic [`INVALID_QUERY`] (which means *malformed*): the
+/// request is well-formed, just unsupported ON THIS SOURCE, so it stays HTTP 400
+/// but carries this stable machine code so callers (Solo's virtual-dataset
+/// browse UI) can branch on the condition instead of matching the human-readable
+/// message. Mirrors the distinct-code precedent of [`STORAGE_ACCESS_DENIED`] /
+/// [`CATALOG_CREDENTIALS_NOT_VENDED`], but keeps the 400 status.
+pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
+
+// =============================================================================
+// Iceberg Errors (iceberg)
+// =============================================================================
+
+/// The Iceberg table carries merge-on-read delete files, which the reader
+/// does not apply (HTTP 409). The table is correctly configured; its current
+/// state is what is refused.
+pub const MERGE_ON_READ_DELETES: &str = "err:iceberg/MergeOnReadDeletes";
+
+// =============================================================================
+// Graph-source identity Errors (auth)
+// =============================================================================
+
+/// A Google token exchange for a graph source's identity was refused (HTTP 401,
+/// or 403 when Google said `PERMISSION_DENIED`) or got no usable answer (502).
+/// Carries Google's error code, never a response body.
+pub const GOOGLE_TOKEN_EXCHANGE: &str = "err:auth/GoogleTokenExchange";
+
+/// A graph source's Google credential configuration was refused (HTTP 400): a
+/// field outside the accepted subset, or a malformed key. Names the field,
+/// never its value.
+pub const GOOGLE_CREDENTIALS_INVALID: &str = "err:auth/GoogleCredentialsInvalid";
+
+/// A graph source asked for a host-derived identity (ambient AWS, the GCE
+/// metadata server, host ADC, host-signed WIF) that the instance's
+/// host-identity policy does not allow (HTTP 403).
+pub const HOST_IDENTITY_REFUSED: &str = "err:auth/HostIdentityRefused";
+
+// =============================================================================
+// Policy/Auth Errors (policy)
+// =============================================================================
+
+/// Access denied by policy
+pub const ACCESS_DENIED: &str = "err:policy/AccessDenied";
+
+/// Unauthorized (missing/invalid credentials)
+pub const UNAUTHORIZED: &str = "err:policy/Unauthorized";
+
+/// Invalid credential
+pub const INVALID_CREDENTIAL: &str = "err:policy/InvalidCredential";
+
+/// Policy violation
+pub const POLICY_VIOLATION: &str = "err:policy/PolicyViolation";
+
+// =============================================================================
+// System Errors (system)
+// =============================================================================
+
+/// Materialization deferred by novelty backpressure — retryable, not a fault.
+/// Distinct from INTERNAL so a client can branch on "try again shortly" rather than
+/// treating normal capacity pressure as a server defect.
+pub const NOVELTY_DEFERRED: &str = "err:db/NoveltyDeferred";
+
+/// A fan-out materialize window in which some target ledgers succeeded and at least one
+/// FAILED. Distinct from NOVELTY_DEFERRED (which is pure capacity, and retryable on its
+/// own) and from INTERNAL (which implies nothing was accomplished) — here some targets
+/// hold new data while the window as a whole will be retried.
+pub const MATERIALIZE_PARTIAL: &str = "err:db/MaterializePartial";
+
+/// Internal server error (catch-all)
+pub const INTERNAL: &str = "err:system/InternalError";
+
+/// Nameservice error
+pub const NAMESERVICE: &str = "err:system/NameServiceError";
+
+/// Configuration error
+pub const CONFIG: &str = "err:system/ConfigError";
+
+/// Format error
+pub const FORMAT: &str = "err:system/FormatError";
+
+/// Indexing error
+pub const INDEXING: &str = "err:system/IndexingError";
+
+/// BM25 index error
+pub const BM25: &str = "err:system/Bm25Error";
+
+/// Index timeout
+pub const INDEX_TIMEOUT: &str = "err:system/IndexTimeout";
+
+/// Indexing disabled
+pub const INDEXING_DISABLED: &str = "err:system/IndexingDisabled";
+
+/// Reindex conflict
+pub const REINDEX_CONFLICT: &str = "err:system/ReindexConflict";
+
+/// The file storage root is held by another open instance
+pub const STORAGE_IN_USE: &str = "err:system/StorageInUse";
+
+/// Cross-ledger model dependency could not be resolved or used.
+///
+/// Surfaces from `f:GraphRef` with `f:ledger` pointing at a model
+/// ledger that is missing, retracted, structurally broken, or
+/// otherwise unable to provide the requested governance artifact.
+/// Mapped to HTTP 502 since this is an upstream-dependency
+/// failure rather than an internal server error.
+pub const CROSS_LEDGER: &str = "err:system/CrossLedgerError";
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Check if a string is an error type IRI
+pub fn is_error_type(s: &str) -> bool {
+    s.starts_with(ERR_PREFIX)
+}
+
+/// Get the category from an error type (e.g., "db" from "err:db/InvalidQuery")
+pub fn error_category(error_type: &str) -> Option<&str> {
+    error_type.strip_prefix(ERR_PREFIX)?.split('/').next()
+}
+
+/// Get the error name from an error type (e.g., "InvalidQuery" from "err:db/InvalidQuery")
+pub fn error_name(error_type: &str) -> Option<&str> {
+    error_type.strip_prefix(ERR_PREFIX)?.split('/').nth(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_error_type() {
+        assert!(is_error_type(INVALID_QUERY));
+        assert!(is_error_type("err:custom/MyError"));
+        assert!(!is_error_type("not:an/error"));
+    }
+
+    #[test]
+    fn test_error_category() {
+        assert_eq!(error_category(INVALID_QUERY), Some("db"));
+        assert_eq!(error_category(JSON_PARSE), Some("parse"));
+        assert_eq!(error_category(INTERNAL), Some("system"));
+    }
+
+    #[test]
+    fn test_error_name() {
+        assert_eq!(error_name(INVALID_QUERY), Some("InvalidQuery"));
+        assert_eq!(error_name(JSON_PARSE), Some("JsonParse"));
+        assert_eq!(error_name(INTERNAL), Some("InternalError"));
+    }
+}

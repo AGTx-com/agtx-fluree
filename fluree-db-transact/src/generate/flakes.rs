@@ -1,0 +1,1219 @@
+//! Flake generation from triple templates
+//!
+//! This module provides `FlakeGenerator` for materializing triple templates
+//! with variable bindings into concrete flakes.
+
+use crate::current_facts::RetractIntent;
+use crate::error::{Result, TransactError};
+use crate::ir::{TemplateGraph, TemplateTerm, TripleTemplate};
+use crate::namespace::NamespaceRegistry;
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_query::{Batch, Binding, VarId};
+use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
+use once_cell::sync::Lazy;
+use rustc_hash::FxHashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+// Well-known datatype SIDs, cached to avoid per-call Arc<str> allocation.
+// Clone is ~5ns (atomic Arc bump) vs ~30-50ns for Sid::new().
+
+pub(crate) static DT_ID: Lazy<Sid> = Lazy::new(|| Sid::new(JSON_LD, "id"));
+pub(crate) static DT_BOOLEAN: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "boolean"));
+pub(crate) static DT_INTEGER: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "integer"));
+pub(crate) static DT_DOUBLE: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "double"));
+pub(crate) static DT_DECIMAL: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "decimal"));
+pub(crate) static DT_DATE_TIME: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "dateTime"));
+pub(crate) static DT_DATE: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "date"));
+pub(crate) static DT_TIME: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "time"));
+pub(crate) static DT_STRING: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "string"));
+pub(crate) static DT_JSON: Lazy<Sid> = Lazy::new(|| Sid::new(RDF, "JSON"));
+pub(crate) static DT_LANG_STRING: Lazy<Sid> = Lazy::new(|| Sid::new(RDF, "langString"));
+pub(crate) static DT_VECTOR: Lazy<Sid> = Lazy::new(|| Sid::new(FLUREE_DB, "embeddingVector"));
+pub(crate) static DT_G_YEAR: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "gYear"));
+pub(crate) static DT_G_YEAR_MONTH: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "gYearMonth"));
+pub(crate) static DT_G_MONTH: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "gMonth"));
+pub(crate) static DT_G_DAY: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "gDay"));
+pub(crate) static DT_G_MONTH_DAY: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "gMonthDay"));
+pub(crate) static DT_YEAR_MONTH_DURATION: Lazy<Sid> =
+    Lazy::new(|| Sid::new(XSD, "yearMonthDuration"));
+pub(crate) static DT_DAY_TIME_DURATION: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "dayTimeDuration"));
+pub(crate) static DT_DURATION: Lazy<Sid> = Lazy::new(|| Sid::new(XSD, "duration"));
+pub(crate) static DT_WKT_LITERAL: Lazy<Sid> = Lazy::new(|| Sid::new(OGC_GEO, "wktLiteral"));
+
+/// The graph a write goes to in the ledger being updated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteGraph {
+    /// The ledger's default graph.
+    Default,
+    /// A named graph, by the IRI it is registered under (or will be, when the
+    /// commit registers it).
+    Named(Arc<str>),
+}
+
+/// Resolves a graph IRI written in a graph position to the graph a write
+/// goes to (see [`FlakeGenerator::set_graph_table`]).
+pub type GraphTable<'a> = &'a (dyn Fn(&str) -> Result<WriteGraph> + Sync);
+
+/// What a template's graph term resolved to for one solution.
+enum SolutionGraph {
+    /// Unbound (or poisoned by OPTIONAL): the template writes nothing.
+    Unbound,
+    /// The default graph.
+    Default,
+    /// A named graph, by its Sid.
+    Named(Sid),
+}
+
+impl SolutionGraph {
+    /// A resolved graph: `None` is the default graph.
+    fn of(graph: Option<Sid>) -> Self {
+        match graph {
+            Some(sid) => Self::Named(sid),
+            None => Self::Default,
+        }
+    }
+}
+
+/// Whether a write parses a lexical form of the datatype `dt` into a value:
+/// an XSD datatype outside the string family, `rdf:JSON`, `geo:wktLiteral`
+/// or `f:embeddingVector`, the datatypes
+/// [`coerce_string_value`](fluree_db_core::coerce::coerce_string_value) does
+/// not take as text. Decided on the Sid alone, so a literal under any other
+/// datatype (`xsd:anyURI`, an application's own) costs no IRI decoding.
+/// `dt` is canonical, so the namespace code is the fixed one.
+fn parses_lexical(dt: &Sid) -> bool {
+    if dt.namespace_code == XSD {
+        !fluree_vocab::xsd_names::is_string_like_name(&dt.name)
+    } else {
+        *dt == *DT_JSON || *dt == *DT_WKT_LITERAL || *dt == *DT_VECTOR
+    }
+}
+
+/// Generates flakes from triple templates
+///
+/// The generator materializes templates by substituting variable bindings with
+/// concrete values. When a variable is unbound or poisoned (from OPTIONAL), the
+/// entire flake is silently skipped rather than producing an error.
+///
+/// This follows SPARQL UPDATE semantics where unbound variables in templates
+/// simply produce no output for that row of bindings.
+pub struct FlakeGenerator<'a> {
+    /// Transaction time for generated flakes
+    t: i64,
+
+    /// Namespace registry for encoding IRIs and skolemizing blank nodes
+    ns_registry: &'a mut NamespaceRegistry,
+
+    /// Transaction ID for blank node skolemization
+    txn_id: String,
+
+    /// Global index of the first WHERE solution in the current batch.
+    ///
+    /// Per SPARQL 1.1 Update §3.1.3, blank nodes in INSERT templates are
+    /// instantiated **fresh per solution**. Skolemization folds in
+    /// `solution_base + row` so each solution mints distinct blank nodes
+    /// (while the same label within one solution stays the same node). The
+    /// streaming driver sets this before generating each batch. Defaults to 0
+    /// (the no-WHERE single-solution case).
+    solution_base: u64,
+
+    /// Named graphs written so far, by IRI. Staging reads this to route,
+    /// guard, and register graphs that `GRAPH ?g` templates resolve to, which
+    /// are only known once WHERE solutions arrive.
+    written_graphs: HashMap<String, Sid>,
+
+    /// WHERE-dataset names that alias a graph, mapped to its canonical IRI, so
+    /// a template `?g` bound to an alias writes to the graph the WHERE read.
+    graph_aliases: HashMap<Arc<str>, Arc<str>>,
+
+    /// The ledger's graph-position table, which a `GRAPH ?g` binding resolves
+    /// through ([`FlakeGenerator::set_graph_table`]).
+    graph_table: Option<GraphTable<'a>>,
+
+    /// Graph-variable resolutions keyed by the bound IRI, so each distinct
+    /// binding resolves once, not once per row. `None` is the default graph.
+    bound_graphs: HashMap<Box<str>, Option<Sid>>,
+
+    /// Graph-variable resolutions keyed by the bound Sid, so a Sid-bound `?g`
+    /// rebuilds and resolves its IRI once per graph, not once per row.
+    sid_graphs: HashMap<Sid, Option<Sid>>,
+
+    /// Canonical Sids of the fallback-encoded IRIs written so far, keyed by
+    /// the IRI (the fallback Sid's name), so each is re-encoded once per
+    /// transaction, not once per flake.
+    canonical_sids: FxHashMap<Arc<str>, Sid>,
+
+    /// List members asserted so far, held as lists for staging to store
+    /// ([`crate::lists`]): each list's members and its chain cells' label.
+    lists: Vec<(Vec<Flake>, String)>,
+    /// Each list by its template list, solution and owner: a template list
+    /// is a fresh list in every solution.
+    list_slots: HashMap<ListKey, usize>,
+}
+
+/// A list a transaction asserts: the template list, the solution, and the
+/// owning graph, subject and predicate.
+type ListKey = (Option<u32>, u64, Option<Sid>, Sid, Sid);
+
+impl<'a> FlakeGenerator<'a> {
+    /// Create a new flake generator
+    ///
+    /// # Arguments
+    /// * `t` - Transaction time for generated flakes
+    /// * `ns_registry` - Namespace registry for encoding IRIs
+    /// * `txn_id` - Transaction ID for blank node skolemization
+    pub fn new(t: i64, ns_registry: &'a mut NamespaceRegistry, txn_id: String) -> Self {
+        Self {
+            t,
+            ns_registry,
+            txn_id,
+            solution_base: 0,
+            written_graphs: HashMap::new(),
+            graph_aliases: HashMap::new(),
+            graph_table: None,
+            bound_graphs: HashMap::new(),
+            sid_graphs: HashMap::new(),
+            canonical_sids: FxHashMap::default(),
+            lists: Vec::new(),
+            list_slots: HashMap::new(),
+        }
+    }
+
+    /// The lists asserted so far, for [`crate::lists::store_lists`].
+    pub fn take_lists(&mut self) -> Vec<crate::lists::PendingList> {
+        self.list_slots.clear();
+        std::mem::take(&mut self.lists)
+            .into_iter()
+            .map(|(members, cells)| crate::lists::PendingList::new(members, cells))
+            .collect()
+    }
+
+    /// Hold `member`, asserted by `template` in `solution`, as a member of
+    /// its list.
+    fn hold_list_member(&mut self, template: &TripleTemplate, solution: u64, member: Flake) {
+        let key = (
+            template.list_id,
+            solution,
+            member.g.clone(),
+            member.s.clone(),
+            member.p.clone(),
+        );
+        let slot = match self.list_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let n = self.lists.len();
+                let cells = format!("{}-{solution}--l{n}-", self.txn_id);
+                self.lists.push((Vec::new(), cells));
+                self.list_slots.insert(key, n);
+                n
+            }
+        };
+        self.lists[slot].0.push(member);
+    }
+
+    /// `sid`'s IRI, decoded with the transaction's namespace codes: the
+    /// ledger's and the ones the transaction has allocated.
+    pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
+        let prefix = self.ns_registry.get_prefix(sid.namespace_code)?;
+        Some(format!("{prefix}{}", sid.name))
+    }
+
+    /// Set the WHERE dataset's alias names and the canonical IRI each resolves
+    /// to (see [`DataSet::with_named_graph_alias`](fluree_db_query::DataSet)).
+    pub fn set_graph_aliases(&mut self, aliases: HashMap<Arc<str>, Arc<str>>) {
+        self.graph_aliases = aliases;
+    }
+
+    /// Resolve every `GRAPH ?g` binding through `table`, the ledger's
+    /// graph-position table, so a template writes the graph its binding names
+    /// in that ledger (the ledger's own address writes its default graph, and
+    /// `L#<g>` the graph `<g>`). Without a table a binding names the graph of
+    /// that IRI.
+    pub fn set_graph_table(&mut self, table: GraphTable<'a>) {
+        self.graph_table = Some(table);
+    }
+
+    /// Named graphs written so far, as (IRI, Sid).
+    pub fn written_graphs(&self) -> &HashMap<String, Sid> {
+        &self.written_graphs
+    }
+
+    fn graph_sid(&mut self, iri: &str) -> Sid {
+        if let Some(sid) = self.written_graphs.get(iri) {
+            return sid.clone();
+        }
+        let sid = self.ns_registry.sid_for_iri(iri);
+        self.written_graphs.insert(iri.to_string(), sid.clone());
+        sid
+    }
+
+    /// Put `sid` under its canonical namespace code. A WHERE constant whose
+    /// namespace the ledger has not registered lowers to the encoder's
+    /// fallback, `Sid(EMPTY, iri)`; it is re-encoded through the
+    /// transaction's registry, which gives the namespace its code, as a
+    /// template naming the IRI would. Every other Sid is already canonical.
+    #[inline]
+    fn canonicalize(&mut self, sid: &mut Sid) {
+        if sid.namespace_code == fluree_vocab::namespaces::EMPTY {
+            *sid = self.canonical_sid(sid);
+        }
+    }
+
+    /// The canonical Sid for the fallback-encoded `sid`, re-encoded on its
+    /// IRI's first write in the transaction and cached: a hit clones the
+    /// cached Sid, a refcount bump.
+    #[cold]
+    fn canonical_sid(&mut self, sid: &Sid) -> Sid {
+        if let Some(canonical) = self.canonical_sids.get(&*sid.name) {
+            return canonical.clone();
+        }
+        let canonical = self.ns_registry.sid_for_iri(&sid.name);
+        self.canonical_sids
+            .insert(Arc::clone(&sid.name), canonical.clone());
+        canonical
+    }
+
+    /// The Sid a template writes for a `Binding::Iri`: an IRI no registered
+    /// namespace covers, as `IRI()` or `UUID()` builds it. Any absolute IRI
+    /// can be written, so it takes the encoder's fallback `Sid(EMPTY, iri)`,
+    /// the form a WHERE constant in an unseen namespace has: an assertion
+    /// canonicalizes it under the namespace the write registers, the Sid a
+    /// direct insert of the IRI stores, and a retraction keeps it and
+    /// matches nothing stored. A blank-node label (`BNODE()` output) or a
+    /// string that is not an absolute IRI names no IRI and stays refused.
+    #[cold]
+    fn bound_iri_sid(iri: &str, position: &str) -> Result<Sid> {
+        if iri.starts_with("_:")
+            || fluree_db_core::graph_registry::validate_absolute_graph_iri(iri).is_err()
+        {
+            return Err(TransactError::InvalidTerm(format!(
+                "Raw IRI from graph source cannot be used as {position} for flake generation"
+            )));
+        }
+        Ok(Sid::new(fluree_vocab::namespaces::EMPTY, iri))
+    }
+
+    /// Set the global solution index of the next batch's first row, so blank
+    /// nodes skolemize fresh per WHERE solution (SPARQL 1.1 Update §3.1.3).
+    /// Call once per batch, before generating its retractions/assertions, with
+    /// the cumulative count of solution rows already processed.
+    pub fn set_solution_base(&mut self, base: u64) {
+        self.solution_base = base;
+    }
+
+    /// Generate assertion flakes from insert templates
+    pub fn generate_assertions(
+        &mut self,
+        templates: &[TripleTemplate],
+        bindings: &Batch,
+    ) -> Result<Vec<Flake>> {
+        self.generate_flakes(templates, bindings, true)
+    }
+
+    /// Instantiate DELETE templates into retraction intents, one per template
+    /// per solution row. `witnessed[i]` says whether a WHERE triple witnesses
+    /// `templates[i]` (see `delete_witness`). An intent is what the
+    /// transaction asks to retract, not yet a retraction: the resolver turns
+    /// it into one only if it names a stored fact.
+    pub(crate) fn generate_retract_intents(
+        &mut self,
+        templates: &[TripleTemplate],
+        witnessed: &[bool],
+        bindings: &Batch,
+    ) -> Result<Vec<RetractIntent>> {
+        self.generate_retract_intents_noting(templates, witnessed, bindings, |_, _| {})
+    }
+
+    /// [`Self::generate_retract_intents`], calling `note` with each intent and
+    /// the index of the template it came from.
+    pub(crate) fn generate_retract_intents_noting(
+        &mut self,
+        templates: &[TripleTemplate],
+        witnessed: &[bool],
+        bindings: &Batch,
+        mut note: impl FnMut(usize, &Flake),
+    ) -> Result<Vec<RetractIntent>> {
+        debug_assert_eq!(templates.len(), witnessed.len());
+        let mut intents = Vec::new();
+        for row_idx in 0..Self::solution_rows(bindings) {
+            for (i, (template, &witnessed)) in templates.iter().zip(witnessed).enumerate() {
+                if let Some(flake) =
+                    self.materialize_template(template, bindings, row_idx, false)?
+                {
+                    note(i, &flake);
+                    intents.push(RetractIntent::new(flake, witnessed));
+                }
+            }
+        }
+        Ok(intents)
+    }
+
+    /// Generate flakes from templates with given operation flag
+    fn generate_flakes(
+        &mut self,
+        templates: &[TripleTemplate],
+        bindings: &Batch,
+        op: bool,
+    ) -> Result<Vec<Flake>> {
+        let mut flakes = Vec::new();
+        for row_idx in 0..Self::solution_rows(bindings) {
+            for template in templates {
+                let Some(flake) = self.materialize_template(template, bindings, row_idx, op)?
+                else {
+                    continue;
+                };
+                if op && template.list_index.is_some() {
+                    let solution = self.solution_base + row_idx as u64;
+                    self.hold_list_member(template, solution, flake);
+                } else {
+                    flakes.push(flake);
+                }
+            }
+        }
+        Ok(flakes)
+    }
+
+    /// Solution rows in a WHERE batch.
+    ///
+    /// - INSERT without WHERE produces an "empty bindings" batch (0 vars, 0
+    ///   rows). Templates still materialize once, so it is one empty row.
+    /// - UPDATE/UPSERT where WHERE matches nothing produces an empty batch
+    ///   with a non-empty schema (vars present but 0 rows): **zero solution
+    ///   rows**, so templates produce **zero flakes** (no-op).
+    fn solution_rows(bindings: &Batch) -> usize {
+        if bindings.is_empty() {
+            usize::from(bindings.schema().is_empty())
+        } else {
+            bindings.len()
+        }
+    }
+
+    /// Materialize a single template with bindings into a flake
+    fn materialize_template(
+        &mut self,
+        template: &TripleTemplate,
+        bindings: &Batch,
+        row_idx: usize,
+        op: bool,
+    ) -> Result<Option<Flake>> {
+        let graph = match &template.graph {
+            TemplateGraph::Default => None,
+            TemplateGraph::Iri(iri) => Some(self.graph_sid(iri)),
+            TemplateGraph::Var(var) => match self.resolve_graph_var(*var, bindings, row_idx)? {
+                SolutionGraph::Unbound => return Ok(None),
+                SolutionGraph::Default => None,
+                SolutionGraph::Named(g_sid) => Some(g_sid),
+            },
+        };
+
+        // Resolve each component
+        let s = self.resolve_subject(&template.subject, bindings, row_idx)?;
+        let p = self.resolve_predicate(&template.predicate, bindings, row_idx)?;
+        let explicit_dt = template
+            .dtc
+            .as_ref()
+            .map(fluree_db_core::DatatypeConstraint::datatype);
+        let (o, dt) = self.resolve_object(&template.object, explicit_dt, bindings, row_idx)?;
+
+        let bound_lang = match &template.object {
+            TemplateTerm::Var(var_id) => match bindings.get(row_idx, *var_id) {
+                Some(Binding::Lit { dtc, .. }) => {
+                    dtc.lang_tag().map(std::string::ToString::to_string)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let template_lang = template
+            .dtc
+            .as_ref()
+            .and_then(|d| d.lang_tag())
+            .map(std::string::ToString::to_string);
+
+        // Language-tagged literals use rdf:langString datatype.
+        let dt = if template_lang.is_some() || bound_lang.is_some() {
+            dt.map(|_| DT_LANG_STRING.clone())
+        } else {
+            dt
+        };
+
+        // If any component is None (unbound variable), skip this flake
+        let (mut s, mut p, mut o, mut dt) = match (s, p, o, dt) {
+            (Some(s), Some(p), Some(o), Some(dt)) => (s, p, o, dt),
+            _ => return Ok(None),
+        };
+
+        // An assertion stores every IRI under its canonical namespace code,
+        // whichever path bound it, so one IRI is never stored under two Sids.
+        // A retraction keeps the Sid it was bound to: it must match the flake
+        // as stored.
+        if op {
+            self.canonicalize(&mut s);
+            self.canonicalize(&mut p);
+            if let FlakeValue::Ref(sid) = &mut o {
+                self.canonicalize(sid);
+            }
+            self.canonicalize(&mut dt);
+
+            // A literal bound at run time (`STRDT`, `str-dt`, a stored value
+            // a WHERE matched) arrives as text under its datatype. Parse it as
+            // an insert parses the same literal: a valid lexical form is
+            // stored as its value, and an ill-typed one fails the write with
+            // the insert's error. A template constant was parsed where it was
+            // written (`value_convert` for RDF text). A datatype whose forms
+            // are text (`xsd:string`, `xsd:anyURI`, an application's own) is
+            // told by its Sid, so its IRI is not decoded per flake.
+            if let (TemplateTerm::Var(_), FlakeValue::String(lexical)) = (&template.object, &o) {
+                if parses_lexical(&dt) {
+                    if let Some(dt_iri) = self.decode_sid(&dt) {
+                        o = crate::value_convert::typed_lexical(lexical, &dt_iri)?;
+                    }
+                }
+            }
+        }
+
+        // Late hard guard for storage invariants: catches (FlakeValue, dt)
+        // mis-pairings (e.g. scalar object key with VECTOR_ID datatype) before
+        // they hit the index. Bails out the whole transaction.
+        validate_value_dt_pair(&o, &dt)?;
+
+        // Create metadata if language tag or list_index is present
+        let meta_lang = template_lang.or(bound_lang);
+        let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);
+
+        let flake = match graph {
+            Some(g_sid) => Flake::new_in_graph(g_sid, s, p, o, dt, self.t, op, meta),
+            None => Flake::new(s, p, o, dt, self.t, op, meta),
+        };
+
+        Ok(Some(flake))
+    }
+
+    /// Resolve a template graph variable to the graph it writes.
+    ///
+    /// Unbound (or poisoned by OPTIONAL) skips the triple, as for any other
+    /// template variable. A binding that cannot name a graph is an error
+    /// rather than a skip, matching how a literal subject is treated. A
+    /// binding resolves through the ledger's graph-position table, so the
+    /// graph a WHERE read under a name is the graph the name writes.
+    fn resolve_graph_var(
+        &mut self,
+        var: VarId,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<SolutionGraph> {
+        if bindings.is_empty() {
+            return Err(TransactError::UnboundVariable(format!("var_{var:?}")));
+        }
+        let sid_iri;
+        let mut bound_sid = None;
+        let iri: &str = match bindings.get(row, var) {
+            None | Some(Binding::Unbound | Binding::Poisoned) => return Ok(SolutionGraph::Unbound),
+            Some(Binding::Iri(iri)) => iri,
+            Some(
+                Binding::Sid { sid, .. }
+                | Binding::IriMatch {
+                    primary_sid: sid, ..
+                },
+            ) => {
+                if let Some(graph) = self.sid_graphs.get(sid) {
+                    return Ok(SolutionGraph::of(graph.clone()));
+                }
+                bound_sid = Some(sid);
+                if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
+                    return Err(TransactError::InvalidTerm(
+                        "GRAPH name must be an IRI, not a blank node".to_string(),
+                    ));
+                }
+                let prefix = self
+                    .ns_registry
+                    .get_prefix(sid.namespace_code)
+                    .ok_or_else(|| {
+                        TransactError::InvalidTerm(format!(
+                            "GRAPH name {sid} has an unknown namespace code"
+                        ))
+                    })?;
+                sid_iri = format!("{prefix}{}", sid.name);
+                &sid_iri
+            }
+            Some(Binding::Lit { .. } | Binding::EncodedLit { .. }) => {
+                return Err(TransactError::InvalidTerm(
+                    "GRAPH name must be an IRI, not a literal".to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(TransactError::InvalidTerm(format!(
+                    "GRAPH name must be an IRI; got {other:?}"
+                )))
+            }
+        };
+        let iri = self.graph_aliases.get(iri).map_or(iri, AsRef::as_ref);
+        let graph = match self.bound_graphs.get(iri) {
+            Some(graph) => graph.clone(),
+            None => {
+                let bound: Box<str> = iri.into();
+                let target = match self.graph_table {
+                    Some(table) => table(&bound)?,
+                    None => WriteGraph::Named(Arc::from(&*bound)),
+                };
+                let graph = match target {
+                    WriteGraph::Default => None,
+                    WriteGraph::Named(iri) => {
+                        fluree_db_core::graph_registry::validate_absolute_graph_iri(&iri)
+                            .map_err(TransactError::InvalidTerm)?;
+                        Some(self.graph_sid(&iri))
+                    }
+                };
+                self.bound_graphs.insert(bound, graph.clone());
+                graph
+            }
+        };
+        if let Some(sid) = bound_sid {
+            self.sid_graphs.insert(sid.clone(), graph.clone());
+        }
+        Ok(SolutionGraph::of(graph))
+    }
+
+    /// Resolve a subject term
+    fn resolve_subject(
+        &mut self,
+        term: &TemplateTerm,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<Option<Sid>> {
+        match term {
+            TemplateTerm::Sid(sid) => Ok(Some(sid.clone())),
+            TemplateTerm::Var(var_id) => {
+                if bindings.is_empty() {
+                    return Err(TransactError::UnboundVariable(format!("var_{var_id:?}")));
+                }
+                if let Some(binding) = bindings.get(row, *var_id) {
+                    match binding {
+                        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
+                        Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
+                        Binding::Unbound | Binding::Poisoned => Ok(None),
+                        Binding::Grouped(_) => Err(TransactError::InvalidTerm(
+                            "Subject cannot be a grouped value (GROUP BY output)".to_string(),
+                        )),
+                        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
+                            "Subject cannot be a path or list value".to_string(),
+                        )),
+                        Binding::Lit { .. } => Err(TransactError::InvalidTerm(
+                            "Subject must be a Sid, not a literal".to_string(),
+                        )),
+                        Binding::EncodedLit { .. } => Err(TransactError::InvalidTerm(
+                            "Subject must be a Sid; EncodedLit must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedSid { .. } => Err(TransactError::InvalidTerm(
+                            "Subject must be a Sid; EncodedSid must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
+                            "Subject must be a Sid; EncodedPid cannot be used as subject".to_string(),
+                        )),
+                        Binding::Iri(iri) => Self::bound_iri_sid(iri, "subject").map(Some),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            TemplateTerm::BlankNode(label) => {
+                let solution = self.solution_base + row as u64;
+                let sid = self.skolemize_blank_node(label, solution);
+                Ok(Some(sid))
+            }
+            TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
+                "Subject cannot be a literal value".to_string(),
+            )),
+        }
+    }
+
+    /// Resolve a predicate term
+    fn resolve_predicate(
+        &mut self,
+        term: &TemplateTerm,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<Option<Sid>> {
+        match term {
+            TemplateTerm::Sid(sid) => Ok(Some(sid.clone())),
+            TemplateTerm::Var(var_id) => {
+                if bindings.is_empty() {
+                    return Err(TransactError::UnboundVariable(format!("var_{var_id:?}")));
+                }
+                if let Some(binding) = bindings.get(row, *var_id) {
+                    match binding {
+                        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
+                        Binding::IriMatch { primary_sid, .. } => Ok(Some(primary_sid.clone())),
+                        Binding::Unbound | Binding::Poisoned => Ok(None),
+                        Binding::Grouped(_) => Err(TransactError::InvalidTerm(
+                            "Predicate cannot be a grouped value (GROUP BY output)".to_string(),
+                        )),
+                        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
+                            "Predicate cannot be a path or list value".to_string(),
+                        )),
+                        Binding::Lit { .. } => Err(TransactError::InvalidTerm(
+                            "Predicate must be a Sid, not a literal".to_string(),
+                        )),
+                        Binding::EncodedLit { .. } => Err(TransactError::InvalidTerm(
+                            "Predicate must be a Sid; EncodedLit must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedSid { .. } => Err(TransactError::InvalidTerm(
+                            "Predicate must be a Sid; EncodedSid must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
+                            "Predicate must be a Sid; EncodedPid must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::Iri(iri) => Self::bound_iri_sid(iri, "predicate").map(Some),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            TemplateTerm::BlankNode(_) => Err(TransactError::InvalidTerm(
+                "Predicate cannot be a blank node".to_string(),
+            )),
+            TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
+                "Predicate cannot be a literal value".to_string(),
+            )),
+        }
+    }
+
+    /// Resolve an object term
+    fn resolve_object(
+        &mut self,
+        term: &TemplateTerm,
+        explicit_dt: Option<&Sid>,
+        bindings: &Batch,
+        row: usize,
+    ) -> Result<(Option<FlakeValue>, Option<Sid>)> {
+        match term {
+            TemplateTerm::Sid(sid) => {
+                // Reference type
+                Ok((Some(FlakeValue::Ref(sid.clone())), Some(DT_ID.clone())))
+            }
+            TemplateTerm::Value(val) => {
+                let dt = explicit_dt.cloned().unwrap_or_else(|| infer_datatype(val));
+                Ok((Some(val.clone()), Some(dt)))
+            }
+            TemplateTerm::Var(var_id) => {
+                if bindings.is_empty() {
+                    return Err(TransactError::UnboundVariable(format!("var_{var_id:?}")));
+                }
+                if let Some(binding) = bindings.get(row, *var_id) {
+                    match binding {
+                        Binding::Sid { sid, .. } => {
+                            Ok((Some(FlakeValue::Ref(sid.clone())), Some(DT_ID.clone())))
+                        }
+                        Binding::IriMatch { primary_sid, .. } => Ok((
+                            Some(FlakeValue::Ref(primary_sid.clone())),
+                            Some(DT_ID.clone()),
+                        )),
+                        Binding::Lit { val, dtc, .. } => {
+                            Ok((Some(val.clone()), Some(dtc.datatype().clone())))
+                        }
+                        Binding::EncodedLit { .. } => Err(TransactError::InvalidTerm(
+                            "EncodedLit must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedSid { .. } => Err(TransactError::InvalidTerm(
+                            "EncodedSid must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::EncodedPid { .. } => Err(TransactError::InvalidTerm(
+                            "EncodedPid must be materialized before flake generation".to_string(),
+                        )),
+                        Binding::Unbound | Binding::Poisoned => Ok((None, None)),
+                        Binding::Grouped(_) => Err(TransactError::InvalidTerm(
+                            "Object cannot be a grouped value (GROUP BY output)".to_string(),
+                        )),
+                        Binding::Path { .. }
+                        | Binding::Rel(_)
+                        | Binding::List(_)
+                        | Binding::Map(_) => Err(TransactError::InvalidTerm(
+                            "Object cannot be a path or list value".to_string(),
+                        )),
+                        Binding::Iri(iri) => {
+                            let sid = Self::bound_iri_sid(iri, "object")?;
+                            Ok((Some(FlakeValue::Ref(sid)), Some(DT_ID.clone())))
+                        }
+                    }
+                } else {
+                    Ok((None, None))
+                }
+            }
+            TemplateTerm::BlankNode(label) => {
+                let solution = self.solution_base + row as u64;
+                let sid = self.skolemize_blank_node(label, solution);
+                Ok((Some(FlakeValue::Ref(sid)), Some(DT_ID.clone())))
+            }
+        }
+    }
+
+    /// The Sid an upsert's blank node `label` skolemizes to.
+    ///
+    /// Upsert has no WHERE, so its templates are instantiated for exactly one
+    /// solution — index 0 — and this is the Sid that solution's assertions
+    /// carry. The upsert wave uses it to find the stored values of a blank
+    /// subject whose skolem scope is deterministic.
+    pub(crate) fn upsert_blank_subject(&mut self, label: &str) -> Sid {
+        self.skolemize_blank_node(label, 0)
+    }
+
+    /// Skolemize a blank node to a Sid.
+    ///
+    /// Creates a unique Sid for a blank node label within this transaction and
+    /// WHERE solution. The key is `{txn_id}-{solution}-{label}`: folding in the
+    /// solution index makes blank nodes fresh per solution (SPARQL 1.1 Update
+    /// §3.1.3), while the same label within one solution maps to one node.
+    fn skolemize_blank_node(&mut self, label: &str, solution: u64) -> Sid {
+        let local = label.trim_start_matches("_:");
+        let unique_id = format!("{}-{solution}-{local}", self.txn_id);
+        self.ns_registry.blank_node_sid(&unique_id)
+    }
+}
+
+/// Hard-fail invariants between the resolved datatype Sid and FlakeValue
+/// shape, run before a flake is committed. Catches mis-paired forms like
+/// `(FlakeValue::Double, dt=embeddingVector)` produced by upstream parsing
+/// bugs — without this guard, those go on to generate VECTOR_ID flakes
+/// pointing at scalar arena handles, corrupting the index.
+pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
+    let is_vector_dt = dt == &*DT_VECTOR;
+    let is_vector_val = matches!(val, FlakeValue::Vector(_));
+    if is_vector_dt != is_vector_val {
+        return Err(TransactError::FlakeGeneration(format!(
+            "f:embeddingVector must pair only with FlakeValue::Vector \
+             (dt_vector={is_vector_dt}, val_vector={is_vector_val}); \
+             a parser produced a mismatched (value, datatype) shape"
+        )));
+    }
+    // Every vector must be one the vector arena can store. An empty vector
+    // would also collide with the `FlakeValue::max()` upper-bound sentinel.
+    // Whether its length matches the property's other vectors is checked per
+    // commit (`crate::vector_dims`).
+    if let FlakeValue::Vector(v) = val {
+        fluree_db_core::vector::check_vector_f64(None, v)
+            .map_err(|e| TransactError::InvalidVector(e.to_string()))?;
+    }
+    if dt == &*DT_JSON && !matches!(val, FlakeValue::Json(_)) {
+        return Err(TransactError::FlakeGeneration(format!(
+            "rdf:JSON must pair only with FlakeValue::Json (got {val:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Shared core of the two `emit_reified_triple` impls (`FlakeSink` /
+/// `ImportSink`) and of TriG bulk import: a resolved reifier attachment →
+/// validated → the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle,
+/// so the bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD
+/// `@annotation` at the flake level; cascade retracts cancel either
+/// surface) cannot drift between those callers — each keeps only its own
+/// error channel and emission (Vec-extend vs commit-writer/spool).
+/// RDF text staged as templates (upsert, sync, the TriG insert fallback)
+/// builds the same bundle with [`bundle_templates`]; the parity is pinned by
+/// `trig_star_in_graph_block_matches_jsonld_named_graph_annotation`.
+///
+/// `g` is `None` for the Turtle sinks (default graph) and the block's graph
+/// for TriG import; list-occurrence annotations are deferred in v1 →
+/// `list_i = None`.
+///
+/// The validation is the same late hard guard as `build_flake` /
+/// `push_triple`: a bad (value, dt) pair must fail the whole ingest, not
+/// silently drop or corrupt the bundle. The base triple hit the same
+/// guard already, so this only fires on shapes the base emission also
+/// rejected.
+pub(crate) fn reified_triple_bundle(
+    g: Option<Sid>,
+    s: Sid,
+    p: Sid,
+    o: FlakeValue,
+    dtc: &fluree_db_core::DatatypeConstraint,
+    ann: &Sid,
+    t: i64,
+) -> Result<Vec<Flake>> {
+    let dt = dtc.datatype().clone();
+    let lang = dtc.lang_tag().map(std::string::ToString::to_string);
+    validate_value_dt_pair(&o, &dt)?;
+    let key = fluree_db_core::edge::EdgeKey {
+        g,
+        s,
+        p,
+        o,
+        dt,
+        lang,
+        list_i: None,
+    };
+    Ok(key.to_reifies_facts_jsonld_compatible(ann, t, true))
+}
+
+/// The `f:reifies*` bundle of a reifier attachment, as templates: `ann`
+/// reifies `(s, p, o)`, where `o_dtc` is the object's datatype constraint
+/// (`None` for a node object).
+///
+/// The shape is the one the JSON-LD `@annotation` lowering writes and
+/// [`reified_triple_bundle`] builds as flakes: `f:reifiesSubject`,
+/// `f:reifiesPredicate`, `f:reifiesObject` (carrying the object's datatype
+/// and language tag), and `f:reifiesLang` for a language-tagged object; no
+/// `f:reifiesDatatype`. The `f:reifiesGraph` anchor is deliberately not
+/// here: the scope that places the templates in a named graph adds it, so
+/// no template builder can state an anchor that disagrees with the graph
+/// the bundle lands in.
+pub(crate) fn bundle_templates(
+    s: TemplateTerm,
+    p: TemplateTerm,
+    o: TemplateTerm,
+    o_dtc: Option<fluree_db_core::DatatypeConstraint>,
+    ann: TemplateTerm,
+) -> Vec<TripleTemplate> {
+    use fluree_db_core::namespaces::{
+        reifies_lang_sid, reifies_object_sid, reifies_predicate_sid, reifies_subject_sid,
+    };
+    let lang = match &o_dtc {
+        Some(fluree_db_core::DatatypeConstraint::LangTag(lang)) => Some(lang.to_string()),
+        _ => None,
+    };
+    let slot = |pred: &Sid, obj: TemplateTerm| {
+        TripleTemplate::new(ann.clone(), TemplateTerm::Sid(pred.clone()), obj)
+    };
+    let mut out = Vec::with_capacity(4);
+    out.push(slot(reifies_subject_sid(), s));
+    out.push(slot(reifies_predicate_sid(), p));
+    if let Some(lang) = lang {
+        out.push(slot(
+            reifies_lang_sid(),
+            TemplateTerm::Value(FlakeValue::String(lang)),
+        ));
+    }
+    let mut object = slot(reifies_object_sid(), o);
+    if let Some(dtc) = o_dtc {
+        object = object.with_dtc(dtc);
+    }
+    out.push(object);
+    out
+}
+
+/// Infer datatype from a FlakeValue
+///
+/// Returns the appropriate XSD/RDF datatype Sid for the given value.
+/// This is used both for flake generation and for VALUES clause binding conversion.
+pub fn infer_datatype(val: &FlakeValue) -> Sid {
+    match val {
+        FlakeValue::Ref(_) => DT_ID.clone(),
+        FlakeValue::Boolean(_) => DT_BOOLEAN.clone(),
+        // JSON-LD default for integral numbers is xsd:integer.
+        // Preserve explicit xsd:long only when the source literal is explicitly typed.
+        FlakeValue::Long(_) => DT_INTEGER.clone(),
+        FlakeValue::Double(_) => DT_DOUBLE.clone(),
+        FlakeValue::BigInt(_) => DT_INTEGER.clone(),
+        FlakeValue::Decimal(_) => DT_DECIMAL.clone(),
+        FlakeValue::DateTime(_) => DT_DATE_TIME.clone(),
+        FlakeValue::Date(_) => DT_DATE.clone(),
+        FlakeValue::Time(_) => DT_TIME.clone(),
+        FlakeValue::String(_) => DT_STRING.clone(),
+        FlakeValue::Json(_) => DT_JSON.clone(),
+        FlakeValue::Vector(_) => DT_VECTOR.clone(),
+        FlakeValue::GYear(_) => DT_G_YEAR.clone(),
+        FlakeValue::GYearMonth(_) => DT_G_YEAR_MONTH.clone(),
+        FlakeValue::GMonth(_) => DT_G_MONTH.clone(),
+        FlakeValue::GDay(_) => DT_G_DAY.clone(),
+        FlakeValue::GMonthDay(_) => DT_G_MONTH_DAY.clone(),
+        FlakeValue::YearMonthDuration(_) => DT_YEAR_MONTH_DURATION.clone(),
+        FlakeValue::DayTimeDuration(_) => DT_DAY_TIME_DURATION.clone(),
+        FlakeValue::Duration(_) => DT_DURATION.clone(),
+        FlakeValue::GeoPoint(_) => DT_WKT_LITERAL.clone(),
+        // Null isn't a standard RDF literal; treat as xsd:string for now (MVP).
+        FlakeValue::Null => DT_STRING.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::DatatypeConstraint;
+    use fluree_db_query::VarId;
+    use std::sync::Arc;
+
+    fn make_empty_batch() -> Batch {
+        let schema: Arc<[VarId]> = Arc::new([]);
+        Batch::empty(schema).unwrap()
+    }
+
+    #[test]
+    fn test_generate_simple_assertion() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
+        )];
+
+        let batch = make_empty_batch();
+        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+
+        assert_eq!(flakes.len(), 1);
+        assert!(flakes[0].op);
+        assert_eq!(flakes[0].s.name.as_ref(), "ex:alice");
+        assert_eq!(flakes[0].p.name.as_ref(), "ex:name");
+    }
+
+    #[test]
+    fn test_generate_retraction() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
+        )];
+
+        let batch = make_empty_batch();
+        let intents = generator
+            .generate_retract_intents(&templates, &[false], &batch)
+            .unwrap();
+
+        assert_eq!(intents.len(), 1);
+        assert!(!intents[0].flake().op);
+    }
+
+    #[test]
+    fn test_blank_node_skolemization() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn123".to_string());
+
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::BlankNode("_:b1".to_string()),
+            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Value(FlakeValue::String("Test".to_string())),
+        )];
+
+        let batch = make_empty_batch();
+        let flakes = generator.generate_assertions(&templates, &batch).unwrap();
+
+        assert_eq!(flakes.len(), 1);
+        // Check that the blank node was skolemized
+        assert!(flakes[0].s.name.contains("b1"));
+    }
+
+    /// `parses_lexical` passes over a datatype only when the write paths'
+    /// parser takes every lexical form of it as text, so skipping the parse
+    /// never changes what a flake stores.
+    #[test]
+    fn a_datatype_passed_over_by_its_sid_takes_any_text() {
+        use fluree_vocab::{fluree, geo, rdf, xsd, xsd_names};
+        let mut registry = NamespaceRegistry::new();
+        let mut iris: Vec<String> = [
+            xsd_names::STRING,
+            xsd_names::NORMALIZED_STRING,
+            xsd_names::TOKEN,
+            xsd_names::LANGUAGE,
+            xsd_names::ANY_URI,
+            xsd_names::INTEGER,
+            xsd_names::BYTE,
+            xsd_names::UNSIGNED_LONG,
+            xsd_names::DECIMAL,
+            xsd_names::DOUBLE,
+            xsd_names::FLOAT,
+            xsd_names::BOOLEAN,
+            xsd_names::DATE_TIME,
+            xsd_names::DATE,
+            xsd_names::TIME,
+            xsd_names::G_YEAR,
+            xsd_names::G_MONTH_DAY,
+            xsd_names::DURATION,
+            xsd_names::DAY_TIME_DURATION,
+            xsd_names::BASE64_BINARY,
+        ]
+        .iter()
+        .map(|name| format!("{}{name}", xsd::NS))
+        .collect();
+        iris.extend(
+            [
+                rdf::JSON,
+                rdf::LANG_STRING,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#HTML",
+                geo::WKT_LITERAL,
+                "http://www.opengis.net/ont/geosparql#gmlLiteral",
+                fluree::EMBEDDING_VECTOR,
+                fluree::FULL_TEXT,
+                "http://example.org/types#custom",
+            ]
+            .map(str::to_string),
+        );
+        let lexicals = [
+            "x",
+            "1",
+            "300",
+            "true",
+            "1.5",
+            "INF",
+            "P1D",
+            "2024",
+            "2024-01-01",
+            "2024-01-01T00:00:00Z",
+            "12:00:00",
+            "--01-01",
+            "POINT(1 2)",
+            "[1, 2]",
+            r#"{"a": 1}"#,
+        ];
+        let mut parsed = 0;
+        for iri in &iris {
+            let dt = registry.sid_for_iri(iri);
+            if parses_lexical(&dt) {
+                parsed += 1;
+                continue;
+            }
+            for lexical in lexicals {
+                assert_eq!(
+                    fluree_db_core::coerce::coerce_string_value(lexical, iri).ok(),
+                    Some(FlakeValue::String(lexical.to_string())),
+                    "{iri} is passed over, so \"{lexical}\" must be stored as text"
+                );
+            }
+        }
+        // Every non-string XSD datatype, rdf:JSON, wktLiteral and the vector.
+        assert_eq!(parsed, 18, "{iris:?}");
+        assert!(!parses_lexical(&registry.sid_for_iri(xsd::ANY_URI)));
+    }
+
+    #[test]
+    fn test_infer_datatype() {
+        assert_eq!(
+            infer_datatype(&FlakeValue::Long(42)).name.as_ref(),
+            "integer"
+        );
+        assert_eq!(
+            infer_datatype(&FlakeValue::Double(3.5)).name.as_ref(),
+            "double"
+        );
+        assert_eq!(
+            infer_datatype(&FlakeValue::String("test".to_string()))
+                .name
+                .as_ref(),
+            "string"
+        );
+        assert_eq!(
+            infer_datatype(&FlakeValue::Boolean(true)).name.as_ref(),
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn test_generate_with_list_index() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+
+        // Create templates with list indices
+        let templates = vec![
+            TripleTemplate::new(
+                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Value(FlakeValue::String("red".to_string())),
+            )
+            .with_list_index(0),
+            TripleTemplate::new(
+                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Value(FlakeValue::String("green".to_string())),
+            )
+            .with_list_index(1),
+            TripleTemplate::new(
+                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Value(FlakeValue::String("blue".to_string())),
+            )
+            .with_list_index(2),
+        ];
+
+        let batch = make_empty_batch();
+        let held = generator.generate_assertions(&templates, &batch).unwrap();
+        assert!(held.is_empty(), "list members are held as a list");
+        let flakes = crate::lists::store_new_lists(generator.take_lists());
+
+        assert_eq!(flakes.len(), 3);
+
+        // Check list indices are preserved in metadata
+        assert_eq!(flakes[0].m.as_ref().and_then(|m| m.i), Some(0));
+        assert_eq!(flakes[1].m.as_ref().and_then(|m| m.i), Some(1));
+        assert_eq!(flakes[2].m.as_ref().and_then(|m| m.i), Some(2));
+
+        // Check values
+        assert_eq!(flakes[0].o, FlakeValue::String("red".to_string()));
+        assert_eq!(flakes[1].o, FlakeValue::String("green".to_string()));
+        assert_eq!(flakes[2].o, FlakeValue::String("blue".to_string()));
+    }
+
+    #[test]
+    fn test_generate_with_language_and_list_index() {
+        let mut registry = NamespaceRegistry::new();
+        let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
+
+        // Create template with both language and list_index
+        let templates = vec![TripleTemplate::new(
+            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+            TemplateTerm::Sid(Sid::new(1, "ex:names")),
+            TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
+        )
+        .with_dtc(DatatypeConstraint::LangTag(Arc::from("en")))
+        .with_list_index(0)];
+
+        let batch = make_empty_batch();
+        let held = generator.generate_assertions(&templates, &batch).unwrap();
+        assert!(held.is_empty(), "list members are held as a list");
+        let flakes = crate::lists::store_new_lists(generator.take_lists());
+
+        assert_eq!(flakes.len(), 1);
+
+        // Check both language and list_index are present in metadata
+        let meta = flakes[0].m.as_ref().expect("should have metadata");
+        assert_eq!(meta.lang.as_deref(), Some("en"));
+        assert_eq!(meta.i, Some(0));
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_vector_dt_with_non_vector_value() {
+        let err = validate_value_dt_pair(
+            &FlakeValue::Double(0.1),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect_err("scalar paired with embeddingVector dt must fail");
+        assert!(format!("{err}").contains("embeddingVector"));
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_empty_vector() {
+        // Empty Vector is reserved as the FlakeValue::max() sentinel and the
+        // vector arena rejects it; the write-path guard must catch it even if
+        // it bypassed coerce_array_to_vector.
+        let err = validate_value_dt_pair(
+            &FlakeValue::Vector(Vec::new().into()),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect_err("empty vector must be rejected");
+        assert!(format!("{err}").contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_a_vector_longer_than_the_arena_holds() {
+        let dt = Sid::new(FLUREE_DB, "embeddingVector");
+        let longest = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS];
+        validate_value_dt_pair(&FlakeValue::Vector(longest.into()), &dt).expect("65535 elements");
+        let too_long = vec![0.5; fluree_db_core::vector::MAX_VECTOR_DIMS + 1];
+        let err = validate_value_dt_pair(&FlakeValue::Vector(too_long.into()), &dt)
+            .expect_err("65536 elements must be rejected");
+        assert!(matches!(err, TransactError::InvalidVector(_)), "{err}");
+    }
+
+    #[test]
+    fn test_validate_pair_accepts_non_empty_vector() {
+        validate_value_dt_pair(
+            &FlakeValue::Vector(vec![0.1, 0.2].into()),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect("non-empty vector with embeddingVector dt is valid");
+    }
+}

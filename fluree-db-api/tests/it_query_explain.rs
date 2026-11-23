@@ -1,0 +1,1055 @@
+//! Explain API integration tests
+//!
+//! The native/statistics-backed tests live in `it_query_explain_native.rs`.
+
+mod support;
+
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use support::{genesis_ledger, graphdb_from_ledger};
+
+/// Serializes `FLUREE_HASH_JOIN` access across this file's tests and restores the
+/// prior value on drop. `HashJoinPlanner` reads this var at plan time, so a test
+/// that forces the hash join must not run while another builds a plan, and must not
+/// leak the override on panic. Every plan-building test holds one for its duration;
+/// `acquire()` starts each test in the default (AUTO) mode.
+struct HashJoinEnv {
+    _guard: MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+impl HashJoinEnv {
+    fn acquire() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("FLUREE_HASH_JOIN").ok();
+        std::env::remove_var("FLUREE_HASH_JOIN");
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+    fn force_on(&self) {
+        std::env::set_var("FLUREE_HASH_JOIN", "1");
+    }
+}
+
+impl Drop for HashJoinEnv {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("FLUREE_HASH_JOIN", v),
+            None => std::env::remove_var("FLUREE_HASH_JOIN"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn explain_no_stats_reports_none_and_reason() {
+    let _env = HashJoinEnv::acquire();
+    // Scenario: explain-no-stats-test
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "no-stats:main");
+
+    // Ensure the `ex` namespace is allocated (so query parsing can encode IRIs),
+    // but do NOT run indexing so stats remain unavailable.
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?person"],
+        "where": [{"@id":"?person","ex:name":"?name"}]
+    });
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree.explain(&db, &q).await.expect("explain");
+    assert_eq!(resp["plan"]["optimization"], "none");
+    assert_eq!(resp["plan"]["reason"], "No statistics available");
+    assert!(resp.get("query").is_some());
+    assert!(resp["plan"].get("where-clause").is_some());
+}
+
+#[tokio::test]
+async fn explain_sparql_no_stats_reports_none_and_reason() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "no-stats-sparql:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person WHERE { ?person ex:name ?name }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    assert_eq!(resp["plan"]["optimization"], "none");
+    assert_eq!(resp["plan"]["reason"], "No statistics available");
+    assert!(resp.get("query").is_some());
+    // SPARQL explain does not include where-clause (that's a JSON-LD concept)
+    assert!(resp["plan"].get("where-clause").is_none());
+}
+
+#[tokio::test]
+async fn explain_physical_plan_present_and_concretely_named() {
+    let _env = HashJoinEnv::acquire();
+    // plan.physical is built from the REAL operator tree (build-only, no exec).
+    // Validate it is present and operators resolve to concrete names (the
+    // default op_name() must see through dyn dispatch, not report "dyn Operator").
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-names:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT ?person ?name WHERE { ?person ex:name ?name }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+    assert!(
+        physical.get("error").is_none(),
+        "physical build errored: {physical}"
+    );
+    let op = physical["op"].as_str().expect("physical.op is a string");
+    assert!(!op.is_empty());
+    assert!(
+        !op.contains("dyn Operator"),
+        "operator name should be concrete, got {op:?}"
+    );
+    // The tree is connected (not truncated at the root): the scan leaf is reachable.
+    assert!(
+        physical_contains_op(physical, "DatasetOperator"),
+        "expected a DatasetOperator scan leaf in the physical tree: {physical}"
+    );
+}
+
+/// Recursively search a `plan.physical` node (and its `children[].node`) for an
+/// operator whose `op` equals `name`.
+fn physical_contains_op(node: &serde_json::Value, name: &str) -> bool {
+    physical_find_op(node, name).is_some()
+}
+
+/// Recursively find the first `plan.physical` node whose `op` equals `name`.
+fn physical_find_op<'a>(node: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    if node["op"] == name {
+        return Some(node);
+    }
+    node["children"]
+        .as_array()
+        .and_then(|cs| cs.iter().find_map(|e| physical_find_op(&e["node"], name)))
+}
+
+#[tokio::test]
+async fn explain_physical_object_subject_join_shows_hash_join_decision() {
+    // 2-pattern object→subject join: `?b ex:knows ?x` with `?x` bound from
+    // `?a ex:knows ?x`. This is the exact shape the object→subject hash join
+    // targets. Default (no stats): the planner keeps the NestedLoop and records
+    // the rejected hash-join reason. FLUREE_HASH_JOIN=1: the hash join is chosen.
+    let env = HashJoinEnv::acquire(); // AUTO mode; restored (and serialized) via guard
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-join:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:knows": {"@id":"ex:bob"}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT ?a ?b WHERE { ?a ex:knows ?x . ?b ex:knows ?x }";
+    let db = graphdb_from_ledger(&ledger);
+
+    // Default (AUTO): nested-loop join, hash join evaluated and rejected.
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(nl) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+    let nl = physical_find_op(physical, "NestedLoopJoinOperator")
+        .expect("expected a NestedLoopJoinOperator in physical plan");
+    assert_eq!(
+        nl["details"]["hash-join-chosen"], false,
+        "nested loop should record the rejected hash join"
+    );
+    assert!(
+        nl["details"]["hash-join-reason"].is_string(),
+        "nested loop should carry a hash-join reason"
+    );
+
+    // Forced: the object→subject hash join is selected.
+    env.force_on();
+    let resp_forced = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical_forced = &resp_forced["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(hash) = {}",
+        serde_json::to_string_pretty(physical_forced).unwrap()
+    );
+    let hj = physical_find_op(physical_forced, "HashJoinOperator")
+        .expect("expected a HashJoinOperator under FLUREE_HASH_JOIN=1");
+    assert_eq!(hj["details"]["hash-join-chosen"], true);
+    assert_eq!(hj["details"]["hash-join-reason"], "forced-on");
+}
+
+#[tokio::test]
+async fn explain_logical_estimates_are_bound_var_aware() {
+    let _env = HashJoinEnv::acquire();
+    // `?s ex:p ?o . ?o ex:q ?x`: the second triple's subject ?o is bound by the
+    // first, so its logical estimate must be the (selective) bound-subject estimate,
+    // not a full predicate scan as if no earlier variable were bound. Even without
+    // stats the defaults differ (bound-subject vs property-scan), so this catches a
+    // node rendered with an empty bound set.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "logical-bound:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:a",
+                "ex:p": {"@id":"ex:b", "ex:q": {"@id":"ex:c"}}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?s ?x WHERE { ?s ex:p ?o . ?o ex:q ?x }";
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let logical = resp["plan"]["logical"]
+        .as_array()
+        .expect("logical plan array");
+    assert_eq!(logical.len(), 2, "two triples expected: {logical:?}");
+    let row_count = |n: &serde_json::Value| n["estimate"]["row-count"].as_i64();
+    let first = row_count(&logical[0]).expect("first row-count");
+    let second = row_count(&logical[1]).expect("second row-count");
+    assert!(
+        second < first,
+        "bound-subject second triple must estimate below the first full scan: {first} then {second}"
+    );
+}
+
+#[tokio::test]
+async fn explain_physical_plan_surfaces_fast_path() {
+    let _env = HashJoinEnv::acquire();
+    // A COUNT(*) over a predicate is answered by a metadata fast path. The
+    // planner selects it at build time, so plan.physical names the fast-path
+    // operator (label-tagged) — the signal the pattern-level views cannot give.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-fastpath:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT (COUNT(?o) AS ?c) WHERE { ?s ex:name ?o }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(count) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+    let s = serde_json::to_string(physical).unwrap();
+    assert!(
+        s.contains("FastPath"),
+        "expected a fast-path operator in physical plan: {s}"
+    );
+}
+
+#[tokio::test]
+async fn explain_physical_expands_subquery_inner_plan() {
+    let _env = HashJoinEnv::acquire();
+    // BSBM-BI queries are subquery-based; the inner joins are where the time is.
+    // The SubqueryOperator builds its subplan lazily, so explain rebuilds it
+    // (build-only) and exposes it under a `SubqueryBody` node.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-subquery:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice",
+                "ex:knows": {"@id":"ex:bob"}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+        SELECT ?a ?c WHERE { \
+          ?a ex:name ?n . \
+          { SELECT ?a (COUNT(?x) AS ?c) WHERE { ?a ex:knows ?x } GROUP BY ?a } \
+        }";
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(subquery) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+
+    let sub = physical_find_op(physical, "SubqueryOperator")
+        .expect("expected a SubqueryOperator in physical plan");
+    // The inner plan is expanded under a SubqueryBody node, not opaque.
+    let body = physical_find_op(sub, "SubqueryBody")
+        .expect("subquery inner plan should be expanded under SubqueryBody");
+    // The inner operator tree is visible (a real operator under the body).
+    assert!(
+        body["children"].as_array().is_some_and(|cs| !cs.is_empty()),
+        "SubqueryBody should contain the inner operator tree"
+    );
+    // The inner aggregation (the GROUP BY / COUNT) is no longer opaque.
+    assert!(
+        physical_find_op(body, "GroupAggregateOperator").is_some(),
+        "inner subquery aggregation should be visible: {body}"
+    );
+}
+
+#[tokio::test]
+async fn explain_logical_plan_preserves_compound_structure() {
+    let _env = HashJoinEnv::acquire();
+    // The `logical` plan view is the compound-aware reorder_patterns order,
+    // available even without stats. Verify a triple + OPTIONAL render as a
+    // `triple` node and an `optional` node containing its inner triple.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "logical-compound:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice",
+                "ex:email":"alice@example.org"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person ?email WHERE { ?person ex:name ?name . OPTIONAL { ?person ex:email ?email } }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+
+    let logical = resp["plan"]["logical"]
+        .as_array()
+        .expect("plan.logical is an array");
+    assert!(!logical.is_empty(), "logical plan should not be empty");
+
+    // Every node carries a kind + category.
+    assert!(logical
+        .iter()
+        .all(|n| n.get("kind").is_some() && n.get("category").is_some()));
+
+    // The OPTIONAL renders as an expander node holding its inner triple,
+    // not flattened away.
+    let optional = logical
+        .iter()
+        .find(|n| n["kind"] == "optional")
+        .expect("optional node present in logical plan");
+    assert_eq!(optional["category"], "expander");
+    let inner = optional["patterns"]
+        .as_array()
+        .expect("optional has inner patterns");
+    assert!(inner.iter().any(|n| n["kind"] == "triple"));
+
+    // The required triple is a source.
+    let triple = logical
+        .iter()
+        .find(|n| n["kind"] == "triple")
+        .expect("required triple present");
+    assert_eq!(triple["category"], "source");
+}
+
+/// Count `"op": "DistinctOperator"` nodes in a physical plan tree.
+fn count_distinct_nodes(node: &serde_json::Value) -> usize {
+    let mut n = usize::from(node["op"] == "DistinctOperator");
+    if let Some(children) = node["children"].as_array() {
+        n += children
+            .iter()
+            .map(|e| count_distinct_nodes(&e["node"]))
+            .sum::<usize>();
+    }
+    n
+}
+
+/// Seed a 3-hop chain so `ex:` predicates are encodable, then return the
+/// physical plan for `sparql`.
+async fn chain_physical_plan(sparql: &str) -> serde_json::Value {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "dedup-plan:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:p1":{"@id":"ex:b1"}},
+                    {"@id":"ex:b1","ex:p2":{"@id":"ex:m1"}},
+                    {"@id":"ex:m1","ex:p3":"v"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = resp["plan"]["physical"].clone();
+    assert!(physical.is_object(), "plan.physical present: {resp}");
+    physical
+}
+
+/// A chain query whose only aggregate is duplicate-insensitive
+/// (`COUNT(DISTINCT ?x)`) gets WHERE-level early dedup: `DistinctOperator`
+/// nodes are inserted where projection trimming drops a dead variable, so
+/// duplicate multiplicity cannot compound through the join chain. There is no
+/// outer `SELECT DISTINCT` here, so every `DistinctOperator` in the plan is
+/// the early-dedup insertion.
+#[tokio::test]
+async fn explain_chain_count_distinct_inserts_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(DISTINCT ?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert!(
+        count_distinct_nodes(&physical) >= 1,
+        "early dedup must fire for an all-duplicate-insensitive aggregate chain: {physical}"
+    );
+}
+
+/// Count `DistinctOperator` nodes strictly below the `ProjectOperator` — the
+/// WHERE-level early-dedup insertions, excluding the outer `SELECT DISTINCT`.
+fn count_early_dedup_nodes(node: &serde_json::Value) -> usize {
+    if node["op"] == "ProjectOperator" {
+        return node["children"]
+            .as_array()
+            .map(|cs| cs.iter().map(|e| count_distinct_nodes(&e["node"])).sum())
+            .unwrap_or(0);
+    }
+    node["children"]
+        .as_array()
+        .map(|cs| cs.iter().map(|e| count_early_dedup_nodes(&e["node"])).sum())
+        .unwrap_or(0)
+}
+
+/// Early dedup is inserted only where a step trims a variable that was still
+/// live before it. The anchored chain plans as `ex:a1 ex:p1 ?b` (nothing dead:
+/// `?b` feeds the next hop), then `?b ex:p2 ?m` (`?b` dies — dedup), then
+/// `?m ex:p3 ?x` (both live and projected — no dedup). A current-state join
+/// step that keeps every variable it produces cannot duplicate an already
+/// distinct stream, so re-deduplicating behind it only re-hashed the whole
+/// intermediate (BSBM Q5's label probe behind its deduplicated candidates).
+#[tokio::test]
+async fn explain_chain_dedups_only_where_a_live_var_dies() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT DISTINCT ?m ?x\n\
+         WHERE { ex:a1 ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_early_dedup_nodes(&physical),
+        1,
+        "exactly one early dedup (after `?b` dies), none behind the all-live tail step: {physical}"
+    );
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        2,
+        "the outer SELECT DISTINCT is the only other DistinctOperator: {physical}"
+    );
+}
+
+/// `MIN`/`MAX` are duplicate-insensitive without a DISTINCT modifier, so the
+/// same early dedup applies.
+#[tokio::test]
+async fn explain_chain_max_inserts_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (MAX(?x) AS ?mx)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert!(
+        count_distinct_nodes(&physical) >= 1,
+        "early dedup must fire for MIN/MAX aggregates: {physical}"
+    );
+}
+
+/// A plain `COUNT(?x)` observes row multiplicity — no early dedup may be
+/// inserted anywhere in the chain.
+#[tokio::test]
+async fn explain_chain_plain_count_no_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        0,
+        "plain COUNT is duplicate-sensitive; early dedup would change it: {physical}"
+    );
+}
+
+/// A mix of duplicate-insensitive and duplicate-sensitive aggregates blocks
+/// early dedup (the sensitive one still observes multiplicity).
+#[tokio::test]
+async fn explain_chain_mixed_aggregates_no_early_dedup() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (COUNT(DISTINCT ?x) AS ?c) (COUNT(?x) AS ?n)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        0,
+        "a duplicate-sensitive aggregate in the mix must block early dedup: {physical}"
+    );
+}
+
+/// `SELECT DISTINCT` over a plain `COUNT`: the outer DISTINCT dedups *result*
+/// rows after aggregation and must NOT license WHERE-level dedup (that was the
+/// bug — the intermediate relation was collapsed before the count). Exactly
+/// one `DistinctOperator` may appear: the outer one above the aggregation.
+#[tokio::test]
+async fn explain_select_distinct_plain_count_only_outer_distinct() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT DISTINCT (COUNT(?x) AS ?c)\n\
+         WHERE { ?a ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        1,
+        "only the outer result-row DISTINCT is allowed; WHERE-level dedup \
+         under a plain COUNT is unsound: {physical}"
+    );
+}
+
+/// Physical plan of `sparql` over e1–e3 Net, e4–e5 Local, e6 Remote.
+async fn areas_physical_plan(sparql: &str) -> serde_json::Value {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "grouped-projection-plan:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:e1","ex:area":"Net"},
+                    {"@id":"ex:e2","ex:area":"Net"},
+                    {"@id":"ex:e3","ex:area":"Net"},
+                    {"@id":"ex:e4","ex:area":"Local"},
+                    {"@id":"ex:e5","ex:area":"Local"},
+                    {"@id":"ex:e6","ex:area":"Remote"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    resp["plan"]["physical"].clone()
+}
+
+/// #1978: a grouped SELECT expression runs per group, above the grouping — so
+/// the query takes the same streaming `GroupAggregateOperator` plan as one that
+/// projects the key, instead of the list-carrying `GroupByOperator` +
+/// `AggregateOperator` pair (which stores every input row).
+#[tokio::test]
+async fn explain_grouped_select_expression_streams() {
+    let _env = HashJoinEnv::acquire();
+    for aggregate in ["(COUNT(?e) AS ?n)", "(MIN(?e) AS ?m)"] {
+        let physical = areas_physical_plan(&format!(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) {aggregate}\n\
+             WHERE {{ ?e ex:area ?a }} GROUP BY ?a"
+        ))
+        .await;
+        let bind = physical_find_op(&physical, "BindOperator")
+            .unwrap_or_else(|| panic!("the Extend is a BindOperator: {physical}"));
+        assert!(
+            physical_contains_op(bind, "GroupAggregateOperator"),
+            "the Extend runs above the streaming grouping: {physical}"
+        );
+        assert!(
+            !physical_contains_op(&physical, "GroupByOperator"),
+            "no list-carrying GroupByOperator: {physical}"
+        );
+    }
+}
+
+/// Dedup-only `GROUP BY ?a` with a SELECT expression: the expression runs above
+/// the `GroupByOperator`, which now carries only the key — so WHERE-level early
+/// dedup applies below it, exactly as for `SELECT ?a … GROUP BY ?a`.
+#[tokio::test]
+async fn explain_dedup_only_grouped_select_expression() {
+    let _env = HashJoinEnv::acquire();
+    let physical = areas_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg)\n\
+         WHERE { ?e ex:area ?a } GROUP BY ?a",
+    )
+    .await;
+    let bind = physical_find_op(&physical, "BindOperator")
+        .unwrap_or_else(|| panic!("the Extend is a BindOperator: {physical}"));
+    let group_by = physical_find_op(bind, "GroupByOperator")
+        .unwrap_or_else(|| panic!("the Extend runs above the grouping: {physical}"));
+    assert!(
+        physical_contains_op(group_by, "DistinctOperator"),
+        "WHERE-level early dedup below the grouping: {physical}"
+    );
+}
+
+async fn about_lang_ledger(fluree: &support::MemoryFluree, id: &str) -> support::MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:about":{"@id":"ex:T1"},"ex:lang":"fr"},
+                    {"@id":"ex:a2","ex:about":{"@id":"ex:T2"},"ex:lang":"en"},
+                    {"@id":"ex:a3","ex:about":{"@id":"ex:T1"},"ex:lang":"de"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+async fn sparql_rows(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+    body: &str,
+) -> Vec<serde_json::Value> {
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+    let result = fluree
+        .query(&graphdb_from_ledger(ledger), sparql.as_str())
+        .await
+        .unwrap_or_else(|e| panic!("query {body}: {e}"));
+    support::normalize_sparql_bindings(&result.to_sparql_json(&ledger.snapshot).unwrap())
+}
+
+/// The planner costs every triple after a variable-free BIND with its variable
+/// bound, so the BIND has to run first: held back, it only checked `?o` after a
+/// scan that read every `ex:about` triple.
+fn assert_bind_seeds_every_scan(physical: &serde_json::Value, shape: &str) {
+    assert!(
+        physical.get("error").is_none(),
+        "{shape}: physical build errored: {physical}"
+    );
+    assert!(
+        physical_contains_op(physical, "BindOperator"),
+        "{shape}: the BIND runs as its own operator: {physical}"
+    );
+    assert!(
+        !physical_contains_op(physical, "DatasetOperator"),
+        "{shape}: every triple probes off the BIND row, none scans: {physical}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_constant_iri_bind_seeds_the_triples_that_read_it() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-sparql:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, bind, values, expect_rows) in [
+        (
+            "object",
+            r#"BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:lang "fr""#,
+            r#"VALUES ?o { ex:T1 } ?s ex:about ?o . ?s ex:lang "fr""#,
+            1,
+        ),
+        (
+            "subject",
+            "BIND(ex:a1 AS ?s) ?s ex:about ?o",
+            "VALUES ?s { ex:a1 } ?s ex:about ?o",
+            1,
+        ),
+        (
+            "predicate",
+            "BIND(ex:about AS ?p) ?s ?p ex:T1",
+            "VALUES ?p { ex:about } ?s ?p ex:T1",
+            2,
+        ),
+        (
+            "after a literal BIND",
+            r#"BIND("fr" AS ?l) BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:lang ?l"#,
+            r#"VALUES ?l { "fr" } VALUES ?o { ex:T1 } ?s ex:about ?o . ?s ex:lang ?l"#,
+            1,
+        ),
+        (
+            "after an unread IRI BIND",
+            "BIND(ex:T2 AS ?t) BIND(ex:T1 AS ?o) ?s ex:about ?o",
+            "VALUES ?t { ex:T2 } VALUES ?o { ex:T1 } ?s ex:about ?o",
+            2,
+        ),
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {bind} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], shape);
+
+        let got = sparql_rows(&fluree, &ledger, bind).await;
+        assert_eq!(got.len(), expect_rows, "{shape}: {got:?}");
+        assert_eq!(got, sparql_rows(&fluree, &ledger, values).await, "{shape}");
+    }
+}
+
+#[tokio::test]
+async fn jsonld_constant_iri_bind_seeds_the_triples_that_read_it() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-jsonld:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, q) in [
+        (
+            "object",
+            json!({
+                "@context": {"ex":"http://example.org/"},
+                "select": ["?s"],
+                "where": [["bind", "?o", ["iri", "http://example.org/T1"]], {"@id":"?s","ex:about":"?o","ex:lang":"fr"}]
+            }),
+        ),
+        (
+            "after a literal BIND",
+            json!({
+                "@context": {"ex":"http://example.org/"},
+                "select": ["?s"],
+                "where": [["bind", "?l", "fr"], ["bind", "?o", ["iri", "http://example.org/T1"]], {"@id":"?s","ex:about":"?o","ex:lang":"?l"}]
+            }),
+        ),
+    ] {
+        let resp = fluree.explain(&db, &q).await.expect("explain");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], shape);
+
+        let rows = fluree
+            .query(&db, &q)
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .unwrap();
+        assert_eq!(rows, json!([["ex:a1"]]), "{shape}");
+    }
+}
+
+/// A literal BIND ahead of a constant-IRI one stays a term check: the IRI seeds
+/// the triples, and `1` matches only the `xsd:integer` the scan reads. Seeded as
+/// a probe it would also match the `xsd:int`, `xsd:long`, `xsd:decimal` and
+/// `xsd:double` ones, as `VALUES ?n { 1 }` does.
+#[tokio::test]
+async fn literal_bind_ahead_of_a_constant_iri_bind_still_compares_terms() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-literal-first:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/","xsd":"http://www.w3.org/2001/XMLSchema#"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1","@type":"xsd:int"}},
+                    {"@id":"ex:a2","ex:about":{"@id":"ex:T1"},"ex:n":1},
+                    {"@id":"ex:a3","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1.0","@type":"xsd:decimal"}},
+                    {"@id":"ex:a4","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1","@type":"xsd:long"}},
+                    {"@id":"ex:a5","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1.0E0","@type":"xsd:double"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let subjects = |rows: Vec<serde_json::Value>| -> Vec<String> {
+        rows.iter()
+            .map(|r| r["s"]["value"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let held_back = subjects(sparql_rows(&fluree, &ledger, "BIND(1 AS ?n) ?s ex:n ?n").await);
+    assert_eq!(held_back, ["http://example.org/a2"]);
+
+    for body in [
+        "BIND(1 AS ?n) BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:n ?n",
+        "BIND(1 AS ?n) BIND(ex:T1 AS ?o) ?s ex:n ?n . ?s ex:about ?o",
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], body);
+        assert_eq!(
+            subjects(sparql_rows(&fluree, &ledger, body).await),
+            held_back,
+            "{body}"
+        );
+    }
+}
+
+/// Seeding changes when the BIND runs, never which rows survive: an IRI the
+/// ledger has never seen matches nothing, a JSON-LD BIND into a variable a
+/// triple binds still checks it, and an OPTIONAL body's BIND still runs per
+/// outer row.
+#[tokio::test]
+async fn constant_iri_bind_seed_keeps_bind_results() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-results:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (body, expect_rows) in [
+        ("BIND(ex:T9 AS ?o) ?s ex:about ?o", 0),
+        ("BIND(<http://nowhere.example/x> AS ?o) ?s ex:about ?o", 0),
+        ("BIND(<http://nowhere.example/x> AS ?s) ?s ex:about ?o", 0),
+    ] {
+        let got = sparql_rows(&fluree, &ledger, body).await;
+        assert_eq!(got.len(), expect_rows, "{body}: {got:?}");
+    }
+
+    let optional = sparql_rows(
+        &fluree,
+        &ledger,
+        "?s ex:lang ?l OPTIONAL { BIND(ex:T1 AS ?o) ?s ex:about ?o }",
+    )
+    .await;
+    assert_eq!(optional.len(), 3, "{optional:?}");
+    assert_eq!(
+        optional,
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "?s ex:lang ?l OPTIONAL { VALUES ?o { ex:T1 } ?s ex:about ?o }",
+        )
+        .await
+    );
+
+    let rebind = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?s"],
+        "where": [{"@id":"?s","ex:about":"?o"}, ["bind", "?o", ["iri", "http://example.org/T1"]]]
+    });
+    let rows = fluree
+        .query(&db, &rebind)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        support::normalize_rows(&rows),
+        vec![json!(["ex:a1"]), json!(["ex:a3"])]
+    );
+}
+
+/// A seed would take a star off the `PropertyJoinOperator` it plans as without
+/// one, which starts from the star's other bound object. Seeded, the chain
+/// starts at the triple reading the BIND's variable instead, which the planner
+/// prices as rare whatever the IRI: here `ex:Common` is on most subjects and
+/// `ex:lang "fr"` on one. A seed into the star's subject pins it to one subject,
+/// so that one stays.
+#[tokio::test]
+async fn constant_iri_bind_leaves_a_star_its_property_join() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-star:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"fr","ex:p1":"x1","ex:p2":"y1"},
+                    {"@id":"ex:a2","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x2","ex:p2":"y2"},
+                    {"@id":"ex:a3","@type":"ex:Other","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x3","ex:p2":"y3"},
+                    {"@id":"ex:a4","@type":"ex:Thing","ex:about":{"@id":"ex:T1"},"ex:lang":"fr","ex:p1":"x4","ex:p2":"y4"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, bind, values, expect_rows) in [
+        (
+            "object, with a bound object to start from",
+            r#"BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "object, after a literal BIND",
+            r#"BIND("x" AS ?k) BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?k { "x" } VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "class",
+            r#"BIND("fr" AS ?l) BIND(ex:Thing AS ?c) ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            r#"VALUES ?l { "fr" } VALUES ?c { ex:Thing } ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            1,
+        ),
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {bind} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        let physical = &resp["plan"]["physical"];
+        assert!(
+            physical_contains_op(physical, "PropertyJoinOperator"),
+            "{shape}: the star keeps its property join: {physical}"
+        );
+        let got = sparql_rows(&fluree, &ledger, bind).await;
+        assert_eq!(got.len(), expect_rows, "{shape}: {got:?}");
+        assert_eq!(got, sparql_rows(&fluree, &ledger, values).await, "{shape}");
+    }
+
+    let jsonld = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            ["bind", "?c", ["iri", "http://example.org/Common"]],
+            {"@id":"?s","ex:lang":"fr","ex:p1":"?a","ex:p2":"?b","ex:about":"?c"}
+        ]
+    });
+    let resp = fluree.explain(&db, &jsonld).await.expect("explain");
+    assert!(
+        physical_contains_op(&resp["plan"]["physical"], "PropertyJoinOperator"),
+        "JSON-LD: the star keeps its property join: {}",
+        resp["plan"]["physical"]
+    );
+    let rows = fluree
+        .query(&db, &jsonld)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["ex:a1"]]));
+
+    let subject = r#"BIND(ex:a1 AS ?s) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?o"#;
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {subject} }}");
+    let resp = fluree
+        .explain_sparql(&db, &sparql)
+        .await
+        .expect("explain_sparql");
+    assert_bind_seeds_every_scan(&resp["plan"]["physical"], "subject of a star");
+    let got = sparql_rows(&fluree, &ledger, subject).await;
+    assert_eq!(got.len(), 1, "subject of a star: {got:?}");
+}

@@ -1,0 +1,599 @@
+//! SPARQL query parsing.
+//!
+//! This module parses SPARQL queries from tokens into AST nodes.
+
+mod construct;
+mod describe;
+mod modifier;
+mod pattern;
+mod pragma;
+pub use pragma::pragma_names;
+mod select;
+mod term;
+mod update;
+
+#[cfg(test)]
+mod tests;
+
+use crate::ast::path::PropertyPath;
+use crate::ast::{
+    BaseDecl, GraphPattern, Pragmas, PrefixDecl, Prologue, QueryBody, SparqlAst, TriplePattern,
+    UpdateRequest, UpdateRequestOp,
+};
+use crate::diag::{DiagCode, Diagnostic, ParseOutput};
+use crate::lex::{tokenize_with_comments, TokenKind};
+use crate::span::SourceSpan;
+
+// Re-export sub-module dependencies for use via `super::` in child modules.
+use super::expr;
+use super::path;
+
+/// A verb in a triple pattern: either a simple predicate or a property path.
+enum Verb {
+    /// Simple predicate (variable, IRI, or `a`)
+    Simple(crate::ast::PredicateTerm),
+    /// Property path expression
+    Path(PropertyPath),
+}
+
+/// Parse a SPARQL query string into an AST.
+///
+/// Returns a `ParseOutput` containing the AST (if parsing succeeded) and
+/// any diagnostics (errors or warnings).
+pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
+    let (tokens, comments) = tokenize_with_comments(input);
+
+    // Check for lexer errors first
+    let lex_errors: Vec<_> = tokens
+        .iter()
+        .filter(|t| matches!(&t.kind, TokenKind::Error(_)))
+        .collect();
+
+    if !lex_errors.is_empty() {
+        let diagnostics = lex_errors
+            .into_iter()
+            .map(|t| {
+                if let TokenKind::Error(msg) = &t.kind {
+                    Diagnostic::error(DiagCode::ExpectedToken, msg.to_string(), t.span)
+                } else {
+                    unreachable!()
+                }
+            })
+            .collect();
+
+        return ParseOutput::with_diagnostics(None, diagnostics);
+    }
+
+    let mut stream = super::stream::TokenStream::new(tokens);
+    let mut parser = Parser::with_source(&mut stream, input);
+
+    match parser.parse_query() {
+        Some(mut ast) => {
+            let (pragmas, pragma_diagnostics) = pragma::extract_pragmas(&comments, &ast);
+            ast.pragmas = pragmas;
+
+            // Trailing-token / EOF assertion: after a complete Query or
+            // Update request parses, every remaining non-EOF token is an
+            // error-severity diagnostic. Without this, anything after the
+            // parsed form was silently discarded — most damagingly a
+            // multi-operation UPDATE request (`INSERT ...; DELETE ...`),
+            // which committed only the first operation: silent data loss
+            // (issue #1438). Update requests are parsed as a full
+            // `;`-separated sequence (including a legal trailing `;`) by
+            // `parse_update_request`, so anything still unconsumed here is
+            // genuinely trailing garbage for queries and updates alike.
+            let mut unconsumed_input = false;
+            if !stream.is_eof() {
+                unconsumed_input = true;
+                stream.error_at_current("unexpected trailing tokens after the end of the query");
+            }
+
+            let mut diagnostics = stream.take_diagnostics();
+            diagnostics.extend(pragma_diagnostics);
+            // Parse-time *semantic* rejections (currently the V5 BIND-scope
+            // check) and unconsumed trailing input must prevent AST
+            // production: unlike recovered syntax errors — where returning a
+            // best-effort AST keeps diagnostics flowing for IDE/LSP use —
+            // these produce an AST that does not faithfully represent the
+            // request (V5: parsed completely but spec-invalid; trailing
+            // input: the AST covers only a prefix of the input). Callers
+            // that only check for an AST — most dangerously external users
+            // of the public `lower_sparql_update_ast` entry, which takes the
+            // AST without seeing these diagnostics — would otherwise execute
+            // it; for a multi-operation UPDATE that re-opens exactly the
+            // #1438 silent-data-loss window the guard above closes (roadmap
+            // D-4: hard errors, no diagnostic-swallowing).
+            // A pragma that cannot be applied is rejected the same way: running
+            // the request without the option it asked for (a fuel cap, a
+            // policy) would silently weaken it.
+            let semantic_reject = diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    DiagCode::BindTargetAlreadyInScope | DiagCode::InvalidPragma
+                ) && d.is_error()
+            });
+            if semantic_reject || unconsumed_input {
+                ParseOutput::with_diagnostics(None, diagnostics)
+            } else {
+                ParseOutput::with_diagnostics(Some(ast), diagnostics)
+            }
+        }
+        None => ParseOutput::with_diagnostics(None, stream.take_diagnostics()),
+    }
+}
+
+/// The `# PRAGMA` options of a SPARQL request, for a host that needs them
+/// before it parses the request to run it — a fuel cap, a policy selection, a
+/// `min-t` wait.
+///
+/// Text with no comment that could be a `# PRAGMA` returns the defaults
+/// without parsing. A request that fails to parse for any other reason also
+/// returns the defaults: it will not run, and the parse that would run it
+/// reports the error.
+pub fn request_pragmas(input: &str) -> Result<Pragmas, String> {
+    if !may_carry_pragma(input) {
+        return Ok(Pragmas::default());
+    }
+    let output = parse_sparql(input);
+    if let Some(ast) = output.ast {
+        return Ok(ast.pragmas);
+    }
+    let errors: Vec<&str> = output
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == DiagCode::InvalidPragma)
+        .map(|d| d.message.as_str())
+        .collect();
+    if errors.is_empty() {
+        Ok(Pragmas::default())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Whether some `#` in `input` is followed, past further `#`s and same-line
+/// whitespace, by `pragma` in any case. That covers every comment the parser
+/// reads as a directive, without lexing; a `#` inside a string or IRI can only
+/// cost a parse, never hide a pragma.
+fn may_carry_pragma(input: &str) -> bool {
+    input.match_indices('#').any(|(at, _)| {
+        input[at..]
+            .trim_start_matches(|c: char| c == '#' || (c.is_whitespace() && c != '\n' && c != '\r'))
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("pragma"))
+    })
+}
+
+/// Parse a group graph pattern from a token stream.
+///
+/// This is used by the expression parser for EXISTS/NOT EXISTS patterns.
+/// Expects the stream to be positioned at the opening `{`.
+pub fn parse_group_graph_pattern(
+    stream: &mut super::stream::TokenStream,
+) -> Result<GraphPattern, String> {
+    // Expect opening brace
+    if !stream.check(&TokenKind::LBrace) {
+        return Err(format!(
+            "Expected '{{' at position {}",
+            stream.current_span().start
+        ));
+    }
+    stream.advance(); // consume {
+
+    let mut parser = Parser::new(stream);
+    parser
+        .parse_group_graph_pattern()
+        .ok_or_else(|| "Failed to parse group graph pattern".to_string())
+}
+
+/// Parse a SPARQL 1.2 triple-term value `<<( s p o )>>` from a token
+/// stream, for the expression parser's `BIND(<<( … )>> AS ?v)` /
+/// `FILTER(… <<( … )>> …)` forms. Expects the stream positioned at the
+/// opening `<<(`. Blank nodes are rejected — a triple term used in an
+/// expression is a value, not a pattern (negative `bindbnode-tripleterm`).
+/// The specific diagnostic is recorded on the shared stream; the returned
+/// error string is only the coarse Result-level fallback.
+pub fn parse_triple_term_value(
+    stream: &mut super::stream::TokenStream,
+) -> Result<crate::ast::annotation::TripleTerm, String> {
+    let mut parser = Parser::new(stream);
+    parser
+        .parse_triple_term_value(false)
+        .ok_or_else(|| "Failed to parse triple term".to_string())
+}
+
+/// The SPARQL parser.
+struct Parser<'a> {
+    stream: &'a mut super::stream::TokenStream,
+    /// Raw query text, when available. Used for checks that need the
+    /// token's original lexeme (e.g. the VERSION specifier must be a
+    /// *short* quoted string — the cooked `TokenKind::String` value
+    /// cannot distinguish `"1.2"` from `"""1.2"""`). `None` for
+    /// sub-parsers spun up without source access (EXISTS groups),
+    /// which never parse a prologue.
+    source: Option<&'a str>,
+    /// Monotonic counter minting unique labels for blank-node property lists
+    /// (`[ :p ?o ]`). Each list desugars to a fresh labeled blank node so the
+    /// node and its nested triples share one join variable.
+    bnode_counter: usize,
+    /// Triples produced by a blank-node property list while parsing an
+    /// object/subject term. The enclosing object-list / triples-block parser
+    /// drains these into its BGP once the term that produced them is placed.
+    pending_bnpl_triples: Vec<TriplePattern>,
+    /// Non-triple graph patterns produced while parsing an object/subject
+    /// term: a property path used as the verb inside a blank-node property
+    /// list (`[ :p|:q ?x ]`) emits a `GraphPattern::Path`, which cannot ride
+    /// the `pending_bnpl_triples` channel. Drained alongside the triples by
+    /// the enclosing triples-block / path-object-list parser; template
+    /// contexts (CONSTRUCT, INSERT/DELETE) reject a non-empty channel since
+    /// paths are not legal there.
+    pending_bnpl_patterns: Vec<GraphPattern>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(stream: &'a mut super::stream::TokenStream) -> Self {
+        Self {
+            stream,
+            source: None,
+            bnode_counter: 0,
+            pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
+        }
+    }
+
+    fn with_source(stream: &'a mut super::stream::TokenStream, source: &'a str) -> Self {
+        Self {
+            stream,
+            source: Some(source),
+            bnode_counter: 0,
+            pending_bnpl_triples: Vec::new(),
+            pending_bnpl_patterns: Vec::new(),
+        }
+    }
+
+    /// Run `f` one recursion level deeper, emitting a
+    /// [`DiagCode::NestingTooDeep`] diagnostic and returning `None` past the
+    /// stream's depth ceiling. Owns both sides of the depth bookkeeping for
+    /// the diagnostic-based pattern/term parsers; the `Result`-based
+    /// expression and path parsers use
+    /// [`TokenStream::with_recursion_guard`](super::stream::TokenStream::with_recursion_guard).
+    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.stream.try_enter_recursion() {
+            let span = self.stream.current_span();
+            self.stream.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                format!(
+                    "query nesting exceeds the maximum depth of {}",
+                    super::stream::MAX_PARSE_DEPTH
+                ),
+                span,
+            ));
+            return None;
+        }
+        let result = f(self);
+        self.stream.leave_recursion();
+        result
+    }
+
+    /// Parse a complete SPARQL query or update request.
+    fn parse_query(&mut self) -> Option<SparqlAst> {
+        let start_span = self.stream.current_span();
+
+        // Parse prologue (BASE and PREFIX declarations)
+        let prologue = self.parse_prologue();
+
+        // Query forms are single-bodied; everything else is parsed as an
+        // update request (`Update ::= Prologue ( Update1 ( ';' Update )? )?`),
+        // which also covers the valid empty / prologue-only request.
+        match &self.stream.peek().kind {
+            TokenKind::KwSelect
+            | TokenKind::KwAsk
+            | TokenKind::KwDescribe
+            | TokenKind::KwConstruct => {
+                let body = self.parse_query_body()?;
+                let end_span = self.stream.previous_span();
+                let span = start_span.union(end_span);
+                Some(SparqlAst::new(prologue, body, span))
+            }
+            _ => self.parse_update_request(prologue, start_span),
+        }
+    }
+
+    /// Parse a SPARQL Update request: a `;`-separated sequence of update
+    /// operations sharing an accumulating prologue.
+    ///
+    /// Grammar: `Update ::= Prologue ( Update1 ( ';' Update )? )?` — the
+    /// recursion means (a) the operation list may be empty (an empty or
+    /// prologue-only request is a valid no-op), (b) one trailing `;` after
+    /// the last operation is legal, and (c) each `;` may be followed by
+    /// further `PREFIX`/`BASE` declarations that become visible to every
+    /// subsequent operation. Each parsed operation snapshots the prologue
+    /// in effect for it, so a later redeclaration cannot retroactively
+    /// change an earlier operation's prefix resolution.
+    ///
+    /// Cross-operation blank-node scope (SPARQL 1.1 Update §19.6 grammar
+    /// note): reusing a blank-node label from one operation's template/data
+    /// in a *different* operation of the same request is an error — each
+    /// operation mints its own fresh blank nodes, so a shared label could
+    /// not mean what it says.
+    fn parse_update_request(
+        &mut self,
+        mut prologue: Prologue,
+        start_span: SourceSpan,
+    ) -> Option<SparqlAst> {
+        let mut operations: Vec<UpdateRequestOp> = Vec::new();
+        // Blank-node labels used by previous operations' templates/data.
+        let mut prior_op_bnode_labels: std::collections::HashSet<std::sync::Arc<str>> =
+            std::collections::HashSet::new();
+
+        loop {
+            if self.stream.is_eof() {
+                break;
+            }
+            match &self.stream.peek().kind {
+                TokenKind::KwInsert
+                | TokenKind::KwDelete
+                | TokenKind::KwWith
+                | TokenKind::KwLoad
+                | TokenKind::KwClear
+                | TokenKind::KwDrop
+                | TokenKind::KwCreate
+                | TokenKind::KwAdd
+                | TokenKind::KwCopy
+                | TokenKind::KwMove => {
+                    let operation = self.parse_update_operation()?;
+
+                    // Cross-op bnode-label scope validation.
+                    let mut labels = Vec::new();
+                    update::collect_template_bnode_labels(&operation, &mut labels);
+                    let mut this_op_labels: Vec<std::sync::Arc<str>> = Vec::new();
+                    for (label, span) in labels {
+                        if prior_op_bnode_labels.contains(&label) {
+                            self.stream.add_diagnostic(Diagnostic::error(
+                                DiagCode::InvalidBlankNode,
+                                format!(
+                                    "blank node label _:{label} was already used by a previous \
+                                     operation of this request; blank node labels are scoped to \
+                                     a single operation (SPARQL 1.1 Update §19.6)"
+                                ),
+                                span,
+                            ));
+                        }
+                        this_op_labels.push(label);
+                    }
+                    prior_op_bnode_labels.extend(this_op_labels);
+
+                    operations.push(UpdateRequestOp {
+                        prologue: prologue.clone(),
+                        operation,
+                    });
+                }
+                _ => {
+                    self.stream.error_at_current(
+                        "expected query form (SELECT, CONSTRUCT, ASK, DESCRIBE) or update (INSERT, DELETE)",
+                    );
+                    return None;
+                }
+            }
+
+            if self.stream.check(&TokenKind::Semicolon) {
+                self.stream.advance(); // consume ';'
+                                       // The recursive Update may add PREFIX/BASE declarations.
+                self.accumulate_prologue(&mut prologue);
+            } else {
+                // EOF here is the normal end of the request; anything else
+                // is rejected by `parse_sparql`'s trailing-token assertion.
+                break;
+            }
+        }
+
+        let end_span = self.stream.previous_span();
+        let span = start_span.union(end_span);
+        let body = QueryBody::Update(UpdateRequest::new(operations, span));
+        Some(SparqlAst::new(prologue, body, span))
+    }
+
+    /// Parse additional BASE/PREFIX declarations after a `;`, merging them
+    /// into the accumulated request prologue. A redeclared prefix replaces
+    /// the earlier binding (later declarations win for subsequent
+    /// operations); earlier operations keep their own prologue snapshot.
+    fn accumulate_prologue(&mut self, prologue: &mut Prologue) {
+        let additional = self.parse_prologue();
+        if let Some(base) = additional.base {
+            prologue.base = Some(base);
+        }
+        for decl in additional.prefixes {
+            if let Some(existing) = prologue
+                .prefixes
+                .iter_mut()
+                .find(|p| p.prefix == decl.prefix)
+            {
+                *existing = decl;
+            } else {
+                prologue.prefixes.push(decl);
+            }
+        }
+    }
+
+    /// Parse the prologue (BASE and PREFIX declarations).
+    fn parse_prologue(&mut self) -> Prologue {
+        let mut prologue = Prologue::new();
+
+        loop {
+            if self.stream.check_keyword(TokenKind::KwBase) {
+                if let Some(base) = self.parse_base_decl() {
+                    prologue = prologue.with_base(base);
+                }
+            } else if self.stream.check_keyword(TokenKind::KwPrefix) {
+                if let Some(prefix) = self.parse_prefix_decl() {
+                    prologue = prologue.with_prefix(prefix);
+                }
+            } else if self.stream.check_keyword(TokenKind::KwVersion) {
+                self.parse_version_decl();
+            } else {
+                break;
+            }
+        }
+
+        prologue
+    }
+
+    /// Parse and discard a SPARQL 1.2 `VERSION "1.2"` declaration.
+    ///
+    /// Fluree runs the RDF 1.2 / SPARQL 1.2 surface ungated, so the
+    /// declaration is purely informational — we lex-and-accept it so a
+    /// conformant 1.2 client that emits the mandated `VERSION "1.2"`
+    /// pragma parses instead of hard-failing. The version string is not
+    /// validated against a specific value (a future version would still
+    /// parse).
+    fn parse_version_decl(&mut self) {
+        self.stream.advance(); // consume VERSION
+        match self.stream.consume_string() {
+            None => {
+                self.stream
+                    .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+            }
+            Some((_, span)) => {
+                // Grammar: VersionSpecifier ::= STRING_LITERAL1 |
+                // STRING_LITERAL2 — long (triple-quoted) strings are not
+                // legal here (W3C negative tests version-bad-01/02).
+                if let Some(source) = self.source {
+                    let raw = source.get(span.start..span.end).unwrap_or("");
+                    if raw.starts_with("\"\"\"") || raw.starts_with("'''") {
+                        self.stream.error_at(
+                            "VERSION requires a short quoted string (e.g. \"1.2\"); \
+                             long (triple-quoted) strings are not allowed",
+                            span,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse a BASE declaration.
+    fn parse_base_decl(&mut self) -> Option<BaseDecl> {
+        let start = self.stream.current_span();
+        self.stream.advance(); // consume BASE
+
+        // Expect an IRI
+        if let Some((iri, iri_span)) = self.stream.consume_iri() {
+            let span = start.union(iri_span);
+            Some(BaseDecl::new(iri.as_ref(), span))
+        } else {
+            self.stream.error_at_current("expected IRI after BASE");
+            None
+        }
+    }
+
+    /// Parse a PREFIX declaration.
+    fn parse_prefix_decl(&mut self) -> Option<PrefixDecl> {
+        let start = self.stream.current_span();
+        self.stream.advance(); // consume PREFIX
+
+        // Expect prefix namespace (e.g., "ex:" or ":")
+        let prefix = if let Some((prefix, _)) = self.stream.consume_prefixed_name_ns() {
+            prefix
+        } else {
+            self.stream
+                .error_at_current("expected prefix namespace (e.g., 'ex:')");
+            return None;
+        };
+
+        // Expect an IRI
+        if let Some((iri, iri_span)) = self.stream.consume_iri() {
+            let span = start.union(iri_span);
+            Some(PrefixDecl::new(prefix.as_ref(), iri.as_ref(), span))
+        } else {
+            self.stream
+                .error_at_current("expected IRI after prefix namespace");
+            None
+        }
+    }
+
+    /// Parse the query body (SELECT, CONSTRUCT, ASK, or DESCRIBE).
+    ///
+    /// Update requests never reach this — `parse_query` routes every
+    /// non-query-form token stream through `parse_update_request`.
+    fn parse_query_body(&mut self) -> Option<QueryBody> {
+        match &self.stream.peek().kind {
+            TokenKind::KwSelect => {
+                let query = self.parse_select_query()?;
+                Some(QueryBody::Select(query))
+            }
+            TokenKind::KwAsk => {
+                let query = self.parse_ask_query()?;
+                Some(QueryBody::Ask(query))
+            }
+            TokenKind::KwDescribe => {
+                let query = self.parse_describe_query()?;
+                Some(QueryBody::Describe(query))
+            }
+            TokenKind::KwConstruct => {
+                let query = self.parse_construct_query()?;
+                Some(QueryBody::Construct(query))
+            }
+            _ => {
+                if self.stream.is_eof() {
+                    self.stream.error_unexpected_eof("query or update form");
+                } else {
+                    self.stream
+                        .error_at_current("expected query form (SELECT, CONSTRUCT, ASK, DESCRIBE) or update (INSERT, DELETE)");
+                }
+                None
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Free helper functions
+// =========================================================================
+
+/// Flush accumulated triples into the pattern list as a BGP.
+///
+/// This is a common pattern used throughout the parser when transitioning
+/// from triple accumulation to a keyword-based pattern (OPTIONAL, FILTER, etc.).
+fn flush_current_triples(
+    current_triples: &mut Vec<TriplePattern>,
+    patterns: &mut Vec<GraphPattern>,
+) {
+    if !current_triples.is_empty() {
+        let bgp_span = span_of_triples(current_triples);
+        patterns.push(GraphPattern::bgp(std::mem::take(current_triples), bgp_span));
+    }
+}
+
+/// Calculate the span covering a list of triple patterns.
+fn span_of_triples(triples: &[TriplePattern]) -> SourceSpan {
+    if triples.is_empty() {
+        SourceSpan::point(0)
+    } else {
+        let first = triples.first().unwrap().span;
+        let last = triples.last().unwrap().span;
+        first.union(last)
+    }
+}
+
+/// Combine multiple patterns into a single pattern.
+///
+/// - If empty, returns an empty BGP
+/// - If one pattern, returns it directly
+/// - If multiple patterns, wraps them in a Group
+fn collect_patterns_into_one(
+    patterns: Vec<GraphPattern>,
+    fallback_span: SourceSpan,
+) -> GraphPattern {
+    match patterns.len() {
+        0 => GraphPattern::empty_bgp(fallback_span),
+        1 => patterns.into_iter().next().unwrap(),
+        _ => {
+            let span = patterns
+                .iter()
+                .map(super::super::ast::pattern::GraphPattern::span)
+                .reduce(super::super::span::SourceSpan::union)
+                .unwrap_or(fallback_span);
+            GraphPattern::group(patterns, span)
+        }
+    }
+}

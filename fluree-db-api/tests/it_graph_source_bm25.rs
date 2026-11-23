@@ -1,0 +1,2334 @@
+use crate::support;
+use fluree_db_api::{Bm25CreateConfig, FlureeBuilder, FlureeIndexProvider};
+use fluree_db_nameservice::STORAGE_SEGMENT_GRAPH_SOURCES;
+use fluree_db_query::bm25::{Analyzer, Bm25IndexProvider, Bm25Scorer};
+use serde_json::json;
+
+/// Minimal end-to-end check that create_full_text_index actually indexes documents
+/// (not just publishes an empty snapshot).
+#[tokio::test]
+async fn bm25_create_full_text_index_indexes_docs_and_is_loadable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Seed a small ledger
+    let ledger_id = "bm25/docs:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Hello world" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Hello rust" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Indexing query: root var is ?x (so execute_indexing_query can populate top-level @id)
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("bm25-search", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert!(created.doc_count > 0, "expected index to include documents");
+    assert!(created.index_id.is_some(), "expected persisted index id");
+
+    // Load the index back via nameservice+storage
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(idx.num_docs() > 0, "loaded index should include documents");
+}
+
+/// Test that BM25 search returns scored results
+#[tokio::test]
+async fn bm25_search_returns_scored_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Seed ledger with documents
+    let ledger_id = "bm25/search:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming language" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and systems programming" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python programming language" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create BM25 index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("search-test", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+
+    // Load and search using Bm25Scorer
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+
+    // Analyze query and score
+    let analyzer = Analyzer::english_default();
+    let query_terms = analyzer.analyze_to_strings("rust programming");
+    let term_refs: Vec<&str> = query_terms
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let results = scorer.top_k(10);
+
+    // Should find all 3 docs (they all have "programming")
+    assert!(!results.is_empty(), "expected search results");
+    assert_eq!(results.len(), 3, "expected 3 results");
+
+    // Rust documents (doc1, doc2) should rank higher than Python (doc3)
+    // because they match "rust" in addition to "programming"
+    let ids: Vec<_> = results
+        .iter()
+        .map(|(doc_key, _score)| doc_key.subject_iri.as_ref())
+        .collect();
+
+    // Find positions of each document
+    let doc1_pos = ids.iter().position(|id| id.contains("doc1"));
+    let doc2_pos = ids.iter().position(|id| id.contains("doc2"));
+    let doc3_pos = ids.iter().position(|id| id.contains("doc3"));
+
+    // Verify rust docs (doc1, doc2) rank before python doc (doc3)
+    assert!(
+        doc1_pos.is_some() && doc2_pos.is_some() && doc3_pos.is_some(),
+        "expected all docs in results, got: {ids:?}"
+    );
+    assert!(
+        doc1_pos.unwrap() < doc3_pos.unwrap(),
+        "expected doc1 to rank before doc3 (rust before python)"
+    );
+    assert!(
+        doc2_pos.unwrap() < doc3_pos.unwrap(),
+        "expected doc2 to rank before doc3 (rust before python)"
+    );
+}
+
+/// Test BM25 sync indexes new documents after initial creation
+#[tokio::test]
+async fn bm25_sync_indexes_new_documents() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create initial ledger with one doc
+    let ledger_id = "bm25/sync:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    // Create BM25 index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("sync-test", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert_eq!(created.doc_count, 1, "expected 1 doc initially");
+
+    // Add more documents
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Second document" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Third document" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    // Sync the index (uses sync_bm25_index which does a full resync when stale)
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    // Verify sync was successful - new watermark should be > old
+    assert!(synced.was_full_resync || synced.new_watermark >= synced.old_watermark);
+
+    // Verify by loading the index and checking doc count
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.num_docs(), 3, "loaded index should have 3 docs");
+}
+
+/// Test BM25 snapshot history tracks versions for time-travel
+#[tokio::test]
+async fn bm25_snapshot_history_tracks_versions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with doc
+    let ledger_id = "bm25/history:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Version one" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+    let t1 = ledger1.t();
+
+    // Create BM25 index (snapshot at t1)
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("history-test", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+
+    // Add another doc and sync (snapshot at t2)
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Version two" }
+        ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+    let t2 = ledger2.t();
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(synced.was_full_resync || synced.new_watermark >= synced.old_watermark);
+
+    // Load at t1 should get 1 doc (returns tuple of (index, actual_t))
+    let (idx_t1, actual_t1) = fluree
+        .load_bm25_index_at(&created.graph_source_id, t1)
+        .await
+        .unwrap();
+    assert_eq!(idx_t1.num_docs(), 1, "expected 1 doc at t1");
+    assert_eq!(actual_t1, t1, "expected snapshot at exactly t1");
+
+    // Load at t2 should get 2 docs
+    let (idx_t2, actual_t2) = fluree
+        .load_bm25_index_at(&created.graph_source_id, t2)
+        .await
+        .unwrap();
+    assert_eq!(idx_t2.num_docs(), 2, "expected 2 docs at t2");
+    assert_eq!(actual_t2, t2, "expected snapshot at exactly t2");
+}
+
+/// Test BM25 drop cleans up index and prevents further syncs
+#[tokio::test]
+async fn bm25_drop_full_text_index_cleans_up() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with doc
+    let ledger_id = "bm25/drop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Test document" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create BM25 index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("drop-test", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert!(created.doc_count > 0);
+
+    // Verify we can load it
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.num_docs(), 1);
+
+    // Drop the index
+    let drop_result = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(drop_result.graph_source_id, created.graph_source_id);
+    assert!(!drop_result.was_already_retracted);
+    assert!(
+        drop_result.deleted_snapshots >= 1,
+        "expected at least 1 deleted snapshot"
+    );
+
+    // Sync should now fail
+    let sync_result = fluree.sync_bm25_index(&created.graph_source_id).await;
+    assert!(
+        sync_result.is_err(),
+        "sync should fail for dropped graph source"
+    );
+
+    // Add another doc to ledger
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Second doc" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    // Sync should still fail
+    let sync_result2 = fluree.sync_bm25_index(&created.graph_source_id).await;
+    assert!(
+        sync_result2.is_err(),
+        "sync should still fail after ledger update"
+    );
+
+    // Drop again should be idempotent (was_already_retracted = true)
+    let drop_result2 = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(drop_result2.was_already_retracted);
+    assert_eq!(drop_result2.deleted_snapshots, 0);
+}
+
+/// Test BM25 recreate index after drop: can create a new index with the same name after dropping
+///
+/// Scenario: drop a graph source
+/// and then recreate it with the same name.
+#[tokio::test]
+async fn bm25_recreate_after_drop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with docs
+    let ledger_id = "bm25/recreate:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Original document two" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create BM25 index with a specific name
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("recreate-test", ledger_id, query.clone());
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert_eq!(created.doc_count, 2, "initial index should have 2 docs");
+
+    // Verify search works
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let analyzer = Analyzer::english_default();
+    let terms = analyzer.analyze_to_strings("original");
+    let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let results = scorer.top_k(10);
+    assert_eq!(results.len(), 2, "search should find 2 original docs");
+
+    // Drop the index
+    let drop_result = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!drop_result.was_already_retracted);
+
+    // Add new documents to ledger with a distinctive term
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Additional documentation three" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    // Recreate index with SAME name
+    let cfg2 = Bm25CreateConfig::new("recreate-test", ledger_id, query);
+    let created2 = fluree.create_full_text_index(cfg2).await.unwrap();
+
+    // New index should see all 3 documents
+    assert_eq!(created2.doc_count, 3, "recreated index should have 3 docs");
+    assert_eq!(
+        created2.graph_source_id, created.graph_source_id,
+        "should have same alias"
+    );
+
+    // Verify search works on new index
+    let idx2 = fluree
+        .load_bm25_index(&created2.graph_source_id)
+        .await
+        .unwrap();
+
+    // Search for "additional" which only appears in the new doc
+    let terms2 = analyzer.analyze_to_strings("additional");
+    let term_refs2: Vec<&str> = terms2.iter().map(std::string::String::as_str).collect();
+    let scorer2 = Bm25Scorer::new(&idx2, &term_refs2);
+    let results2 = scorer2.top_k(10);
+    assert_eq!(
+        results2.len(),
+        1,
+        "search should find 1 new doc with 'additional'"
+    );
+
+    // Also verify "original" still finds 2 docs
+    let terms3 = analyzer.analyze_to_strings("original");
+    let term_refs3: Vec<&str> = terms3.iter().map(std::string::String::as_str).collect();
+    let scorer3 = Bm25Scorer::new(&idx2, &term_refs3);
+    let results3 = scorer3.top_k(10);
+    assert_eq!(
+        results3.len(),
+        2,
+        "search should still find 2 original docs"
+    );
+}
+
+/// A dropped BM25 index stays as a tombstone whose snapshots are deleted; a
+/// query names it as not found rather than failing to read them.
+#[tokio::test]
+async fn bm25_query_after_drop_is_not_found() {
+    use fluree_db_query::bm25::Bm25SearchProvider;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming" }]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("dropped-text", ledger_id, query))
+        .await
+        .unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let id = created.graph_source_id.as_str();
+    provider
+        .bm25_index(id, Some(ledger.t()), false, None)
+        .await
+        .expect("index before drop");
+    provider
+        .search_bm25(id, "rust", 10, None, false, None)
+        .await
+        .expect("search before drop");
+
+    fluree.drop_full_text_index(id).await.unwrap();
+    let not_found = |err: fluree_db_query::QueryError| {
+        assert!(
+            err.to_string().contains("Graph source not found"),
+            "after drop: {err}"
+        );
+    };
+    not_found(
+        provider
+            .bm25_index(id, Some(ledger.t()), false, None)
+            .await
+            .expect_err("index after drop"),
+    );
+    not_found(
+        provider
+            .search_bm25(id, "rust", 10, None, false, None)
+            .await
+            .expect_err("search after drop"),
+    );
+}
+
+/// Test BM25 federated query: FlureeIndexProvider loads index and search works
+///
+/// This tests the full integration flow:
+/// 1. FlureeIndexProvider implements Bm25IndexProvider trait
+/// 2. Index can be loaded through the provider
+/// 3. Search results can be used to look up documents in the ledger
+#[tokio::test]
+async fn bm25_federated_query_via_provider() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with documents
+    let ledger_id = "bm25/federated:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide", "ex:author":"Alice" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly", "ex:author":"Bob" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners", "ex:author":"Charlie" }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create BM25 index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("fed-search", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert_eq!(created.doc_count, 3);
+
+    // Test 1: FlureeIndexProvider can load the index
+    let provider = FlureeIndexProvider::new(&fluree);
+    let idx = provider
+        .bm25_index(&created.graph_source_id, Some(ledger.t()), false, None)
+        .await
+        .expect("provider should load BM25 index");
+
+    // Test 2: Search for "rust programming" returns scored results
+    let analyzer = Analyzer::english_default();
+    let terms = analyzer.analyze_to_strings("rust programming");
+    let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let results = scorer.top_k(10);
+
+    assert!(!results.is_empty(), "expected search results");
+
+    // Test 3: Results contain valid document IRIs that match ledger data
+    let mut found_rust_doc = false;
+    let mut rust_scores = Vec::new();
+    let mut python_score = None;
+
+    for (doc_key, score) in &results {
+        let iri = doc_key.subject_iri.as_ref();
+
+        // Verify IRI is one of our documents
+        if iri.contains("doc1") || iri.contains("doc2") {
+            found_rust_doc = true;
+            rust_scores.push(*score);
+        } else if iri.contains("doc3") {
+            python_score = Some(*score);
+        }
+    }
+
+    assert!(found_rust_doc, "expected to find Rust documents in results");
+
+    // Test 4: Rust docs score higher than Python doc (relevance ranking)
+    if let Some(py_score) = python_score {
+        let max_rust = rust_scores.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            max_rust >= py_score,
+            "Rust docs should score >= Python doc: rust_max={max_rust}, python={py_score}"
+        );
+    }
+
+    // Test 5: Results can be used to query ledger for additional properties
+    // (simulating what a federated query would do)
+    for (doc_key, _score) in results.iter().take(2) {
+        let iri = doc_key.subject_iri.as_ref();
+
+        // Use the IRI to query ledger for author
+        let doc_query = json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id": iri, "ex:author":"?author" }],
+            "select": ["?author"]
+        });
+
+        let result = support::query_jsonld(&fluree, &ledger, &doc_query)
+            .await
+            .unwrap();
+
+        // Should have exactly one result (one author per doc)
+        assert_eq!(result.batches.len(), 1, "expected one batch for doc query");
+        let batch = &result.batches[0];
+        assert!(!batch.is_empty(), "expected author result for {iri}");
+    }
+}
+
+/// Test BM25 with file-backed storage: index persists to disk and search works
+///
+/// Scenario: filesystem BM25 which verifies:
+/// - Index creation works with file storage
+/// - Graph source directory exists on disk
+/// - Search works with persisted index
+#[tokio::test]
+async fn bm25_file_backed_storage() {
+    // Create temp directory for file storage
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+
+    // Build file-backed Fluree instance
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    // Create ledger with documents
+    let ledger_id = "bm25/file:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:article1", "@type":"ex:Article", "ex:title":"Rust programming guide" },
+            { "@id":"ex:article2", "@type":"ex:Article", "ex:title":"Python for beginners" },
+            { "@id":"ex:article3", "@type":"ex:Article", "ex:title":"Systems programming in Rust" }
+        ]
+    });
+    let ledger = fluree.insert(ledger, &tx).await.expect("insert").ledger;
+
+    // Create BM25 index
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Article", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("article-search", ledger_id, query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index");
+    assert_eq!(created.doc_count, 3, "expected 3 indexed docs");
+    assert!(created.index_id.is_some(), "expected persisted index id");
+
+    // Verify graph-sources directory exists
+    let gs_dir = std::path::Path::new(&storage_path).join(STORAGE_SEGMENT_GRAPH_SOURCES);
+    assert!(gs_dir.exists(), "graph-sources directory should exist");
+
+    // Load and search using file-backed index
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .expect("load index");
+    assert_eq!(idx.num_docs(), 3, "loaded index should have 3 docs");
+
+    let analyzer = Analyzer::english_default();
+    let terms = analyzer.analyze_to_strings("rust");
+    let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let results = scorer.top_k(10);
+
+    // Should find 2 Rust-related articles
+    assert_eq!(results.len(), 2, "expected 2 results for 'rust'");
+
+    // Verify scores are numeric and in descending order
+    let scores: Vec<f64> = results.iter().map(|(_, score)| *score).collect();
+    assert!(
+        scores[0] >= scores[1],
+        "scores should be in descending order"
+    );
+
+    // Search for python should find 1 result
+    let terms2 = analyzer.analyze_to_strings("python");
+    let term_refs2: Vec<&str> = terms2.iter().map(std::string::String::as_str).collect();
+    let scorer2 = Bm25Scorer::new(&idx, &term_refs2);
+    let results2 = scorer2.top_k(10);
+    assert_eq!(results2.len(), 1, "expected 1 result for 'python'");
+
+    // Verify we can query ledger data alongside BM25 results (federated use case)
+    let (doc_key, _score) = &results[0];
+    let doc_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id": doc_key.subject_iri.as_ref(), "ex:title":"?title" }],
+        "select": ["?title"]
+    });
+    let query_result = support::query_jsonld(&fluree, &ledger, &doc_query)
+        .await
+        .expect("doc query");
+    assert!(
+        !query_result.batches.is_empty() && !query_result.batches[0].is_empty(),
+        "should be able to query ledger for BM25 result doc"
+    );
+
+    // tmp directory will be cleaned up when `tmp` goes out of scope
+}
+
+/// Test BM25 query_connection_with_bm25 with f:* pattern syntax
+///
+/// This test verifies the full end-to-end integration:
+/// - `query_connection_with_bm25` correctly wires the FlureeIndexProvider
+/// - `f:*` patterns in where clauses resolve against BM25 graph source indexes
+/// - Search results include document IRIs and scores
+/// - Results can be joined with ledger data (via IriMatch bindings)
+#[tokio::test]
+async fn bm25_query_connection_with_idx_pattern() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with documents
+    let ledger_id = "bm25/qc:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide", "ex:author":"Alice" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly", "ex:author":"Bob" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners", "ex:author":"Charlie" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.expect("insert failed");
+
+    // Create BM25 index
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("qc-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index failed");
+    assert_eq!(created.doc_count, 3, "expected 3 indexed docs");
+
+    // Test 1: Regular query via query_connection_with_bm25
+    let regular_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "from": ledger_id,
+        "where": [{"@id": "?doc", "@type": "ex:Doc", "ex:author": "?author"}],
+        "select": ["?doc", "?author"]
+    });
+
+    let result = fluree
+        .query_connection_with_bm25(&regular_query)
+        .await
+        .expect("query_connection_with_bm25 failed for regular query");
+    let total_results: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(total_results, 3, "expected 3 results from regular query");
+
+    // Test 2: Execute f:* pattern through query_connection_with_bm25
+    // This tests the full end-to-end flow:
+    // - Pattern parsing (f:searchText, f:searchResult, f:searchLimit)
+    // - BM25 operator execution
+    // - IriMatch binding for cross-ledger joins
+    // - Join with ledger data to get author
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [
+            // Search the BM25 index for "rust" FIRST - produces initial bindings
+            {
+                "f:graphSource": &created.graph_source_id,
+                "f:searchText": "rust",
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            },
+            // Join with ledger data to get author
+            { "@id": "?doc", "ex:author": "?author" }
+        ],
+        "select": ["?doc", "?score", "?author"]
+    });
+
+    let idx_result = fluree
+        .query_connection_with_bm25(&idx_query)
+        .await
+        .expect("query_connection_with_bm25 failed for f:* query");
+
+    // Should have results (2 rust docs)
+    let idx_total: usize = idx_result
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert!(
+        idx_total >= 2,
+        "expected at least 2 rust docs in f:* query results, got {idx_total}"
+    );
+
+    // Verify scores are present (VarRegistry uses "?score" with the ? prefix)
+    let score_var_id = idx_result.vars.get("?score");
+    assert!(
+        score_var_id.is_some(),
+        "expected ?score variable in results"
+    );
+
+    // Test 3: Verify FlureeIndexProvider can load the index directly
+    let provider = FlureeIndexProvider::new(&fluree);
+    let idx = provider
+        .bm25_index(&created.graph_source_id, Some(1), false, None)
+        .await
+        .expect("FlureeIndexProvider should load BM25 index");
+    assert_eq!(idx.num_docs(), 3, "index should have 3 docs");
+
+    // Test 4: Direct search via provider (validates BM25 scorer)
+    let analyzer = Analyzer::english_default();
+    let terms = analyzer.analyze_to_strings("rust");
+    let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let search_results = scorer.top_k(10);
+    assert_eq!(
+        search_results.len(),
+        2,
+        "expected 2 rust docs via direct search"
+    );
+}
+
+/// Regression: embedded `f:searchText` must resolve through the STANDARD query
+/// path (`query_connection`), not only the dedicated `query_connection_with_bm25`.
+///
+/// This is exactly what the HTTP `POST /v1/fluree/query` route executes (via
+/// `query_from()`). Before the dataset/view execution context wired a
+/// `FlureeIndexProvider` as `bm25_provider`, this returned
+/// `InvalidQuery("BM25 IndexSearch requires ExecutionContext.bm25_search_provider
+/// or bm25_provider (not configured)")`. It must now succeed.
+#[tokio::test]
+async fn bm25_embedded_search_via_plain_query_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/plain-qc:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide", "ex:author":"Alice" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly", "ex:author":"Bob" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners", "ex:author":"Charlie" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.expect("insert failed");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let cfg = Bm25CreateConfig::new("plain-qc-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index failed");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [
+            {
+                "f:graphSource": &created.graph_source_id,
+                "f:searchText": "rust",
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            },
+            { "@id": "?doc", "ex:author": "?author" }
+        ],
+        "select": ["?doc", "?score", "?author"]
+    });
+
+    // The PLAIN connection path — NOT `_with_bm25`. This mirrors the HTTP query
+    // route; it must now serve the embedded BM25 search rather than error.
+    let result = fluree
+        .query_connection(&idx_query)
+        .await
+        .expect("plain query_connection must serve f:searchText (bm25 provider wired into the query context)");
+
+    let total: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert!(
+        total >= 2,
+        "expected >=2 rust docs via plain query_connection, got {total}"
+    );
+    assert!(
+        result.vars.get("?score").is_some(),
+        "expected ?score binding from the embedded BM25 search"
+    );
+}
+
+/// Test BM25 federated query with aggregation: search + join + groupBy/count
+///
+/// Scenario: federated BM25 aggregation scenarios.
+/// Tests that BM25 results can be combined with ledger data for aggregation.
+#[tokio::test]
+async fn bm25_federated_query_with_aggregation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Create ledger with books having year and category metadata
+    let ledger_id = "bm25/agg:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:book1", "@type":"ex:Book", "ex:title":"Rust Systems Programming", "ex:year": 2020, "ex:category":"programming" },
+            { "@id":"ex:book2", "@type":"ex:Book", "ex:title":"Learning Rust", "ex:year": 2021, "ex:category":"programming" },
+            { "@id":"ex:book3", "@type":"ex:Book", "ex:title":"Advanced Rust Patterns", "ex:year": 2021, "ex:category":"programming" },
+            { "@id":"ex:book4", "@type":"ex:Book", "ex:title":"Python Data Science", "ex:year": 2020, "ex:category":"data" },
+            { "@id":"ex:book5", "@type":"ex:Book", "ex:title":"Database Design", "ex:year": 2019, "ex:category":"data" }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    // Create BM25 index on title
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Book", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let cfg = Bm25CreateConfig::new("book-search", ledger_id, query);
+    let created = fluree.create_full_text_index(cfg).await.unwrap();
+    assert_eq!(created.doc_count, 5, "expected 5 indexed books");
+
+    // Load index and search for "rust" (should find 3 books)
+    let idx = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let analyzer = Analyzer::english_default();
+    let terms = analyzer.analyze_to_strings("rust");
+    let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
+    let scorer = Bm25Scorer::new(&idx, &term_refs);
+    let search_results = scorer.top_k(10);
+    assert_eq!(
+        search_results.len(),
+        3,
+        "expected 3 rust books in search results"
+    );
+
+    // For each search result, query ledger for year to simulate aggregation
+    // This mimics what a federated query with groupBy would do
+    let mut year_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+
+    for (doc_key, _score) in &search_results {
+        let iri = doc_key.subject_iri.as_ref();
+
+        // Query ledger for year property
+        let year_query = json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id": iri, "ex:year":"?year" }],
+            "select": ["?year"]
+        });
+
+        let result = support::query_jsonld(&fluree, &ledger, &year_query)
+            .await
+            .unwrap();
+        if !result.batches.is_empty() && !result.batches[0].is_empty() {
+            // Extract year from result
+            let batch = &result.batches[0];
+            if let Some(fluree_db_query::binding::Binding::Lit {
+                val: fluree_db_core::FlakeValue::Long(year),
+                ..
+            }) = batch.column_by_idx(0).and_then(|col| col.first())
+            {
+                *year_counts.entry(*year).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Verify aggregation results: Rust books by year
+    // - 2020: 1 book (Rust Systems Programming)
+    // - 2021: 2 books (Learning Rust, Advanced Rust Patterns)
+    assert_eq!(
+        year_counts.get(&2020),
+        Some(&1),
+        "expected 1 rust book in 2020"
+    );
+    assert_eq!(
+        year_counts.get(&2021),
+        Some(&2),
+        "expected 2 rust books in 2021"
+    );
+    assert!(
+        !year_counts.contains_key(&2019),
+        "expected no rust books in 2019"
+    );
+}
+
+/// A non-root view policy must hide inline BM25 search hits whose indexed text
+/// the identity cannot view (indexed-flake readability). Regression for the C3
+/// leak: the inline BM25 operator emitted matched subjects with no policy
+/// filtering, so a bare search (no constraining BGP) leaked restricted docs.
+#[tokio::test]
+async fn bm25_search_enforces_view_policy_on_indexed_flake() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Rust programming guide", "ex:author": "Alice" },
+            { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "Rust and WebAssembly", "ex:author": "Bob" }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &tx).await.expect("insert");
+
+    let index_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let cfg = Bm25CreateConfig::new("policy-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index");
+
+    // Bare search for "rust" (no constraining BGP), selecting only the doc.
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy => both rust docs match.
+    let control = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": search_where.clone(),
+        "select": ["?doc"]
+    });
+    let control_res = fluree
+        .query_connection_with_bm25(&control)
+        .await
+        .expect("control query");
+    let control_total: usize = control_res
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both rust docs should match");
+
+    // Policy: ex:title is viewable only for Alice-authored docs (doc1). doc2's
+    // indexed title is hidden, so its search hit must be dropped.
+    let policy = json!([{
+        "@id": "ex:titlePolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/title" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let policy_query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "opts": { "policy": policy, "default-allow": false },
+        "where": search_where,
+        "select": ["?doc"]
+    });
+    let result = fluree
+        .query_connection_with_bm25(&policy_query)
+        .await
+        .expect("policy query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    let rendered = jsonld.to_string();
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable title) must remain in search results; got: {jsonld:#?}"
+    );
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden title) must not leak through inline BM25 search; got: {jsonld:#?}"
+    );
+}
+
+/// Regression: embedded `f:searchText` must also resolve through the **dataset**
+/// execution path (`execute_dataset_*`), not only the single-graph view path.
+///
+/// A multi-ledger `from` is what routes a query to the dataset path; the plain
+/// single-graph test above exercises the `view/mod.rs` macro site instead. The
+/// two dataset sites are the bulk of this change and are what
+/// `POST /v1/fluree/query` takes for a multi-ledger query, so they need their own
+/// guard: the fix is a struct-field initializer, the easiest thing for a future
+/// refactor of `dataset_query.rs` to drop while CI stays green. Reverting either
+/// site to `bm25_provider: None` must turn this red.
+#[tokio::test]
+async fn bm25_embedded_search_via_dataset_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Two ledgers so `from` is a dataset, forcing the dataset execution path.
+    let l1 = "bm25/dataset-a:main";
+    let l2 = "bm25/dataset-b:main";
+    let a0 = support::genesis_ledger(&fluree, l1);
+    let _ = fluree
+        .insert(
+            a0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [
+                    { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+                    { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly" },
+                    { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert a");
+
+    let b0 = support::genesis_ledger(&fluree, l2);
+    let _ = fluree
+        .insert(
+            b0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [{ "@id":"ex:other1", "@type":"ex:Note", "ex:title":"Unrelated note" }]
+            }),
+        )
+        .await
+        .expect("insert b");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("dataset-search", l1, index_query))
+        .await
+        .expect("create index");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": [l1, l2],
+        "where": [{
+            "f:graphSource": &created.graph_source_id,
+            "f:searchText": "rust",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+        }],
+        "select": ["?doc", "?score"]
+    });
+
+    let result = fluree.query_connection(&idx_query).await.expect(
+        "DATASET path must serve f:searchText (bm25 provider wired into the dataset context)",
+    );
+
+    let total: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        total, 2,
+        "expected both rust docs via the dataset path, got {total}"
+    );
+    assert!(
+        result.vars.get("?score").is_some(),
+        "expected ?score binding from the embedded BM25 search"
+    );
+}
+
+/// A view policy must still hide unreadable hits on the path this PR opens.
+///
+/// The suite's other policy test drives `query_connection_with_bm25`, which was
+/// reachable before this change. This drives the plain `query_connection` — the
+/// standard, policy-enforced route the HTTP endpoint uses — because that is the
+/// surface being widened, and the failure mode of a gap here is returning
+/// documents a policy says the caller cannot read.
+#[tokio::test]
+async fn bm25_embedded_search_enforces_policy_via_plain_query_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/plain-policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Rust programming guide", "ex:author": "Alice" },
+                    { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "Rust and WebAssembly", "ex:author": "Bob" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let index_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "plain-policy-search",
+            ledger_id,
+            index_query,
+        ))
+        .await
+        .expect("create index");
+
+    // Bare search, no constraining BGP — the shape that leaked in the C3 regression.
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy, over the plain route => both rust docs match.
+    let control_res = fluree
+        .query_connection(&json!({
+            "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "where": search_where.clone(),
+            "select": ["?doc"]
+        }))
+        .await
+        .expect("control query");
+    let control_total: usize = control_res
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both rust docs should match");
+
+    // ex:title is viewable only on Alice-authored docs, so doc2's indexed text
+    // is unreadable and its hit must be dropped.
+    let policy = json!([{
+        "@id": "ex:titlePolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/title" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let result = fluree
+        .query_connection(&json!({
+            "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "opts": { "policy": policy, "default-allow": false },
+            "where": search_where,
+            "select": ["?doc"]
+        }))
+        .await
+        .expect("policy query");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rendered = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+        .to_string();
+
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden title) must not leak through embedded BM25 search on the \
+         standard query route; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable title) must remain; got: {rendered}"
+    );
+}
+
+/// Regression: the **tracked** dataset site must be wired too.
+///
+/// There are two dataset wiring sites and a multi-ledger `from` alone does not
+/// reach both — which builder method you call decides it:
+///
+/// - `query_connection` / `query_from().execute_formatted()` land in
+///   `execute_dataset_internal_with_r2rml` → `execute_dataset_into_with_r2rml`;
+/// - `query_from().execute_tracked()` lands in `execute_dataset_tracked` →
+///   `execute_dataset_tracked_with_r2rml`.
+///
+/// Per-site mutation proves the split: reverting only the tracked site leaves
+/// the plain dataset test above green, and reverting only the other leaves this
+/// one green. Each site needs its own test.
+#[tokio::test]
+async fn bm25_embedded_search_via_tracked_dataset_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let l1 = "bm25/tracked-a:main";
+    let l2 = "bm25/tracked-b:main";
+    let a0 = support::genesis_ledger(&fluree, l1);
+    let _ = fluree
+        .insert(
+            a0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [
+                    { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+                    { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly" },
+                    { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert a");
+
+    let b0 = support::genesis_ledger(&fluree, l2);
+    let _ = fluree
+        .insert(
+            b0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [{ "@id":"ex:other1", "@type":"ex:Note", "ex:title":"Unrelated note" }]
+            }),
+        )
+        .await
+        .expect("insert b");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "tracked-dataset-search",
+            l1,
+            index_query,
+        ))
+        .await
+        .expect("create index");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": [l1, l2],
+        "where": [{
+            "f:graphSource": &created.graph_source_id,
+            "f:searchText": "rust",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+        }],
+        "select": ["?doc", "?score"]
+    });
+
+    // `execute_tracked()` — NOT `execute_formatted()`, which routes to
+    // `execute_dataset_internal_with_r2rml` and lands on the *other* dataset
+    // site. Only the tracked builder path reaches
+    // `execute_dataset_tracked_with_r2rml`.
+    let result = fluree
+        .query_from()
+        .jsonld(&idx_query)
+        .execute_tracked()
+        .await
+        .expect("TRACKED dataset path must serve f:searchText");
+
+    let rendered = serde_json::to_value(&result.result)
+        .expect("serialize tracked result")
+        .to_string();
+    assert!(
+        rendered.contains("doc1") && rendered.contains("doc2"),
+        "expected both rust docs via the tracked dataset path; got: {rendered}"
+    );
+}
+
+/// Count files under the graph-sources storage segment.
+fn graph_source_blob_count(storage_path: &str) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                if e.path().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    walk(&std::path::Path::new(storage_path).join(STORAGE_SEGMENT_GRAPH_SOURCES))
+}
+
+/// Overwrite a graph source's BM25 manifest with bytes that are not valid JSON,
+/// so loading it fails to deserialize. Returns how many blobs were rewritten.
+///
+/// The manifest is published as a `ContentKind::IndexRoot`, so it lives under
+/// `<graph source>/index/roots/*.fir6` rather than in the graph-sources segment
+/// alongside the snapshots it references.
+fn corrupt_bm25_manifest(storage_path: &str, graph_source_name: &str) -> usize {
+    fn walk(dir: &std::path::Path, graph_source_name: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    return walk(&path, graph_source_name);
+                }
+                let manifest = path.extension().is_some_and(|ext| ext == "fir6")
+                    && path.to_string_lossy().contains(graph_source_name);
+                if manifest {
+                    std::fs::write(&path, b"{ not json").map_or(0, |()| 1)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    walk(std::path::Path::new(storage_path), graph_source_name)
+}
+
+/// The generic `drop_graph_source` — what `POST /drop` and `fluree drop` reach
+/// — must sweep BM25 snapshot blobs in `Hard` mode, not just retract the
+/// nameservice record. It used to delete only Iceberg mapping blobs, so a BM25
+/// index dropped this way left every snapshot on disk with no way to reach it.
+#[tokio::test]
+async fn drop_graph_source_deletes_bm25_snapshots() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/hard-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Systems programming" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("hard-drop-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    let before = graph_source_blob_count(&storage_path);
+    assert!(before > 0, "index should have written blobs");
+
+    let report = fluree
+        .drop_graph_source("hard-drop-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop graph source");
+
+    assert!(
+        report.files_deleted >= 1,
+        "hard drop should report deleted snapshots, got {}: {:?}",
+        report.files_deleted,
+        report.warnings
+    );
+    assert!(
+        graph_source_blob_count(&storage_path) < before,
+        "hard drop must remove snapshot blobs from storage (was {before})"
+    );
+}
+
+/// Drop is the recovery action for a wedged graph source, so it has to work
+/// even when the snapshot sweep cannot. The manifest load used to propagate
+/// with `?`, returning before the retract below it — so a BM25 index whose
+/// manifest blob was unreadable could not be dropped at all through
+/// `POST /drop`, which is the one path an operator has left at that point.
+#[tokio::test]
+async fn drop_graph_source_retracts_when_the_bm25_manifest_is_unreadable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/wedged-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wedged-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    assert!(
+        corrupt_bm25_manifest(&storage_path, "wedged-search") > 0,
+        "test needs the manifest blob to corrupt"
+    );
+
+    let report = fluree
+        .drop_graph_source("wedged-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop must still succeed when the manifest cannot be read");
+
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("manifest unreadable")),
+        "the skipped sweep should be reported as a warning, got: {:?}",
+        report.warnings
+    );
+    assert!(
+        fluree.sync_bm25_index("wedged-search:main").await.is_err(),
+        "the index must be retracted despite the sweep being skipped"
+    );
+}
+
+/// Every sync entrypoint must refuse a dropped index. `sync_bm25_index_to`
+/// used to skip the retraction check its siblings made, so a pinned sync wrote
+/// a fresh snapshot for a graph source whose snapshots had just been deleted,
+/// putting a dropped index back to serving results.
+#[tokio::test]
+async fn bm25_sync_refuses_a_retracted_index() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/retracted:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" }]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let source_t = ledger1.t();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("retracted-test", ledger_id, query))
+        .await
+        .unwrap();
+
+    let dropped = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!dropped.was_already_retracted);
+
+    let head_sync = fluree.sync_bm25_index(&created.graph_source_id).await;
+    assert!(
+        head_sync.is_err(),
+        "head sync must refuse a retracted index"
+    );
+
+    let pinned_sync = fluree
+        .sync_bm25_index_to(&created.graph_source_id, source_t, None)
+        .await;
+    assert!(
+        pinned_sync.is_err(),
+        "pinned sync must refuse a retracted index too, got: {:?}",
+        pinned_sync.map(|r| r.new_watermark)
+    );
+
+    let resync = fluree.resync_bm25_index(&created.graph_source_id).await;
+    assert!(resync.is_err(), "resync must refuse a retracted index");
+}
+
+/// The incremental sync path must produce byte-for-byte the same index as a
+/// full rebuild.
+///
+/// `sync_bm25_index` narrows its indexing query to the subjects the commit log
+/// says changed, instead of re-running the whole query over the whole ledger
+/// and filtering afterwards. That is the difference between O(delta) and
+/// O(corpus) per sync, but it is only a safe optimisation if the narrowed query
+/// yields exactly what the wide one did.
+///
+/// So: build two identical indexes over one ledger, mutate the ledger, then
+/// take one down the incremental path and rebuild the other from scratch, and
+/// require the resulting structures to match. Nothing here asserts *how* the
+/// query was narrowed — only that narrowing changed no outcome, which is the
+/// property that has to hold even if the scoping heuristic changes later.
+#[tokio::test]
+async fn bm25_incremental_sync_matches_full_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/diff:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"alpha beta gamma" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"gamma epsilon zeta" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let incremental = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-incremental",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+    let rebuilt = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-rebuilt",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+
+    // Touch a subset: one existing document changes, one new one appears, so the
+    // affected set is a strict subset of the corpus and the narrowing is load
+    // bearing rather than incidentally equal to "everything".
+    let delta = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta omega" },
+            { "@id":"ex:doc4", "@type":"ex:Doc", "ex:title":"eta theta" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &delta).await.unwrap().ledger;
+
+    let sync = fluree
+        .sync_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        !sync.was_full_resync,
+        "this test is meaningless if the sync silently fell back to a full resync"
+    );
+
+    fluree
+        .resync_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    let a = fluree
+        .load_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    let b = fluree
+        .load_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        a.num_docs(),
+        b.num_docs(),
+        "document count diverged between incremental and full rebuild"
+    );
+    assert_eq!(
+        a.num_terms(),
+        b.num_terms(),
+        "vocabulary size diverged between incremental and full rebuild"
+    );
+
+    // Doc keys carry the ledger alias, which differs per graph source, so compare
+    // the subject IRIs and their term counts — the parts that describe the corpus
+    // rather than which index it lives in.
+    let mut a_docs: Vec<(String, u32)> = a
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                a.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut b_docs: Vec<(String, u32)> = b
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                b.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    a_docs.sort();
+    b_docs.sort();
+    assert_eq!(
+        a_docs, b_docs,
+        "incremental and full rebuild disagree on the indexed documents or their lengths"
+    );
+
+    // The mutated document must actually reflect the new text in both, otherwise
+    // the two could agree simply by both being stale.
+    assert!(
+        a_docs.iter().any(|(iri, _)| iri.ends_with("doc4")),
+        "the newly inserted document never reached the incremental index: {a_docs:?}"
+    );
+}
+
+/// The narrowing has to reduce the work the engine does, not merely the rows it
+/// hands back. `bm25_incremental_sync_matches_full_resync` pins correctness,
+/// `it_bm25_sync_scoping.rs` pins that the sync path really takes this branch,
+/// and the `scope_tests` unit tests pin the shape of the generated clause and
+/// every condition that declines it.
+///
+/// This one is deliberately none of those: it is a **characterization test of
+/// the query engine**, and it passes with this PR's source reverted, because it
+/// hand-builds the `values` clause. Keep it anyway — it is what would catch a
+/// future engine change that turned a `values` binding into a post-filter over a
+/// full scan, quietly removing the reason for scoping at all. It does not
+/// belong to this PR's guard set; the two tests named above are that.
+///
+/// Measured against a corpus large enough that a full scan cannot be mistaken
+/// for a narrow one, on an **indexed** ledger because that is what the sync
+/// path meets in practice: novelty holds only commits since the last index
+/// build, and everything older is in leaflets that a bound subject can seek
+/// into. Fuel on the indexed corpus is flat in corpus size when scoped and
+/// linear when not.
+#[tokio::test]
+async fn scoped_indexing_query_narrows_the_indexed_scan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/fuel:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    const CORPUS: usize = 400;
+    let docs: Vec<_> = (0..CORPUS)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:doc{i}"),
+                "@type": "ex:Doc",
+                "ex:title": format!("document number {i} with some filler text")
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger0,
+            &json!({ "@context": { "ex":"http://example.org/" }, "@graph": docs }),
+        )
+        .await
+        .unwrap();
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+
+    let full = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    // The same clause `scope_indexing_query_to_subjects` builds: the single
+    // object-form select variable bound to the affected IRIs, as full IRIs.
+    let mut scoped = full.clone();
+    scoped.as_object_mut().unwrap().insert(
+        "values".to_string(),
+        json!(["?x", [{ "@id": "http://example.org/doc7" }]]),
+    );
+
+    // Strip the flat 1.000 `QUERY_FLOOR_MICRO_FUEL` charged at query entry —
+    // it is the same for both and would otherwise dominate the comparison.
+    let work = |v: Option<f64>| v.expect("tracked query reported no fuel") - 1.0;
+
+    let full_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &full)
+            .await
+            .expect("full indexing query failed")
+            .fuel,
+    );
+    let scoped_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &scoped)
+            .await
+            .expect("scoped indexing query failed")
+            .fuel,
+    );
+
+    // One subject out of 400 measures ~270x at the time of writing. The bound
+    // is deliberately loose: it pins the order of magnitude, so it survives
+    // unrelated changes to the fuel schedule but fails outright if the
+    // narrowing stops reaching the scan.
+    assert!(
+        scoped_work * 20.0 < full_work,
+        "scoping one subject out of {CORPUS} did not narrow the indexed scan: \
+         scoped {scoped_work} vs full {full_work} (fuel above the query floor)"
+    );
+}
+
+/// A commit that touches NO indexed property must advance the watermark, not
+/// rebuild the index.
+///
+/// The regression: `sync_bm25_index` traced the commits, found an empty affected
+/// set, and treated that determinate "nothing I index changed" as if it were
+/// "I could not work out what changed" — falling back to a full resync. On an
+/// append-heavy ledger whose writes mostly miss the indexed properties, that made
+/// the *cheapest* possible window trigger the *most expensive* possible operation,
+/// once per commit. In production it produced 23 full rebuilds in 10 minutes and
+/// OOM-killed the process three times.
+///
+/// `was_full_resync` is the observable that separates the two paths. Doc count and
+/// watermark are identical either way — a resync arrives at the same correct index,
+/// just by rebuilding it — which is exactly why this went unnoticed.
+#[tokio::test]
+async fn sync_without_indexed_changes_advances_watermark_without_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/noop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    // The index depends on ex:title only.
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("noop-test", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let docs_before = before.num_docs();
+
+    // Commit something the index does not cover. NOTE the absence of `@type`:
+    // `affected_subjects` filters flakes by PREDICATE (`predicate_sids.contains(f.p)`),
+    // and this query's deps include `rdf:type` because it matches on `@type ex:Doc`.
+    // So any typed insert — even `@type ex:Observation`, an unrelated class — counts
+    // as touching an indexed predicate and never reaches the empty-set branch.
+    //
+    // The first version of this test used `{"@id":"ex:obs1","@type":"ex:Observation",
+    // "ex:reading":"42"}` and passed against the unfixed code, because of exactly
+    // that. Only a subject touching NO dependent predicate exercises this path.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:note1", "ex:reading":"42" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+    let ledger_t = ledger2.t();
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+
+    assert!(
+        !synced.was_full_resync,
+        "a commit touching no indexed property must NOT trigger a full resync; \
+         this is the bug that OOM-killed production three times"
+    );
+    assert_eq!(
+        synced.upserted, 0,
+        "nothing the index covers changed, so nothing should be upserted"
+    );
+    assert_eq!(
+        synced.new_watermark, ledger_t,
+        "the watermark must advance to the ledger's t, or every later sync \
+         re-walks a commit range that grows without bound"
+    );
+
+    // And the index itself is unchanged and still correct.
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.num_docs(),
+        docs_before,
+        "an untouched index must keep its documents"
+    );
+}
+
+/// The complement of the test above: advancing the watermark on an empty
+/// change set is only sound when the tracked property set is *total*, and a
+/// wildcard select makes it anything but.
+///
+/// `select {"?x": ["*"]}` observes every property of the document, yet the
+/// dependency extractor can only name the ones it can see — here just
+/// `rdf:type` from the `where`. A commit that changes `ex:title` therefore
+/// touches no tracked property, the change set comes back empty, and the
+/// watermark-advance branch would record the index as current at a `t` whose
+/// change it never indexed. Every later sync starts above that `t`, so the
+/// staleness is permanent and `is_valid_at` vouches for it.
+///
+/// The sync must instead notice that its dependencies are incomplete and take
+/// the full rebuild. `was_full_resync` pins the routing; the term check pins
+/// the outcome that matters.
+#[tokio::test]
+async fn sync_with_wildcard_select_rebuilds_instead_of_advancing_past_the_change() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/wildcard:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["*"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wildcard", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    // Touch a property the wildcard covers and no explicit dependency names.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a wildcard select cannot be tracked incrementally; the sync must rebuild"
+    );
+    assert_eq!(synced.new_watermark, ledger2.t());
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the new title never reached the index: the sync advanced past it"
+    );
+}
+
+/// A nested projection indexes text from *another* subject, so the flake that
+/// changes the document is not on the document. `affected_subjects` attributes
+/// a flake to its own subject, and the old extractor did not even see the
+/// nested predicate — either way the change set is empty and the index goes
+/// stale. Same required outcome as the wildcard case: rebuild.
+#[tokio::test]
+async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/nested:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document",
+            "ex:author": { "@id":"ex:author1", "ex:name":"Ada" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title", { "ex:author": ["ex:name"] }] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("nested", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        before.term_idx("ada").is_some(),
+        "the nested author name should be part of the document text"
+    );
+
+    // Change the author, not the document.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:author1", "ex:name":"Grace" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a nested projection cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("grace").is_some(),
+        "the author's new name never reached the document that projects it"
+    );
+}
+
+/// Reasoning infers from properties the patterns never name: asserting
+/// `ex:Memo rdfs:subClassOf ex:Doc` makes every memo a document. No tracked
+/// property changes, so the sync must rebuild.
+#[tokio::test]
+async fn sync_with_reasoning_rebuilds_when_the_schema_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/reasoning:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let tx1 = json!({
+        "@context": ctx,
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" },
+            { "@id":"ex:memo1", "@type":"ex:Memo", "ex:title":"quokka" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title"] },
+        "reasoning": "rdfs"
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("reasoning", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    let tx2 = json!({
+        "@context": ctx,
+        "@graph": [ { "@id":"ex:Memo", "rdfs:subClassOf": { "@id":"ex:Doc" } } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "reasoning cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the memo, now a document, never reached the index"
+    );
+}
+
+/// A variable predicate observes every property, so the tracked set cannot be
+/// total. Here the changed property happens to be tracked anyway, which is why
+/// the index ends up correct on either path — the routing is the assertion.
+#[tokio::test]
+async fn sync_with_variable_predicate_always_rebuilds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/varpred:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [
+            { "@id":"?x", "@type":"ex:Doc" },
+            { "@id":"?x", "?p":"?v" }
+        ],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("varpred", ledger_id, query))
+        .await
+        .unwrap();
+    // `doc_count` reports result rows, and `?p ?v` yields one row per property
+    // of the document, so count documents in the index instead.
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(before.num_docs(), 1);
+
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a variable predicate cannot be tracked incrementally; the sync must rebuild"
+    );
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(after.term_idx("quokka").is_some());
+}
+
+/// The refusal every route gives a query that names an index source where a
+/// graph is read.
+fn assert_not_a_graph<T: std::fmt::Debug>(
+    result: Result<T, fluree_db_api::ApiError>,
+    gs: &str,
+    route: &str,
+) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceNotAGraph",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 400, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "graph source '{gs}' is a BM25 index, not a graph: query it with an \
+             f:graphSource pattern, with its source ledger as the dataset"
+        )),
+        "{route}: {message}"
+    );
+}
+
+/// An index source has no triples: its searches find it by the `f:graphSource`
+/// id in their own pattern, with the source ledger as the dataset. Named where
+/// a graph is read (the query target, `FROM`, `FROM NAMED`, `GRAPH`) it is
+/// refused on SPARQL and JSON-LD alike. Each route once answered something
+/// else: triple patterns read it as an empty graph (0 rows), the target
+/// answered "Ledger not found", and a search with the index as the dataset
+/// either answered (through `query_connection_with_bm25`) or failed with "No
+/// BM25 snapshot ... at t=0" (through `query_from`). The documented form, the
+/// source ledger as the dataset, still answers.
+#[tokio::test]
+async fn an_index_source_is_refused_as_a_graph_and_searched_through_its_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "notagraph/docs:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert");
+    let cfg = Bm25CreateConfig::new(
+        "notagraph-search",
+        ledger_id,
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+            "select": { "?x": ["@id", "ex:title"] }
+        }),
+    );
+    let gs = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index")
+        .graph_source_id;
+    let ctx = json!({ "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" });
+    let search = json!({
+        "f:graphSource": gs,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+    });
+
+    // A3, the documented form: the source ledger is the dataset.
+    let documented = json!({
+        "@context": ctx, "from": ledger_id, "where": [search], "select": ["?doc", "?score"]
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&documented)
+        .execute_formatted()
+        .await
+        .expect("search through the source ledger");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(
+        fluree
+            .query_connection_with_bm25(&documented)
+            .await
+            .expect("search through the source ledger")
+            .row_count(),
+        1
+    );
+
+    // A1 / A2: the same search with the index as the dataset.
+    let search_from_index = json!({
+        "@context": ctx, "from": gs, "where": [search], "select": ["?doc", "?score"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&search_from_index)
+            .execute_formatted()
+            .await,
+        &gs,
+        "A1 search, index as dataset",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_connection_with_bm25(&search_from_index)
+            .await
+            .map(|r| r.row_count()),
+        &gs,
+        "A2 query_connection_with_bm25, index as dataset",
+    );
+
+    // B / C / C2: triple patterns over FROM <index>.
+    let triples = json!({
+        "@context": ctx, "from": gs,
+        "where": [{"@id": "?s", "ex:title": "?t"}], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&triples)
+            .execute_formatted()
+            .await,
+        &gs,
+        "B JSON-LD from",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s ?t FROM <{gs}> WHERE {{ ?s <http://example.org/title> ?t }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C SPARQL FROM",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!("SELECT * FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C2 SPARQL FROM, ?s ?p ?o",
+    );
+
+    // D / D2: the index as the query target.
+    let target = fluree.graph(&gs);
+    let target_search = json!({"@context": ctx, "where": [search], "select": ["?doc", "?score"]});
+    assert_not_a_graph(
+        target
+            .query()
+            .jsonld(&target_search)
+            .execute_formatted()
+            .await,
+        &gs,
+        "D JSON-LD target",
+    );
+    assert_not_a_graph(
+        target
+            .query()
+            .sparql("SELECT * WHERE { ?s ?p ?o }")
+            .execute_formatted()
+            .await,
+        &gs,
+        "D2 SPARQL target",
+    );
+
+    // E: FROM NAMED <index> + GRAPH <index>.
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT * FROM <{ledger_id}> FROM NAMED <{gs}> WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "E SPARQL FROM NAMED + GRAPH",
+    );
+    let named = json!({
+        "@context": ctx, "from": ledger_id, "fromNamed": [gs],
+        "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree.query_from().jsonld(&named).execute_formatted().await,
+        &gs,
+        "E JSON-LD fromNamed + graph",
+    );
+
+    // F: GRAPH <index> inside a query of the ledger, with no dataset naming it.
+    // Only the iceberg feature resolves a GRAPH IRI that names a graph source;
+    // without it the IRI names no graph in the ledger and matches nothing.
+    if cfg!(feature = "iceberg") {
+        let ledger = fluree.graph(ledger_id);
+        assert_not_a_graph(
+            ledger
+                .query()
+                .sparql(&format!("SELECT * WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"))
+                .execute_formatted()
+                .await,
+            &gs,
+            "F SPARQL GRAPH in a ledger query",
+        );
+        let in_ledger = json!({
+            "@context": ctx,
+            "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+        });
+        assert_not_a_graph(
+            ledger.query().jsonld(&in_ledger).execute_formatted().await,
+            &gs,
+            "F JSON-LD graph in a ledger query",
+        );
+    }
+}

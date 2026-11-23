@@ -1,0 +1,266 @@
+//! # Fluree DB Core
+//!
+//! Runtime-agnostic core library for Fluree DB queries.
+//!
+//! This crate provides:
+//! - Core types: `Sid`, `FlakeValue`, `Flake`
+//! - Index comparators for all 4 orderings (SPOT, PSOT, POST, OPST)
+//! - Storage and cache trait interfaces
+//! - Range query implementation
+//!
+//! ## Design Principles
+//!
+//! 1. **Runtime-agnostic**: No tokio, no forced `Send + Sync`
+//! 2. **Async at I/O seam only**: Synchronous traversal once data is in memory
+//! 3. **Strict total ordering**: No nil-as-wildcard; use explicit min/max bounds
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use fluree_db_core::{LedgerSnapshot, range, IndexType, RangeTest};
+//!
+//! // Apps provide their own Storage implementation
+//! let db = load_ledger_snapshot(&storage, &root_id, "ledger/main").await?;
+//! let flakes = range(&db, IndexType::Spot, RangeTest::Eq, match_val, opts).await?;
+//! ```
+
+pub mod address;
+pub mod address_path;
+pub mod annotation_index;
+pub mod cancellation;
+pub mod clock;
+pub mod coerce;
+pub mod commit;
+pub mod comparator;
+pub mod conflict_key;
+pub mod content_id;
+pub mod content_kind;
+pub mod dataset_ref;
+pub mod datatype_constraint;
+pub mod datatypes;
+pub mod db;
+pub mod dict_novelty;
+/// Shared LRU disk cache for content-addressed blobs (index artifacts, Iceberg
+/// data files), with a single global byte budget. Native (filesystem) only.
+/// Also compiled on wasm32 (std::fs stubs): every read misses, writes are
+/// best-effort no-ops, so CAS consumers fall through to pure fetch. SEAM(wasm).
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
+pub mod disk_cache;
+pub mod edge;
+pub mod error;
+pub mod fd_limit;
+pub mod flake;
+pub mod geo;
+pub mod graph_db_ref;
+pub mod graph_registry;
+pub mod ids;
+pub mod index_schema;
+pub mod index_stats;
+pub mod ledger_config;
+pub mod ledger_id;
+pub mod namespaces;
+pub mod nonempty;
+pub mod ns_encoding;
+pub mod ns_vec_bi_dict;
+pub mod o_type;
+pub mod o_type_registry;
+pub mod overlay;
+pub mod pack;
+pub mod prefix_trie;
+pub mod query_bounds;
+pub mod range;
+pub mod range_provider;
+pub mod rdf_list;
+pub mod runtime_small_dicts;
+pub mod same_t;
+pub mod schema_hierarchy;
+pub mod serde;
+pub mod sid;
+pub mod skolem;
+pub mod stats_view;
+pub mod stats_wire;
+pub mod storage;
+pub mod subject_id;
+pub mod sysmem;
+#[cfg(feature = "native")]
+pub mod task;
+pub mod temporal;
+pub mod topk;
+pub mod tracking;
+pub mod value;
+pub mod value_id;
+pub mod vec_bi_dict;
+pub mod vector;
+pub mod verified_identity;
+// moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
+// unit tests. See module docs.
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod wasm_cache;
+
+// Re-export main types
+pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
+pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
+pub use cancellation::{MemoryCharge, QueryCancellation, QueryCancellationReason};
+pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
+pub use commit::{
+    collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
+    commit_to_summary, diff_branches, find_common_ancestor, first_t_where_graph_registered,
+    load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
+    trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
+    walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitGraphLifecycle, CommitSummary,
+    CommitTransferPage, CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry,
+    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+};
+pub use comparator::IndexType;
+pub use conflict_key::ConflictKey;
+pub use content_id::{CommitId, ContentId, IndexRootId, TxnId};
+pub use content_kind::{
+    ContentKind, DictKind, CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+    CODEC_FLUREE_ANNOTATION_FORWARD_LEAF, CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+    CODEC_FLUREE_ANNOTATION_REVERSE_LEAF, CODEC_FLUREE_COMMIT, CODEC_FLUREE_DICT_BLOB,
+    CODEC_FLUREE_GARBAGE, CODEC_FLUREE_GRAPH_SOURCE_MAPPING, CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT,
+    CODEC_FLUREE_HISTORY_SIDECAR, CODEC_FLUREE_INDEX_BRANCH, CODEC_FLUREE_INDEX_LEAF,
+    CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
+    CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
+};
+pub use dataset_ref::{
+    AddressText, DatasetRef, GraphIri, GraphNameTable, GraphPosition, GraphSel, LedgerRef,
+    MemberRef, RefError, TargetError, TargetGraph, TargetLedger, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
+};
+pub use datatype_constraint::DatatypeConstraint;
+pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
+pub use dict_novelty::DictNovelty;
+pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
+pub use error::{Error, Result};
+pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
+pub use graph_db_ref::GraphDbRef;
+pub use graph_registry::{
+    config_graph_iri, txn_meta_graph_iri, GraphDrop, GraphRegistry, CONFIG_GRAPH_ID,
+    DEFAULT_GRAPH_ID, DEFAULT_GRAPH_IRI, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID,
+};
+pub use ids::{
+    DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,
+    StringId, TxnT, NO_ARENA_GRAPH,
+};
+pub use index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
+pub use index_stats::{
+    ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry,
+    IndexStats, PropertyStatEntry,
+};
+pub use ledger_id::{
+    format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
+    split_ledger_id, split_time_travel_suffix, validate_branch_name, validate_ledger_name,
+    IntoLedgerId, LedgerId, LedgerIdParseError, LedgerIdTimeSpec, LedgerName, ParsedLedgerId,
+    COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, LEDGER_URN_PREFIX, TIME_TRAVEL_TAGS,
+};
+pub use namespaces::{
+    default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,
+    is_owl_equivalent_class, is_owl_equivalent_property, is_owl_functional_property,
+    is_owl_imports, is_owl_inverse_functional_property, is_owl_inverse_of,
+    is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
+    is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_rest,
+    is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
+    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
+    is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
+    is_schema_class, is_schema_predicate, reifies_predicate_sids,
+};
+pub use nonempty::NonEmpty;
+pub use ns_encoding::{
+    builtin_prefix_trie, canonical_split, NamespaceCodes, NsAllocError, NsLookup, NsSplitMode,
+    HOST_PLUS_N_MAX,
+};
+pub use o_type::{DecodeKind, OType};
+pub use o_type_registry::OTypeRegistry;
+pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
+pub use prefix_trie::PrefixTrie;
+pub use range::{
+    flake_matches_range_eq, overlay_eq_bounds, range, range_bounded_with_overlay,
+    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, StringDatatype,
+    BATCHED_JOIN_SIZE,
+};
+pub use range_provider::{RangeProvider, RangeQuery};
+pub use runtime_small_dicts::RuntimeSmallDicts;
+pub use schema_hierarchy::{
+    compute_schema_hierarchy_with_overlay, SchemaHierarchy, SchemaHierarchyCache,
+};
+pub use sid::{Sid, SidInterner};
+pub use stats_view::{PropertyStatData, StatsView};
+pub use storage::EncryptionAdmin;
+pub use storage::{
+    bridge_content_store,
+    content_address,
+    content_path,
+    content_store_for,
+    // Helper functions for storage implementations
+    ledger_id_prefix_for_path,
+    sha256_hex,
+    BranchedContentStore,
+    CasAction,
+    CasOutcome,
+    ContentAddressedWrite,
+    ContentStore,
+    ContentWriteResult,
+    Durability,
+    ListResult,
+    MemoryContentStore,
+    MemoryStorage,
+    ReadHint,
+    RemoteObject,
+    Storage,
+    StorageBackend,
+    StorageCas,
+    StorageContentStore,
+    StorageDelete,
+    StorageExtError,
+    StorageExtResult,
+    StorageList,
+    StorageMethod,
+    StorageRead,
+    StorageWrite,
+    STORAGE_METHOD_IPFS,
+    STORAGE_METHOD_MEMORY,
+    STORAGE_METHOD_S3,
+};
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use storage::{
+    FileStorage, RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE,
+    STORAGE_METHOD_FILE,
+};
+pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
+pub use temporal::{Date, DateTime, Time};
+pub use tracking::{
+    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally, Tracker,
+    TrackingOptions, TrackingTally,
+};
+pub use value::{
+    parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
+    FlakeValue, GeoPointBits,
+};
+pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use verified_identity::VerifiedIdentity;
+
+/// Prelude module for convenient imports of storage traits and common types.
+///
+/// # Example
+///
+/// ```ignore
+/// use fluree_db_core::prelude::*;
+///
+/// async fn example<S: Storage>(storage: &S) {
+///     let bytes = storage.read_bytes("address").await?;
+///     storage.write_bytes("address", &bytes).await?;
+/// }
+/// ```
+pub mod prelude {
+    pub use crate::content_id::ContentId;
+    pub use crate::content_kind::{ContentKind, DictKind};
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    pub use crate::storage::FileStorage;
+    pub use crate::storage::{
+        CasAction, CasOutcome, ContentAddressedWrite, ContentStore, ContentWriteResult, ListResult,
+        MemoryContentStore, MemoryStorage, ReadHint, RemoteObject, Storage, StorageCas,
+        StorageContentStore, StorageDelete, StorageExtError, StorageExtResult, StorageList,
+        StorageRead, StorageWrite,
+    };
+}

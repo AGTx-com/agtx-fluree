@@ -1,0 +1,21 @@
+//! Flake generation from transaction templates
+//!
+//! This module provides functionality for materializing triple templates
+//! into concrete flakes, handling variable substitution, blank node
+//! skolemization, and assertion/retraction cancellation
+//! ([`FlakeAccumulator`]).
+
+pub mod accumulator;
+pub mod flakes;
+
+pub use accumulator::FlakeAccumulator;
+pub(crate) use flakes::bundle_templates;
+#[cfg(feature = "import")]
+pub(crate) use flakes::DT_ID;
+pub use flakes::{infer_datatype, FlakeGenerator, GraphTable, WriteGraph};
+pub(crate) use flakes::{
+    validate_value_dt_pair, DT_BOOLEAN, DT_DATE, DT_DATE_TIME, DT_DAY_TIME_DURATION, DT_DECIMAL,
+    DT_DOUBLE, DT_DURATION, DT_G_DAY, DT_G_MONTH, DT_G_MONTH_DAY, DT_G_YEAR, DT_G_YEAR_MONTH,
+    DT_INTEGER, DT_JSON, DT_LANG_STRING, DT_STRING, DT_TIME, DT_WKT_LITERAL,
+    DT_YEAR_MONTH_DURATION,
+};

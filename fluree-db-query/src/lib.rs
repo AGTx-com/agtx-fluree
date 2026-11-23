@@ -1,0 +1,550 @@
+//! # Fluree DB Query
+//!
+//! Query execution engine for Fluree DB.
+//!
+//! This crate provides:
+//! - Columnar batch-based execution model
+//! - Operator trait with `open/next_batch/close` lifecycle
+//! - DatasetOperator for dataset-aware triple-pattern evaluation (multi-graph fanout)
+//! - BinaryScanOperator for single-graph scanning (binary cursor + range fallback)
+//! - Variable registry for compact binding indices
+//!
+//! ## Quick Start
+//!
+//! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
+
+// `ExecutionContext::binary_g_id` is deprecated so that its readers are
+// listed: a lane takes its graph from `ExecutionContext::index_scope()`, which
+// says how many graphs it reads. Allowed here until #2075 makes the field
+// private. To list the readers, delete this line and run
+// `cargo check -p fluree-db-query --all-targets`.
+#![allow(deprecated)]
+
+pub mod aggregate;
+pub(crate) mod aggregate_complement_fold;
+pub mod annotation_edge_probe;
+pub mod binary_history;
+pub mod binary_range;
+pub mod binary_scan;
+pub mod bind;
+pub mod binding;
+pub mod bm25;
+pub mod context;
+pub(crate) mod count_plan;
+pub(crate) mod count_plan_exec;
+pub(crate) mod count_rows;
+pub(crate) mod cyclic_bgp;
+pub mod datalog_rules;
+pub mod dataset;
+pub mod dataset_operator;
+pub mod default_graph_source;
+pub mod dict_overlay;
+pub mod distinct;
+pub mod error;
+pub mod eval;
+pub mod execute;
+pub mod exists;
+pub mod explain;
+pub(crate) mod fast_count;
+pub(crate) mod fast_exists_join_count_distinct_object;
+pub(crate) mod fast_group_count_firsts;
+pub(crate) mod fast_label_regex_type;
+pub(crate) mod fast_min_max_string;
+pub(crate) mod fast_path_common;
+pub mod fast_path_outcome;
+pub(crate) mod fast_path_plus_count_all;
+pub(crate) mod fast_post_order_limit;
+pub(crate) mod fast_predicate_scalar_agg;
+pub(crate) mod fast_star_const_order_topk;
+pub(crate) mod fast_string_fold;
+pub(crate) mod fast_string_prefix_count_all;
+pub(crate) mod fast_sum_strlen_group_concat;
+pub(crate) mod fast_union_star_count_all;
+pub(crate) mod fast_vector_topk;
+pub(crate) mod fast_whole_graph_agg;
+pub mod filter;
+pub(crate) mod filter_fold;
+pub(crate) mod frontier;
+pub mod geo_rewrite;
+pub mod geo_search;
+pub mod graph;
+pub mod group_aggregate;
+pub mod groupby;
+pub mod hash_join;
+pub mod having;
+pub mod index_scope;
+pub mod ir;
+pub mod join;
+pub mod lang_support;
+pub mod limit;
+pub mod list_entries;
+pub mod list_view;
+pub mod materializer;
+pub(crate) mod membership_join;
+pub mod merged_cursor;
+pub mod minus;
+pub(crate) mod object_binding;
+pub mod offset;
+pub mod operator;
+pub mod optional;
+pub(crate) mod optional_filter_fold;
+pub mod parse;
+pub mod plan_node;
+pub mod planner;
+pub mod policy;
+pub mod project;
+pub mod property_join;
+pub mod property_path;
+pub mod r2rml;
+pub mod range_semijoin;
+pub mod reasoning;
+pub mod reasoning_ops;
+pub mod remote_service;
+pub mod rewrite;
+pub mod rewrite_owl_ql;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod s2_search;
+pub mod schema_bundle;
+pub mod search_readability;
+pub mod seed;
+pub(crate) mod semijoin;
+pub mod service;
+pub mod shortest_path;
+pub(crate) mod sid_iri;
+pub mod sort;
+pub mod sparql_results;
+pub(crate) mod stats_cache;
+pub mod stats_query;
+pub mod subquery;
+pub mod temporal_mode;
+pub mod union;
+pub(crate) mod union_fact;
+pub mod union_group_count;
+pub mod unwind;
+pub mod values;
+pub mod var_registry;
+pub mod vector;
+
+// Re-exports
+pub use aggregate::AggregateOperator;
+pub use binary_history::BinaryHistoryScanOperator;
+pub use binary_range::BinaryRangeProvider;
+pub use binary_scan::BinaryScanOperator;
+pub use bind::BindOperator;
+pub use binding::{
+    Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView, UnmatchedOptional,
+};
+pub use context::{ExecutionContext, WellKnownDatatypes};
+pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef, MemberKind};
+pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
+pub use distinct::DistinctOperator;
+pub use error::{QueryError, Result};
+pub use execute::{
+    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
+    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
+};
+pub use exists::ExistsOperator;
+pub use explain::{
+    explain_execution_hints, explain_patterns, ExecutionStrategyHint, ExplainPlan, FallbackReason,
+    OptimizationStatus, PatternDisplay, SelectivityInputs,
+};
+pub use filter::FilterOperator;
+pub use geo_rewrite::rewrite_geo_patterns;
+pub use graph::GraphOperator;
+pub use group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
+pub use groupby::GroupByOperator;
+pub use having::HavingOperator;
+pub use ir::{AggregateFn, AggregateSpec};
+pub use ir::{
+    CompareOp, Expression, FlakeValue, Function, PathModifier, Pattern, PropertyPathPattern, Query,
+    QueryOutput, R2rmlPattern, ReasoningConfig, ReasoningModes, Ref, ServiceEndpoint,
+    ServicePattern, SubqueryPattern, Term, TriplePattern,
+};
+pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};
+pub use limit::LimitOperator;
+pub use materializer::{ComparableValue, JoinKey, JoinKeyMode, Materializer};
+pub use minus::MinusOperator;
+pub use offset::OffsetOperator;
+pub use operator::{BoxedOperator, Operator, OperatorState};
+pub use optional::OptionalOperator;
+pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
+pub use planner::{
+    extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
+    RangeConstraint, RangeValue,
+};
+pub use policy::{QueryPolicyEnforcer, QueryPolicyExecutor};
+pub use project::ProjectOperator;
+pub use property_join::PropertyJoinOperator;
+pub use property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
+pub use r2rml::{NoOpR2rmlProvider, R2rmlProvider, R2rmlScanOperator, R2rmlTableProvider};
+pub use reasoning::{global_reasoning_cache, ReasoningOverlay};
+pub use rewrite::{rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits};
+pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
+pub use seed::{EmptyOperator, SeedOperator};
+pub use shortest_path::ShortestPathOperator;
+pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
+pub use stats_query::stats_count_by_predicate_operator;
+pub use subquery::SubqueryOperator;
+pub use temporal_mode::{PlanningContext, TemporalMode};
+pub use unwind::UnwindOperator;
+
+// Re-export DatatypeConstraint from fluree-db-core for convenience
+pub use fluree_db_core::DatatypeConstraint;
+pub use union::UnionOperator;
+pub use values::ValuesOperator;
+
+// Re-export from fluree-db-core for convenience
+pub use fluree_db_core::ObjectBounds;
+pub use parse::{parse_query, parse_query_in_dataset};
+pub use var_registry::{VarId, VarRegistry};
+
+use execute::build_where_operators_seeded;
+
+/// The planner stats a transaction's WHERE plans `db` from (the
+/// novelty-merged estimates, cached per overlay content). See
+/// [`fluree_db_core::StatsView::estimates_only`] for planning a state these
+/// don't describe exactly.
+pub fn planner_stats_view(db: GraphDbRef<'_>) -> Option<Arc<fluree_db_core::StatsView>> {
+    let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+    stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+}
+use fluree_db_core::GraphDbRef;
+use std::sync::Arc;
+
+/// Execute a single triple pattern query
+///
+/// Returns all batches of results for the pattern.
+///
+/// # Arguments
+///
+/// * `db` - Bundled database reference (snapshot + graph id + overlay + as-of time)
+/// * `vars` - Variable registry containing the pattern's variables
+/// * `pattern` - Triple pattern to match
+///
+pub async fn execute_pattern(
+    db: GraphDbRef<'_>,
+    vars: &VarRegistry,
+    pattern: TriplePattern,
+) -> Result<Vec<Batch>> {
+    let ctx = ExecutionContext::from_graph_db_ref(db, vars);
+    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
+    // planner-mode refactor (always emits asserts + retracts), so use the
+    // current-state scan directly here.
+    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
+
+    scan.open(&ctx).await?;
+
+    let mut batches = Vec::new();
+    while let Some(batch) = scan.next_batch(&ctx).await? {
+        batches.push(batch);
+    }
+
+    scan.close();
+    Ok(batches)
+}
+
+/// Cursor handle over a WHERE operator tree that yields result batches
+/// incrementally via [`WhereCursor::next_batch`].
+///
+/// This is the streaming counterpart to [`execute_where`]. Instead of driving
+/// the operator to completion and collecting a `Vec<Batch>`, the caller
+/// pulls one batch at a time — typically to process (materialize, generate
+/// flakes, push into an accumulator) and drop before pulling the next.
+/// That keeps transact-side peak memory bounded by one batch plus whatever
+/// the caller chooses to retain, independent of total WHERE result size.
+///
+/// Non-blocking operators (BGP scans, filters, inner joins, union,
+/// optional, distinct, limit/offset, project) naturally emit incrementally
+/// and benefit directly. Blocking operators (GROUP BY, SORT, some
+/// aggregates) still materialize their input internally, but the top-level
+/// cursor only surfaces batches as they become available — in the worst
+/// case this is equivalent to the eager path.
+///
+/// The operator is `open`ed on construction and `close`d when the cursor
+/// is dropped, or explicitly via [`WhereCursor::close`]. Calling
+/// `next_batch` after a `None` return is safe and continues to return
+/// `None`.
+pub struct WhereCursor<'a> {
+    inner: CursorInner<'a>,
+}
+
+enum CursorInner<'a> {
+    /// Normal case: a real operator tree to drive. Boxed because
+    /// `ExecutionContext` is ~300 bytes and dwarfs the other variant;
+    /// keeping the enum body small avoids pessimizing every `WhereCursor`.
+    Operator(Box<WhereCursorOperator<'a>>),
+    /// Empty-patterns case: mirror the eager function's
+    /// `vec![Batch::empty(Arc::new([]))]` return by emitting one empty
+    /// batch and then signalling end-of-stream.
+    SingleEmpty { schema: Arc<[VarId]>, emitted: bool },
+}
+
+struct WhereCursorOperator<'a> {
+    operator: BoxedOperator,
+    ctx: ExecutionContext<'a>,
+    closed: bool,
+}
+
+impl WhereCursor<'_> {
+    /// Pull the next result batch. Returns `Ok(None)` when the operator is
+    /// exhausted; further calls continue to return `Ok(None)`.
+    ///
+    /// A nested subquery is planned when it is first pulled, so its plan
+    /// errors surface here; like the open errors, they name their variables.
+    pub async fn next_batch(&mut self) -> Result<Option<Batch>> {
+        match &mut self.inner {
+            CursorInner::Operator(state) => {
+                if state.closed {
+                    return Ok(None);
+                }
+                let result = state
+                    .operator
+                    .next_batch(&state.ctx)
+                    .await
+                    .map_err(|e| e.name_variables(state.ctx.vars))?;
+                // A batch built after a key comparison failed to read is not
+                // an answer (see `ExecutionContext::check_key_reads`).
+                state.ctx.check_key_reads()?;
+                if result.is_none() {
+                    state.operator.close();
+                    state.closed = true;
+                }
+                Ok(result)
+            }
+            CursorInner::SingleEmpty { schema, emitted } => {
+                if *emitted {
+                    Ok(None)
+                } else {
+                    *emitted = true;
+                    Ok(Some(Batch::empty(schema.clone())?))
+                }
+            }
+        }
+    }
+
+    /// Close the cursor. After this call, `next_batch` returns `Ok(None)`
+    /// for every subsequent invocation. Idempotent; called automatically on
+    /// drop.
+    ///
+    /// For the `Operator` variant this closes the underlying operator tree.
+    /// For the `SingleEmpty` variant it marks the empty batch as already
+    /// emitted, so a caller that closes before pulling the first batch
+    /// observes end-of-stream rather than a late empty batch.
+    pub fn close(&mut self) {
+        match &mut self.inner {
+            CursorInner::Operator(state) => {
+                if !state.closed {
+                    state.operator.close();
+                    state.closed = true;
+                }
+            }
+            CursorInner::SingleEmpty { emitted, .. } => {
+                *emitted = true;
+            }
+        }
+    }
+}
+
+impl Drop for WhereCursor<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Open a streaming WHERE cursor over `patterns`.
+///
+/// Strict-by-default: bind evaluation errors become query errors, matching
+/// the strict semantics of [`execute::ContextConfig`]. `dataset = Some(_)`
+/// enables GRAPH pattern resolution against named graphs; `None` is the
+/// single-graph case. `unmatched_optional` is the WHERE's surface-language
+/// OPTIONAL null semantics (Cypher writes pass `Poisoned`).
+///
+/// History-range planning is detected at the dataset/view layer
+/// (`view::dataset_query`) before this entry point runs; the WHERE-clause
+/// path is always current-state.
+pub async fn execute_where_streaming<'a>(
+    db: GraphDbRef<'a>,
+    vars: &'a VarRegistry,
+    patterns: &[Pattern],
+    dataset: Option<&'a DataSet<'a>>,
+    unmatched_optional: UnmatchedOptional,
+) -> Result<WhereCursor<'a>> {
+    if patterns.is_empty() {
+        let schema: Arc<[VarId]> = Arc::new([]);
+        return Ok(WhereCursor {
+            inner: CursorInner::SingleEmpty {
+                schema,
+                emitted: false,
+            },
+        });
+    }
+
+    // Plan with the same cached stats view the read path uses — without it,
+    // `reorder_patterns` falls back to default selectivities, where a bound-
+    // object seek (`?a <id> 4112` → 1 row) ties with a class scan
+    // (`?a rdf:type User` → N rows) and lowering order wins, turning an
+    // update's anchored MATCH into a full label scan.
+    //
+    // A WHERE that is one plain triple has no join order to choose (index
+    // selection is fixed by the bound terms), so skip the stats view
+    // entirely: its cache key includes the overlay epoch, which advances on
+    // every commit, so under a write-heavy load every update's WHERE misses
+    // the cache and rebuilds the novelty-merged view — measured at +60% on
+    // pattern-form deletes (`DELETE WHERE { <s> ?p ?o }`). A single compound
+    // pattern (UNION/OPTIONAL/subquery) still carries interior join
+    // decisions and keeps the stats-driven planning.
+    let single_triple = patterns.len() == 1 && matches!(patterns[0], Pattern::Triple(_));
+    let stats = if single_triple {
+        None
+    } else {
+        let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+        stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+    };
+
+    let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
+    if let Some(ds) = dataset {
+        ctx = ctx.with_dataset(ds);
+    }
+    // The UPDATE-WHERE path can carry a multi-member default union
+    // (`USING <g1> USING <g2>`): arm the SPARQL §13.2 set-merge exactly as
+    // the query path does (#1469), so a triple present in both graphs binds
+    // ONE solution — observable e.g. through per-solution INSERT-template
+    // blank minting. Single-graph datasets keep the flag off (byte-identical
+    // planning).
+    let planning = temporal_mode::PlanningContext::current()
+        .with_dataset_scope(dataset)
+        .with_unmatched_optional(unmatched_optional);
+    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
+        .map_err(|e| e.name_variables(vars))?;
+    operator
+        .open(&ctx)
+        .await
+        .map_err(|e| e.name_variables(vars))?;
+    Ok(WhereCursor {
+        inner: CursorInner::Operator(Box::new(WhereCursorOperator {
+            operator,
+            ctx,
+            closed: false,
+        })),
+    })
+}
+
+/// Eagerly execute `patterns` as a WHERE clause and collect every result
+/// batch. Strict-by-default; `dataset` enables GRAPH pattern resolution.
+///
+/// This is a thin convenience over [`execute_where_streaming`]: it opens a
+/// cursor and drains it. Callers that care about peak memory should use the
+/// streaming primitive directly.
+pub async fn execute_where<'a>(
+    db: GraphDbRef<'a>,
+    vars: &'a VarRegistry,
+    patterns: &[Pattern],
+    dataset: Option<&'a DataSet<'a>>,
+) -> Result<Vec<Batch>> {
+    let mut cursor =
+        execute_where_streaming(db, vars, patterns, dataset, UnmatchedOptional::default()).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_public_api() {
+        // Ensure public API is accessible
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let o = vars.get_or_insert("?o");
+
+        let _pattern = TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            Term::Var(o),
+        );
+    }
+
+    /// Empty-patterns cursor yields one empty batch then end-of-stream,
+    /// matching the eager `execute_where` behavior of returning
+    /// `vec![Batch::empty(schema)?]`.
+    #[tokio::test]
+    async fn test_streaming_cursor_empty_patterns() {
+        use crate::binding::Batch;
+        use fluree_db_core::{overlay::NoOverlay, GraphDbRef, LedgerSnapshot};
+
+        let vars = VarRegistry::new();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let overlay = NoOverlay;
+        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
+
+        let first: Option<Batch> = cursor.next_batch().await.expect("first");
+        assert!(first.is_some(), "empty-patterns cursor emits one batch");
+        let b = first.unwrap();
+        assert_eq!(b.len(), 0);
+        assert_eq!(b.schema().len(), 0);
+
+        let second = cursor.next_batch().await.expect("second");
+        assert!(second.is_none(), "second call returns None");
+
+        let third = cursor.next_batch().await.expect("third");
+        assert!(third.is_none(), "further calls keep returning None");
+    }
+
+    /// Explicit close is idempotent and leaves the cursor returning `None`.
+    #[tokio::test]
+    async fn test_streaming_cursor_close_is_idempotent() {
+        use fluree_db_core::{overlay::NoOverlay, GraphDbRef, LedgerSnapshot};
+
+        let vars = VarRegistry::new();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let overlay = NoOverlay;
+        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
+
+        let _ = cursor.next_batch().await.expect("first");
+        cursor.close();
+        cursor.close(); // idempotent
+        let after = cursor.next_batch().await.expect("after close");
+        assert!(after.is_none());
+    }
+
+    /// Regression: calling `close()` on a fresh `SingleEmpty` cursor must
+    /// suppress the pending empty batch — `next_batch` should return `None`
+    /// rather than emitting the empty batch after close. Contradicts an
+    /// earlier version that only terminated the `Operator` variant on close.
+    #[tokio::test]
+    async fn test_streaming_cursor_close_terminates_single_empty() {
+        use fluree_db_core::{overlay::NoOverlay, GraphDbRef, LedgerSnapshot};
+
+        let vars = VarRegistry::new();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let overlay = NoOverlay;
+        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+
+        let mut cursor =
+            execute_where_streaming(db, &vars, &[], None, UnmatchedOptional::default())
+                .await
+                .expect("cursor");
+
+        // Close BEFORE consuming the pending empty batch.
+        cursor.close();
+        let after = cursor.next_batch().await.expect("after close");
+        assert!(
+            after.is_none(),
+            "close() must suppress the pending empty batch for SingleEmpty cursors"
+        );
+    }
+}

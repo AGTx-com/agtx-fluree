@@ -1,0 +1,811 @@
+//! Core policy types
+//!
+//! This module defines the fundamental types for policy enforcement:
+//! - `PolicyRestriction`: An individual policy rule
+//! - `PolicyValue`: Allow, Deny, or conditional Query
+//! - `PolicySet`: Indexed collection of restrictions
+//! - `PolicyWrapper`: Container with view and modify policy sets
+
+use fluree_db_core::Sid;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// Query language of a policy's `f:query` condition
+///
+/// Discriminated by the RDF datatype of the stored literal:
+/// - `@json` / `rdf:JSON` (and legacy bare `xsd:string`) → [`JsonLd`](Self::JsonLd)
+/// - `f:sparql` → [`Sparql`](Self::Sparql)
+/// - `f:cypher` → [`Cypher`](Self::Cypher)
+///
+/// Marked `#[non_exhaustive]` so future languages can be added without
+/// breaking downstream matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum PolicyQueryLanguage {
+    /// Fluree JSON-LD query (the historical default)
+    #[default]
+    JsonLd,
+    /// SPARQL ASK/SELECT source text (SHACL-SPARQL-style `$this` / `$identity`
+    /// special variables)
+    Sparql,
+    /// openCypher read query. `$this` / `$identity` are supplied as Cypher
+    /// parameters carrying the subject / identity IRI strings (compare with
+    /// `id(n)` / `elementId(n)`); at least one result row = the condition
+    /// holds.
+    Cypher,
+}
+
+impl PolicyQueryLanguage {
+    /// Human-readable name for diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyQueryLanguage::JsonLd => "json-ld",
+            PolicyQueryLanguage::Sparql => "sparql",
+            PolicyQueryLanguage::Cypher => "cypher",
+        }
+    }
+}
+
+/// Which transaction state a policy condition evaluates against
+/// (`f:queryState` on the policy node).
+///
+/// On the write path, `Pre` is committed state before the transaction and
+/// `Post` is committed state plus the staged flakes. On the read path there
+/// is no transaction in flight, so the two coincide (a `Post` condition
+/// evaluates against current state) — policies governing both actions stay
+/// portable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConditionState {
+    /// Pre-transaction state (`f:preState`, the default)
+    #[default]
+    Pre,
+    /// Post-transaction state (`f:postState`): committed + staged flakes
+    Post,
+}
+
+/// Policy query for conditional evaluation
+///
+/// Represents a query that determines if a policy allows access.
+/// If the query returns any results, access is granted.
+///
+/// IMPORTANT: This stores the raw query source (for JSON-LD, a string
+/// containing a JSON object; for SPARQL, the query text). Parsing/lowering is
+/// delegated to the query engine to avoid duplicating query parsing logic
+/// inside the policy system (and to support FILTER, etc.).
+#[derive(Debug, Clone)]
+pub struct PolicyQuery {
+    /// Raw query source text (interpretation depends on `language`)
+    pub source: String,
+    /// Language the source is written in
+    pub language: PolicyQueryLanguage,
+    /// Which transaction state the condition evaluates against
+    pub state: ConditionState,
+}
+
+/// Target mode for a policy restriction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMode {
+    /// Targets specific subjects (f:onSubject)
+    OnSubject,
+    /// Targets specific properties (f:onProperty)
+    OnProperty,
+    /// Targets instances of classes (f:onClass)
+    OnClass,
+    /// Default policy (applies when no specific target matches)
+    Default,
+}
+
+/// Policy action - which operations this policy applies to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolicyAction {
+    /// View (query) operations only
+    View,
+    /// Modify (transaction) operations only
+    Modify,
+    /// Both view and modify operations
+    #[default]
+    Both,
+}
+
+/// The lifecycle of a subject within one transaction, derived from its
+/// existence before and after the transaction:
+///
+/// | exists pre-state | exists post-state | lifecycle |
+/// |------------------|-------------------|-----------|
+/// | no               | yes               | Create    |
+/// | yes              | yes               | Update    |
+/// | yes              | no                | Delete    |
+///
+/// Every staged flake inherits its subject's lifecycle verb: asserts occur
+/// under Create/Update, retracts under Update/Delete. Changing a value
+/// (retract old + assert new on an existing subject) is entirely Update;
+/// clearing one value of a persisting subject is Update; Delete means the
+/// subject is removed outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteVerb {
+    /// Subject does not exist in pre-state (all its flakes are asserts)
+    Create,
+    /// Subject exists in both pre- and post-state
+    Update,
+    /// Subject exists in pre-state and is fully removed by this transaction
+    Delete,
+}
+
+/// The set of write verbs a modify policy governs (`f:create` / `f:update` /
+/// `f:delete` in `f:action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteVerbs {
+    pub create: bool,
+    pub update: bool,
+    pub delete: bool,
+}
+
+impl WriteVerbs {
+    /// All three verbs (equivalent coverage to bare `f:modify`, but with
+    /// exact lifecycle/class semantics).
+    pub const ALL: WriteVerbs = WriteVerbs {
+        create: true,
+        update: true,
+        delete: true,
+    };
+
+    /// True if this set contains the given lifecycle verb.
+    pub fn contains(&self, verb: WriteVerb) -> bool {
+        match verb {
+            WriteVerb::Create => self.create,
+            WriteVerb::Update => self.update,
+            WriteVerb::Delete => self.delete,
+        }
+    }
+
+    /// True if at least one verb is set.
+    pub fn any(&self) -> bool {
+        self.create || self.update || self.delete
+    }
+}
+
+/// Write-time evaluation context for one staged flake.
+///
+/// Carries the per-subject lifecycle and class information the write
+/// evaluator needs. Built by the transaction staging layer from the staged
+/// flake batch plus pre-state lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteFlakeInfo<'a> {
+    /// Lifecycle of the flake's subject within this transaction.
+    pub lifecycle: WriteVerb,
+    /// The flake's operation: `true` = assert, `false` = retract. Bound
+    /// into conditions as `?$op` (`"assert"` / `"retract"`) so a value
+    /// constraint can exempt retractions (a value change retracts the old
+    /// value, whose `?$value` would otherwise fail the constraint).
+    pub op: bool,
+    /// Subject's classes in pre-state. Governs class targeting for legacy
+    /// bare-`f:modify` policies (`verbs: None`).
+    pub pre_classes: &'a [Sid],
+    /// Subject's classes in pre ∪ post state (pre-state classes plus
+    /// `rdf:type` classes asserted in this transaction). Governs class
+    /// targeting for verb policies — a deny on class C cannot be escaped by
+    /// un-typing in the same transaction, and a create sees the class being
+    /// minted.
+    pub union_classes: &'a [Sid],
+    /// For `rdf:type` flakes whose object is a class ref: that class.
+    /// Verb policies match type flakes by this OBJECT class — adding or
+    /// removing membership in C is an operation ON C — so an allow scoped
+    /// to class A can never mint class B, even on a subject that is
+    /// (post-state) an A.
+    pub type_object_class: Option<&'a Sid>,
+}
+
+/// Result of detailed policy evaluation
+///
+/// This enum provides access to the winning restriction on allow,
+/// or the candidate set on denial, avoiding the need for a second
+/// evaluation pass to extract error messages.
+///
+/// # Semantics
+///
+/// - `Allowed { restriction: Some(_) }`: A specific policy granted access
+/// - `Allowed { restriction: None }`: Root/schema bypass (no policy evaluated)
+/// - `Denied { candidates: [...] }`: One or more policies were evaluated but denied access
+/// - `Denied { candidates: [] }`: **Default deny** - no policies applied to this flake
+///   and `default_allow` is `false`. This is distinct from "policies evaluated and denied".
+#[derive(Debug)]
+pub enum PolicyDecision<'a> {
+    /// Access allowed - optionally includes the winning restriction
+    Allowed {
+        /// The restriction that granted access (None for root/schema bypass)
+        restriction: Option<&'a PolicyRestriction>,
+    },
+    /// Access denied - includes the candidate restrictions that were evaluated
+    ///
+    /// Note: An empty `candidates` vec means "default deny" (no policies applied),
+    /// not "policies were evaluated and denied".
+    Denied {
+        /// The restrictions that were evaluated but didn't allow access
+        /// (useful for extracting error messages)
+        candidates: Vec<&'a PolicyRestriction>,
+    },
+}
+
+impl PolicyDecision<'_> {
+    /// Returns true if access was allowed
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, PolicyDecision::Allowed { .. })
+    }
+
+    /// Returns true if access was denied
+    pub fn is_denied(&self) -> bool {
+        matches!(self, PolicyDecision::Denied { .. })
+    }
+
+    /// Get the first `f:exMessage` from the candidate restrictions, if any.
+    ///
+    /// Returns `None` if:
+    /// - The decision is `Allowed`
+    /// - The decision is `Denied` but no candidates have a message
+    /// - The decision is `Denied` with empty candidates (default deny)
+    ///
+    /// Callers should provide their own action-specific default message
+    /// when this returns `None` (e.g., "Policy enforcement prevents modification.").
+    pub fn deny_message(&self) -> Option<&str> {
+        match self {
+            PolicyDecision::Denied { candidates } => candidates
+                .iter()
+                .filter_map(|r| r.message.as_deref())
+                .next(),
+            PolicyDecision::Allowed { .. } => None,
+        }
+    }
+}
+
+/// Policy value - the effect of the policy
+#[derive(Debug, Clone)]
+pub enum PolicyValue {
+    /// Allow access unconditionally
+    Allow,
+    /// Deny access (but don't short-circuit - try next policy)
+    Deny,
+    /// Conditional access based on query result
+    Query(PolicyQuery),
+}
+
+/// An individual policy restriction (rule)
+#[derive(Debug, Clone)]
+pub struct PolicyRestriction {
+    /// Policy identifier (for tracking/debugging)
+    pub id: String,
+    /// Target mode (OnSubject, OnProperty, OnClass, Default)
+    pub target_mode: TargetMode,
+    /// Resolved target SIDs (HashSet for O(1) lookup)
+    pub targets: HashSet<Sid>,
+    /// Action (View, Modify, Both)
+    pub action: PolicyAction,
+    /// Write verbs this policy governs on the modify side.
+    ///
+    /// `None` = bare `f:modify` (legacy): all operations, class targeting
+    /// evaluated against the subject's PRE-state classes only (a
+    /// class-targeted policy therefore never applies to brand-new
+    /// subjects). `Some(verbs)` = explicit `f:create` / `f:update` /
+    /// `f:delete` in `f:action`: exact lifecycle semantics — see
+    /// [`WriteVerb`] and [`WriteFlakeInfo`].
+    pub verbs: Option<WriteVerbs>,
+    /// Policy value (Allow, Deny, Query)
+    pub value: PolicyValue,
+    /// Required flag (for subset filtering)
+    pub required: bool,
+    /// Custom error message (f:exMessage)
+    pub message: Option<String>,
+
+    // For f:onClass (indexed into by_property)
+    /// True if this restriction comes from f:onClass
+    pub class_policy: bool,
+    /// Class SIDs this targets (HashSet for subset checks)
+    pub for_classes: HashSet<Sid>,
+    /// True if runtime class membership check is needed
+    pub class_check_needed: bool,
+}
+
+/// Entry in the property index
+///
+/// `class_check_needed` is set for every class policy's entry: statistics
+/// list the properties a class's typed members use, never which subjects
+/// carry a property, so the subject's classes are always checked.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyPolicyEntry {
+    /// Index into the restrictions vector
+    pub idx: usize,
+    /// Whether the subject's classes are checked (only meaningful for class
+    /// policies)
+    pub class_check_needed: bool,
+}
+
+/// Indexed policy set
+///
+/// A view set's class policies are indexed INTO by_property (pre-expanded via
+/// class→property stats); a modify set's, and those of the view set a
+/// reasoning query reads ([`Self::selecting_classes_by_subject`]), are indexed
+/// by class in `by_class`. This is designed for efficient lookup.
+#[derive(Debug, Default, Clone)]
+pub struct PolicySet {
+    /// All restrictions in parse order (insertion order preserved)
+    pub restrictions: Vec<PolicyRestriction>,
+    /// Index: subject SID -> restriction indices
+    pub by_subject: HashMap<Sid, Vec<usize>>,
+    /// Index: property SID -> property policy entries (includes stats-expanded
+    /// view-set class policies!)
+    /// Each entry includes whether class check is needed for that specific property
+    pub by_property: HashMap<Sid, Vec<PropertyPolicyEntry>>,
+    /// Index: class SID -> restriction indices.
+    ///
+    /// Modify-side `f:onClass` policies are selected by the subject's
+    /// classes at evaluation time instead of being pre-expanded into
+    /// `by_property` via class→property stats. Stats describe committed
+    /// data — exactly what a write is about to change: pre-expansion
+    /// misses properties the class has never used. View sets keep the stats
+    /// expansion
+    /// (committed data matches stats there, and scan volume makes the
+    /// precomputed property index worthwhile), except for a query that
+    /// reads reasoned facts: see [`Self::selecting_classes_by_subject`].
+    pub by_class: HashMap<Sid, Vec<usize>>,
+    /// Default-bucket policy indices
+    pub defaults: Vec<usize>,
+}
+
+/// Entry returned when looking up policies for a flake
+///
+/// Contains the restriction index and per-property class_check_needed flag.
+#[derive(Debug, Clone, Copy)]
+pub struct FlakePolicyEntry {
+    /// Index into the restrictions vector
+    pub idx: usize,
+    /// Whether the subject's classes are still to be checked: false when the
+    /// entry was selected by them (only meaningful for class policies)
+    pub class_check_needed: bool,
+}
+
+impl PolicySet {
+    /// Create an empty policy set
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// This set with its `f:onClass` policies selected by the subject's
+    /// classes, as modify sets select them, rather than by the properties
+    /// class statistics list. `None` when it has none.
+    ///
+    /// For a view that reads reasoned facts. Statistics describe asserted
+    /// data, so they neither know a subject that is a member only by
+    /// derivation, nor a derived property of an asserted member; a class
+    /// policy expanded through them leaves both ungoverned.
+    pub fn selecting_classes_by_subject(&self) -> Option<PolicySet> {
+        let on_class = |idx: usize| self.restrictions[idx].target_mode == TargetMode::OnClass;
+        if !(0..self.restrictions.len()).any(on_class) {
+            return None;
+        }
+        let mut set = self.clone();
+        set.by_property.retain(|_, entries| {
+            entries.retain(|entry| !on_class(entry.idx));
+            !entries.is_empty()
+        });
+        for (idx, restriction) in self.restrictions.iter().enumerate() {
+            if on_class(idx) {
+                for class in &restriction.for_classes {
+                    let bucket = set.by_class.entry(class.clone()).or_default();
+                    if !bucket.contains(&idx) {
+                        bucket.push(idx);
+                    }
+                }
+            }
+        }
+        Some(set)
+    }
+
+    /// Collect the deduplicated class-bucket restriction indices for a
+    /// subject's classes, in insertion order. Empty unless this set selects
+    /// `f:onClass` policies by class: a modify set, or a view set for a
+    /// reasoning query.
+    fn class_bucket_indices(&self, subject_classes: &[Sid]) -> Vec<usize> {
+        if self.by_class.is_empty() {
+            return Vec::new();
+        }
+        let mut idxs: Vec<usize> = subject_classes
+            .iter()
+            .filter_map(|c| self.by_class.get(c))
+            .flatten()
+            .copied()
+            .collect();
+        // A restriction targeting two of the subject's classes is still one
+        // candidate; ascending index order == insertion order.
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs
+    }
+
+    /// Get candidate restrictions for a flake
+    ///
+    /// Order: property-specific -> class-specific -> subject-specific -> defaults
+    /// Preserves insertion order within each bucket.
+    pub fn restrictions_for_flake(
+        &self,
+        subject: &Sid,
+        property: &Sid,
+        subject_classes: &[Sid],
+    ) -> Vec<&PolicyRestriction> {
+        let mut candidates = Vec::new();
+
+        // 1. Property-specific (includes stats-expanded view-set class policies)
+        if let Some(entries) = self.by_property.get(property) {
+            for entry in entries {
+                candidates.push(&self.restrictions[entry.idx]);
+            }
+        }
+
+        // 2. Class-specific (modify sets, and a reasoning query's view set)
+        for idx in self.class_bucket_indices(subject_classes) {
+            candidates.push(&self.restrictions[idx]);
+        }
+
+        // 3. Subject-specific (preserve insertion order)
+        if let Some(indices) = self.by_subject.get(subject) {
+            for &idx in indices {
+                candidates.push(&self.restrictions[idx]);
+            }
+        }
+
+        // 4. Default-bucket policies (preserve insertion order)
+        for &idx in &self.defaults {
+            candidates.push(&self.restrictions[idx]);
+        }
+
+        candidates
+    }
+
+    /// Get candidate policy entries for a flake with per-property class_check_needed info.
+    ///
+    /// Order: property-specific -> class-specific -> subject-specific -> defaults.
+    /// Preserves insertion order within each bucket.
+    ///
+    /// Returns `FlakePolicyEntry` which includes:
+    /// - `idx`: restriction index
+    /// - `class_check_needed`: whether class membership check is needed for THIS property
+    ///
+    /// Class-bucket entries are selected BY the subject's classes, so their
+    /// membership check is already done (`class_check_needed: false`). For
+    /// non-class policies (property, subject, default), `class_check_needed`
+    /// is always false since they don't need class membership verification.
+    pub fn policy_entries_for_flake(
+        &self,
+        subject: &Sid,
+        property: &Sid,
+        subject_classes: &[Sid],
+    ) -> Vec<FlakePolicyEntry> {
+        let mut candidates = Vec::new();
+
+        // 1. Property-specific (includes stats-expanded view-set class policies)
+        // Uses per-property class_check_needed
+        if let Some(entries) = self.by_property.get(property) {
+            for entry in entries {
+                candidates.push(FlakePolicyEntry {
+                    idx: entry.idx,
+                    class_check_needed: entry.class_check_needed,
+                });
+            }
+        }
+
+        // 2. Class-specific (modify sets, and a reasoning query's view set):
+        //    selection by class IS the check
+        for idx in self.class_bucket_indices(subject_classes) {
+            candidates.push(FlakePolicyEntry {
+                idx,
+                class_check_needed: false,
+            });
+        }
+
+        // 3. Subject-specific (never need class check)
+        if let Some(indices) = self.by_subject.get(subject) {
+            for &idx in indices {
+                candidates.push(FlakePolicyEntry {
+                    idx,
+                    class_check_needed: false,
+                });
+            }
+        }
+
+        // 4. Default-bucket policies (don't need class check)
+        for &idx in &self.defaults {
+            candidates.push(FlakePolicyEntry {
+                idx,
+                class_check_needed: false,
+            });
+        }
+
+        candidates
+    }
+
+    /// True if any materialized restriction in this set *could* apply to a flake
+    /// whose predicate is `p`.
+    ///
+    /// When this returns `false`, every `evaluate_flake*` call for a `p`-flake is
+    /// guaranteed to collect no candidate entries (see
+    /// [`policy_entries_for_flake`](Self::policy_entries_for_flake)) and therefore
+    /// fall to the empty-candidates branch that returns the wrapper's
+    /// `default_allow` constant — independent of the flake's subject, object, or
+    /// subject classes. A fast path can use that to skip the per-flake filter
+    /// (keeping the fast path when `default_allow` is true, or short-circuiting to
+    /// an empty result when it is false).
+    ///
+    /// Soundness: this inspects the *built* index buckets that
+    /// `policy_entries_for_flake` itself reads — `by_property` (which view-set
+    /// `f:onClass` policies are pre-expanded into at build time), plus the
+    /// predicate-agnostic `by_class` (modify sets), `by_subject`, and
+    /// `defaults`. It never derives coverage from the raw
+    /// `restrictions`/`for_classes`, so a `false` verdict is a faithful
+    /// optimization of the per-flake evaluator and can never disagree with it
+    /// (even when class policies were expanded under absent stats). Schema
+    /// predicates always report `true` so the per-flake `is_schema_flake` bypass
+    /// keeps firing rather than being constant-folded away.
+    pub fn covers_predicate(&self, p: &Sid) -> bool {
+        crate::schema::is_schema_predicate(p)
+            || self.by_property.contains_key(p)
+            || !self.by_class.is_empty()
+            || !self.by_subject.is_empty()
+            || !self.defaults.is_empty()
+    }
+}
+
+/// Inner data for PolicyWrapper (Arc-wrapped for cheap cloning)
+#[derive(Debug)]
+struct PolicyWrapperInner {
+    /// View (query) policy set
+    view: PolicySet,
+    /// `view` with class policies selected by subject, when it has any.
+    /// Built on first use: a query that does not reason never reads it.
+    reasoned_view: std::sync::OnceLock<Option<PolicySet>>,
+    /// Modify (transaction) policy set
+    modify: PolicySet,
+    /// Root flag - bypasses all policies
+    root: bool,
+    /// Single default-allow knob
+    default_allow: bool,
+    /// Policy values map (for identity/context bindings)
+    policy_values: HashMap<String, Sid>,
+}
+
+/// Policy wrapper container
+///
+/// Provides cheap cloning via Arc and access to both view and modify policy sets.
+#[derive(Debug, Clone)]
+pub struct PolicyWrapper {
+    inner: Arc<PolicyWrapperInner>,
+}
+
+impl PolicyWrapper {
+    /// Create a new policy wrapper
+    pub fn new(
+        view: PolicySet,
+        modify: PolicySet,
+        root: bool,
+        default_allow: bool,
+        policy_values: HashMap<String, Sid>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(PolicyWrapperInner {
+                view,
+                reasoned_view: std::sync::OnceLock::new(),
+                modify,
+                root,
+                default_allow,
+                policy_values,
+            }),
+        }
+    }
+
+    /// Create a root policy wrapper (bypasses all policies)
+    pub fn root() -> Self {
+        Self {
+            inner: Arc::new(PolicyWrapperInner {
+                view: PolicySet::default(),
+                reasoned_view: std::sync::OnceLock::new(),
+                modify: PolicySet::default(),
+                root: true,
+                default_allow: true,
+                policy_values: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Check if this is a root policy (bypasses all checks)
+    pub fn is_root(&self) -> bool {
+        self.inner.root
+    }
+
+    /// Get the default allow setting
+    pub fn default_allow(&self) -> bool {
+        self.inner.default_allow
+    }
+
+    /// Get the view policy set
+    pub fn view(&self) -> &PolicySet {
+        &self.inner.view
+    }
+
+    /// The view policy set for a query that reads reasoned facts
+    /// ([`PolicySet::selecting_classes_by_subject`]).
+    pub fn reasoned_view(&self) -> &PolicySet {
+        self.inner
+            .reasoned_view
+            .get_or_init(|| self.inner.view.selecting_classes_by_subject())
+            .as_ref()
+            .unwrap_or(&self.inner.view)
+    }
+
+    /// Get the modify policy set
+    pub fn modify(&self) -> &PolicySet {
+        &self.inner.modify
+    }
+
+    /// Get policy values (identity/context bindings)
+    pub fn policy_values(&self) -> &HashMap<String, Sid> {
+        &self.inner.policy_values
+    }
+
+    /// Check if any view or modify policy needs class membership checks
+    ///
+    /// Returns true if there are any class policies (f:onClass).
+    /// This is used to decide whether to pre-populate the class cache.
+    ///
+    /// Every class policy checks the subject's classes, so any one needs them.
+    pub fn has_class_policies(&self) -> bool {
+        let view_has = self.inner.view.restrictions.iter().any(|r| r.class_policy);
+
+        let modify_has = self
+            .inner
+            .modify
+            .restrictions
+            .iter()
+            .any(|r| r.class_policy);
+
+        view_has || modify_has
+    }
+
+    /// Check if the modify set contains any explicit write-verb policies
+    /// (`f:create` / `f:update` / `f:delete`).
+    ///
+    /// Used by the transaction staging layer to decide whether per-subject
+    /// lifecycle classification (pre/post existence probes) is needed.
+    pub fn has_write_verb_policies(&self) -> bool {
+        self.inner
+            .modify
+            .restrictions
+            .iter()
+            .any(|r| r.verbs.is_some())
+    }
+
+    /// Check if the modify set contains any `f:queryState f:postState`
+    /// conditions.
+    ///
+    /// Used by the transaction staging layer to decide whether a staged
+    /// (post-state) view must be constructed for condition execution.
+    pub fn has_post_state_conditions(&self) -> bool {
+        self.inner.modify.restrictions.iter().any(|r| {
+            matches!(
+                &r.value,
+                PolicyValue::Query(q) if q.state == ConditionState::Post
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sid(ns: u16, name: &str) -> Sid {
+        Sid::new(ns, name)
+    }
+
+    #[test]
+    fn test_policy_wrapper_root() {
+        let wrapper = PolicyWrapper::root();
+        assert!(wrapper.is_root());
+        assert!(wrapper.default_allow());
+    }
+
+    #[test]
+    fn test_policy_set_restrictions_for_flake() {
+        let mut set = PolicySet::new();
+
+        // Add a property-specific restriction
+        let prop_restriction = PolicyRestriction {
+            id: "prop-1".to_string(),
+            target_mode: TargetMode::OnProperty,
+            targets: [make_sid(100, "name")].into_iter().collect(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: PolicyValue::Allow,
+            required: false,
+            message: None,
+            class_policy: false,
+            for_classes: HashSet::new(),
+            class_check_needed: false,
+        };
+        set.restrictions.push(prop_restriction);
+        set.by_property
+            .entry(make_sid(100, "name"))
+            .or_default()
+            .push(PropertyPolicyEntry {
+                idx: 0,
+                class_check_needed: false,
+            });
+
+        // Add a default restriction
+        let default_restriction = PolicyRestriction {
+            id: "default-1".to_string(),
+            target_mode: TargetMode::Default,
+            targets: HashSet::new(),
+            action: PolicyAction::Both,
+            verbs: None,
+            value: PolicyValue::Deny,
+            required: false,
+            message: Some("Access denied".to_string()),
+            class_policy: false,
+            for_classes: HashSet::new(),
+            class_check_needed: false,
+        };
+        set.restrictions.push(default_restriction);
+        set.defaults.push(1);
+
+        // Query for the "name" property
+        let candidates =
+            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "name"), &[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].id, "prop-1");
+        assert_eq!(candidates[1].id, "default-1");
+
+        // Query for a different property
+        let other_candidates =
+            set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "age"), &[]);
+        assert_eq!(other_candidates.len(), 1);
+        assert_eq!(other_candidates[0].id, "default-1");
+    }
+
+    #[test]
+    fn test_covers_predicate() {
+        use fluree_vocab::namespaces::{RDF, RDFS};
+
+        // Empty set: a regular predicate is provably uncovered...
+        let empty = PolicySet::new();
+        assert!(!empty.covers_predicate(&make_sid(100, "name")));
+        // ...but schema predicates always report covered so the per-flake
+        // is_schema_flake bypass keeps firing.
+        assert!(empty.covers_predicate(&make_sid(RDFS, "subClassOf")));
+        assert!(empty.covers_predicate(&make_sid(RDF, "type")));
+
+        // A by_property entry (this is also where f:onClass policies are
+        // pre-expanded) covers exactly its predicate, nothing else.
+        let mut by_prop = PolicySet::new();
+        by_prop
+            .by_property
+            .entry(make_sid(100, "ssn"))
+            .or_default()
+            .push(PropertyPolicyEntry {
+                idx: 0,
+                class_check_needed: false,
+            });
+        assert!(by_prop.covers_predicate(&make_sid(100, "ssn")));
+        assert!(!by_prop.covers_predicate(&make_sid(100, "name")));
+
+        // Predicate-agnostic buckets force "covered" for every predicate, since
+        // any subject/default entry can match a flake of any predicate.
+        let mut by_subj = PolicySet::new();
+        by_subj
+            .by_subject
+            .entry(make_sid(100, "alice"))
+            .or_default()
+            .push(0);
+        assert!(by_subj.covers_predicate(&make_sid(100, "name")));
+
+        let mut with_default = PolicySet::new();
+        with_default.defaults.push(0);
+        assert!(with_default.covers_predicate(&make_sid(100, "name")));
+    }
+}

@@ -1,0 +1,1591 @@
+//! Database struct
+//!
+//! The `LedgerSnapshot` struct represents a database value at a specific point in time.
+//! It is a pure value type — no storage backend reference.
+
+use crate::content_id::ContentId;
+use crate::content_kind::ContentKind;
+use crate::error::{Error, Result};
+use crate::graph_registry::GraphRegistry;
+use crate::ids::GraphId;
+use crate::index_schema::IndexSchema;
+use crate::index_stats::IndexStats;
+use crate::ledger_id::{IntoLedgerId, LedgerId};
+use crate::namespaces::default_namespace_codes;
+use crate::ns_encoding::{encode_registered, table_full, NsSplitMode};
+use crate::range_provider::RangeProvider;
+use crate::schema_hierarchy::SchemaHierarchy;
+use crate::sid::Sid;
+use crate::storage::StorageRead;
+use fluree_vocab::namespaces::{is_full_iri, OVERFLOW};
+use once_cell::sync::OnceCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Metadata for creating a database from its index root.
+///
+/// Bundles all the metadata fields extracted from a BinaryIndexRoot
+/// for constructing a metadata-only `LedgerSnapshot`.
+pub struct LedgerSnapshotMetadata {
+    /// Ledger ID (e.g., "mydb:main")
+    pub ledger_id: LedgerId,
+    /// Current transaction time (upper bound of index coverage).
+    pub t: i64,
+    /// Earliest transaction time covered by this index.
+    ///
+    /// The index answers queries for any `target_t` in `base_t..=t` directly
+    /// from persisted history (FIR6 Region 3). `target_t < base_t` is outside
+    /// coverage and must fall back to overlay-only replay.
+    ///
+    /// `0` for full-history indexes and genesis snapshots.
+    pub base_t: i64,
+    /// Namespace code -> IRI prefix mapping
+    pub namespace_codes: HashMap<u16, String>,
+    /// Ledger-fixed split mode from the index root.
+    pub ns_split_mode: NsSplitMode,
+    /// Index statistics (flakes count, total size)
+    pub stats: Option<Arc<IndexStats>>,
+    /// Schema (class/property hierarchy)
+    pub schema: Option<IndexSchema>,
+    /// Per-namespace max local_id watermarks from the index root
+    pub subject_watermarks: Vec<u64>,
+    /// Max assigned string_id from the index root
+    pub string_watermark: u32,
+    /// Graph IRIs from index root in raw root format.
+    /// Index 0 = g_id 1 (txn-meta), index 1 = g_id 2 (config),
+    /// index 2 = g_id 3 (first user graph), etc.
+    /// Matches `IndexRoot.graph_iris` encoding.
+    pub graph_iris: Vec<String>,
+    /// Sticky bit: `true` once any `f:reifies*` flake has ever been
+    /// observed in this ledger's history. Carried in `IndexRoot`
+    /// and consulted by the cascade fast-path in
+    /// `fluree-db-transact::stage` so non-annotation ledgers skip
+    /// the per-retract POST scan entirely.
+    pub has_annotations: bool,
+    /// Optional inline pointer to the on-disk annotation arenas.
+    ///
+    /// Combined with `has_annotations` and `had_annotation_arena`:
+    /// - `has_annotations=false, annotation_index=None` — hard
+    ///   guarantee: zero attachments.
+    /// - `has_annotations=true, annotation_index=Some(_)` — builder
+    ///   ran; arenas authoritative through `max_t`, novelty covers
+    ///   the tail.
+    /// - `has_annotations=true, annotation_index=None,
+    ///   had_annotation_arena=false` — fresh bulk-import state, no
+    ///   indexer pass has yet processed the annotation-bearing
+    ///   flakes. Readers fall back to scan; the provider may
+    ///   bootstrap an `Authoritative` arena from a one-time
+    ///   base-index scan.
+    /// - `has_annotations=true, annotation_index=None,
+    ///   had_annotation_arena=true` — indexer-owned annotation
+    ///   history with no current arena (defensive drop, or an
+    ///   indexer pass that processed annotation events without
+    ///   sealing). Readers fall back to scan; the provider MUST
+    ///   NOT bootstrap from a live-only scan — the indexer
+    ///   already owns history the live base doesn't fully
+    ///   reflect, so a live-only reseal would silently drop
+    ///   retract/reassert rows.
+    /// - `has_annotations=false, annotation_index=Some(_)` is an
+    ///   invariant violation; the FIR6 encoder coerces the sticky
+    ///   bit when an arena is present.
+    pub annotation_index: Option<crate::AnnotationIndexRoot>,
+    /// Sticky bit governing the `ApiAttachmentEventsProvider`'s
+    /// base-index scan-fallback. Despite the name, the
+    /// load-bearing meaning is "base-index bootstrap is **not**
+    /// allowed" — it's true on *any* indexer-produced root that
+    /// has annotation history (`has_annotations=true`), regardless
+    /// of whether an arena was actually sealed by that pass.
+    ///
+    /// Only fresh bulk-import roots leave the bit false, because
+    /// the import pipeline writes annotation flakes directly to
+    /// the base index without an indexer-owned event stream.
+    /// Those roots are the unique state where the provider may
+    /// reconstruct an `Authoritative` arena from a one-time
+    /// base-index scan.
+    ///
+    /// Once set, never cleared — including across defensive
+    /// drops, no-provider indexer passes, and any other state
+    /// transition. The FIR6 encoder coerces the bit on whenever
+    /// `annotation_index.is_some()`; the decoder coerces on whenever
+    /// either the extended-flags bit is set *or* an
+    /// `annotation_index` is present (handles pre-this-change
+    /// roots that already sealed an arena).
+    pub had_annotation_arena: bool,
+
+    /// Whether any indexed row carries an RDF-list position. `Some(false)`
+    /// lets the write path skip list-meta hydration; `None` means the root
+    /// predates tracking and lists must be assumed possible. See
+    /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
+    /// canonical contract.
+    pub has_list_meta: Option<bool>,
+    /// Graphs dropped at or before `t`, from the root (see
+    /// `IndexRoot.graph_drops` in `fluree-db-binary-index`).
+    pub graph_drops: Vec<(crate::GraphId, crate::GraphDrop)>,
+    /// Content id of the index root this metadata was decoded from; `None`
+    /// when the caller doesn't have it.
+    pub index_root_id: Option<ContentId>,
+}
+
+/// Database value at a specific point in time.
+///
+/// A pure value type — no storage backend reference. All I/O (loading,
+/// writing) happens at the call site, not inside `Db`.
+pub struct LedgerSnapshot {
+    /// Ledger ID (e.g., "mydb:main")
+    pub ledger_id: LedgerId,
+    /// Current transaction time
+    pub t: i64,
+    /// Earliest transaction time covered by the underlying index.
+    ///
+    /// For snapshots loaded from an index root, the index answers queries
+    /// for any `target_t` in `base_t..=t`. For genesis snapshots, both
+    /// `base_t` and `t` are `0`.
+    pub base_t: i64,
+    /// Index version
+    pub version: i32,
+
+    /// Namespace code -> IRI prefix mapping.
+    ///
+    /// Private to enforce bimap invariant with `namespace_reverse`.
+    /// Use `namespaces()` for read access, `insert_namespace_code()` for mutation.
+    ///
+    /// `Arc`-wrapped so per-query consumers (notably the result-formatting
+    /// `IriCompactor`) can share the table by refcount bump instead of deep-
+    /// cloning the whole map on every request. Mutations go through
+    /// `Arc::make_mut` (copy-on-write); writers are rare and serialized.
+    namespace_codes: Arc<HashMap<u16, String>>,
+
+    /// Reverse: IRI prefix -> namespace code (for O(1) canonical encode lookup).
+    /// Kept in sync with `namespace_codes` by all mutation paths. `Arc`-wrapped
+    /// for the same reason: a transaction's namespace registry layers over
+    /// both tables by refcount bump instead of rebuilding them.
+    namespace_reverse: Arc<HashMap<String, u16>>,
+
+    /// Ledger-fixed split mode for canonical IRI encoding.
+    ///
+    /// Determines how IRIs are split into `(prefix, suffix)` for SID encoding.
+    /// Defaults to `MostGranular`. Immutable once the ledger allocates user
+    /// namespace codes.
+    ///
+    /// Use `ns_split_mode()` for read access and `set_ns_split_mode()` for mutation.
+    ns_split_mode: NsSplitMode,
+
+    /// Index statistics (flakes count, total size).
+    ///
+    /// Shared, because the class table grows with the number of distinct
+    /// classes (millions on a class-per-subject ledger) and snapshots are
+    /// cloned on per-query paths.
+    pub stats: Option<Arc<IndexStats>>,
+    /// Schema (class/property hierarchy)
+    pub schema: Option<IndexSchema>,
+
+    /// Cached schema hierarchy for reasoning (lazily computed)
+    schema_hierarchy_cache: OnceCell<SchemaHierarchy>,
+
+    /// Per-namespace max local_id watermarks from the index root.
+    ///
+    /// Used by `DictNovelty` to route forward lookups between the
+    /// persisted dictionary tree and the novel overlay. Empty vec
+    /// means "everything is novel" (genesis or old root without watermarks).
+    pub subject_watermarks: Vec<u64>,
+
+    /// Max assigned string_id from the index root. 0 = no strings indexed.
+    pub string_watermark: u32,
+
+    /// Binary range provider.
+    ///
+    /// When set, `range_with_overlay()` delegates to this provider.
+    /// All existing range callers (reasoner, API, policy, SHACL) use this
+    /// automatically.
+    pub range_provider: Option<Arc<dyn RangeProvider>>,
+
+    /// Optional CAS handle for arena-backed reads.
+    ///
+    /// Set by ledger-load paths that have a content store available
+    /// (the same one backing `range_provider`). Formatter / cascade
+    /// callers consult [`Self::annotation_index`] alongside this field
+    /// to decide whether to use the on-disk arena or fall back to the
+    /// scan-based hydration path.
+    ///
+    /// `Arc<dyn ContentStore>` (rather than a borrowed reference)
+    /// because the snapshot is `Clone` and outlives any individual
+    /// query / cascade scope.
+    pub content_store: Option<Arc<dyn crate::storage::ContentStore>>,
+
+    /// Ledger-wide graph IRI → GraphId registry.
+    ///
+    /// Populated from index root (via `seed_from_root_iris`) or ledger creation
+    /// (via `new_for_ledger`), and updated during novelty replay
+    /// (via `apply_envelope_deltas`). Provides IRI→GraphId resolution
+    /// without requiring a binary index.
+    pub graph_registry: GraphRegistry,
+
+    /// Sticky bit: `true` once any `f:reifies*` flake has ever been
+    /// observed in this ledger's history. Carried in `IndexRoot`'s
+    /// flag bits, plumbed here, and consulted by the cascade
+    /// fast-path so non-annotation ledgers pay zero per-retract
+    /// cost.
+    pub has_annotations: bool,
+    /// On-disk annotation-arena pointer (forward/reverse branch CIDs +
+    /// stats). See `crate::annotation_index` for the truth table that
+    /// pairs this field with `has_annotations` and
+    /// `had_annotation_arena`.
+    pub annotation_index: Option<crate::AnnotationIndexRoot>,
+    /// Sticky bit governing whether the
+    /// `ApiAttachmentEventsProvider` is allowed to bootstrap an
+    /// `Authoritative` annotation arena from a one-time base-index
+    /// scan. Despite the name, the load-bearing meaning is
+    /// "base-index bootstrap is **not** allowed":
+    /// - `false` only on fresh bulk-import roots (no indexer pass
+    ///   has touched the annotation history yet) — bootstrap is
+    ///   safe because the live base IS the complete history.
+    /// - `true` on any indexer-produced root with
+    ///   `has_annotations=true`, including defensive drops and
+    ///   indexer passes that didn't seal an arena — bootstrap is
+    ///   unsafe because the indexer owns history the live base
+    ///   doesn't fully reflect.
+    ///
+    /// Sticky: once set, never cleared. Carried in
+    /// `IndexRoot.had_annotation_arena` via the FIR6 extended-flags
+    /// byte.
+    pub had_annotation_arena: bool,
+
+    /// Whether any indexed row carries an RDF-list position. `Some(false)`
+    /// lets the write path skip list-meta hydration; `None` means the root
+    /// predates tracking and lists must be assumed possible. See
+    /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
+    /// canonical contract.
+    pub has_list_meta: Option<bool>,
+
+    /// Content id of the index root the stats, schema and annotation arena
+    /// came from. Two loads of one root agree and roots with different stats
+    /// don't, which makes it the stats' identity for caches derived from
+    /// them. `None` when the snapshot wasn't loaded from a root, or was
+    /// decoded by [`Self::from_root_bytes`] without one.
+    index_root_id: Option<ContentId>,
+}
+
+impl Clone for LedgerSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            ledger_id: self.ledger_id.clone(),
+            t: self.t,
+            base_t: self.base_t,
+            version: self.version,
+            namespace_codes: self.namespace_codes.clone(),
+            namespace_reverse: self.namespace_reverse.clone(),
+            ns_split_mode: self.ns_split_mode,
+            stats: self.stats.clone(),
+            schema: self.schema.clone(),
+            schema_hierarchy_cache: self.schema_hierarchy_cache.clone(),
+            subject_watermarks: self.subject_watermarks.clone(),
+            string_watermark: self.string_watermark,
+            range_provider: self.range_provider.clone(),
+            graph_registry: self.graph_registry.clone(),
+            has_annotations: self.has_annotations,
+            annotation_index: self.annotation_index.clone(),
+            had_annotation_arena: self.had_annotation_arena,
+            has_list_meta: self.has_list_meta,
+            content_store: self.content_store.clone(),
+            index_root_id: self.index_root_id.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LedgerSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerSnapshot")
+            .field("ledger_id", &self.ledger_id)
+            .field("t", &self.t)
+            .field("version", &self.version)
+            .field(
+                "range_provider",
+                &self.range_provider.as_ref().map(|_| "..."),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Build reverse map from code→prefix forward map.
+fn build_namespace_reverse(codes: &HashMap<u16, String>) -> Arc<HashMap<String, u16>> {
+    Arc::new(
+        codes
+            .iter()
+            .map(|(&code, prefix)| (prefix.clone(), code))
+            .collect(),
+    )
+}
+
+impl LedgerSnapshot {
+    /// Create a genesis (empty) database for a new ledger.
+    ///
+    /// Used when a nameservice has a commit but no index yet.
+    /// The database starts at t=0 with no base data.  Queries against
+    /// a genesis LedgerSnapshot return overlay (novelty) flakes only.
+    pub fn genesis(ledger_id: impl IntoLedgerId) -> Self {
+        let ledger_id = ledger_id.into_ledger_id();
+        let namespace_codes = default_namespace_codes();
+        let namespace_reverse = build_namespace_reverse(&namespace_codes);
+        Self {
+            graph_registry: GraphRegistry::new_for_ledger(&ledger_id),
+            ledger_id,
+            t: 0,
+            base_t: 0,
+            version: 3,
+            namespace_codes: Arc::new(namespace_codes),
+            namespace_reverse,
+            ns_split_mode: NsSplitMode::default(),
+            stats: None,
+            schema: None,
+            schema_hierarchy_cache: OnceCell::new(),
+            subject_watermarks: Vec::new(),
+            string_watermark: 0,
+            range_provider: None,
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
+            // An empty snapshot has no indexed rows, so "no list rows" is
+            // exact — everything lives in novelty, which tracks its own bit.
+            has_list_meta: Some(false),
+            content_store: None,
+            index_root_id: None,
+        }
+    }
+
+    /// Create a Db from metadata only (no index roots).
+    ///
+    /// Used when the binary columnar index is the source of truth.
+    /// The Db carries namespace codes, stats, and schema for callers
+    /// that need ledger metadata, while all actual range queries go
+    /// through `BinaryIndexStore` / `BinaryScanOperator`.
+    pub fn new_meta(meta: LedgerSnapshotMetadata) -> Result<Self> {
+        // Seed graph registry from index root graph IRIs.
+        // If graph_iris is empty (old index or genesis), seed with ledger-scoped txn-meta.
+        let graph_registry = if meta.graph_iris.is_empty() {
+            GraphRegistry::new_for_ledger(&meta.ledger_id)
+        } else {
+            GraphRegistry::seed_from_root_iris(&meta.graph_iris)
+                .map_err(|e| Error::invalid_index(format!("graph registry seed from root: {e}")))?
+        };
+        let mut graph_registry = graph_registry;
+        graph_registry.set_graph_drops(meta.graph_drops.iter().copied());
+
+        let namespace_reverse = build_namespace_reverse(&meta.namespace_codes);
+        let mut snapshot = Self {
+            ledger_id: meta.ledger_id,
+            t: meta.t,
+            base_t: meta.base_t,
+            version: 3,
+            namespace_codes: Arc::new(meta.namespace_codes),
+            namespace_reverse,
+            ns_split_mode: meta.ns_split_mode,
+            stats: None,
+            schema: meta.schema,
+            schema_hierarchy_cache: OnceCell::new(),
+            subject_watermarks: meta.subject_watermarks,
+            string_watermark: meta.string_watermark,
+            range_provider: None,
+            graph_registry,
+            has_annotations: meta.has_annotations,
+            annotation_index: meta.annotation_index,
+            had_annotation_arena: meta.had_annotation_arena,
+            has_list_meta: meta.has_list_meta,
+            content_store: None,
+            index_root_id: meta.index_root_id,
+        };
+        snapshot.stats = meta
+            .stats
+            .map(|stats| snapshot.with_canonical_predicate_keys(stats));
+        Ok(snapshot)
+    }
+
+    /// Extract metadata from raw index root bytes (FIR6 binary format).
+    pub fn from_root_bytes(bytes: &[u8]) -> Result<Self> {
+        let meta = decode_fir6_metadata(bytes).map_err(|e| {
+            let hint = if bytes.len() >= 4 && &bytes[0..4] == b"IRB1" {
+                " (found IRB1 magic — this ledger uses an older index format; re-indexing is required)"
+            } else {
+                ""
+            };
+            Error::invalid_index(format!("index root: FIR6 decode: {e}{hint}"))
+        })?;
+        Self::new_meta(meta)
+    }
+
+    /// [`Self::from_root_bytes`] for the root `root_id` names, which then
+    /// identifies the snapshot's stats.
+    pub fn from_root(root_id: &ContentId, bytes: &[u8]) -> Result<Self> {
+        let mut snapshot = Self::from_root_bytes(bytes)?;
+        snapshot.index_root_id = Some(root_id.clone());
+        Ok(snapshot)
+    }
+
+    // FIR6 decoding lives in `decode_fir6_metadata` below.
+
+    /// Content id of the index root this snapshot's stats, schema and
+    /// annotation arena came from.
+    pub fn index_root_id(&self) -> Option<&ContentId> {
+        self.index_root_id.as_ref()
+    }
+
+    /// Take the stats of the index root `root_id`, keeping the two together.
+    pub fn set_index_root_stats(&mut self, stats: Option<Arc<IndexStats>>, root_id: ContentId) {
+        self.stats = stats.map(|stats| self.with_canonical_predicate_keys(stats));
+        self.index_root_id = Some(root_id);
+    }
+
+    /// `stats` with each predicate keyed by the Sid its IRI encodes to here,
+    /// which is the Sid a query or a write gives it.
+    ///
+    /// Index builders key a predicate whose prefix has no code under a
+    /// shorter registered prefix, or whole under EMPTY; a full table gives it
+    /// `OVERFLOW`. Unless re-keyed as stats enter the snapshot, the planner
+    /// reads its lookup miss as an absent predicate, and novelty's counts for
+    /// it land in a second entry. Every predicate a class usage names has a
+    /// property entry, so the property table is the whole key set.
+    fn with_canonical_predicate_keys(&self, stats: Arc<IndexStats>) -> Arc<IndexStats> {
+        let keys: HashMap<Sid, Sid> = stats
+            .properties
+            .iter()
+            .flatten()
+            .filter_map(|property| {
+                let stored = Sid::new(property.sid.0, &property.sid.1);
+                let canonical = self.encode_iri_inner(&self.decode_sid(&stored)?);
+                (canonical != stored).then_some((stored, canonical))
+            })
+            .collect();
+        if keys.is_empty() {
+            return stats;
+        }
+        let mut stats = Arc::unwrap_or_clone(stats);
+        stats.rekey_predicates(&keys);
+        Arc::new(stats)
+    }
+
+    /// Attach a range provider for binary index queries.
+    pub fn with_range_provider(mut self, provider: Arc<dyn RangeProvider>) -> Self {
+        self.range_provider = Some(provider);
+        self
+    }
+
+    /// Attach a content store handle. Required (alongside
+    /// [`Self::annotation_index`]) for arena-backed annotation reads;
+    /// callers that only need range queries can leave this `None`.
+    pub fn with_content_store(mut self, store: Arc<dyn crate::storage::ContentStore>) -> Self {
+        self.content_store = Some(store);
+        self
+    }
+
+    /// True iff this snapshot has both the index root section
+    /// pointing at on-disk arenas AND a CAS handle to read them. The
+    /// hot path for arena-backed lookups gates on this — when `false`,
+    /// callers fall back to the M2a scan-based hydration / cascade
+    /// paths.
+    #[inline]
+    pub fn has_arena_reader(&self) -> bool {
+        self.annotation_index.is_some() && self.content_store.is_some()
+    }
+
+    /// Encode an IRI to a SID using this db's namespace codes.
+    ///
+    /// An IRI whose canonical prefix has no code is stored whole under
+    /// `OVERFLOW` once the namespace table is full, and encodes that way here.
+    /// While the table has room no stored IRI has such a prefix, so it falls
+    /// back to the EMPTY namespace (code 0) with the full IRI as the local
+    /// name: queries for it return empty results rather than erroring.
+    ///
+    /// Use [`encode_iri_strict`](Self::encode_iri_strict) when unknown IRIs
+    /// should produce an error (e.g., resolving policy identity IRIs). A
+    /// datatype IRI is never one of those: any IRI names a datatype, so a
+    /// query's datatype (a pattern constraint, `STRDT`, a typed literal in an
+    /// expression) takes this fallback.
+    pub fn encode_iri(&self, iri: &str) -> Option<Sid> {
+        Some(self.encode_iri_inner(iri))
+    }
+
+    /// Encode an IRI to a SID, returning `None` for an IRI this ledger cannot
+    /// hold: one whose prefix has no code while the namespace table has room.
+    ///
+    /// Unlike [`encode_iri`](Self::encode_iri), this does NOT fall back to
+    /// the EMPTY namespace for unknown IRIs. Use this when the caller needs
+    /// to distinguish between known and unknown namespaces (e.g., `IRI()` in
+    /// an expression, which keeps an unknown IRI as an IRI, or policy
+    /// identity resolution). Once the table is full, every IRI has a known
+    /// encoding: its prefix's code, or `OVERFLOW`.
+    ///
+    /// Note: bare strings with no scheme (e.g., `"just-a-string"`) canonically
+    /// split to the EMPTY prefix `""` and are intentionally rejected here, even
+    /// though EMPTY is a registered code. This is correct — such strings are not
+    /// valid IRIs in any known namespace.
+    pub fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
+        let sid = self.encode_iri_inner(iri);
+        if sid.namespace_code == fluree_vocab::namespaces::EMPTY {
+            None
+        } else {
+            Some(sid)
+        }
+    }
+
+    /// Shared IRI → SID encoding using canonical splitting and exact-prefix
+    /// lookup, per [`encode_registered`]. No longest-prefix-match — canonical
+    /// encoding prohibits `starts_with` matching.
+    fn encode_iri_inner(&self, iri: &str) -> Sid {
+        encode_registered(
+            iri,
+            self.ns_split_mode,
+            |prefix| self.namespace_reverse.get(prefix).copied(),
+            || table_full(&self.namespace_codes),
+        )
+    }
+
+    /// Build a reverse lookup from graph Sid → GraphId.
+    ///
+    /// Returns `Err` if any registered graph IRI cannot be encoded (missing
+    /// namespace prefix) or if two graph IRIs collide to the same Sid.
+    ///
+    /// **Prerequisite**: `apply_envelope_deltas()` must be called first so that
+    /// namespace codes are available for `encode_iri()`.
+    pub fn build_reverse_graph(&self) -> Result<HashMap<Sid, GraphId>> {
+        let mut map = HashMap::new();
+        for (g_id, iri) in self.graph_registry.iter_entries() {
+            if g_id == 0 {
+                continue;
+            } // default graph has no Sid
+            let sid = self.encode_iri(iri).ok_or_else(|| {
+                Error::invalid_index(format!(
+                    "graph IRI '{iri}' (g_id={g_id}) has no matching namespace prefix \
+                     — namespace_codes may be incomplete"
+                ))
+            })?;
+            if let Some(prev_g_id) = map.insert(sid.clone(), g_id) {
+                return Err(Error::invalid_index(format!(
+                    "Sid collision: graph IRIs for g_id={prev_g_id} and g_id={g_id} encode to same Sid '{sid}'"
+                )));
+            }
+        }
+        for (g_id, iri) in self.graph_registry.iter_aliases() {
+            if let Some(sid) = self.encode_iri(iri) {
+                map.insert(sid, g_id);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decode a SID to an IRI using this db's namespace codes.
+    ///
+    /// - `EMPTY (0)`: returns `Some(sid.name)` — name is the full IRI
+    /// - `OVERFLOW (0xFFFE)`: returns `Some(sid.name)` — full IRI stored as name
+    /// - Registered code: returns `Some(prefix + name)`
+    /// - Unknown code: returns `None` (corruption/bug)
+    pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
+        if is_full_iri(sid.namespace_code) {
+            return Some(sid.name.to_string());
+        }
+        self.namespace_codes
+            .get(&sid.namespace_code)
+            .map(|prefix| format!("{}{}", prefix, sid.name))
+    }
+
+    /// Get all registered namespace codes (code → prefix).
+    pub fn namespaces(&self) -> &HashMap<u16, String> {
+        &self.namespace_codes
+    }
+
+    /// Get a cheap, shareable handle to the namespace table.
+    ///
+    /// Returns an `Arc` clone (refcount bump, no copy) so per-query consumers
+    /// such as the result-formatting `IriCompactor` can hold the stable table
+    /// without deep-cloning it on every request.
+    pub fn shared_namespaces(&self) -> Arc<HashMap<u16, String>> {
+        Arc::clone(&self.namespace_codes)
+    }
+
+    /// Get the reverse namespace map (prefix → code) for conflict checking.
+    pub fn namespace_reverse(&self) -> &HashMap<String, u16> {
+        &self.namespace_reverse
+    }
+
+    /// A shareable handle to the reverse namespace map, the twin of
+    /// [`Self::shared_namespaces`].
+    pub fn shared_namespace_reverse(&self) -> Arc<HashMap<String, u16>> {
+        Arc::clone(&self.namespace_reverse)
+    }
+
+    /// Get the ledger's split mode for canonical IRI encoding.
+    #[inline]
+    pub fn ns_split_mode(&self) -> NsSplitMode {
+        self.ns_split_mode
+    }
+
+    /// Set the ledger's split mode (immutable after user namespace allocation).
+    ///
+    /// Validates that the mode is acceptable: if user namespaces have already
+    /// been allocated under a different mode, returns `Err`. Otherwise sets the mode.
+    ///
+    /// `commit_t` is included in error messages for diagnostics.
+    pub fn set_ns_split_mode(&mut self, mode: NsSplitMode, commit_t: i64) -> Result<()> {
+        if self.has_user_namespace_codes() && self.ns_split_mode != mode {
+            return Err(Error::invalid_index(format!(
+                "ns_split_mode conflict: commit t={} declares {:?} \
+                 but ledger already has user namespaces under {:?}",
+                commit_t, mode, self.ns_split_mode
+            )));
+        }
+        self.ns_split_mode = mode;
+        Ok(())
+    }
+
+    /// Insert a namespace code if not already present.
+    ///
+    /// Keeps the reverse map in sync. Returns `Ok(true)` if the entry was new,
+    /// `Ok(false)` if the code was already registered (no-op), or `Err` if the
+    /// prefix is already mapped to a different code (bimap conflict).
+    pub fn insert_namespace_code(&mut self, code: u16, prefix: String) -> Result<bool> {
+        if let Some(existing) = self.namespace_codes.get(&code) {
+            if existing != &prefix {
+                return Err(Error::invalid_index(format!(
+                    "namespace bimap conflict: code {code} already maps to {existing:?} \
+                     but {prefix:?} was requested"
+                )));
+            }
+            return Ok(false);
+        }
+        if let Some(&existing_code) = self.namespace_reverse.get(&prefix) {
+            if existing_code != code {
+                return Err(Error::invalid_index(format!(
+                    "namespace bimap conflict: prefix {prefix:?} already maps to code {existing_code} \
+                     but code {code} was requested"
+                )));
+            }
+            return Ok(false);
+        }
+        Arc::make_mut(&mut self.namespace_reverse).insert(prefix.clone(), code);
+        Arc::make_mut(&mut self.namespace_codes).insert(code, prefix);
+        Ok(true)
+    }
+
+    /// Apply commit envelope deltas (namespace + graph) to this snapshot.
+    ///
+    /// Called at commit-apply time only. Centralizes all snapshot mutations
+    /// so callers don't need to know which fields to update.
+    ///
+    /// **Call order invariant**: namespace deltas are applied first so that
+    /// `encode_iri()` can decompose graph IRIs when building reverse maps.
+    ///
+    /// **Cross-commit namespace conflict check**: each namespace delta entry is validated against
+    /// the current table. A code that already maps to a different prefix, or
+    /// a prefix that already maps to a different code, is a conflict that
+    /// indicates an invalid commit chain. Returns `Err` so the caller can
+    /// reject the commit rather than crashing the process.
+    pub fn apply_envelope_deltas(
+        &mut self,
+        ns_delta: &HashMap<u16, String>,
+        graph_iris: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<()> {
+        // Validate delta against both directions of the bimap inline,
+        // using the already-maintained namespace_reverse map.
+        for (&code, prefix) in ns_delta {
+            // code → prefix direction
+            if let Some(existing) = self.namespace_codes.get(&code) {
+                if existing != prefix {
+                    return Err(Error::invalid_index(format!(
+                        "namespace conflict: code {code} maps to {existing:?} but delta has {prefix:?}"
+                    )));
+                }
+                continue;
+            }
+            // prefix → code direction
+            if let Some(&existing_code) = self.namespace_reverse.get(prefix.as_str()) {
+                if existing_code != code {
+                    return Err(Error::invalid_index(format!(
+                        "namespace conflict: prefix {prefix:?} has code {existing_code} but delta has code {code}"
+                    )));
+                }
+                continue;
+            }
+            // New mapping — insert into both maps.
+            Arc::make_mut(&mut self.namespace_codes).insert(code, prefix.clone());
+            Arc::make_mut(&mut self.namespace_reverse).insert(prefix.clone(), code);
+        }
+        self.graph_registry.apply_delta(graph_iris);
+        Ok(())
+    }
+
+    /// Record a commit's graph drops at `t` (see `Commit::graph_drops`): the
+    /// registry marks them, and their index statistics go, since the index
+    /// facts they count are no longer visible. Applies before the commit's
+    /// own writes; see [`Self::revive_graphs`] for those.
+    pub fn apply_graph_drops(&mut self, g_ids: &[crate::GraphId], t: i64) {
+        if g_ids.is_empty() {
+            return;
+        }
+        self.graph_registry.apply_drops(g_ids, t);
+        self.forget_graph_stats(g_ids);
+    }
+
+    /// The graphs a drop took after the index, as an edge names its graph
+    /// (`EdgeKey::g`, `None` for the default graph). The sealed annotation
+    /// arena predates those drops, so what it holds of their edges is gone:
+    /// an edge of theirs carries only what novelty holds. Empty, allocating
+    /// nothing, on a ledger that never dropped a graph since its index.
+    pub fn edge_graphs_dropped_since_index(&self) -> Vec<Option<crate::Sid>> {
+        if !self.graph_registry.has_drops() {
+            return Vec::new();
+        }
+        self.graph_registry
+            .dropped_after(self.t)
+            .into_iter()
+            .filter_map(|g_id| {
+                if g_id == crate::DEFAULT_GRAPH_ID {
+                    return Some(None);
+                }
+                let iri = self.graph_registry.iri_for_graph_id(g_id)?;
+                self.encode_iri(iri).map(Some)
+            })
+            .collect()
+    }
+
+    /// Record that a commit at `t` wrote `graph_iris` (its `graph_delta`)
+    /// after its drops applied: each dropped graph among them exists again.
+    pub fn revive_graphs<'a>(&mut self, graph_iris: impl IntoIterator<Item = &'a str>, t: i64) {
+        self.graph_registry.revive(graph_iris, t);
+    }
+
+    /// Forget the index statistics of `g_ids`: a reader answering from them
+    /// (the count shortcuts) would count facts a drop took. They come back
+    /// with the next index build, which counts what the graphs hold then.
+    pub fn forget_graph_stats(&mut self, g_ids: &[crate::GraphId]) {
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        let held = stats
+            .graphs
+            .as_ref()
+            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)));
+        if !held {
+            return;
+        }
+        let stats = Arc::make_mut(stats);
+        let (mut flakes, mut size) = (0u64, 0u64);
+        if let Some(graphs) = stats.graphs.as_mut() {
+            graphs.retain(|g| {
+                let dropped = g_ids.contains(&g.g_id);
+                if dropped {
+                    flakes += g.flakes;
+                    size += g.size;
+                }
+                !dropped
+            });
+        }
+        stats.flakes = stats.flakes.saturating_sub(flakes);
+        stats.size = stats.size.saturating_sub(size);
+    }
+
+    /// Whether user namespace codes have been allocated (any code >= USER_START).
+    ///
+    /// Once user codes exist, the `ns_split_mode` is locked — changing it would
+    /// re-split existing IRIs differently, breaking decode consistency.
+    pub fn has_user_namespace_codes(&self) -> bool {
+        self.namespace_codes
+            .keys()
+            .any(|&code| (fluree_vocab::namespaces::USER_START..OVERFLOW).contains(&code))
+    }
+
+    /// Get the schema hierarchy for RDFS reasoning.
+    pub fn schema_hierarchy(&self) -> Option<SchemaHierarchy> {
+        self.schema.as_ref().map(|schema| {
+            self.schema_hierarchy_cache
+                .get_or_init(|| SchemaHierarchy::from_db_root_schema(schema))
+                .clone()
+        })
+    }
+
+    /// Get the schema epoch (transaction ID when schema was last updated).
+    pub fn schema_epoch(&self) -> Option<u64> {
+        self.schema.as_ref().map(|s| s.t as u64)
+    }
+}
+
+// =============================================================================
+// FIR6 root metadata decode (core-only, no binary-index dependency)
+// =============================================================================
+
+fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata> {
+    use crate::stats_wire;
+
+    // Mirror `fluree-db-binary-index` wire format:
+    // [magic(4)][version(1)][flags(1)][pad(2)][index_t(8)][base_t(8)] ...
+    if bytes.len() < 24 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            // Keep legacy substring "too short" for tests and callers that
+            // match error text, while preserving FIR6 decode context.
+            "FIR6: too short (truncated root < 24 bytes)",
+        ));
+    }
+    if &bytes[0..4] != b"FIR6" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FIR6: expected magic bytes",
+        ));
+    }
+    let version = bytes[4];
+    // FIR6 version 2 adds `lang_id` to each `FulltextArenaRef` so fulltext
+    // arenas can be keyed by `(g_id, p_id, lang_id)`. This helper doesn't
+    // parse arena refs — it only consumes the header bits it needs — so
+    // both versions are accepted here. The authoritative parser
+    // (`IndexRoot::decode` in `fluree-db-binary-index`) enforces version
+    // matching for the full-root deserialization path.
+    if version != 1 && version != 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("FIR6: unsupported version {version}"),
+        ));
+    }
+    let flags = bytes[5];
+
+    // Optional-section flags (must match binary-index IndexRoot).
+    const FLAG_HAS_STATS: u8 = 1 << 0;
+    const FLAG_HAS_SCHEMA: u8 = 1 << 1;
+    const FLAG_HAS_PREV_INDEX: u8 = 1 << 2;
+    const FLAG_HAS_GARBAGE: u8 = 1 << 3;
+    const FLAG_HAS_SKETCH: u8 = 1 << 4;
+    /// Sticky bit: this snapshot has at least one currently- or
+    /// previously-asserted edge-annotation `f:reifies*` flake. Used
+    /// by the cascade fast-path in `fluree-db-transact::stage` to
+    /// skip the per-retract POST scan on non-annotation ledgers.
+    const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
+    /// Optional `AnnotationIndexRoot` section is present in the inline
+    /// tail. Decoder uses ciborium; metadata-only callers skip it.
+    const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
+    let has_annotations = flags & FLAG_HAS_ANNOTATIONS != 0;
+    let has_annotation_index_section = flags & FLAG_HAS_ANNOTATION_INDEX != 0;
+
+    // Extended-flags byte at bytes[6] (must match
+    // binary-index IndexRoot's `FLAG_EXT_*` set). Old roots
+    // wrote `0u16` to this position so the raw bit decodes
+    // false; the post-decode coercion below handles legacy
+    // roots whose `annotation_index` was sealed before this
+    // change shipped.
+    const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+    const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
+    const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
+    const FLAG_EXT_GRAPH_DROPS: u8 = 1 << 3;
+    let flags_ext = bytes[6];
+    let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
+    let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
+        None
+    } else {
+        Some(flags_ext & FLAG_EXT_HAS_LIST_META != 0)
+    };
+
+    #[inline]
+    fn ensure(bytes: &[u8], pos: usize, need: usize, ctx: &str) -> std::io::Result<()> {
+        if pos + need > bytes.len() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "FIR6: truncated at {ctx} (need {need} at offset {pos}, have {})",
+                    bytes.len()
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn read_u8(bytes: &[u8], pos: &mut usize) -> std::io::Result<u8> {
+        ensure(bytes, *pos, 1, "u8")?;
+        let v = bytes[*pos];
+        *pos += 1;
+        Ok(v)
+    }
+    #[inline]
+    fn read_u16(bytes: &[u8], pos: &mut usize) -> std::io::Result<u16> {
+        ensure(bytes, *pos, 2, "u16")?;
+        let v = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+        *pos += 2;
+        Ok(v)
+    }
+    #[inline]
+    fn read_u32(bytes: &[u8], pos: &mut usize) -> std::io::Result<u32> {
+        ensure(bytes, *pos, 4, "u32")?;
+        let v = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        Ok(v)
+    }
+    #[inline]
+    fn read_u64(bytes: &[u8], pos: &mut usize) -> std::io::Result<u64> {
+        ensure(bytes, *pos, 8, "u64")?;
+        let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+        *pos += 8;
+        Ok(v)
+    }
+    #[inline]
+    fn read_i64(bytes: &[u8], pos: &mut usize) -> std::io::Result<i64> {
+        ensure(bytes, *pos, 8, "i64")?;
+        let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+        *pos += 8;
+        Ok(v)
+    }
+
+    #[inline]
+    fn read_string(bytes: &[u8], pos: &mut usize) -> std::io::Result<String> {
+        let len = read_u16(bytes, pos)? as usize;
+        ensure(bytes, *pos, len, "string bytes")?;
+        let s = std::str::from_utf8(&bytes[*pos..*pos + len]).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("utf8: {e}"))
+        })?;
+        *pos += len;
+        Ok(s.to_string())
+    }
+
+    #[inline]
+    fn read_string_array(bytes: &[u8], pos: &mut usize) -> std::io::Result<Vec<String>> {
+        let count = read_u16(bytes, pos)? as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(read_string(bytes, pos)?);
+        }
+        Ok(out)
+    }
+
+    #[inline]
+    fn skip_cid(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
+        let len = read_u16(bytes, pos)? as usize;
+        ensure(bytes, *pos, len, "cid bytes")?;
+        *pos += len;
+        Ok(())
+    }
+
+    fn skip_dict_pack_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
+        // string forward packs
+        let sp_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..sp_count {
+            let _first = read_u64(bytes, pos)?;
+            let _last = read_u64(bytes, pos)?;
+            skip_cid(bytes, pos)?;
+        }
+        // subject forward packs per namespace
+        let ns_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..ns_count {
+            let _ns_code = read_u16(bytes, pos)?;
+            let pack_count = read_u16(bytes, pos)? as usize;
+            for _ in 0..pack_count {
+                let _first = read_u64(bytes, pos)?;
+                let _last = read_u64(bytes, pos)?;
+                skip_cid(bytes, pos)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_dict_tree_refs(bytes: &[u8], pos: &mut usize) -> std::io::Result<()> {
+        skip_cid(bytes, pos)?; // branch CID
+        let leaf_count = read_u32(bytes, pos)? as usize;
+        for _ in 0..leaf_count {
+            skip_cid(bytes, pos)?;
+        }
+        Ok(())
+    }
+
+    fn skip_graph_arenas(bytes: &[u8], pos: &mut usize, version: u8) -> std::io::Result<()> {
+        // Matches `write_graph_arenas_v5` in binary-index.
+        let _g_id = read_u16(bytes, pos)?;
+
+        // numbig
+        let nb_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..nb_count {
+            let _p_id = read_u32(bytes, pos)?;
+            skip_cid(bytes, pos)?;
+        }
+        // vectors
+        let vec_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..vec_count {
+            let _p_id = read_u32(bytes, pos)?;
+            skip_cid(bytes, pos)?; // manifest
+            let shard_count = read_u16(bytes, pos)? as usize;
+            for _ in 0..shard_count {
+                skip_cid(bytes, pos)?;
+            }
+        }
+        // spatial
+        let sp_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..sp_count {
+            let _p_id = read_u32(bytes, pos)?;
+            skip_cid(bytes, pos)?; // root_cid
+            skip_cid(bytes, pos)?; // manifest
+            skip_cid(bytes, pos)?; // arena
+            let leaflet_count = read_u16(bytes, pos)? as usize;
+            for _ in 0..leaflet_count {
+                skip_cid(bytes, pos)?;
+            }
+        }
+        // fulltext (v2 adds `lang_id: u16` per entry)
+        let ft_count = read_u16(bytes, pos)? as usize;
+        for _ in 0..ft_count {
+            let _p_id = read_u32(bytes, pos)?;
+            if version >= 2 {
+                let _lang_id = read_u16(bytes, pos)?;
+            }
+            skip_cid(bytes, pos)?;
+        }
+
+        Ok(())
+    }
+
+    let mut pos = 8; // skip pad(2)
+    let index_t = read_i64(bytes, &mut pos)?;
+    let base_t = read_i64(bytes, &mut pos)?;
+
+    // Ledger ID. Roots are re-stamped from the nameservice record on load,
+    // so this is provenance, not identity; roots written before
+    // canonicalization may carry a branchless id.
+    let ledger_id = LedgerId::parse(&read_string(bytes, &mut pos)?).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("index root ledger id: {e}"),
+        )
+    })?;
+
+    // Subject ID encoding (skip; stored on FIR6 root only)
+    let _subject_id_encoding = read_u8(bytes, &mut pos)?;
+
+    // ns_split_mode
+    let ns_split_mode_byte = read_u8(bytes, &mut pos)?;
+    let ns_split_mode = crate::ns_encoding::NsSplitMode::from_byte(ns_split_mode_byte);
+
+    // Namespace codes
+    let ns_count = read_u16(bytes, &mut pos)? as usize;
+    let mut namespace_codes: HashMap<u16, String> = HashMap::with_capacity(ns_count);
+    for _ in 0..ns_count {
+        let ns_code = read_u16(bytes, &mut pos)?;
+        let prefix = read_string(bytes, &mut pos)?;
+        namespace_codes.insert(ns_code, prefix);
+    }
+
+    // Predicate SIDs (skip)
+    let pred_count = read_u32(bytes, &mut pos)? as usize;
+    for _ in 0..pred_count {
+        let _ns_code = read_u16(bytes, &mut pos)?;
+        let _suffix = read_string(bytes, &mut pos)?;
+    }
+
+    // Small dict inlines
+    let graph_iris = read_string_array(bytes, &mut pos)?;
+    let _datatype_iris = read_string_array(bytes, &mut pos)?;
+    let _language_tags = read_string_array(bytes, &mut pos)?;
+
+    // Dict refs (skip)
+    skip_dict_pack_refs(bytes, &mut pos)?;
+    skip_dict_tree_refs(bytes, &mut pos)?; // subject reverse
+    skip_dict_tree_refs(bytes, &mut pos)?; // string reverse
+
+    // Per-graph specialty arenas (skip)
+    let arena_count = read_u16(bytes, &mut pos)? as usize;
+    for _ in 0..arena_count {
+        skip_graph_arenas(bytes, &mut pos, version)?;
+    }
+
+    // Watermarks
+    let wm_count = read_u16(bytes, &mut pos)? as usize;
+    let mut subject_watermarks = Vec::with_capacity(wm_count);
+    for _ in 0..wm_count {
+        subject_watermarks.push(read_u64(bytes, &mut pos)?);
+    }
+    let string_watermark = read_u32(bytes, &mut pos)?;
+
+    // Cumulative commit stats (skip)
+    let _total_commit_size = read_u64(bytes, &mut pos)?;
+    let _total_asserts = read_u64(bytes, &mut pos)?;
+    let _total_retracts = read_u64(bytes, &mut pos)?;
+
+    // o_type table (skip)
+    let otype_count = read_u32(bytes, &mut pos)? as usize;
+    for _ in 0..otype_count {
+        let _o_type = read_u16(bytes, &mut pos)?;
+        let _decode_kind = read_u8(bytes, &mut pos)?;
+        let entry_flags = read_u8(bytes, &mut pos)?;
+        if entry_flags & 1 != 0 {
+            let _dt_iri = read_string(bytes, &mut pos)?;
+        }
+        if entry_flags & 2 != 0 {
+            let _dict_family = read_u8(bytes, &mut pos)?;
+        }
+    }
+
+    // Default graph routing (skip)
+    let default_order_count = read_u8(bytes, &mut pos)? as usize;
+    for _ in 0..default_order_count {
+        let _order_id = read_u8(bytes, &mut pos)?;
+        let leaf_count = read_u32(bytes, &mut pos)? as usize;
+        for _ in 0..leaf_count {
+            // first_key + last_key (RunRecordV2 ordered key)
+            const RECORD_V2_WIRE_SIZE: usize = 30;
+            ensure(bytes, pos, RECORD_V2_WIRE_SIZE, "RunRecordV2 first_key")?;
+            pos += RECORD_V2_WIRE_SIZE;
+            ensure(bytes, pos, RECORD_V2_WIRE_SIZE, "RunRecordV2 last_key")?;
+            pos += RECORD_V2_WIRE_SIZE;
+            let _row_count = read_u64(bytes, &mut pos)?;
+            skip_cid(bytes, &mut pos)?;
+            let has_sidecar = read_u8(bytes, &mut pos)?;
+            if has_sidecar != 0 {
+                skip_cid(bytes, &mut pos)?;
+            }
+        }
+    }
+
+    // Named graph routing (skip)
+    let named_count = read_u16(bytes, &mut pos)? as usize;
+    for _ in 0..named_count {
+        let _g_id = read_u16(bytes, &mut pos)?;
+        let order_count = read_u8(bytes, &mut pos)? as usize;
+        for _ in 0..order_count {
+            let _order_id = read_u8(bytes, &mut pos)?;
+            skip_cid(bytes, &mut pos)?;
+        }
+    }
+
+    // Optional sections
+    let stats = if flags & FLAG_HAS_STATS != 0 {
+        let stats_len = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, stats_len, "stats section")?;
+        let (s, _consumed) = stats_wire::decode_stats(&bytes[pos..pos + stats_len])?;
+        pos += stats_len;
+        Some(Arc::new(s))
+    } else {
+        None
+    };
+
+    let schema = if flags & FLAG_HAS_SCHEMA != 0 {
+        let schema_len = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, schema_len, "schema section")?;
+        let (s, _consumed) = stats_wire::decode_schema(&bytes[pos..pos + schema_len])?;
+        pos += schema_len;
+        Some(s)
+    } else {
+        None
+    };
+
+    if flags & FLAG_HAS_PREV_INDEX != 0 {
+        let _t = read_i64(bytes, &mut pos)?;
+        skip_cid(bytes, &mut pos)?;
+    }
+    if flags & FLAG_HAS_GARBAGE != 0 {
+        skip_cid(bytes, &mut pos)?;
+    }
+    if flags & FLAG_HAS_SKETCH != 0 {
+        skip_cid(bytes, &mut pos)?;
+    }
+
+    // Optional `AnnotationIndexRoot` section. Decoded eagerly via
+    // ciborium so the metadata-only fast path surfaces the same
+    // pointer that `IndexRoot::decode` would produce. The section
+    // is small (a couple of CIDs and counters), so eager decode
+    // costs ~tens of bytes — comparable to `stats`/`schema` already
+    // parsed above.
+    let annotation_index = if has_annotation_index_section {
+        let len = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, len, "annotation_index section")?;
+        let ann =
+            ciborium::de::from_reader::<crate::AnnotationIndexRoot, _>(&bytes[pos..pos + len])
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("FIR6: annotation_index decode: {e}"),
+                    )
+                })?;
+        pos += len;
+        Some(ann)
+    } else {
+        None
+    };
+
+    let graph_drops = if flags_ext & FLAG_EXT_GRAPH_DROPS != 0 {
+        crate::graph_registry::decode_graph_drops(bytes, &mut pos)?
+    } else {
+        Vec::new()
+    };
+
+    // Trailing-byte sentinel: any unread bytes after the last section
+    // indicate a future format extension or a writer bug. Surface that
+    // explicitly rather than silently drop the bytes.
+    if pos != bytes.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "FIR6: trailing bytes after the last section ({} unread)",
+                bytes.len() - pos
+            ),
+        ));
+    }
+
+    // Decode-side coercion (mirrors `IndexRoot::decode`'s
+    // backward-compat fix): a root with a populated
+    // `annotation_index` implies `had_annotation_arena = true`,
+    // even if the extended-flags byte is zero (pre-this-change
+    // FIR6 roots that already had a sealed arena). Without this,
+    // a later defensive drop on such a root would land in the
+    // bootstrap-eligible state and the provider's base-index
+    // scan-fallback would silently lose retract/reassert history.
+    let had_annotation_arena = had_annotation_arena || annotation_index.is_some();
+
+    Ok(LedgerSnapshotMetadata {
+        ledger_id,
+        t: index_t,
+        base_t,
+        namespace_codes,
+        ns_split_mode,
+        stats,
+        schema,
+        subject_watermarks,
+        string_watermark,
+        graph_iris,
+        has_annotations,
+        annotation_index,
+        had_annotation_arena,
+        has_list_meta,
+        graph_drops,
+        index_root_id: None,
+    })
+}
+
+/// Load a database from an index root content ID.
+///
+/// The returned Db is metadata-only (`range_provider = None`). The caller
+/// (typically the API layer) must load a `BinaryIndexStore` and attach a
+/// `BinaryRangeProvider` before serving range queries.
+///
+/// The storage address is derived internally from the `ContentId` and
+/// `ledger_id` using the storage backend's method identifier.
+pub async fn load_ledger_snapshot(
+    storage: &(impl StorageRead + crate::storage::StorageMethod),
+    root_id: &ContentId,
+    ledger_id: &str,
+) -> Result<LedgerSnapshot> {
+    let root_address = crate::content_address(
+        storage.storage_method(),
+        ContentKind::IndexRoot,
+        ledger_id,
+        &root_id.digest_hex(),
+    );
+    let bytes = storage.read_bytes(&root_address).await?;
+    LedgerSnapshot::from_root(root_id, &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_vocab::namespaces::EMPTY;
+
+    #[test]
+    fn test_from_root_bytes_rejects_non_fir6() {
+        let json = b"{\"ledger_id\": \"test:main\"}";
+        let err = LedgerSnapshot::from_root_bytes(json).unwrap_err();
+        assert!(err.to_string().contains("FIR6"));
+    }
+
+    #[test]
+    fn test_from_root_bytes_rejects_truncated() {
+        let err = LedgerSnapshot::from_root_bytes(b"FI").unwrap_err();
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn has_arena_reader_requires_both_index_and_store() {
+        // Genesis snapshot: neither annotation_index nor content_store
+        // — has_arena_reader returns false.
+        let snap = LedgerSnapshot::genesis("test:main");
+        assert!(!snap.has_arena_reader(), "genesis has no arena");
+
+        // Adding only the content store still doesn't enable arena
+        // reads — the snapshot must also point at on-disk arenas.
+        let store = Arc::new(crate::storage::MemoryContentStore::new())
+            as Arc<dyn crate::storage::ContentStore>;
+        let snap = snap.with_content_store(store);
+        assert!(
+            !snap.has_arena_reader(),
+            "store without annotation_index does not enable arena reads"
+        );
+
+        // Adding annotation_index with no store still doesn't suffice.
+        let mut snap = snap;
+        snap.content_store = None;
+        snap.annotation_index = Some(crate::AnnotationIndexRoot {
+            version: 1,
+            max_t: 0,
+            forward_branch_cid: ContentId::new(ContentKind::AnnotationForwardBranch, b"empty-fwd"),
+            reverse_branch_cid: ContentId::new(ContentKind::AnnotationReverseBranch, b"empty-rev"),
+            stats: crate::AnnotationStats::default(),
+        });
+        assert!(
+            !snap.has_arena_reader(),
+            "annotation_index without store does not enable arena reads"
+        );
+
+        // Both present — arena reader is available.
+        snap.content_store = Some(Arc::new(crate::storage::MemoryContentStore::new()));
+        assert!(snap.has_arena_reader());
+    }
+
+    #[test]
+    fn test_encode_decode_sid() {
+        let mut ns = HashMap::new();
+        ns.insert(0u16, String::new());
+        ns.insert(100u16, "http://example.org/".to_string());
+        let db = LedgerSnapshot::new_meta(LedgerSnapshotMetadata {
+            ledger_id: LedgerId::parse("test:main").unwrap(),
+            t: 1,
+            base_t: 0,
+            namespace_codes: ns,
+            ns_split_mode: NsSplitMode::default(),
+            stats: None,
+            schema: None,
+            subject_watermarks: vec![],
+            string_watermark: 0,
+            graph_iris: vec![],
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
+            has_list_meta: None,
+            graph_drops: Vec::new(),
+            index_root_id: None,
+        })
+        .unwrap();
+
+        let sid = db.encode_iri("http://example.org/Alice").unwrap();
+        assert_eq!(sid.namespace_code, 100);
+        assert_eq!(sid.name.as_ref(), "Alice");
+
+        let iri = db.decode_sid(&sid).unwrap();
+        assert_eq!(iri, "http://example.org/Alice");
+    }
+
+    #[test]
+    fn test_genesis_db() {
+        let db = LedgerSnapshot::genesis("test:main");
+        assert_eq!(db.t, 0);
+        assert_eq!(db.ledger_id, "test:main");
+        assert!(db.range_provider.is_none());
+    }
+
+    #[test]
+    fn test_encode_iri_txn_meta_graph() {
+        let db = LedgerSnapshot::genesis("mydb:main");
+        let txn_meta_iri = crate::graph_registry::txn_meta_graph_iri("mydb:main");
+        assert_eq!(txn_meta_iri, "urn:fluree:mydb:main#txn-meta");
+
+        // Canonical split (MostGranular) for this opaque IRI: prefix = "urn:fluree:mydb:main#"
+        // Genesis db only has "urn:fluree:" (FLUREE_URN) — canonical prefix not registered.
+        // Canonical encoding: no starts_with fallback → EMPTY.
+        let sid = db
+            .encode_iri(&txn_meta_iri)
+            .expect("encode_iri always returns Some via EMPTY fallback");
+        assert_eq!(sid.namespace_code, EMPTY);
+        assert_eq!(sid.name.as_ref(), "urn:fluree:mydb:main#txn-meta");
+
+        // Round-trip: EMPTY code decodes to sid.name (the full IRI).
+        let decoded = db.decode_sid(&sid).unwrap();
+        assert_eq!(decoded, txn_meta_iri);
+
+        // Once the canonical prefix is registered (by the transact layer),
+        // encode uses the exact prefix.
+        let mut db2 = db.clone();
+        db2.insert_namespace_code(100, "urn:fluree:mydb:main#".to_string())
+            .unwrap();
+        let sid2 = db2.encode_iri(&txn_meta_iri).unwrap();
+        assert_eq!(sid2.namespace_code, 100);
+        assert_eq!(sid2.name.as_ref(), "txn-meta");
+        assert_eq!(db2.decode_sid(&sid2).unwrap(), txn_meta_iri);
+    }
+
+    // =========================================================================
+    // apply_envelope_deltas — conflict rejection
+    // =========================================================================
+
+    /// Helper: build a genesis snapshot with one user namespace pre-registered.
+    fn snapshot_with_ns(code: u16, prefix: &str) -> LedgerSnapshot {
+        let mut db = LedgerSnapshot::genesis("test:main");
+        db.insert_namespace_code(code, prefix.to_string()).unwrap();
+        db
+    }
+
+    #[test]
+    fn apply_envelope_deltas_accepts_identical_mapping() {
+        let mut db = snapshot_with_ns(100, "http://example.org/");
+        let mut delta = HashMap::new();
+        delta.insert(100u16, "http://example.org/".to_string());
+        // Same code, same prefix → no-op, no error.
+        db.apply_envelope_deltas(&delta, std::iter::empty::<&str>())
+            .expect("identical mapping should succeed");
+    }
+
+    #[test]
+    fn apply_envelope_deltas_rejects_code_to_different_prefix() {
+        let mut db = snapshot_with_ns(100, "http://example.org/");
+        let mut delta = HashMap::new();
+        // Same code 100, but different prefix.
+        delta.insert(100u16, "http://other.org/".to_string());
+        let err = db
+            .apply_envelope_deltas(&delta, std::iter::empty::<&str>())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("namespace conflict"),
+            "expected code→prefix conflict, got: {err}"
+        );
+        assert!(err.to_string().contains("100"));
+    }
+
+    #[test]
+    fn apply_envelope_deltas_rejects_prefix_to_different_code() {
+        let mut db = snapshot_with_ns(100, "http://example.org/");
+        let mut delta = HashMap::new();
+        // Different code 200, but same prefix.
+        delta.insert(200u16, "http://example.org/".to_string());
+        let err = db
+            .apply_envelope_deltas(&delta, std::iter::empty::<&str>())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("namespace conflict"),
+            "expected prefix→code conflict, got: {err}"
+        );
+        assert!(err.to_string().contains("200"));
+    }
+
+    #[test]
+    fn apply_envelope_deltas_accepts_new_mapping() {
+        let mut db = snapshot_with_ns(100, "http://example.org/");
+        let mut delta = HashMap::new();
+        delta.insert(200u16, "http://other.org/".to_string());
+        db.apply_envelope_deltas(&delta, std::iter::empty::<&str>())
+            .expect("new non-conflicting mapping should succeed");
+        // Verify both directions.
+        assert_eq!(
+            db.namespaces().get(&200),
+            Some(&"http://other.org/".to_string())
+        );
+        assert_eq!(
+            db.namespace_reverse().get("http://other.org/"),
+            Some(&200u16)
+        );
+    }
+
+    #[test]
+    fn stats_key_each_predicate_as_its_iri_encodes() {
+        use crate::index_stats::{
+            ClassPropertyUsage, ClassStatEntry, GraphStatsEntry, PropertyStatEntry,
+        };
+        use crate::ns_encoding::LAST_USER_CODE;
+
+        let property = |code: u16, name: &str| PropertyStatEntry {
+            sid: (code, name.to_string()),
+            count: 7,
+            ndv_values: 7,
+            ndv_subjects: 7,
+            last_modified_t: 1,
+            datatypes: Vec::new(),
+            observed_datatypes: Vec::new(),
+            historical_datatypes: Vec::new(),
+        };
+        let class = |name: &str, used: &[Sid]| ClassStatEntry {
+            class_sid: Sid::new(OVERFLOW, name),
+            count: 1,
+            properties: used
+                .iter()
+                .map(|sid| ClassPropertyUsage {
+                    property_sid: sid.clone(),
+                    datatypes: Vec::new(),
+                    langs: Vec::new(),
+                    ref_classes: Vec::new(),
+                })
+                .collect(),
+        };
+        // Bulk import keys an uncoded predicate whole under EMPTY; a rebuild
+        // splits it at the longest registered prefix.
+        let imported = "http://rev.example/r#reviewer";
+        let split = "http://short.example/deep/p";
+        let coded = Sid::new(LAST_USER_CODE, "p");
+        let stats = Arc::new(IndexStats {
+            properties: Some(vec![
+                property(EMPTY, imported),
+                property(200, "deep/p"),
+                property(LAST_USER_CODE, "p"),
+            ]),
+            classes: Some(vec![class(
+                "http://c.example/A",
+                &[coded.clone(), Sid::new(EMPTY, imported)],
+            )]),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 0,
+                size: 0,
+                properties: Vec::new(),
+                classes: Some(vec![class(
+                    "http://c.example/B",
+                    &[Sid::new(200, "deep/p")],
+                )]),
+            }]),
+            ..IndexStats::default()
+        });
+
+        let mut db = LedgerSnapshot::genesis("test:main");
+        db.insert_namespace_code(200, "http://short.example/".to_string())
+            .unwrap();
+        db.insert_namespace_code(LAST_USER_CODE, "http://last.example/".to_string())
+            .unwrap();
+        db.set_index_root_stats(
+            Some(Arc::clone(&stats)),
+            ContentId::new(ContentKind::IndexRoot, b"root"),
+        );
+        let rekeyed = db.stats.clone().unwrap();
+
+        let keys: Vec<Sid> = rekeyed
+            .properties
+            .iter()
+            .flatten()
+            .map(|p| Sid::new(p.sid.0, &p.sid.1))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                coded.clone(),
+                Sid::new(OVERFLOW, imported),
+                Sid::new(OVERFLOW, split),
+            ]
+        );
+        let usages = |class: &ClassStatEntry| -> Vec<Sid> {
+            class
+                .properties
+                .iter()
+                .map(|u| u.property_sid.clone())
+                .collect()
+        };
+        let top = &rekeyed.classes.as_ref().unwrap()[0];
+        assert_eq!(top.class_sid, Sid::new(OVERFLOW, "http://c.example/A"));
+        assert_eq!(usages(top), [coded, Sid::new(OVERFLOW, imported)]);
+        let per_graph = &rekeyed.graphs.as_ref().unwrap()[0]
+            .classes
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(usages(per_graph), [Sid::new(OVERFLOW, split)]);
+
+        // While the table has room, an uncoded prefix encodes under EMPTY too,
+        // so imported keys stand and the stats are shared, not copied.
+        let mut roomy = LedgerSnapshot::genesis("test:main");
+        roomy
+            .insert_namespace_code(LAST_USER_CODE - 1, "http://last.example/".to_string())
+            .unwrap();
+        let imported_only = Arc::new(IndexStats {
+            properties: Some(vec![
+                property(EMPTY, imported),
+                property(LAST_USER_CODE - 1, "p"),
+            ]),
+            ..IndexStats::default()
+        });
+        assert!(Arc::ptr_eq(
+            &roomy.with_canonical_predicate_keys(Arc::clone(&imported_only)),
+            &imported_only
+        ));
+    }
+}

@@ -1,0 +1,965 @@
+//! MINUS operator - anti-join semantics
+//!
+//! Implements SPARQL MINUS semantics (set difference):
+//! - Execute the MINUS patterns once without outer bindings (fresh scope)
+//! - If any result matches the input row on shared variables, filter out that input row
+//! - Return rows that don't match anything in the MINUS subtree
+//!
+//! Key semantics:
+//! - MINUS executes with **empty bindings** (fresh scope) - does NOT see outer variables
+//! - Matching is done on **shared variables only** (vars in both outer and MINUS)
+//! - Empty MINUS results do NOT remove input rows (guard: ignore empty solutions)
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::{QueryError, Result};
+use crate::execute::build_where_operators_seeded;
+use crate::ir::Pattern;
+use crate::object_binding::{
+    equality_norm, normalize_for_key, normalize_for_key_cow, EqualityNorm, TermDicts,
+};
+use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::temporal_mode::PlanningContext;
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use fluree_db_core::StatsView;
+use rustc_hash::FxHashSet;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+/// Hash key for MINUS rows where ALL shared variables are matchable (bound).
+///
+/// Wraps the ordered shared-var bindings for O(1) hash-probe lookup.
+/// Only used for fully-bound minus rows; rows with unbound shared vars go
+/// into the wildcard fallback list.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MinusKey(Vec<Binding>);
+
+/// MINUS operator - anti-join semantics (set difference)
+///
+/// Executes the MINUS patterns once with an empty seed (fresh scope), materializes
+/// all results into a hash set for O(1) lookup, then filters input rows.
+///
+/// Uses a partitioned approach:
+/// - `minus_subjects`: compact subject IDs when there is one shared reference.
+/// - `minus_hash`: HashSet of MinusKey for minus rows where ALL shared vars are
+///   matchable — enables O(1) per-input-row lookup in the common case.
+/// - `minus_wildcards`: Vec for minus rows with >= 1 unbound shared var (rare,
+///   from OPTIONAL inside MINUS) — checked via linear scan.
+///
+/// Complexity: O(N + M) in the common case (all bound), vs O(N * M) before.
+pub struct MinusOperator {
+    /// Child operator providing input solutions
+    child: BoxedOperator,
+    /// MINUS patterns to execute
+    minus_patterns: Vec<Pattern>,
+    /// Shared variables (appear in both child schema and MINUS patterns)
+    shared_vars: Vec<VarId>,
+    /// Output schema (same as child)
+    schema: Arc<[VarId]>,
+    /// Operator state
+    state: OperatorState,
+    /// Optional stats for nested query optimization (Arc for cheap cloning in nested operators)
+    stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time. Used when building the
+    /// MINUS subtree so it inherits the same temporal mode.
+    planning: PlanningContext,
+    /// Hash set of minus rows where ALL shared vars are matchable (common case)
+    minus_hash: FxHashSet<MinusKey>,
+    /// Single shared encoded reference: store only its subject ID instead of
+    /// allocating a tuple per row. Other terms retain ordinary binding equality.
+    minus_subjects: FxHashSet<u64>,
+    /// Minus rows with >= 1 unbound shared var (wildcard rows, rare)
+    /// Each entry is a Vec of Option<Binding>: Some(b) for matchable, None for unbound
+    minus_wildcards: Vec<Vec<Option<Binding>>>,
+    /// Store for normalizing decoded bindings to encoded form on both sides
+    /// of the anti-join, so mixed-representation rows match. `None` outside
+    /// single-ledger binary execution.
+    norm: Option<EqualityNorm>,
+}
+
+impl MinusOperator {
+    /// Create a new MINUS operator
+    ///
+    /// # Arguments
+    ///
+    /// * `child` - Input solutions operator
+    /// * `minus_patterns` - Patterns to execute for anti-join matching
+    /// * `stats` - Optional stats for nested query optimization (Arc for cheap cloning)
+    pub fn new(
+        child: BoxedOperator,
+        minus_patterns: Vec<Pattern>,
+        stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
+    ) -> Self {
+        let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
+        let child_vars: HashSet<VarId> = child.schema().iter().copied().collect();
+
+        // Compute variables referenced in MINUS patterns
+        let mut minus_vars: HashSet<VarId> = HashSet::new();
+        collect_vars_from_patterns(&minus_patterns, &mut minus_vars);
+
+        // Shared vars are the intersection
+        let shared_vars: Vec<VarId> = child_vars.intersection(&minus_vars).copied().collect();
+
+        Self {
+            child,
+            minus_patterns,
+            shared_vars,
+            schema,
+            state: OperatorState::Created,
+            stats,
+            planning,
+            minus_hash: FxHashSet::default(),
+            minus_subjects: FxHashSet::default(),
+            minus_wildcards: Vec::new(),
+            norm: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn build_hash_index(&mut self, batches: Vec<Batch>) {
+        for batch in &batches {
+            self.index_minus_batch(batch).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn input_row_eliminated(&self, input_batch: &Batch, row_idx: usize) -> bool {
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        self.row_eliminated(
+            input_batch,
+            row_idx,
+            &mut Vec::new(),
+            &mut MinusKey(Vec::new()),
+            dicts,
+            gv,
+        )
+        .unwrap()
+    }
+
+    /// True when no input row can be eliminated: nothing is shared, or the
+    /// MINUS side produced no rows.
+    fn keeps_all(&self) -> bool {
+        self.shared_vars.is_empty()
+            || (self.minus_subjects.is_empty()
+                && self.minus_hash.is_empty()
+                && self.minus_wildcards.is_empty())
+    }
+
+    /// Per-row keep flags for `batch`.
+    fn keep_mask(&self, batch: &Batch) -> Result<Vec<bool>> {
+        let mut input_bindings = Vec::with_capacity(self.shared_vars.len());
+        let mut probe = MinusKey(Vec::with_capacity(self.shared_vars.len()));
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        (0..batch.len())
+            .map(|row_idx| {
+                Ok(!self.row_eliminated(
+                    batch,
+                    row_idx,
+                    &mut input_bindings,
+                    &mut probe,
+                    dicts,
+                    gv,
+                )?)
+            })
+            .collect()
+    }
+
+    /// Add one batch of MINUS rows to the hash set and wildcard list.
+    fn index_minus_batch(&mut self, batch: &Batch) -> Result<()> {
+        if let [var] = self.shared_vars.as_slice() {
+            let Some(column) = batch.column(*var) else {
+                return Ok(());
+            };
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
+            for binding in column.iter().filter(|b| b.is_matchable()) {
+                let key = normalize_for_key_cow(binding, dicts, gv)?;
+                if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
+                    self.minus_subjects.insert(*s_id);
+                } else {
+                    self.minus_hash.insert(MinusKey(vec![key.into_owned()]));
+                }
+            }
+            // With one shared variable, an unbound right row has no shared
+            // bound domain and therefore cannot eliminate any left row.
+            return Ok(());
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        for row_idx in 0..batch.len() {
+            let mut key_bindings = Vec::with_capacity(self.shared_vars.len());
+            let mut has_wildcard = false;
+
+            for &var in &self.shared_vars {
+                let binding = batch.column(var).map(|col| &col[row_idx]);
+                match binding {
+                    Some(b) if b.is_matchable() => {
+                        key_bindings.push(Some(normalize_for_key(b, dicts, gv)?));
+                    }
+                    _ => {
+                        key_bindings.push(None);
+                        has_wildcard = true;
+                    }
+                }
+            }
+
+            if has_wildcard {
+                self.minus_wildcards.push(key_bindings);
+            } else {
+                // All shared vars are matchable — unwrap the Options into a MinusKey
+                let key = MinusKey(
+                    key_bindings
+                        .into_iter()
+                        .map(|opt| opt.expect("checked: no wildcard"))
+                        .collect(),
+                );
+                self.minus_hash.insert(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if an input row is eliminated by the MINUS.
+    ///
+    /// Per W3C SPARQL §8.3, MINUS removes an input row µ when there exists a
+    /// MINUS row µ' such that:
+    ///   1. µ and µ' are **compatible**: for every variable in dom(µ) ∩ dom(µ'),
+    ///      µ(v) = µ'(v).
+    ///   2. dom(µ) ∩ dom(µ') ≠ ∅: at least one shared variable is bound in both.
+    ///
+    /// Uses hash probe for the common case (all shared vars matchable on both sides),
+    /// with linear scan fallback for wildcard rows.
+    ///
+    /// `input_bindings` and `probe` are scratch buffers reused across rows.
+    #[allow(clippy::too_many_arguments)]
+    fn row_eliminated(
+        &self,
+        input_batch: &Batch,
+        row_idx: usize,
+        input_bindings: &mut Vec<Option<Binding>>,
+        probe: &mut MinusKey,
+        dicts: Option<TermDicts<'_>>,
+        gv: Option<&fluree_db_binary_index::TermView>,
+    ) -> Result<bool> {
+        if let [var] = self.shared_vars.as_slice() {
+            let Some(binding) = input_batch.column(*var).map(|col| &col[row_idx]) else {
+                return Ok(false);
+            };
+            if let Binding::EncodedSid { s_id, .. } = binding {
+                return Ok(self.minus_subjects.contains(s_id));
+            }
+            if !binding.is_matchable() {
+                return Ok(false);
+            }
+            let key = normalize_for_key_cow(binding, dicts, gv)?;
+            if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
+                return Ok(self.minus_subjects.contains(s_id));
+            }
+            probe.0.clear();
+            probe.0.push(key.into_owned());
+            return Ok(self.minus_hash.contains(probe));
+        }
+        // Extract input shared-var bindings
+        input_bindings.clear();
+        let mut input_has_wildcard = false;
+
+        for &var in &self.shared_vars {
+            let binding = input_batch.column(var).map(|col| &col[row_idx]);
+            match binding {
+                Some(b) if b.is_matchable() => {
+                    input_bindings.push(Some(normalize_for_key(b, dicts, gv)?));
+                }
+                _ => {
+                    input_bindings.push(None);
+                    input_has_wildcard = true;
+                }
+            }
+        }
+
+        if !input_has_wildcard {
+            // Common case: all input shared vars are matchable.
+            // Hash probe against minus_hash — O(1).
+            probe.0.clear();
+            probe.0.extend(
+                input_bindings
+                    .iter_mut()
+                    .map(|opt| opt.take().expect("checked: no wildcard")),
+            );
+            if self.minus_hash.contains(probe) {
+                return Ok(true);
+            }
+
+            // Check wildcard minus rows — O(W), W typically 0. A wildcard
+            // minus row matches if every matchable position equals the input.
+            if self.minus_wildcards.is_empty() {
+                return Ok(false);
+            }
+            input_bindings.clear();
+            input_bindings.extend(probe.0.iter().cloned().map(Some));
+            for wc_row in &self.minus_wildcards {
+                if wildcard_matches(input_bindings, wc_row) {
+                    return Ok(true);
+                }
+            }
+        } else {
+            // Rare: input has unbound shared var(s).
+            // Must linear-scan both sets for partial matching.
+
+            // Check minus_hash entries
+            for entry in &self.minus_hash {
+                if matches_partial(input_bindings, &entry.0) {
+                    return Ok(true);
+                }
+            }
+
+            // Check wildcard minus rows
+            for wc_row in &self.minus_wildcards {
+                if wildcard_matches(input_bindings, wc_row) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+/// Check if an input row matches a wildcard minus row.
+///
+/// Both vecs are ordered by shared_vars. `minus_row` has `None` for unbound positions.
+/// Match fires if: compatible on all positions AND at least one position is bound on both sides.
+fn wildcard_matches(input: &[Option<Binding>], minus_row: &[Option<Binding>]) -> bool {
+    let mut has_shared_bound = false;
+
+    for (i_opt, m_opt) in input.iter().zip(minus_row.iter()) {
+        if let (Some(i), Some(m)) = (i_opt, m_opt) {
+            // Both bound: must be equal
+            if i != m {
+                return false;
+            }
+            has_shared_bound = true;
+        }
+        // One or both unbound: trivially compatible, doesn't count as shared bound
+    }
+
+    has_shared_bound
+}
+
+/// Check if a partially-bound input matches a fully-bound minus entry.
+///
+/// `input` has `None` for unbound positions, `minus_bindings` are all matchable.
+fn matches_partial(input: &[Option<Binding>], minus_bindings: &[Binding]) -> bool {
+    let mut has_shared_bound = false;
+
+    for (i_opt, m) in input.iter().zip(minus_bindings.iter()) {
+        match i_opt {
+            Some(i) => {
+                if i != m {
+                    return false;
+                }
+                has_shared_bound = true;
+            }
+            None => {
+                // Input unbound: trivially compatible
+            }
+        }
+    }
+
+    has_shared_bound
+}
+
+/// Check if two rows match on shared variables (free function for testing).
+///
+/// Preserves the original `rows_match` semantics for unit tests.
+#[cfg(test)]
+fn rows_match(
+    shared_vars: &[VarId],
+    input_batch: &Batch,
+    input_row_idx: usize,
+    minus_batch: &Batch,
+    minus_row_idx: usize,
+) -> bool {
+    let mut has_shared_bound = false;
+
+    let compatible = shared_vars.iter().all(|&var| {
+        let input_binding = input_batch.column(var).map(|col| &col[input_row_idx]);
+        let minus_binding = minus_batch.column(var).map(|col| &col[minus_row_idx]);
+
+        match (input_binding, minus_binding) {
+            (Some(i), Some(m)) if i.is_matchable() && m.is_matchable() => {
+                has_shared_bound = true;
+                i == m
+            }
+            _ => true,
+        }
+    });
+
+    compatible && has_shared_bound
+}
+
+#[async_trait]
+impl Operator for MinusOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — MINUS is an anti-join whose output
+    /// is a SUBSET of the primary (each primary row emits 0 or 1), so a finite
+    /// budget on the primary can under-produce (the excluded rows don't count
+    /// toward `k`). This is the SAME reasoning the inner nested-loop join uses to
+    /// absorb rather than forward (`join.rs`). NOTE: this DEVIATES from the item's
+    /// brief ("MINUS forwards to primary"), on soundness grounds — see the audit
+    /// implementation log. Explicit (was a silent trait-default no-op).
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "MINUS row-budget swallowed (unsound: anti-join output ⊆ primary, multiplicity ≤1)"
+        );
+    }
+
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.minus_subjects.clear();
+        self.minus_hash.clear();
+        self.minus_wildcards.clear();
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
+        // Materialize the MINUS subtree once with an empty seed (fresh scope).
+        // MINUS is always uncorrelated — the subtree doesn't see outer variables.
+        if !self.shared_vars.is_empty() {
+            // Only the shared variables are compared, so the subtree need
+            // not carry any other column. No explicit seed is needed for a
+            // fresh scope: it would turn the first scan into an unnecessary
+            // nested-loop join and prevent ordinary star planning.
+            let mut minus_op = build_where_operators_seeded(
+                None,
+                &self.minus_patterns,
+                self.stats.clone(),
+                Some(&self.shared_vars),
+                &self.planning,
+            )?;
+
+            minus_op.open(ctx).await?;
+
+            let build: Result<()> = async {
+                loop {
+                    ctx.checkpoint()?;
+                    let Some(batch) = minus_op.next_batch(ctx).await? else {
+                        break;
+                    };
+                    let before = (
+                        self.minus_subjects.len(),
+                        self.minus_hash.len(),
+                        self.minus_wildcards.len(),
+                    );
+                    self.index_minus_batch(&batch)?;
+                    // Approximate retained keys, excluding table slack and
+                    // shared payloads, charged only when the index grows.
+                    let tuple_bytes = std::mem::size_of::<MinusKey>()
+                        + self.shared_vars.len() * std::mem::size_of::<Binding>();
+                    let wildcard_bytes = std::mem::size_of::<Vec<Option<Binding>>>()
+                        + self.shared_vars.len() * std::mem::size_of::<Option<Binding>>();
+                    ctx.record_alloc(
+                        (self.minus_subjects.len() - before.0) * std::mem::size_of::<u64>()
+                            + (self.minus_hash.len() - before.1) * tuple_bytes
+                            + (self.minus_wildcards.len() - before.2) * wildcard_bytes,
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            minus_op.close();
+            build?;
+            tracing::debug!(
+                subject_keys = self.minus_subjects.len(),
+                tuple_keys = self.minus_hash.len(),
+                wildcard_rows = self.minus_wildcards.len(),
+                "minus index built"
+            );
+        }
+
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+
+        loop {
+            ctx.checkpoint()?;
+            // Get next batch from child
+            let input_batch = match self.child.next_batch(ctx).await? {
+                Some(b) if !b.is_empty() => b,
+                Some(_) => continue, // Skip empty batches
+                None => {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                }
+            };
+
+            if self.keeps_all() {
+                return Ok(Some(input_batch));
+            }
+
+            let keep = self.keep_mask(&input_batch)?;
+            if let Some(kept) = input_batch.filter_rows(&keep) {
+                return Ok(Some(kept));
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.minus_subjects.clear();
+        self.minus_hash.clear();
+        self.minus_wildcards.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        // Could be 0 to child rows, return child estimate as upper bound
+        self.child.estimated_rows()
+    }
+
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        let mut count: u64 = 0;
+        loop {
+            ctx.checkpoint()?;
+            match self.child.next_batch(ctx).await? {
+                Some(batch) if !batch.is_empty() => {
+                    let kept = if self.keeps_all() {
+                        batch.len()
+                    } else {
+                        self.keep_mask(&batch)?.iter().filter(|&&k| k).count()
+                    };
+                    count = count.checked_add(kept as u64).ok_or_else(|| {
+                        QueryError::execution("COUNT(*) overflow in MINUS drain_count")
+                    })?;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        self.state = OperatorState::Exhausted;
+        Ok(Some(count))
+    }
+}
+
+/// Collect all variables referenced in a list of patterns
+fn collect_vars_from_patterns(patterns: &[Pattern], vars: &mut HashSet<VarId>) {
+    for p in patterns {
+        for v in p.referenced_vars() {
+            vars.insert(v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::triple::{Ref, Term, TriplePattern};
+    use fluree_db_core::Sid;
+
+    #[test]
+    fn test_shared_vars_computation() {
+        // Create a child with schema [?s, ?name]
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let child: BoxedOperator = Box::new(TestEmptyWithSchema {
+            schema: child_schema,
+        });
+
+        // MINUS pattern references ?s and ?age
+        let minus_patterns = vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)), // ?s - shared
+            Ref::Sid(Sid::new(100, "age")),
+            Term::Var(VarId(2)), // ?age - not shared
+        ))];
+
+        let op = MinusOperator::new(
+            child,
+            minus_patterns,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+
+        // Only ?s should be shared
+        assert_eq!(op.shared_vars.len(), 1);
+        assert!(op.shared_vars.contains(&VarId(0)));
+    }
+
+    #[test]
+    fn test_minus_schema_preserved() {
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let child: BoxedOperator = Box::new(TestEmptyWithSchema {
+            schema: child_schema.clone(),
+        });
+
+        let op = MinusOperator::new(
+            child,
+            vec![],
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+
+        // Output schema should match child schema
+        assert_eq!(op.schema(), &*child_schema);
+    }
+
+    // Helper struct for testing
+    struct TestEmptyWithSchema {
+        schema: Arc<[VarId]>,
+    }
+
+    #[async_trait]
+    impl Operator for TestEmptyWithSchema {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(None)
+        }
+
+        fn close(&mut self) {}
+    }
+
+    /// Helper: build a MinusOperator with a given child schema and shared vars
+    fn make_minus_with_shared(shared: Vec<VarId>) -> MinusOperator {
+        let child_schema: Arc<[VarId]> = Arc::from(shared.clone().into_boxed_slice());
+        let child: BoxedOperator = Box::new(TestEmptyWithSchema {
+            schema: child_schema.clone(),
+        });
+        MinusOperator {
+            child,
+            minus_patterns: vec![],
+            shared_vars: shared,
+            schema: child_schema,
+            state: OperatorState::Created,
+            stats: None,
+            planning: crate::temporal_mode::PlanningContext::current(),
+            minus_hash: FxHashSet::default(),
+            minus_subjects: FxHashSet::default(),
+            minus_wildcards: Vec::new(),
+            norm: None,
+        }
+    }
+
+    /// Helper: build a 1-row Batch with given bindings
+    fn batch_1row(schema: &[VarId], bindings: Vec<Binding>) -> Batch {
+        let arc_schema: Arc<[VarId]> = Arc::from(schema.to_vec().into_boxed_slice());
+        let columns: Vec<Vec<Binding>> = bindings.into_iter().map(|b| vec![b]).collect();
+        Batch::new(arc_schema, columns).unwrap()
+    }
+
+    #[test]
+    fn single_key_index_matches_compatibility_for_ids_and_other_terms() {
+        let shared = [VarId(0)];
+        let right = [
+            Binding::encoded_sid(7),
+            Binding::EncodedSid {
+                s_id: 7,
+                t: Some(23),
+                op: Some(false),
+            },
+            Binding::lit(fluree_db_core::FlakeValue::Long(7), Sid::xsd_integer()),
+            Binding::sid(Sid::new(100, "decoded")),
+            Binding::Unbound,
+            Binding::Poisoned,
+        ];
+        let batches: Vec<_> = right
+            .iter()
+            .map(|b| batch_1row(&shared, vec![b.clone()]))
+            .collect();
+        let mut op = make_minus_with_shared(shared.to_vec());
+        op.build_hash_index(batches.clone());
+        assert_eq!(op.minus_subjects.len(), 1, "duplicate IDs share one entry");
+        assert_eq!(op.minus_hash.len(), 2, "other terms keep binding equality");
+        assert!(
+            op.minus_wildcards.is_empty(),
+            "unbound single keys cannot eliminate rows"
+        );
+        for binding in right
+            .into_iter()
+            .chain([Binding::encoded_sid(8), Binding::EncodedPid { p_id: 7 }])
+        {
+            let input = batch_1row(&shared, vec![binding]);
+            let expected = batches
+                .iter()
+                .any(|batch| rows_match(&shared, &input, 0, batch, 0));
+            assert_eq!(op.input_row_eliminated(&input, 0), expected, "{input:?}");
+        }
+        let mut op = make_minus_with_shared(shared.to_vec());
+        op.build_hash_index(vec![batch_1row(&shared, vec![Binding::encoded_sid(7)])]);
+        assert!(
+            !op.keeps_all(),
+            "the compact index participates in the empty-side check"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_index_checks_distinct_key_memory_and_cancellation() {
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation, QueryCancellationReason};
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        for (budget, cancelled) in [(16, false), (15, false), (16, true)] {
+            let cancellation = QueryCancellation::new();
+            cancellation.set_memory_limit(budget);
+            if cancelled {
+                cancellation.cancel_with(QueryCancellationReason::Timeout);
+            }
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+            let mut op = make_minus_with_shared(vec![VarId(0)]);
+            op.minus_patterns = vec![Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![
+                    vec![Binding::encoded_sid(1)],
+                    vec![Binding::encoded_sid(1)],
+                    vec![Binding::encoded_sid(2)],
+                ],
+            }];
+            let result = op.open(&ctx).await;
+            if cancelled {
+                assert!(matches!(result, Err(QueryError::Cancelled { .. })));
+            } else if budget == 15 {
+                assert!(matches!(
+                    result,
+                    Err(QueryError::MemoryBudgetExceeded { .. })
+                ));
+            } else {
+                result.unwrap();
+                assert_eq!(ctx.mem_used(), 16);
+                assert_eq!(op.minus_subjects.len(), 2);
+            }
+            op.close();
+            assert!(op.minus_subjects.is_empty());
+        }
+    }
+
+    #[test]
+    fn rows_match_both_bound_equal() {
+        let shared = vec![VarId(0)];
+        let sid = Sid::new(100, "x");
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(sid.clone())]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(sid)]);
+        assert!(rows_match(&shared, &input, 0, &minus, 0));
+    }
+
+    #[test]
+    fn rows_match_both_bound_unequal() {
+        let shared = vec![VarId(0)];
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(200, "y"))]);
+        assert!(!rows_match(&shared, &input, 0, &minus, 0));
+    }
+
+    #[test]
+    fn rows_match_input_unbound_trivially_compatible() {
+        // Input has Unbound, MINUS has a value — trivially compatible
+        // but no shared bound variables → match should NOT fire
+        let shared = vec![VarId(0)];
+        let input = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        assert!(
+            !rows_match(&shared, &input, 0, &minus, 0),
+            "no shared bound var → match must not fire"
+        );
+    }
+
+    #[test]
+    fn rows_match_minus_unbound_trivially_compatible() {
+        // MINUS has Unbound, input has a value — trivially compatible
+        // but no shared bound variables → match should NOT fire
+        let shared = vec![VarId(0)];
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        assert!(
+            !rows_match(&shared, &input, 0, &minus, 0),
+            "no shared bound var → match must not fire"
+        );
+    }
+
+    #[test]
+    fn rows_match_both_unbound() {
+        let shared = vec![VarId(0)];
+        let input = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        assert!(
+            !rows_match(&shared, &input, 0, &minus, 0),
+            "both unbound → no shared bound var → no match"
+        );
+    }
+
+    #[test]
+    fn rows_match_poisoned_trivially_compatible() {
+        // Poisoned (from failed OPTIONAL) is not in domain
+        let shared = vec![VarId(0)];
+        let input = batch_1row(&[VarId(0)], vec![Binding::Poisoned]);
+        let minus = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        assert!(
+            !rows_match(&shared, &input, 0, &minus, 0),
+            "poisoned is not matchable → no shared bound var"
+        );
+    }
+
+    #[test]
+    fn rows_match_multi_var_one_unbound_one_equal() {
+        // Two shared vars: var0 is bound+equal, var1 has input Unbound
+        // Compatible (unbound is trivially ok) AND has shared bound (var0)
+        let shared = vec![VarId(0), VarId(1)];
+        let sid = Sid::new(100, "x");
+        let input = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid.clone()), Binding::Unbound],
+        );
+        let minus = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(200, "y"))],
+        );
+        assert!(
+            rows_match(&shared, &input, 0, &minus, 0),
+            "var0 is shared+equal, var1 unbound in input → compatible + has_shared_bound"
+        );
+    }
+
+    #[test]
+    fn rows_match_multi_var_one_equal_one_unequal() {
+        // Two shared vars: var0 bound+equal, var1 bound+unequal → NOT compatible
+        let shared = vec![VarId(0), VarId(1)];
+        let sid = Sid::new(100, "x");
+        let input = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid.clone()), Binding::sid(Sid::new(300, "a"))],
+        );
+        let minus = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(400, "b"))],
+        );
+        assert!(
+            !rows_match(&shared, &input, 0, &minus, 0),
+            "var1 disagrees → incompatible"
+        );
+    }
+
+    // === Hash-probe specific tests ===
+
+    #[test]
+    fn hash_index_fully_bound_rows_go_to_hash() {
+        let mut op = make_minus_with_shared(vec![VarId(0), VarId(1)]);
+        let batch = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![
+                Binding::sid(Sid::new(100, "x")),
+                Binding::sid(Sid::new(200, "y")),
+            ],
+        );
+        op.build_hash_index(vec![batch]);
+        assert_eq!(op.minus_hash.len(), 1);
+        assert!(op.minus_wildcards.is_empty());
+    }
+
+    #[test]
+    fn hash_index_unbound_rows_go_to_wildcards() {
+        let mut op = make_minus_with_shared(vec![VarId(0), VarId(1)]);
+        let batch = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound],
+        );
+        op.build_hash_index(vec![batch]);
+        assert!(op.minus_hash.is_empty());
+        assert_eq!(op.minus_wildcards.len(), 1);
+    }
+
+    #[test]
+    fn input_row_eliminated_hash_hit() {
+        let mut op = make_minus_with_shared(vec![VarId(0)]);
+        let sid = Sid::new(100, "x");
+        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::sid(sid.clone())]);
+        op.build_hash_index(vec![minus_batch]);
+
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(sid)]);
+        assert!(op.input_row_eliminated(&input, 0));
+    }
+
+    #[test]
+    fn input_row_eliminated_hash_miss() {
+        let mut op = make_minus_with_shared(vec![VarId(0)]);
+        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(100, "x"))]);
+        op.build_hash_index(vec![minus_batch]);
+
+        let input = batch_1row(&[VarId(0)], vec![Binding::sid(Sid::new(200, "y"))]);
+        assert!(!op.input_row_eliminated(&input, 0));
+    }
+
+    #[test]
+    fn input_row_eliminated_wildcard_minus_match() {
+        // Minus row has unbound var1, input is fully bound.
+        // Shared vars: [var0, var1]. Minus has var0=x, var1=unbound.
+        // Input has var0=x, var1=anything → should match (var0 equal, var1 wildcard).
+        let mut op = make_minus_with_shared(vec![VarId(0), VarId(1)]);
+        let sid = Sid::new(100, "x");
+        let minus_batch = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid.clone()), Binding::Unbound],
+        );
+        op.build_hash_index(vec![minus_batch]);
+
+        let input = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid), Binding::sid(Sid::new(200, "y"))],
+        );
+        assert!(
+            op.input_row_eliminated(&input, 0),
+            "wildcard minus row should match fully-bound input"
+        );
+    }
+
+    #[test]
+    fn input_row_eliminated_input_unbound_vs_hash() {
+        // Input has unbound var, minus is fully bound.
+        // var0: input=x, minus=x (match). var1: input=unbound → compatible.
+        // Has shared bound (var0) → eliminated.
+        let mut op = make_minus_with_shared(vec![VarId(0), VarId(1)]);
+        let sid = Sid::new(100, "x");
+        let minus_batch = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid.clone()), Binding::sid(Sid::new(200, "y"))],
+        );
+        op.build_hash_index(vec![minus_batch]);
+
+        let input = batch_1row(
+            &[VarId(0), VarId(1)],
+            vec![Binding::sid(sid), Binding::Unbound],
+        );
+        assert!(
+            op.input_row_eliminated(&input, 0),
+            "input unbound var → partial match should work"
+        );
+    }
+
+    #[test]
+    fn input_row_eliminated_all_unbound_no_match() {
+        // Both sides all unbound → no shared bound var → no elimination.
+        let mut op = make_minus_with_shared(vec![VarId(0)]);
+        let minus_batch = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        op.build_hash_index(vec![minus_batch]);
+
+        let input = batch_1row(&[VarId(0)], vec![Binding::Unbound]);
+        assert!(
+            !op.input_row_eliminated(&input, 0),
+            "both unbound → no shared bound var → no elimination"
+        );
+    }
+}

@@ -1,0 +1,1314 @@
+//! SPARQL expression parsing.
+//!
+//! This module implements expression parsing with proper operator precedence.
+//!
+//! ## SPARQL Expression Precedence (lowest to highest)
+//!
+//! 1. `||` (OR)
+//! 2. `&&` (AND)
+//! 3. `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `NOT IN`
+//! 4. `+`, `-` (additive)
+//! 5. `*`, `/` (multiplicative)
+//! 6. `+`, `-`, `!` (unary)
+//! 7. Primary expressions (literals, variables, function calls, parenthesized)
+
+use crate::ast::annotation::TripleTerm;
+use crate::ast::expr::{AggregateFunction, BinaryOp, Expression, FunctionName, UnaryOp};
+use crate::ast::pattern::GraphPattern;
+use crate::ast::term::{Iri, IriValue, Literal, PredicateTerm, SubjectTerm, Term, Var};
+use crate::lex::TokenKind;
+use crate::parse::stream::TokenStream;
+use crate::span::SourceSpan;
+use std::sync::Arc;
+
+/// Parse a SPARQL expression.
+///
+/// This is the main entry point for expression parsing.
+///
+/// Recursion-guarded: parenthesized expressions and function arguments
+/// re-enter here from `parse_primary_expr`, so each expression nesting
+/// level counts against the stream's depth ceiling.
+pub fn parse_expression(tokens: &mut TokenStream) -> Result<Expression, String> {
+    tokens.with_recursion_guard(parse_or_expr)
+}
+
+/// Parse an OR expression: expr1 || expr2
+fn parse_or_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+    let mut left = parse_and_expr(tokens)?;
+
+    while tokens.check(&TokenKind::Or) {
+        tokens.advance(); // consume ||
+        let right = parse_and_expr(tokens)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        left = Expression::binary(BinaryOp::Or, left, right, span);
+    }
+
+    Ok(left)
+}
+
+/// Parse an AND expression: expr1 && expr2
+fn parse_and_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+    let mut left = parse_relational_expr(tokens)?;
+
+    while tokens.check(&TokenKind::And) {
+        tokens.advance(); // consume &&
+        let right = parse_relational_expr(tokens)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        left = Expression::binary(BinaryOp::And, left, right, span);
+    }
+
+    Ok(left)
+}
+
+/// Parse a relational expression: =, !=, <, <=, >, >=, IN, NOT IN
+fn parse_relational_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+    let mut left = parse_additive_expr(tokens)?;
+
+    loop {
+        let op = if tokens.check(&TokenKind::Eq) {
+            tokens.advance();
+            Some(BinaryOp::Eq)
+        } else if tokens.check(&TokenKind::Ne) {
+            tokens.advance();
+            Some(BinaryOp::Ne)
+        } else if tokens.check(&TokenKind::Lt) {
+            tokens.advance();
+            Some(BinaryOp::Lt)
+        } else if tokens.check(&TokenKind::Le) {
+            tokens.advance();
+            Some(BinaryOp::Le)
+        } else if tokens.check(&TokenKind::Gt) {
+            tokens.advance();
+            Some(BinaryOp::Gt)
+        } else if tokens.check(&TokenKind::Ge) {
+            tokens.advance();
+            Some(BinaryOp::Ge)
+        } else {
+            None
+        };
+
+        if let Some(op) = op {
+            let right = parse_additive_expr(tokens)?;
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            left = Expression::binary(op, left, right, span);
+        } else if tokens.check_keyword(TokenKind::KwIn) {
+            // IN (expr, expr, ...)
+            tokens.advance(); // consume IN
+            let list = parse_expression_list(tokens)?;
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            left = Expression::In {
+                expr: Box::new(left),
+                list,
+                negated: false,
+                span,
+            };
+        } else if tokens.check_keyword(TokenKind::KwNot) {
+            // Check for NOT IN
+            let saved_pos = tokens.position();
+            tokens.advance(); // consume NOT
+            if tokens.check_keyword(TokenKind::KwIn) {
+                tokens.advance(); // consume IN
+                let list = parse_expression_list(tokens)?;
+                let span = SourceSpan::new(start, tokens.previous_span().end);
+                left = Expression::In {
+                    expr: Box::new(left),
+                    list,
+                    negated: true,
+                    span,
+                };
+            } else {
+                // Backtrack - this NOT belongs to something else
+                tokens.restore(saved_pos);
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(left)
+}
+
+/// Parse an additive expression: +, -
+fn parse_additive_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+    let mut left = parse_multiplicative_expr(tokens)?;
+
+    loop {
+        let op = if tokens.check(&TokenKind::Plus) {
+            tokens.advance();
+            Some(BinaryOp::Add)
+        } else if tokens.check(&TokenKind::Minus) {
+            tokens.advance();
+            Some(BinaryOp::Sub)
+        } else {
+            None
+        };
+
+        if let Some(op) = op {
+            let right = parse_multiplicative_expr(tokens)?;
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            left = Expression::binary(op, left, right, span);
+        } else {
+            break;
+        }
+    }
+
+    Ok(left)
+}
+
+/// Parse a multiplicative expression: *, /
+fn parse_multiplicative_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+    let mut left = parse_unary_expr(tokens)?;
+
+    loop {
+        let op = if tokens.check(&TokenKind::Star) {
+            tokens.advance();
+            Some(BinaryOp::Mul)
+        } else if tokens.check(&TokenKind::Slash) {
+            tokens.advance();
+            Some(BinaryOp::Div)
+        } else {
+            None
+        };
+
+        if let Some(op) = op {
+            let right = parse_unary_expr(tokens)?;
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            left = Expression::binary(op, left, right, span);
+        } else {
+            break;
+        }
+    }
+
+    Ok(left)
+}
+
+/// Parse a unary expression: !, +, -
+///
+/// Recursion-guarded: stacked unary operators (`!!x`, `--x`) self-recurse
+/// without passing through `parse_expression`, so each operator counts one
+/// nesting level against the stream's depth ceiling.
+fn parse_unary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+
+    let op = if tokens.check(&TokenKind::Bang) {
+        tokens.advance();
+        Some(UnaryOp::Not)
+    } else if tokens.check(&TokenKind::Plus) {
+        tokens.advance();
+        Some(UnaryOp::Pos)
+    } else if tokens.check(&TokenKind::Minus) {
+        tokens.advance();
+        Some(UnaryOp::Neg)
+    } else {
+        None
+    };
+
+    if let Some(op) = op {
+        let operand = tokens.with_recursion_guard(parse_unary_expr)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        Ok(Expression::unary(op, operand, span))
+    } else {
+        parse_primary_expr(tokens)
+    }
+}
+
+/// Parse a primary expression.
+fn parse_primary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
+    let start = tokens.current_span().start;
+
+    // Parenthesized expression
+    if tokens.check(&TokenKind::LParen) {
+        tokens.advance(); // consume (
+        let inner = parse_expression(tokens)?;
+        if !tokens.check(&TokenKind::RParen) {
+            return Err(format!(
+                "Expected ')' at position {}",
+                tokens.current_span().start
+            ));
+        }
+        tokens.advance(); // consume )
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Expression::Bracketed {
+            inner: Box::new(inner),
+            span,
+        });
+    }
+
+    // Variable
+    if let Some((name, var_span)) = tokens.consume_var() {
+        return Ok(Expression::Var(Var::new(name, var_span)));
+    }
+
+    // Literals
+    if let Some(expr) = try_parse_literal(tokens)? {
+        return Ok(expr);
+    }
+
+    // Keywords: EXISTS, NOT EXISTS, BOUND, etc.
+    if let Some(expr) = try_parse_keyword_expr(tokens)? {
+        return Ok(expr);
+    }
+
+    // RDF 1.2 triple term value `<<( s p o )>>` used as an expression
+    // (`BIND(<<( … )>> AS ?t)`, `FILTER`). It is the SPARQL 1.2
+    // `TRIPLE(s, p, o)` constructor, so it flows through the same
+    // accept-then-defer path (D-1). It is parsed *structurally* by the
+    // query parser — never as three sub-expressions — so a path
+    // (`:p/:q`), collection, reified triple, or blank node inside is
+    // rejected rather than misread (e.g. `/` as division). Note `<<` is
+    // deliberately NOT accepted here: reifiers are not expressions
+    // (negative `bind-reified` / `bind-anonreified`).
+    if tokens.check(&TokenKind::TripleTermStart) {
+        let tt = super::query::parse_triple_term_value(tokens)?;
+        return triple_term_to_expr(tt);
+    }
+
+    // Full IRI - could be function call or just an IRI
+    if let Some((iri_str, iri_span)) = tokens.consume_iri() {
+        let iri = Iri::full(iri_str, iri_span);
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
+            // Function call with IRI (`ArgList ::= NIL | '(' … ')'` — an
+            // empty arg list `()` lexes as a single Nil token)
+            return parse_function_call_with_iri(tokens, iri, start);
+        }
+        return Ok(Expression::iri(iri));
+    }
+
+    // Prefixed name - could be function call or just IRI
+    if let Some((prefix, local, pn_span)) = tokens.consume_prefixed_name() {
+        let iri = Iri {
+            value: IriValue::Prefixed { prefix, local },
+            span: pn_span,
+        };
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
+            // Function call with prefixed IRI (Nil = empty arg list)
+            return parse_function_call_with_iri(tokens, iri, start);
+        }
+        return Ok(Expression::iri(iri));
+    }
+
+    // PrefixedNameNs (just namespace, no local part) - like "ex:"
+    if let Some((prefix, ns_span)) = tokens.consume_prefixed_name_ns() {
+        let iri = Iri {
+            value: IriValue::Prefixed {
+                prefix,
+                local: Arc::from(""),
+            },
+            span: ns_span,
+        };
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
+            return parse_function_call_with_iri(tokens, iri, start);
+        }
+        return Ok(Expression::iri(iri));
+    }
+
+    Err(format!(
+        "Expected expression at position {}",
+        tokens.current_span().start
+    ))
+}
+
+/// Try to parse a literal expression.
+fn try_parse_literal(tokens: &mut TokenStream) -> Result<Option<Expression>, String> {
+    // Integer literal
+    if let Some((value, span)) = tokens.consume_integer() {
+        return Ok(Some(Expression::Literal(Literal::integer(value, span))));
+    }
+
+    // Integer literal past i64. A distinct token from the lexer, so it needs
+    // its own arm here; the sign, if any, is the unary operator above.
+    if let Some((value, span)) = tokens.consume_big_integer() {
+        return Ok(Some(Expression::Literal(Literal::big_integer(value, span))));
+    }
+
+    // Decimal literal
+    if let Some((value, span)) = tokens.consume_decimal() {
+        return Ok(Some(Expression::Literal(Literal::decimal(value, span))));
+    }
+
+    // Double literal
+    if let Some((value, span)) = tokens.consume_double() {
+        return Ok(Some(Expression::Literal(Literal::double(value, span))));
+    }
+
+    // String literal (with possible language tag or datatype)
+    if let Some((value, span)) = tokens.consume_string() {
+        // Check for language tag
+        if let Some((lang, lang_span)) = tokens.consume_lang_tag() {
+            let full_span = SourceSpan::new(span.start, lang_span.end);
+            return Ok(Some(Expression::Literal(Literal::lang_string(
+                value, lang, full_span,
+            ))));
+        }
+
+        // Check for datatype (^^)
+        if tokens.check(&TokenKind::DoubleCaret) {
+            tokens.advance(); // consume ^^
+
+            // Parse datatype IRI
+            if let Some((dt_str, dt_span)) = tokens.consume_iri() {
+                let dt_iri = Iri::full(dt_str, dt_span);
+                let full_span = SourceSpan::new(span.start, dt_span.end);
+                return Ok(Some(Expression::Literal(Literal::typed(
+                    value, dt_iri, full_span,
+                ))));
+            } else if let Some((prefix, local, dt_span)) = tokens.consume_prefixed_name() {
+                let dt_iri = Iri {
+                    value: IriValue::Prefixed { prefix, local },
+                    span: dt_span,
+                };
+                let full_span = SourceSpan::new(span.start, dt_span.end);
+                return Ok(Some(Expression::Literal(Literal::typed(
+                    value, dt_iri, full_span,
+                ))));
+            }
+            return Err("Expected datatype IRI after '^^'".to_string());
+        }
+
+        // Simple string literal
+        return Ok(Some(Expression::Literal(Literal::string(value, span))));
+    }
+
+    // Boolean literal
+    if tokens.check_keyword(TokenKind::KwTrue) {
+        let span = tokens.current_span();
+        tokens.advance();
+        return Ok(Some(Expression::Literal(Literal::boolean(true, span))));
+    }
+    if tokens.check_keyword(TokenKind::KwFalse) {
+        let span = tokens.current_span();
+        tokens.advance();
+        return Ok(Some(Expression::Literal(Literal::boolean(false, span))));
+    }
+
+    Ok(None)
+}
+
+/// Try to parse a keyword-based expression (EXISTS, NOT EXISTS, BOUND, IF, etc.)
+fn try_parse_keyword_expr(tokens: &mut TokenStream) -> Result<Option<Expression>, String> {
+    let start = tokens.current_span().start;
+
+    // EXISTS { pattern }
+    if tokens.check_keyword(TokenKind::KwExists) {
+        tokens.advance();
+        let pattern = parse_group_pattern_for_exists(tokens)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::Exists {
+            pattern: Box::new(pattern),
+            span,
+        }));
+    }
+
+    // NOT EXISTS { pattern }
+    if tokens.check_keyword(TokenKind::KwNot) {
+        let saved_pos = tokens.position();
+        tokens.advance();
+        if tokens.check_keyword(TokenKind::KwExists) {
+            tokens.advance();
+            let pattern = parse_group_pattern_for_exists(tokens)?;
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            return Ok(Some(Expression::NotExists {
+                pattern: Box::new(pattern),
+                span,
+            }));
+        }
+        // Backtrack - NOT is unary operator, handled elsewhere
+        tokens.restore(saved_pos);
+        return Ok(None);
+    }
+
+    // BOUND(?var)
+    if tokens.check_keyword(TokenKind::KwBound) {
+        tokens.advance();
+        if !tokens.check(&TokenKind::LParen) {
+            return Err("Expected '(' after BOUND".to_string());
+        }
+        tokens.advance();
+        if let Some((name, var_span)) = tokens.consume_var() {
+            let var = Var::new(name, var_span);
+            if !tokens.check(&TokenKind::RParen) {
+                return Err("Expected ')' after BOUND(?var)".to_string());
+            }
+            tokens.advance();
+            let span = SourceSpan::new(start, tokens.previous_span().end);
+            return Ok(Some(Expression::FunctionCall {
+                name: FunctionName::Bound,
+                args: vec![Expression::Var(var)],
+                distinct: false,
+                span,
+            }));
+        }
+        return Err("Expected variable in BOUND()".to_string());
+    }
+
+    // IF(cond, then, else)
+    if tokens.check_keyword(TokenKind::KwIf) {
+        tokens.advance();
+        if !tokens.check(&TokenKind::LParen) {
+            return Err("Expected '(' after IF".to_string());
+        }
+        tokens.advance();
+        let condition = parse_expression(tokens)?;
+        if !tokens.check(&TokenKind::Comma) {
+            return Err("Expected ',' in IF expression".to_string());
+        }
+        tokens.advance();
+        let then_expr = parse_expression(tokens)?;
+        if !tokens.check(&TokenKind::Comma) {
+            return Err("Expected ',' in IF expression".to_string());
+        }
+        tokens.advance();
+        let else_expr = parse_expression(tokens)?;
+        if !tokens.check(&TokenKind::RParen) {
+            return Err("Expected ')' after IF expression".to_string());
+        }
+        tokens.advance();
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::If {
+            condition: Box::new(condition),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+            span,
+        }));
+    }
+
+    // COALESCE(expr, expr, ...)
+    if tokens.check_keyword(TokenKind::KwCoalesce) {
+        tokens.advance();
+        let args = parse_expression_list(tokens)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::Coalesce { args, span }));
+    }
+
+    // Aggregate functions: COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT, SAMPLE
+    if let Some(agg) = check_aggregate_keyword(tokens) {
+        return parse_aggregate_expr(tokens, agg, start).map(Some);
+    }
+
+    // Built-in functions that look like keywords
+    if let Some(func_name) = check_builtin_function_keyword(tokens) {
+        tokens.advance();
+        let args = parse_expression_list(tokens)?;
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::FunctionCall {
+            name: func_name,
+            args,
+            distinct: false,
+            span,
+        }));
+    }
+
+    // SPARQL 1.2 triple-term builtins (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE).
+    // These are contextual function-call identifiers (not reserved keywords):
+    // the lexer emits a `TripleTermFn` token carrying the name, and we resolve
+    // + arity-validate it here. Lowering rejects them with `not_implemented`
+    // (burn-down decision D-1, accept-then-defer).
+    if let Some((name, _span)) = tokens.consume_triple_term_fn() {
+        let func_name = FunctionName::parse(&name)
+            .expect("lexer only emits TripleTermFn for known builtin names");
+        let args = parse_expression_list(tokens)?;
+        let arity = triple_term_fn_arity(&func_name);
+        if args.len() != arity {
+            return Err(format!(
+                "{name} expects {arity} argument{}, got {}",
+                if arity == 1 { "" } else { "s" },
+                args.len()
+            ));
+        }
+        let span = SourceSpan::new(start, tokens.previous_span().end);
+        return Ok(Some(Expression::FunctionCall {
+            name: func_name,
+            args,
+            distinct: false,
+            span,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Fixed arity of a SPARQL 1.2 triple-term builtin. `TRIPLE(s,p,o)` takes
+/// three arguments; `SUBJECT`/`PREDICATE`/`OBJECT`/`isTRIPLE` each take one.
+fn triple_term_fn_arity(name: &FunctionName) -> usize {
+    match name {
+        FunctionName::Triple => 3,
+        FunctionName::Subject
+        | FunctionName::Predicate
+        | FunctionName::Object
+        | FunctionName::IsTriple => 1,
+        // Only the five triple-term builtins may be routed here; a silent `1`
+        // for anything else would mis-validate a future caller's arity.
+        other => {
+            debug_assert!(
+                false,
+                "triple_term_fn_arity called with a non-triple-term builtin: {other:?}"
+            );
+            1
+        }
+    }
+}
+
+/// Check if current token is an aggregate keyword.
+fn check_aggregate_keyword(tokens: &TokenStream) -> Option<AggregateFunction> {
+    if tokens.check_keyword(TokenKind::KwCount) {
+        Some(AggregateFunction::Count)
+    } else if tokens.check_keyword(TokenKind::KwSum) {
+        Some(AggregateFunction::Sum)
+    } else if tokens.check_keyword(TokenKind::KwAvg) {
+        Some(AggregateFunction::Avg)
+    } else if tokens.check_keyword(TokenKind::KwMin) {
+        Some(AggregateFunction::Min)
+    } else if tokens.check_keyword(TokenKind::KwMax) {
+        Some(AggregateFunction::Max)
+    } else if tokens.check_keyword(TokenKind::KwGroupConcat) {
+        Some(AggregateFunction::GroupConcat)
+    } else if tokens.check_keyword(TokenKind::KwSample) {
+        Some(AggregateFunction::Sample)
+    } else {
+        None
+    }
+}
+
+/// Check if current token is a built-in function keyword.
+fn check_builtin_function_keyword(tokens: &TokenStream) -> Option<FunctionName> {
+    // Type checking
+    if tokens.check_keyword(TokenKind::KwIsIri) {
+        return Some(FunctionName::IsIri);
+    }
+    if tokens.check_keyword(TokenKind::KwIsUri) {
+        return Some(FunctionName::IsUri);
+    }
+    if tokens.check_keyword(TokenKind::KwIsBlank) {
+        return Some(FunctionName::IsBlank);
+    }
+    if tokens.check_keyword(TokenKind::KwIsLiteral) {
+        return Some(FunctionName::IsLiteral);
+    }
+    if tokens.check_keyword(TokenKind::KwIsNumeric) {
+        return Some(FunctionName::IsNumeric);
+    }
+
+    // Accessors
+    if tokens.check_keyword(TokenKind::KwStr) {
+        return Some(FunctionName::Str);
+    }
+    if tokens.check_keyword(TokenKind::KwLang) {
+        return Some(FunctionName::Lang);
+    }
+    if tokens.check_keyword(TokenKind::KwDatatype) {
+        return Some(FunctionName::Datatype);
+    }
+
+    // Constructors
+    if tokens.check_keyword(TokenKind::KwIri) {
+        return Some(FunctionName::Iri);
+    }
+    if tokens.check_keyword(TokenKind::KwUri) {
+        return Some(FunctionName::Uri);
+    }
+    if tokens.check_keyword(TokenKind::KwBNode) {
+        return Some(FunctionName::BNode);
+    }
+
+    // String functions
+    if tokens.check_keyword(TokenKind::KwStrlen) {
+        return Some(FunctionName::Strlen);
+    }
+    if tokens.check_keyword(TokenKind::KwSubstr) {
+        return Some(FunctionName::Substr);
+    }
+    if tokens.check_keyword(TokenKind::KwUcase) {
+        return Some(FunctionName::Ucase);
+    }
+    if tokens.check_keyword(TokenKind::KwLcase) {
+        return Some(FunctionName::Lcase);
+    }
+    if tokens.check_keyword(TokenKind::KwStrStarts) {
+        return Some(FunctionName::StrStarts);
+    }
+    if tokens.check_keyword(TokenKind::KwStrEnds) {
+        return Some(FunctionName::StrEnds);
+    }
+    if tokens.check_keyword(TokenKind::KwContains) {
+        return Some(FunctionName::Contains);
+    }
+    if tokens.check_keyword(TokenKind::KwStrBefore) {
+        return Some(FunctionName::StrBefore);
+    }
+    if tokens.check_keyword(TokenKind::KwStrAfter) {
+        return Some(FunctionName::StrAfter);
+    }
+    if tokens.check_keyword(TokenKind::KwEncodeForUri) {
+        return Some(FunctionName::EncodeForUri);
+    }
+    if tokens.check_keyword(TokenKind::KwConcat) {
+        return Some(FunctionName::Concat);
+    }
+    if tokens.check_keyword(TokenKind::KwLangMatches) {
+        return Some(FunctionName::LangMatches);
+    }
+    if tokens.check_keyword(TokenKind::KwRegex) {
+        return Some(FunctionName::Regex);
+    }
+    if tokens.check_keyword(TokenKind::KwReplace) {
+        return Some(FunctionName::Replace);
+    }
+    if tokens.check_keyword(TokenKind::KwStrDt) {
+        return Some(FunctionName::StrDt);
+    }
+    if tokens.check_keyword(TokenKind::KwStrLang) {
+        return Some(FunctionName::StrLang);
+    }
+
+    // Numeric functions
+    if tokens.check_keyword(TokenKind::KwAbs) {
+        return Some(FunctionName::Abs);
+    }
+    if tokens.check_keyword(TokenKind::KwRound) {
+        return Some(FunctionName::Round);
+    }
+    if tokens.check_keyword(TokenKind::KwCeil) {
+        return Some(FunctionName::Ceil);
+    }
+    if tokens.check_keyword(TokenKind::KwFloor) {
+        return Some(FunctionName::Floor);
+    }
+    if tokens.check_keyword(TokenKind::KwRand) {
+        return Some(FunctionName::Rand);
+    }
+
+    // Date/time functions
+    if tokens.check_keyword(TokenKind::KwNow) {
+        return Some(FunctionName::Now);
+    }
+    if tokens.check_keyword(TokenKind::KwYear) {
+        return Some(FunctionName::Year);
+    }
+    if tokens.check_keyword(TokenKind::KwMonth) {
+        return Some(FunctionName::Month);
+    }
+    if tokens.check_keyword(TokenKind::KwDay) {
+        return Some(FunctionName::Day);
+    }
+    if tokens.check_keyword(TokenKind::KwHours) {
+        return Some(FunctionName::Hours);
+    }
+    if tokens.check_keyword(TokenKind::KwMinutes) {
+        return Some(FunctionName::Minutes);
+    }
+    if tokens.check_keyword(TokenKind::KwSeconds) {
+        return Some(FunctionName::Seconds);
+    }
+    if tokens.check_keyword(TokenKind::KwTimezone) {
+        return Some(FunctionName::Timezone);
+    }
+    if tokens.check_keyword(TokenKind::KwTz) {
+        return Some(FunctionName::Tz);
+    }
+
+    // Hash functions
+    if tokens.check_keyword(TokenKind::KwMd5) {
+        return Some(FunctionName::Md5);
+    }
+    if tokens.check_keyword(TokenKind::KwSha1) {
+        return Some(FunctionName::Sha1);
+    }
+    if tokens.check_keyword(TokenKind::KwSha256) {
+        return Some(FunctionName::Sha256);
+    }
+    if tokens.check_keyword(TokenKind::KwSha384) {
+        return Some(FunctionName::Sha384);
+    }
+    if tokens.check_keyword(TokenKind::KwSha512) {
+        return Some(FunctionName::Sha512);
+    }
+
+    // Other functions
+    if tokens.check_keyword(TokenKind::KwSameTerm) {
+        return Some(FunctionName::SameTerm);
+    }
+    if tokens.check_keyword(TokenKind::KwUuid) {
+        return Some(FunctionName::Uuid);
+    }
+    if tokens.check_keyword(TokenKind::KwStrUuid) {
+        return Some(FunctionName::StrUuid);
+    }
+
+    // Vector similarity functions
+    if tokens.check_keyword(TokenKind::KwDotProduct) {
+        return Some(FunctionName::DotProduct);
+    }
+    if tokens.check_keyword(TokenKind::KwCosineSimilarity) {
+        return Some(FunctionName::CosineSimilarity);
+    }
+    if tokens.check_keyword(TokenKind::KwEuclideanDistance) {
+        return Some(FunctionName::EuclideanDistance);
+    }
+    if tokens.check_keyword(TokenKind::KwFulltext) {
+        return Some(FunctionName::Fulltext);
+    }
+
+    None
+}
+
+/// Parse an aggregate expression.
+fn parse_aggregate_expr(
+    tokens: &mut TokenStream,
+    function: AggregateFunction,
+    start: usize,
+) -> Result<Expression, String> {
+    tokens.advance(); // consume aggregate keyword
+
+    if !tokens.check(&TokenKind::LParen) {
+        return Err(format!("Expected '(' after {}", function.as_str()));
+    }
+    tokens.advance();
+
+    // Check for DISTINCT
+    let distinct = if tokens.check_keyword(TokenKind::KwDistinct) {
+        tokens.advance();
+        true
+    } else {
+        false
+    };
+
+    // Check for * (COUNT(*))
+    let expr = if tokens.check(&TokenKind::Star) {
+        tokens.advance();
+        None
+    } else {
+        Some(Box::new(parse_expression(tokens)?))
+    };
+
+    // Check for separator (GROUP_CONCAT)
+    let separator = if function == AggregateFunction::GroupConcat {
+        if tokens.check(&TokenKind::Semicolon) {
+            tokens.advance();
+            // Expect SEPARATOR = "string"
+            if !tokens.check_keyword(TokenKind::KwSeparator) {
+                return Err("Expected SEPARATOR in GROUP_CONCAT".to_string());
+            }
+            tokens.advance();
+            if !tokens.check(&TokenKind::Eq) {
+                return Err("Expected '=' after SEPARATOR".to_string());
+            }
+            tokens.advance();
+            if let Some((sep_value, _)) = tokens.consume_string() {
+                Some(sep_value)
+            } else {
+                return Err("Expected string after SEPARATOR =".to_string());
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if !tokens.check(&TokenKind::RParen) {
+        return Err(format!(
+            "Expected ')' after {} expression",
+            function.as_str()
+        ));
+    }
+    tokens.advance();
+
+    let span = SourceSpan::new(start, tokens.previous_span().end);
+    Ok(Expression::Aggregate {
+        function,
+        expr,
+        distinct,
+        separator,
+        span,
+    })
+}
+
+/// Parse a function call with an IRI name.
+fn parse_function_call_with_iri(
+    tokens: &mut TokenStream,
+    iri: Iri,
+    start: usize,
+) -> Result<Expression, String> {
+    let args = parse_expression_list(tokens)?;
+    let span = SourceSpan::new(start, tokens.previous_span().end);
+    Ok(Expression::FunctionCall {
+        name: FunctionName::Extension(iri),
+        args,
+        distinct: false,
+        span,
+    })
+}
+
+/// Parse a parenthesized expression list: (expr, expr, ...)
+fn parse_expression_list(tokens: &mut TokenStream) -> Result<Vec<Expression>, String> {
+    // Handle NIL token - empty arg list like `NOW()` is tokenized as a single Nil token
+    if tokens.check(&TokenKind::Nil) {
+        tokens.advance();
+        return Ok(Vec::new());
+    }
+
+    if !tokens.check(&TokenKind::LParen) {
+        return Err("Expected '(' for expression list".to_string());
+    }
+    tokens.advance();
+
+    let mut args = Vec::new();
+
+    if !tokens.check(&TokenKind::RParen) {
+        args.push(parse_expression(tokens)?);
+        while tokens.check(&TokenKind::Comma) {
+            tokens.advance();
+            args.push(parse_expression(tokens)?);
+        }
+    }
+
+    if !tokens.check(&TokenKind::RParen) {
+        return Err("Expected ')' after expression list".to_string());
+    }
+    tokens.advance();
+
+    Ok(args)
+}
+
+/// Parse a group graph pattern for EXISTS/NOT EXISTS.
+///
+/// This is a forward reference to the pattern parser.
+fn parse_group_pattern_for_exists(tokens: &mut TokenStream) -> Result<GraphPattern, String> {
+    super::query::parse_group_graph_pattern(tokens)
+}
+
+/// Convert a parsed triple-term value `<<( s p o )>>` into the equivalent
+/// expression `TRIPLE(s, p, o)` (SPARQL 1.2 §18.x: `<<( … )>>` in an
+/// expression is the TRIPLE constructor). This reuses the accept-then-defer
+/// lowering of [`FunctionName::Triple`] (D-1) and gives correct variable
+/// tracking for free. A nested triple-term object becomes a nested
+/// `TRIPLE(…)`. Blank-node components are rejected: they are not
+/// expressions (negative `bindbnode-tripleterm`).
+fn triple_term_to_expr(tt: TripleTerm) -> Result<Expression, String> {
+    let span = tt.span;
+    let s = subject_term_to_expr(tt.subject)?;
+    let p = predicate_term_to_expr(tt.predicate);
+    let o = object_term_to_expr(tt.object)?;
+    Ok(Expression::FunctionCall {
+        name: FunctionName::Triple,
+        args: vec![s, p, o],
+        distinct: false,
+        span,
+    })
+}
+
+fn subject_term_to_expr(s: SubjectTerm) -> Result<Expression, String> {
+    match s {
+        SubjectTerm::Var(v) => Ok(Expression::Var(v)),
+        SubjectTerm::Iri(i) => Ok(Expression::iri(i)),
+        SubjectTerm::BlankNode(_) => {
+            Err("blank nodes are not allowed in a triple term used in an expression".to_string())
+        }
+        // Rejected by the value parser before reaching here.
+        SubjectTerm::QuotedTriple(_) | SubjectTerm::TripleTerm(_) => {
+            Err("invalid triple-term subject".to_string())
+        }
+    }
+}
+
+fn predicate_term_to_expr(p: PredicateTerm) -> Expression {
+    match p {
+        PredicateTerm::Var(v) => Expression::Var(v),
+        PredicateTerm::Iri(i) => Expression::iri(i),
+    }
+}
+
+fn object_term_to_expr(o: Term) -> Result<Expression, String> {
+    match o {
+        Term::Var(v) => Ok(Expression::Var(v)),
+        Term::Iri(i) => Ok(Expression::iri(i)),
+        Term::Literal(l) => Ok(Expression::Literal(l)),
+        Term::BlankNode(_) => {
+            Err("blank nodes are not allowed in a triple term used in an expression".to_string())
+        }
+        // A nested triple-term object is itself a TRIPLE(…) constructor.
+        Term::TripleTerm(inner) => triple_term_to_expr(*inner),
+        Term::QuotedTriple(_) => {
+            Err("reified triples (<< s p o >>) are not allowed inside a triple term".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::term::LiteralValue;
+    use crate::lex::tokenize;
+
+    fn parse_expr_str(input: &str) -> Result<Expression, String> {
+        let tokens = tokenize(input);
+        let mut stream = TokenStream::new(tokens);
+        parse_expression(&mut stream)
+    }
+
+    #[test]
+    fn test_simple_variable() {
+        let expr = parse_expr_str("?x").unwrap();
+        assert!(matches!(expr, Expression::Var(_)));
+    }
+
+    #[test]
+    fn test_integer_literal() {
+        let expr = parse_expr_str("42").unwrap();
+        match expr {
+            Expression::Literal(lit) => {
+                assert!(matches!(lit.value, LiteralValue::Integer(42)));
+            }
+            _ => panic!("Expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_string_literal() {
+        let expr = parse_expr_str("\"hello\"").unwrap();
+        match expr {
+            Expression::Literal(lit) => {
+                assert!(matches!(lit.value, LiteralValue::Simple(_)));
+            }
+            _ => panic!("Expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_boolean_literals() {
+        let expr = parse_expr_str("true").unwrap();
+        match expr {
+            Expression::Literal(lit) => {
+                assert!(matches!(lit.value, LiteralValue::Boolean(true)));
+            }
+            _ => panic!("Expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_binary_arithmetic() {
+        let expr = parse_expr_str("1 + 2").unwrap();
+        match expr {
+            Expression::Binary { op, .. } => {
+                assert_eq!(op, BinaryOp::Add);
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_binary_comparison() {
+        let expr = parse_expr_str("?x = 5").unwrap();
+        match expr {
+            Expression::Binary { op, .. } => {
+                assert_eq!(op, BinaryOp::Eq);
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_logical_and() {
+        let expr = parse_expr_str("?x > 0 && ?x < 10").unwrap();
+        match expr {
+            Expression::Binary { op, .. } => {
+                assert_eq!(op, BinaryOp::And);
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_logical_or() {
+        let expr = parse_expr_str("?x = 1 || ?x = 2").unwrap();
+        match expr {
+            Expression::Binary { op, .. } => {
+                assert_eq!(op, BinaryOp::Or);
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_operator_precedence() {
+        // 1 + 2 * 3 should parse as 1 + (2 * 3)
+        let expr = parse_expr_str("1 + 2 * 3").unwrap();
+        match expr {
+            Expression::Binary { op, right, .. } => {
+                assert_eq!(op, BinaryOp::Add);
+                assert!(matches!(
+                    *right,
+                    Expression::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_big_integer_literal() {
+        // xsd:integer is unbounded. The lexer emits a distinct BigInteger token
+        // past i64, which the expression parser used to reject outright even
+        // though term position and lowering both accepted it.
+        let big = "100000000000000000000";
+        match parse_expr_str(big).unwrap() {
+            Expression::Literal(Literal {
+                value: LiteralValue::BigInteger(s),
+                ..
+            }) => assert_eq!(s.as_ref(), big),
+            other => panic!("expected BigInteger literal, got {other:?}"),
+        }
+
+        // The sign is the unary operator, as for any other numeric literal.
+        match parse_expr_str(&format!("-{big}")).unwrap() {
+            Expression::Unary { op, operand, .. } => {
+                assert_eq!(op, UnaryOp::Neg);
+                assert!(matches!(
+                    *operand,
+                    Expression::Literal(Literal {
+                        value: LiteralValue::BigInteger(_),
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected unary negation, got {other:?}"),
+        }
+
+        // Still usable where an expression is expected.
+        assert!(parse_expr_str(&format!("?v > {big}")).is_ok());
+        // One past i64::MAX is already big; i64::MAX itself stays an Integer.
+        assert!(matches!(
+            parse_expr_str("9223372036854775807").unwrap(),
+            Expression::Literal(Literal {
+                value: LiteralValue::Integer(i64::MAX),
+                ..
+            })
+        ));
+        match parse_expr_str("9223372036854775808").unwrap() {
+            Expression::Literal(Literal {
+                value: LiteralValue::BigInteger(s),
+                ..
+            }) => assert_eq!(s.as_ref(), "9223372036854775808"),
+            other => panic!("expected BigInteger just past i64::MAX, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unary_not() {
+        let expr = parse_expr_str("!?bound").unwrap();
+        match expr {
+            Expression::Unary { op, .. } => {
+                assert_eq!(op, UnaryOp::Not);
+            }
+            _ => panic!("Expected unary expression"),
+        }
+    }
+
+    #[test]
+    fn test_unary_negation() {
+        // Note: "-5" is lexed as a single negative integer token
+        // Use negation on a variable to test unary minus
+        let expr = parse_expr_str("-?x").unwrap();
+        match expr {
+            Expression::Unary { op, .. } => {
+                assert_eq!(op, UnaryOp::Neg);
+            }
+            _ => panic!("Expected unary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parenthesized() {
+        let expr = parse_expr_str("(1 + 2) * 3").unwrap();
+        match expr {
+            Expression::Binary { op, left, .. } => {
+                assert_eq!(op, BinaryOp::Mul);
+                assert!(matches!(*left, Expression::Bracketed { .. }));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_bound_function() {
+        let expr = parse_expr_str("BOUND(?x)").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::Bound));
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_count_star() {
+        let expr = parse_expr_str("COUNT(*)").unwrap();
+        match expr {
+            Expression::Aggregate {
+                function,
+                expr,
+                distinct,
+                ..
+            } => {
+                assert_eq!(function, AggregateFunction::Count);
+                assert!(expr.is_none());
+                assert!(!distinct);
+            }
+            _ => panic!("Expected aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let expr = parse_expr_str("COUNT(DISTINCT ?x)").unwrap();
+        match expr {
+            Expression::Aggregate {
+                function, distinct, ..
+            } => {
+                assert_eq!(function, AggregateFunction::Count);
+                assert!(distinct);
+            }
+            _ => panic!("Expected aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_sum_aggregate() {
+        let expr = parse_expr_str("SUM(?price)").unwrap();
+        match expr {
+            Expression::Aggregate { function, .. } => {
+                assert_eq!(function, AggregateFunction::Sum);
+            }
+            _ => panic!("Expected aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_in_expression() {
+        let expr = parse_expr_str("?x IN (1, 2, 3)").unwrap();
+        match expr {
+            Expression::In { negated, list, .. } => {
+                assert!(!negated);
+                assert_eq!(list.len(), 3);
+            }
+            _ => panic!("Expected IN expression"),
+        }
+    }
+
+    #[test]
+    fn test_not_in_expression() {
+        let expr = parse_expr_str("?x NOT IN (1, 2)").unwrap();
+        match expr {
+            Expression::In { negated, .. } => {
+                assert!(negated);
+            }
+            _ => panic!("Expected NOT IN expression"),
+        }
+    }
+
+    #[test]
+    fn test_lang_tagged_literal() {
+        let expr = parse_expr_str("\"hello\"@en").unwrap();
+        match expr {
+            Expression::Literal(lit) => match lit.value {
+                LiteralValue::LangTagged { lang, .. } => {
+                    assert_eq!(lang.as_ref(), "en");
+                }
+                _ => panic!("Expected lang-tagged literal"),
+            },
+            _ => panic!("Expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_zero_arg_function_now() {
+        // NOW() is tokenized as KwNow + Nil (not KwNow + LParen + RParen)
+        let expr = parse_expr_str("NOW()").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::Now));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected function call, got {expr:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zero_arg_function_rand() {
+        let expr = parse_expr_str("RAND()").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::Rand));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_zero_arg_function_uuid() {
+        let expr = parse_expr_str("UUID()").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::Uuid));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_zero_arg_function_struuid() {
+        let expr = parse_expr_str("STRUUID()").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::StrUuid));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_zero_arg_function_bnode() {
+        // BNODE() can be called with or without args
+        let expr = parse_expr_str("BNODE()").unwrap();
+        match expr {
+            Expression::FunctionCall { name, args, .. } => {
+                assert!(matches!(name, FunctionName::BNode));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn fulltext_is_a_function_but_not_a_reserved_word() {
+        for input in ["fulltext(?text, \"rust\")", "FULL_TEXT(?text, \"rust\")"] {
+            match parse_expr_str(input).unwrap() {
+                Expression::FunctionCall { name, args, .. } => {
+                    assert_eq!(name, FunctionName::Fulltext);
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected a function call, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_expr_str("?fulltext").unwrap(),
+            Expression::Var(v) if v.name.as_ref() == "fulltext"
+        ));
+        let query = "PREFIX fulltext: <http://example.org/> \
+                     SELECT ?s WHERE { ?s fulltext:title ?fulltext }";
+        assert!(!crate::parse_sparql(query).has_errors());
+    }
+}

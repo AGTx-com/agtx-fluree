@@ -1,0 +1,114 @@
+//! # Fluree DB Transact
+//!
+//! Transaction support for Fluree DB, including staging and committing changes.
+//!
+//! This crate provides:
+//! - Transaction parsing (JSON-LD → IR)
+//! - Flake generation from templates
+//! - Staging (creates a `StagedLedger` with uncommitted changes)
+//! - Commit (persists to storage and publishes to nameservice)
+//!
+//! ## Transaction Types
+//!
+//! - **Insert**: Add new triples (fails if subject already exists)
+//! - **Upsert**: Insert or update (deletes existing values for provided predicates)
+//! - **Update**: SPARQL-style conditional update with WHERE/DELETE/INSERT
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use fluree_db_transact::{stage_update, commit};
+//! use serde_json::json;
+//!
+//! // Stage an update
+//! let view = stage_update(ledger, &json!({
+//!     "where": { "@id": "?s", "ex:name": "?name" },
+//!     "delete": { "@id": "?s", "ex:name": "?name" },
+//!     "insert": { "@id": "?s", "ex:name": "New Name" }
+//! }), opts).await?;
+//!
+//! // Commit the changes
+//! let (receipt, new_state) = commit(view, &storage, &nameservice, commit_opts).await?;
+//! ```
+
+pub mod address;
+pub mod commit;
+pub mod commit_flakes;
+pub mod current_facts;
+pub mod datatype_limit;
+mod delete_witness;
+pub mod error;
+pub mod flake_sink;
+pub mod generate;
+pub mod ir;
+mod list_edits;
+pub mod lists;
+pub mod lower_cypher_update;
+pub mod lower_sparql_update;
+pub mod namespace;
+pub mod parse;
+pub mod raw_txn_upload;
+pub mod stage;
+pub mod staged_dicts;
+pub mod template_sink;
+pub mod value_convert;
+pub mod vector_dims;
+
+#[cfg(feature = "import")]
+pub mod import;
+#[cfg(feature = "import")]
+pub mod import_sink;
+/// Re-export from `fluree_graph_turtle::splitter` for backwards compatibility.
+#[cfg(feature = "import")]
+pub use fluree_graph_turtle::splitter as turtle_splitter;
+
+// Re-exports
+pub use address::parse_commit_id;
+pub use commit::{
+    build_commit, check_index_loaded, commit, CommitOpts, CommitOptsRequest, CommitReceipt,
+    StagedCommit,
+};
+pub use commit_flakes::generate_commit_flakes;
+pub use current_facts::{
+    graph_id_in, resolve_same_t_pairs, CurrentFacts, FactIdentity, FactKey, FactTerm, MergeKey,
+    Origin, Retraction, SameTPair, Slot, StoredFact, DELETE_POINT_READ_SITE,
+};
+pub use error::{ReportResult, Result, ShaclViolations, TransactError};
+pub use flake_sink::FlakeSink;
+pub use generate::FlakeGenerator;
+pub use ir::{
+    AddressName, GraphMgmtOp, GraphName, GraphScope, GraphSel, GraphTarget, InlineValues,
+    RelationshipDelete, TemplateGraph, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType,
+    WriteGraphs,
+};
+pub use lower_sparql_update::{
+    lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
+};
+pub use namespace::{
+    stable_blank_node_sid, stable_blank_node_sid_from_label, NamespaceRegistry,
+    SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
+};
+pub use parse::{
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, ContentIdentity,
+    Placement, RdfText, RdfTextSummary,
+};
+pub use parse::{
+    is_empty_document, might_contain_graph_block, parse_graph_insert, parse_sync_transaction,
+    parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,
+    RawTrigMeta, RawTriple, TrigPhase1Result,
+};
+pub use raw_txn_upload::PendingRawTxnUpload;
+pub use stage::{
+    drop_needs_unrestricted_identity, generate_txn_id, stage, stage_flakes, stage_with_graph_delta,
+    StageOptions, DELETE_WITNESSED_SITE,
+};
+pub use staged_dicts::{
+    attach_binary_provider, attach_staged_dicts, detach_binary_provider, graphs_to_hide,
+    hide_dropped_graphs, staged_dicts, store_without_dropped_graphs, StagedDicts,
+};
+pub use template_sink::{RdfTextParts, TemplateSink};
+
+#[cfg(feature = "shacl")]
+pub use stage::{validate_view_with_shacl, ShaclGraphPolicy, ShaclValidationOutcome};
+
+pub mod commit_v2;

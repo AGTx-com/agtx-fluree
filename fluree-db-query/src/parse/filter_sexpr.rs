@@ -1,0 +1,882 @@
+//! S-expression filter parsing
+//!
+//! Parses S-expression filter syntax used in JSON-LD queries.
+//!
+//! # Syntax
+//!
+//! - `"(> ?age 18)"`
+//! - `"(and (> ?age 18) (< ?age 65))"`
+//! - `"(in ?status [\"active\" \"pending\"])"`
+//!
+//! # Supported Constructs
+//!
+//! - **Variables**: `?var`
+//! - **Literals**: numbers, booleans (`true`/`false`), quoted strings
+//! - **Comparison**: `=`, `!=`, `<`, `<=`, `>`, `>=`
+//! - **Logical**: `and`, `or`, `not`
+//! - **Arithmetic**: `+`, `-`, `*`, `/`
+//! - **Membership**: `in`, `not-in`, `notin`
+//! - **Functions**: any other operator is treated as a function call
+//!
+//! # Limitations
+//!
+//! - Quoted strings may contain whitespace, parentheses, and backslash
+//!   escapes (`\"` and `\\`); any other `\x` sequence is preserved verbatim
+
+use super::ast::{UnresolvedExpression, UnresolvedFilterValue};
+use super::error::{ParseError, Result};
+use super::filter_common;
+use super::sexpr_tokenize;
+use super::sexpr_tokenize::SexprToken;
+use std::sync::Arc;
+
+/// Parse an S-expression string like "(> ?age 45)" into a filter expression
+///
+/// # Supported syntax
+/// - Atoms: `?var`, numbers, `true`/`false`, quoted strings `"text"`
+/// - Expressions: `(op arg1 arg2 ...)`
+/// - Nested: `(and (> ?x 10) (< ?y 100))`
+/// - Quoted strings may contain whitespace, parentheses, and backslash
+///   escapes (`\"`, `\\`)
+pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
+    let s = s.trim();
+
+    // Must start with (
+    if !s.starts_with('(') || !s.ends_with(')') {
+        // A SPARQL-style call like `contains(lcase(?name), "x")` would fall
+        // through to the plain-string atom fallback and become a truthy
+        // constant — silently a no-op in FILTER. Reject it loudly instead.
+        if let Some(callee) = sparql_style_callee(s) {
+            return Err(sparql_call_syntax_error(callee, s));
+        }
+        // A bare expression is a VALUE — the whole of a `bind` or `unwind`
+        // operand — not a comparison operand, so it keeps its pre-4.2 string
+        // meaning. Classifying it here would change what a transaction
+        // WRITES: `["bind", "?link", "http://example.org/home"]` would insert
+        // a ref where it used to insert a literal.
+        let mut atom = [parse_s_expression_atom(s)?];
+        demote_iri_atoms(&mut atom);
+        let [atom] = atom;
+        return Ok(atom);
+    }
+
+    // Remove outer parens
+    let inner = &s[1..s.len() - 1].trim();
+
+    // Find the operator (first token)
+    let (op, rest) = sexpr_tokenize::split_first_token(inner)?;
+
+    // `(contains(lcase(?name), "x"))` tokenizes into nested lists that put a
+    // variable in operator position; diagnose the real cause instead of
+    // failing later with "Unknown function: ?name".
+    if op.starts_with('?') {
+        return Err(ParseError::InvalidFilter(format!(
+            "variable '{op}' cannot appear in operator position; expressions use \
+             S-expression (prefix) syntax, e.g. (> ?age 18) or (contains (lcase ?name) \"fred\")"
+        )));
+    }
+
+    let op_lower = op.to_lowercase();
+
+    if op_lower.as_str() == "in" || op_lower.as_str() == "not-in" || op_lower.as_str() == "notin" {
+        let (expr, values) = parse_s_expression_in_args(rest)?;
+        return Ok(UnresolvedExpression::In {
+            expr: Box::new(expr),
+            values,
+            negated: op_lower.as_str() != "in",
+        });
+    }
+
+    // Parse arguments, then keep the IRI classification only where an RDF
+    // term comparison is actually being made (see `compares_rdf_terms`).
+    let mut args = parse_s_expression_args(rest)?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
+
+    // Helper closure to clone already-parsed expressions
+    let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
+
+    // Convert to filter expression based on operator
+    match op_lower.as_str() {
+        // Comparison operators
+        op @ ("=" | "eq" | "!=" | "<>" | "ne" | "<" | "lt" | "<=" | "le" | ">" | "gt" | ">="
+        | "ge") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "comparison operator")
+        }
+
+        // Logical operators
+        "and" => filter_common::build_and(&args, clone_expr),
+        "or" => filter_common::build_or(&args, clone_expr),
+        "not" => filter_common::build_not(&args, clone_expr),
+
+        // Arithmetic operators
+        op @ ("+" | "add" | "*" | "mul" | "/" | "div") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "arithmetic operator")
+        }
+        "-" | "sub" => {
+            if args.len() == 1 {
+                filter_common::build_call(&args, "negate", clone_expr, 1, "unary negation")
+            } else {
+                filter_common::build_call(&args, "-", clone_expr, 1, "arithmetic operator")
+            }
+        }
+
+        // Function call
+        _ => Ok(UnresolvedExpression::Call {
+            func: Arc::from(op),
+            args,
+        }),
+    }
+}
+
+/// If `s` is spelled like a SPARQL function call — an identifier immediately
+/// followed by `(` — return the identifier. Quoted strings never match, so
+/// `"\"contains(x)\""` remains expressible as a string literal.
+///
+/// The identifier charset covers the kebab-case spellings `lower_function_name`
+/// accepts (`is-iri`, `str-dt`, `not-in`, ...) and prefixed names like
+/// `geof:distance`. Fully-expanded IRI callees (`http://…/distance(?a ?b)`)
+/// still slip through: `/` and `#` are too common in ordinary unquoted strings
+/// to treat as identifier characters.
+fn sparql_style_callee(s: &str) -> Option<&str> {
+    let open = s.find('(')?;
+    let callee = &s[..open];
+    let is_ident = !callee.is_empty()
+        && callee
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
+    is_ident.then_some(callee)
+}
+
+fn sparql_call_syntax_error(callee: &str, expr: &str) -> ParseError {
+    ParseError::InvalidFilter(format!(
+        "'{callee}(...)' looks like SPARQL function-call syntax, which is not supported \
+         in JSON-LD expressions; use S-expression syntax instead, \
+         e.g. (contains (lcase ?name) \"fred\"). \
+         If you meant a literal string (in a bind, say), wrap it in double quotes: \"{expr}\""
+    ))
+}
+
+/// Byte index just past the closing quote of the string literal at the start
+/// of `s` (which must begin with `"`), honoring `\"` / `\\` escapes.
+/// Returns `None` if the literal is unterminated.
+fn quoted_string_end(s: &str) -> Option<usize> {
+    debug_assert!(s.starts_with('"'));
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Resolve backslash escapes in a string literal's contents. Only `\"` and
+/// `\\` are recognized; any other `\x` is preserved verbatim.
+fn unescape_string(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next @ ('"' | '\\')) => out.push(next),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parse an atom in an S-expression (variable, number, string, boolean)
+fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
+    let s = s.trim();
+
+    // Variable
+    if s.starts_with('?') {
+        return Ok(UnresolvedExpression::var(s));
+    }
+
+    // Boolean
+    if s == "true" {
+        return Ok(UnresolvedExpression::boolean(true));
+    }
+    if s == "false" {
+        return Ok(UnresolvedExpression::boolean(false));
+    }
+
+    // Try to parse as number
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(UnresolvedExpression::long(i));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(UnresolvedExpression::double(f));
+    }
+
+    // String (might be quoted)
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let unquoted = &s[1..s.len() - 1];
+        return Ok(UnresolvedExpression::string(unescape_string(unquoted)));
+    }
+
+    // Unquoted: IRI forms, a possible compact IRI, or a plain string.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// Classify an unquoted atom that is not a variable, boolean or number.
+///
+/// - `<…>` and `http(s)://…` are absolute IRIs.
+/// - `prefix:name` may be a compact IRI; only the WHERE-clause parser, which
+///   has the `@context`, can tell, so it is handed over undecided as
+///   [`UnresolvedFilterValue::Curie`] and lowers as a string if nothing
+///   resolves it.
+/// - Anything else is the bare string it always was.
+fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
+    use fluree_graph_json_ld::iri::UnresolvedIriDisposition;
+    if s.len() > 2 && s.starts_with('<') && s.ends_with('>') {
+        return UnresolvedExpression::Const(UnresolvedFilterValue::iri(&s[1..s.len() - 1]));
+    }
+    // Scheme classification is shared with JSON-LD expansion rather than
+    // spelled again here. Matching `http://` and `https://` by hand made every
+    // other scheme a would-be compact IRI: `did:key:z6Mk…`, `urn:uuid:…` and
+    // `mailto:…` classified as a CURIE, found no such prefix, and fell back to
+    // a string — so `(= ?id did:key:z6Mk…)`, a common shape in policy, never
+    // matched, and in a rule it was rejected outright as an undefined prefix.
+    match fluree_graph_json_ld::iri::check_unresolved_iri(s) {
+        UnresolvedIriDisposition::AllowAbsolute | UnresolvedIriDisposition::AllowKnownScheme => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::iri(s))
+        }
+        UnresolvedIriDisposition::RejectLikelyCompact { .. } if looks_like_compact_iri(s) => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)))
+        }
+        _ => UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s))),
+    }
+}
+
+/// Operators whose operands are compared as RDF *terms*, and so are the only
+/// places an unquoted atom may mean an IRI.
+///
+/// Everywhere else an unquoted atom is the string it has always been. Without
+/// this restriction the classifier reaches every argument position, which is
+/// both wrong and a regression: `(strStarts (str ?s) http://example.org/p/)`
+/// compares a string against an IRI and matches nothing, `(concat ?a <-> ?b)`
+/// builds `IRI("-")`, `(count *)` in HAVING stops being a `*`, and a
+/// `["bind", "?link", "http://example.org/home"]` writes a ref where it used
+/// to write a literal. Identity comparison is the one position where an IRI
+/// operand is both meaningful and what the author must have meant — a string
+/// could never have matched an IRI-valued variable there.
+fn compares_rdf_terms(op_lower: &str) -> bool {
+    matches!(
+        op_lower,
+        "=" | "eq" | "!=" | "<>" | "ne" | "in" | "not-in" | "notin" | "sameterm"
+    )
+}
+
+/// Demote IRI-ish classifications back to plain strings, one level deep.
+///
+/// Only the immediate operands are touched: a nested expression was already
+/// dispatched by its own operator and carries whatever that position decided.
+fn demote_iri_atoms(args: &mut [UnresolvedExpression]) {
+    for arg in args {
+        if let UnresolvedExpression::Const(value) = arg {
+            let text = match value {
+                UnresolvedFilterValue::Iri(t)
+                | UnresolvedFilterValue::Curie(t)
+                | UnresolvedFilterValue::Bare(t) => Some(t.to_string()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                *arg = UnresolvedExpression::string(text);
+            }
+        }
+    }
+}
+
+/// Parse arguments in an S-expression
+fn parse_s_expression_args(s: &str) -> Result<Vec<UnresolvedExpression>> {
+    let mut args = Vec::new();
+    let mut remaining = s.trim();
+
+    while !remaining.is_empty() {
+        if remaining.starts_with('(') {
+            // Find matching close paren
+            let end = sexpr_tokenize::find_matching_paren(remaining)?;
+            let expr_str = &remaining[..=end];
+            args.push(parse_s_expression(expr_str)?);
+            remaining = remaining[end + 1..].trim();
+        } else if remaining.starts_with('[') {
+            let end = sexpr_tokenize::find_matching_bracket(remaining)?;
+            let expr_str = &remaining[..=end];
+            args.push(parse_s_expression_list(expr_str)?);
+            remaining = remaining[end + 1..].trim();
+        } else if remaining.starts_with('"') {
+            // Handle quoted string as a single token (may contain
+            // whitespace/parens and `\"` / `\\` escapes)
+            if let Some(end) = quoted_string_end(remaining) {
+                let inner = &remaining[1..end - 1];
+                args.push(UnresolvedExpression::string(unescape_string(inner)));
+                remaining = remaining[end..].trim();
+            } else {
+                return Err(ParseError::InvalidFilter(
+                    "unclosed string literal".to_string(),
+                ));
+            }
+        } else {
+            // Parse as atom until whitespace or paren
+            let end = remaining
+                .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                .unwrap_or(remaining.len());
+            if end == 0 {
+                // A stray ')' consumes nothing; erroring (rather than
+                // continuing) is what guarantees this loop terminates.
+                return Err(ParseError::InvalidFilter(format!(
+                    "unexpected ')' in expression arguments: {remaining}"
+                )));
+            }
+            let atom = &remaining[..end];
+            args.push(parse_s_expression_atom(atom)?);
+            remaining = remaining[end..].trim();
+        }
+    }
+
+    Ok(args)
+}
+
+/// Parse arguments for 'in' operator which requires special handling
+///
+/// Format: `expr [val1 val2 ...]`
+fn parse_s_expression_in_args(
+    s: &str,
+) -> Result<(UnresolvedExpression, Vec<UnresolvedExpression>)> {
+    let mut remaining = s.trim();
+    let (expr, rest) = parse_s_expression_arg(remaining)?;
+    remaining = rest.trim();
+
+    if !remaining.starts_with('[') {
+        return Err(ParseError::InvalidFilter(
+            "in requires a list literal like [...]".to_string(),
+        ));
+    }
+    let end = sexpr_tokenize::find_matching_bracket(remaining)?;
+    let list_expr = &remaining[..=end];
+    let values_expr = parse_s_expression_list(list_expr)?;
+    let values = match values_expr {
+        UnresolvedExpression::Call { args, .. } => args,
+        other => vec![other],
+    };
+
+    Ok((expr, values))
+}
+
+/// Parse a single argument in an S-expression, returning the expression and remaining string
+fn parse_s_expression_arg(s: &str) -> Result<(UnresolvedExpression, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return Err(ParseError::InvalidFilter("missing argument".to_string()));
+    }
+    if s.starts_with('(') {
+        let end = sexpr_tokenize::find_matching_paren(s)?;
+        let expr_str = &s[..=end];
+        let expr = parse_s_expression(expr_str)?;
+        return Ok((expr, &s[end + 1..]));
+    }
+    if s.starts_with('[') {
+        let end = sexpr_tokenize::find_matching_bracket(s)?;
+        let expr_str = &s[..=end];
+        let expr = parse_s_expression_list(expr_str)?;
+        return Ok((expr, &s[end + 1..]));
+    }
+    if s.starts_with('"') {
+        let end = quoted_string_end(s)
+            .ok_or_else(|| ParseError::InvalidFilter("unclosed string literal".to_string()))?;
+        let inner = &s[1..end - 1];
+        return Ok((
+            UnresolvedExpression::string(unescape_string(inner)),
+            &s[end..],
+        ));
+    }
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '[' || c == ']')
+        .unwrap_or(s.len());
+    if end == 0 {
+        return Err(ParseError::InvalidFilter(format!(
+            "unexpected '{}' in expression argument",
+            &s[..s.chars().next().map_or(0, char::len_utf8)]
+        )));
+    }
+    let atom = &s[..end];
+    let expr = parse_s_expression_atom(atom)?;
+    Ok((expr, &s[end..]))
+}
+
+/// Convert an already-tokenized S-expression into an [`UnresolvedExpression`].
+///
+/// Used by the SELECT-clause parser, which tokenizes once to dispatch between
+/// aggregate and scalar-expression forms and then needs the scalar form as an
+/// expression tree.
+///
+/// Mirrors the operator handling in [`parse_s_expression`], with one caveat:
+/// `in` / `not-in` are rejected because their bracketed-list form (`[...]`)
+/// is not represented in [`SexprToken`]. Use the string S-expression form
+/// inside BIND/FILTER if `IN` is needed.
+pub fn expr_from_sexpr_token(tok: &SexprToken) -> Result<UnresolvedExpression> {
+    match tok {
+        // Quoted strings are *always* string literals — never reparsed as
+        // booleans, numbers, or variables. This is the only way to write
+        // a literal whose source spelling collides with a keyword
+        // (e.g. `"false"`, `"42"`, `"?notavar"`).
+        SexprToken::String(s) => Ok(UnresolvedExpression::string(s)),
+        SexprToken::Atom(s) => atom_token_to_expr(s),
+        SexprToken::List(items) => list_tokens_to_expr(items),
+    }
+}
+
+fn atom_token_to_expr(s: &str) -> Result<UnresolvedExpression> {
+    if s.starts_with('?') {
+        return Ok(UnresolvedExpression::var(s));
+    }
+    if s == "true" {
+        return Ok(UnresolvedExpression::boolean(true));
+    }
+    if s == "false" {
+        return Ok(UnresolvedExpression::boolean(false));
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(UnresolvedExpression::long(i));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(UnresolvedExpression::double(f));
+    }
+    // Unquoted atom that didn't match any other shape: IRI, compact IRI, or
+    // bare string. Quoted strings take the explicit `String` path above.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// `prefix:name` shape: a non-empty alphabetic-leading prefix (or the empty
+/// prefix `:name`), a colon, and a non-empty local part with no whitespace.
+fn looks_like_compact_iri(s: &str) -> bool {
+    let Some((prefix, local)) = s.split_once(':') else {
+        return false;
+    };
+    if local.is_empty() || local.chars().any(char::is_whitespace) {
+        return false;
+    }
+    prefix.is_empty()
+        || (prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+}
+
+fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
+    if items.is_empty() {
+        return Err(ParseError::InvalidSelect(
+            "empty expression in select clause".to_string(),
+        ));
+    }
+
+    let op = items[0].expect_atom("operator")?;
+    let op_lower = op.to_lowercase();
+
+    if matches!(op_lower.as_str(), "in" | "not-in" | "notin") {
+        return Err(ParseError::InvalidSelect(format!(
+            "'{op}' is not supported in select expressions; rewrite using or/and equality (e.g. (or (= ?x 1) (= ?x 2)))"
+        )));
+    }
+
+    let arg_tokens = &items[1..];
+    let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
+    let parsed: Result<Vec<UnresolvedExpression>> =
+        arg_tokens.iter().map(expr_from_sexpr_token).collect();
+    let mut args = parsed?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
+
+    match op_lower.as_str() {
+        op @ ("=" | "eq" | "!=" | "<>" | "ne" | "<" | "lt" | "<=" | "le" | ">" | "gt" | ">="
+        | "ge") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "comparison operator")
+        }
+        "and" => filter_common::build_and(&args, clone_expr),
+        "or" => filter_common::build_or(&args, clone_expr),
+        "not" => filter_common::build_not(&args, clone_expr),
+        op @ ("+" | "add" | "*" | "mul" | "/" | "div") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "arithmetic operator")
+        }
+        "-" | "sub" => {
+            if args.len() == 1 {
+                filter_common::build_call(&args, "negate", clone_expr, 1, "unary negation")
+            } else {
+                filter_common::build_call(&args, "-", clone_expr, 1, "arithmetic operator")
+            }
+        }
+        _ => Ok(UnresolvedExpression::Call {
+            func: Arc::from(op),
+            args,
+        }),
+    }
+}
+
+/// Parse a bracketed list `[...]` as a function call with name "list"
+fn parse_s_expression_list(s: &str) -> Result<UnresolvedExpression> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return Err(ParseError::InvalidFilter(
+            "list must be bracketed".to_string(),
+        ));
+    }
+    let inner = &s[1..s.len() - 1];
+    let args = parse_s_expression_args(inner)?;
+    Ok(UnresolvedExpression::Call {
+        func: Arc::from("list"),
+        args,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_comparison() {
+        let expr = parse_s_expression("(> ?age 18)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), ">");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_logical_and() {
+        let expr = parse_s_expression("(and (> ?x 10) (< ?y 20))").unwrap();
+        match expr {
+            UnresolvedExpression::And(exprs) => {
+                assert_eq!(exprs.len(), 2);
+            }
+            _ => panic!("Expected AND"),
+        }
+    }
+
+    #[test]
+    fn test_parse_atom_variable() {
+        let expr = parse_s_expression_atom("?name").unwrap();
+        match expr {
+            UnresolvedExpression::Var(name) => {
+                assert_eq!(name.as_ref(), "?name");
+            }
+            _ => panic!("Expected variable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_atom_boolean() {
+        let expr = parse_s_expression_atom("true").unwrap();
+        match expr {
+            UnresolvedExpression::Const(_) => {}
+            _ => panic!("Expected constant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_atom_number() {
+        let expr = parse_s_expression_atom("42").unwrap();
+        match expr {
+            UnresolvedExpression::Const(_) => {}
+            _ => panic!("Expected constant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_operator() {
+        let expr = parse_s_expression("(in ?status [\"active\" \"pending\"])").unwrap();
+        match expr {
+            UnresolvedExpression::In {
+                negated, values, ..
+            } => {
+                assert!(!negated);
+                assert_eq!(values.len(), 2);
+            }
+            _ => panic!("Expected IN"),
+        }
+    }
+
+    #[test]
+    fn test_parse_function_call() {
+        let expr = parse_s_expression("(strlen ?name)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "strlen");
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_arithmetic() {
+        let expr = parse_s_expression("(+ ?x 5)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "+");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unary_negation() {
+        let expr = parse_s_expression("(- ?x)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "negate");
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("Expected Call with negate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_variadic_comparison() {
+        let expr = parse_s_expression("(< ?a ?b ?c)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "<");
+                assert_eq!(args.len(), 3);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_parse_variadic_arithmetic() {
+        let expr = parse_s_expression("(+ ?x 5 10)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "+");
+                assert_eq!(args.len(), 3);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_stray_close_paren_errors_instead_of_looping() {
+        // Regression: a stray ')' in the argument list used to make
+        // parse_s_expression_args consume nothing and spin forever,
+        // permanently pinning a tokio worker at 100% CPU.
+        let result = parse_s_expression("(f ?x ))");
+        assert!(result.is_err(), "stray ')' must be a parse error");
+    }
+
+    #[test]
+    fn test_quoted_string_with_escapes_and_parens() {
+        // Escaped quotes inside a string literal must not terminate the
+        // token; parens inside the string are literal content.
+        let expr = parse_s_expression(r#"(fulltext ?content "prunes rows (see \"push.\") tail")"#)
+            .unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "fulltext");
+                assert_eq!(args.len(), 2);
+                match &args[1] {
+                    UnresolvedExpression::Const(_) => {}
+                    other => panic!("expected string constant, got {other:?}"),
+                }
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_fulltext_bind_roundtrip_with_hostile_content() {
+        // The exact shape that wedged the memory MCP server: user content
+        // containing a quote-then-paren, interpolated into a fulltext bind.
+        let content = r#"emit_list_item stores index metadata ("not rdf-list bnodes") and prunes operator-kept rows (scalar-Eq push.")"#;
+        let bind_expr = format!(
+            "(fulltext ?content \"{}\")",
+            content.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let expr = parse_s_expression(&bind_expr).expect("must parse, not hang");
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "fulltext");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_unescape_string_helper() {
+        assert_eq!(unescape_string(r#"a\"b"#), r#"a"b"#);
+        assert_eq!(unescape_string(r"a\\b"), r"a\b");
+        // Unrecognized escapes are preserved verbatim
+        assert_eq!(unescape_string(r"a\nb"), r"a\nb");
+        assert_eq!(unescape_string("plain"), "plain");
+    }
+
+    #[test]
+    fn test_sparql_style_call_rejected() {
+        // Regression: this spelling used to parse as a plain-string constant,
+        // which is truthy — the filter silently matched every row (fail-open).
+        let err = parse_s_expression(r#"contains(lcase(?name), "zzz")"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SPARQL function-call syntax"), "got: {msg}");
+
+        let err = parse_s_expression(r#"strStarts(?name, "A")"#).unwrap_err();
+        assert!(err.to_string().contains("SPARQL function-call syntax"));
+    }
+
+    #[test]
+    fn test_sparql_style_call_rejected_for_kebab_names() {
+        // `lower_function_name` accepts kebab spellings, so the callee charset
+        // must include '-' or these stay fail-open constants.
+        for expr in ["is-iri(?x)", "is-blank(?x)", "str-dt(?v, ?dt)"] {
+            let err = parse_s_expression(expr).unwrap_err();
+            assert!(
+                err.to_string().contains("SPARQL function-call syntax"),
+                "{expr} was not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparql_call_error_suggests_quoting() {
+        // The check also fires in value contexts (bind/unwind), where the user
+        // may have meant a literal like `Acme(Inc)` — point them at quoting.
+        let err = parse_s_expression("Acme(Inc)").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(r#"double quotes: "Acme(Inc)""#), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parenthesized_sparql_style_call_rejected() {
+        // Wrapped in parens the tokenizer walks into the call and ends up with
+        // `?name` in operator position; the error must diagnose that, not
+        // report "Unknown function: ?name" at lowering.
+        let err = parse_s_expression(r#"(contains(lcase(?name), "gustavo"))"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("operator position"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_quoted_string_atom_still_parses() {
+        // Escape hatch: a quoted literal that merely looks like a call is
+        // still expressible as a constant (used by BIND).
+        let expr = parse_s_expression(r#""contains(x)""#).unwrap();
+        match expr {
+            UnresolvedExpression::Const(_) => {}
+            other => panic!("expected string constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_single_arg_arithmetic() {
+        let expr = parse_s_expression("(+ ?x)").unwrap();
+        match expr {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "+");
+                assert_eq!(args.len(), 1);
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    /// The second operand of `(= ?p <atom>)`, as the string-path parser sees it.
+    fn second_operand(expr: &str) -> UnresolvedFilterValue {
+        match parse_s_expression(expr).unwrap() {
+            UnresolvedExpression::Call { args, .. } => match &args[1] {
+                UnresolvedExpression::Const(v) => v.clone(),
+                other => panic!("expected a constant operand, got {other:?}"),
+            },
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unquoted_iri_atoms_are_iris_not_strings() {
+        // `<…>` and http(s) atoms are absolute IRIs, as in SPARQL; they used
+        // to lower as the string "<http://…>" and could never equal an IRI.
+        assert!(matches!(
+            second_operand("(= ?p <http://example.org/knows>)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+        assert!(matches!(
+            second_operand("(= ?p http://example.org/knows)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prefixed_name_is_handed_over_as_curie() {
+        // The S-expression parser has no @context: `ex:knows` is neither an
+        // IRI nor a string yet. The WHERE-clause parser decides.
+        assert!(matches!(
+            second_operand("(= ?p ex:knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == "ex:knows"
+        ));
+        // Empty prefix (`:knows`) is a compact IRI too.
+        assert!(matches!(
+            second_operand("(= ?p :knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == ":knows"
+        ));
+    }
+
+    #[test]
+    fn strings_and_string_lookalikes_stay_strings() {
+        // Quoted operands are always strings, even when they spell an IRI.
+        assert!(matches!(
+            second_operand("(= ?p \"ex:knows\")"),
+            UnresolvedFilterValue::String(s) if s.as_ref() == "ex:knows"
+        ));
+        // A bare word with no prefix is the string it always was (tagged
+        // `Bare` so rule validation can tell it from a quoted literal).
+        assert!(matches!(
+            second_operand("(= ?status active)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "active"
+        ));
+        // A numeric-looking "prefix" is not a compact IRI: `12:30` stays a string.
+        assert!(matches!(
+            second_operand("(= ?slot 12:30)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "12:30"
+        ));
+        // The token path used by select expressions agrees with the string path.
+        assert!(matches!(
+            atom_token_to_expr("ex:knows").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(_))
+        ));
+        assert!(matches!(
+            atom_token_to_expr("12:30").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Bare(_))
+        ));
+    }
+}

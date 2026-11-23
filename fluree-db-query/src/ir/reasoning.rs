@@ -1,0 +1,802 @@
+//! Reasoning configuration for the rewrite phase.
+//!
+//! `ReasoningConfig` bundles the inputs the rewriter consults: a
+//! `ReasoningModes` selector plus an optional pre-resolved
+//! `SchemaBundleFlakes` for ontology imports. Solution modifiers (LIMIT,
+//! OFFSET, ORDER BY, GROUP BY, HAVING) ride on [`Query`](super::Query)
+//! directly.
+//!
+//! `ReasoningModes` is pure config — no behavior, just bit flags and a JSON
+//! rule list. Both types live here in `ir` because they're embedded in
+//! [`Query`](super::Query).
+
+use std::sync::Arc;
+
+use crate::schema_bundle::SchemaBundleFlakes;
+
+/// Reasoning modes for RDFS / OWL / datalog query rewriting.
+///
+/// A composite descriptor — multiple modes can be enabled simultaneously.
+/// The rewriter inspects this to decide which transformations to apply.
+///
+/// # OWL-Datalog Mode
+///
+/// `owl_datalog` extends `owl2rl` with reasoning patterns expressible in
+/// Datalog rules but not in standard OWL-RL semantics:
+/// - Complex intersections in equivalentClass / subClassOf
+/// - Property chains with inverse elements and arbitrary length (≥2)
+/// - Nested restrictions and complex class expressions
+/// - Enhanced someValuesFrom/allValuesFrom reasoning in equivalences
+///
+/// This mode is opt-in and separate from standard `owl2rl`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReasoningModes {
+    /// RDFS reasoning - subclass/subproperty expansion
+    pub rdfs: bool,
+    /// OWL2-QL reasoning - owl:inverseOf, domain/range type queries
+    pub owl2ql: bool,
+    /// Datalog rules (tx-time rules) - Phase 3
+    pub datalog: bool,
+    /// OWL2-RL materialization - Phase 5
+    pub owl2rl: bool,
+    /// OWL-Datalog: Extended OWL with complex class expressions
+    ///
+    /// This is a superset of owl2rl that supports additional constructs
+    /// expressible in Datalog: complex intersections, property chains with
+    /// inverses, nested restrictions, etc.
+    ///
+    /// Opt-in mode, not enabled by default.
+    pub owl_datalog: bool,
+    /// Explicitly disable all reasoning.
+    ///
+    /// Reasoning is opt-in (no mode runs unless requested), so this flag is
+    /// mostly an affirmation — but it also overrides any view- or
+    /// ledger-config-level reasoning default for this query.
+    /// This is set by `"reasoning": "none"` in JSON.
+    pub explicit_none: bool,
+    /// Query-time datalog rules (JSON-LD format)
+    ///
+    /// These rules are merged with database rules when datalog reasoning is enabled.
+    /// Each rule should have `where` and `insert` clauses.
+    pub rules: Vec<serde_json::Value>,
+
+    /// Inline ontology / schema axioms supplied with the query
+    /// (JSON-LD format).
+    ///
+    /// Carries RDFS / OWL axioms (rdfs:subClassOf,
+    /// rdfs:subPropertyOf, owl:inverseOf, owl:equivalentClass,
+    /// rdf:type owl:Class / owl:TransitiveProperty, …) that the
+    /// reasoner should treat as if they came from the ledger's
+    /// `f:schemaSource` graph. Layered additively on top of any
+    /// configured schemaSource bundle; never persisted.
+    ///
+    /// The runner parses these against a temporary
+    /// `NamespaceRegistry` seeded from the live snapshot, projects
+    /// them through the same whitelist as the cross-ledger schema
+    /// materializer, and merges the resulting flakes into
+    /// `ReasoningConfig.schema_bundle` before reasoning runs.
+    pub ontology: Option<serde_json::Value>,
+
+    /// OWL2-RL materialization budget: max derived facts before the closure
+    /// is capped. A capped closure is incomplete — queries may silently miss
+    /// entailments — so the cap surfaces in response tracking metadata.
+    ///
+    /// Sources, in precedence order: query (`"reasoningBudget"` key / SPARQL
+    /// `# PRAGMA reasoning-max-facts:`), ledger config
+    /// (`f:reasoningMaxFacts`, subject to override control), server env
+    /// (`FLUREE_REASONING_MAX_FACTS`), built-in default.
+    pub max_facts: Option<u64>,
+
+    /// OWL2-RL materialization budget: max wall-clock seconds before the
+    /// closure is capped. Same sourcing/precedence as [`Self::max_facts`]
+    /// (query key `maxSeconds`, pragma `reasoning-max-seconds:`, config
+    /// `f:reasoningMaxSeconds`, env `FLUREE_REASONING_MAX_SECONDS`).
+    pub max_seconds: Option<u64>,
+
+    /// Materialization budget: max megabytes of derived facts before the
+    /// closure is capped. Same sourcing/precedence as [`Self::max_facts`]
+    /// (query key `maxMemoryMb`, pragma `reasoning-max-memory-mb:`, config
+    /// `f:reasoningMaxMemoryMb`, env `FLUREE_REASONING_MAX_MEMORY_MB`).
+    ///
+    /// `None` derives the ceiling from the effective fact cap, so the fact cap
+    /// binds first on ordinary data and this one only catches facts that are
+    /// abnormally large.
+    pub max_memory_mb: Option<u64>,
+
+    /// The time `NOW()` and `TODAY()` return in datalog rule bodies. `None`
+    /// uses the commit time of the queried snapshot. Query key
+    /// `"reasoningTime"` / SPARQL `# PRAGMA reasoning-time:`, an ISO 8601
+    /// datetime.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
+}
+
+impl ReasoningModes {
+    /// Create with no reasoning modes enabled
+    pub fn none() -> Self {
+        Self {
+            explicit_none: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create with RDFS enabled
+    pub fn rdfs() -> Self {
+        Self {
+            rdfs: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create with OWL2-QL enabled (includes RDFS for subclass expansion)
+    pub fn owl2ql() -> Self {
+        Self {
+            rdfs: true,
+            owl2ql: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create with datalog enabled and query-time rules
+    pub fn datalog_with_rules(rules: Vec<serde_json::Value>) -> Self {
+        Self {
+            datalog: true,
+            rules,
+            ..Default::default()
+        }
+    }
+
+    /// Builder: enable RDFS
+    pub fn with_rdfs(mut self) -> Self {
+        self.rdfs = true;
+        self
+    }
+
+    /// Builder: enable OWL2-QL
+    pub fn with_owl2ql(mut self) -> Self {
+        self.owl2ql = true;
+        self
+    }
+
+    /// Builder: enable Datalog rules
+    pub fn with_datalog(mut self) -> Self {
+        self.datalog = true;
+        self
+    }
+
+    /// Builder: enable OWL2-RL materialization
+    pub fn with_owl2rl(mut self) -> Self {
+        self.owl2rl = true;
+        self
+    }
+
+    /// Builder: enable OWL-Datalog extended reasoning
+    ///
+    /// This enables complex OWL class expressions that can be expressed in Datalog:
+    /// - Complex intersectionOf/unionOf with restrictions
+    /// - Property chains with inverse elements and arbitrary length
+    /// - Enhanced someValuesFrom/allValuesFrom in equivalences
+    pub fn with_owl_datalog(mut self) -> Self {
+        self.owl_datalog = true;
+        self
+    }
+
+    /// Builder: add query-time rules
+    ///
+    /// Note: This also enables datalog reasoning mode if not already enabled.
+    pub fn with_rules(mut self, rules: Vec<serde_json::Value>) -> Self {
+        if !rules.is_empty() {
+            self.datalog = true;
+        }
+        self.rules = rules;
+        self
+    }
+
+    /// Check if any mode is explicitly enabled
+    pub fn has_any_enabled(&self) -> bool {
+        self.rdfs || self.owl2ql || self.datalog || self.owl2rl || self.owl_datalog
+    }
+
+    /// Check if reasoning is explicitly disabled
+    pub fn is_disabled(&self) -> bool {
+        self.explicit_none
+    }
+
+    /// Parse from a JSON value (string or array of strings)
+    ///
+    /// Valid values:
+    /// - `"none"` - disable all reasoning
+    /// - `"rdfs"` - RDFS only
+    /// - `"owl2ql"` - OWL2-QL (implies RDFS)
+    /// - `"datalog"` - Datalog rules
+    /// - `"owl2rl"` - OWL2-RL materialization
+    /// - `["rdfs", "owl2ql", ...]` - multiple modes
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::Null => Ok(Self::default()),
+            serde_json::Value::String(s) => Self::parse_single(s),
+            serde_json::Value::Array(arr) => {
+                let mut modes = Self::default();
+                for item in arr {
+                    let s = item
+                        .as_str()
+                        .ok_or_else(|| "reasoning array must contain strings".to_string())?;
+                    modes = modes.merge(&Self::parse_single(s)?);
+                }
+                Ok(modes)
+            }
+            _ => Err("reasoning must be a string or array of strings".to_string()),
+        }
+    }
+
+    /// Parse reasoning modes from a query JSON object
+    ///
+    /// This extracts both the `reasoning` key (mode selection) and the `rules` key
+    /// (query-time datalog rules) from a query object.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fluree_db_query::ir::ReasoningModes;
+    /// use serde_json::json;
+    ///
+    /// let query = json!({
+    ///     "reasoning": "datalog",
+    ///     "rules": [{
+    ///         "@context": {"ex": "http://example.org/"},
+    ///         "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+    ///         "insert": {"@id": "?person", "ex:grandparent": "?grandparent"}
+    ///     }]
+    /// });
+    /// let modes = ReasoningModes::from_query_json(&query).unwrap();
+    /// assert!(modes.datalog);
+    /// assert!(modes.has_rules());
+    /// ```
+    pub fn from_query_json(query: &serde_json::Value) -> Result<Self, String> {
+        // Parse reasoning modes
+        let mut modes = if let Some(reasoning) = query.get("reasoning") {
+            Self::from_json(reasoning)?
+        } else {
+            Self::default()
+        };
+
+        // Parse query-time rules
+        if let Some(rules) = query.get("rules") {
+            match rules {
+                serde_json::Value::Array(arr) => {
+                    modes.rules = arr.clone();
+                    // Enable datalog if rules are provided
+                    if !modes.rules.is_empty() {
+                        modes.datalog = true;
+                    }
+                }
+                serde_json::Value::Null => {}
+                _ => {
+                    return Err("rules must be an array".to_string());
+                }
+            }
+        }
+
+        // Parse query-time ontology (RDFS / OWL axioms supplied
+        // inline). Layered on top of f:schemaSource at reasoning
+        // prep; doesn't itself flip any mode flag — reasoning is
+        // a separate, explicit decision (the axioms only take
+        // effect when a reasoning mode is requested).
+        if let Some(ontology) = query.get("ontology") {
+            if !ontology.is_null() {
+                modes.ontology = Some(ontology.clone());
+            }
+        }
+
+        // Parse the per-query materialization budget. Doesn't flip any mode
+        // flag — it only takes effect when a reasoning mode is requested.
+        if let Some(budget) = query.get("reasoningBudget") {
+            let (max_facts, max_seconds, max_memory_mb) = Self::parse_budget_json(budget)?;
+            modes.max_facts = max_facts;
+            modes.max_seconds = max_seconds;
+            modes.max_memory_mb = max_memory_mb;
+        }
+
+        // Like the budget, the evaluation time enables no mode by itself.
+        if let Some(time) = query.get("reasoningTime") {
+            modes.evaluation_time = Self::parse_evaluation_time(time)?;
+        }
+
+        Ok(modes)
+    }
+
+    /// Parse a `"reasoningTime"` value: an ISO 8601 datetime string.
+    pub fn parse_evaluation_time(
+        value: &serde_json::Value,
+    ) -> Result<Option<fluree_db_core::temporal::DateTime>, String> {
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => fluree_db_core::temporal::DateTime::parse(s)
+                .map(Some)
+                .map_err(|e| format!("reasoningTime must be an ISO 8601 datetime: {e}")),
+            _ => Err("reasoningTime must be an ISO 8601 datetime string".to_string()),
+        }
+    }
+
+    /// Parse a `"reasoningBudget"` JSON object.
+    ///
+    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300, "maxMemoryMb": 512}`
+    /// (all optional; `max-facts`/`max_facts` variants accepted).
+    #[allow(clippy::type_complexity)]
+    fn parse_budget_json(
+        value: &serde_json::Value,
+    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), String> {
+        let serde_json::Value::Object(obj) = value else {
+            if value.is_null() {
+                return Ok((None, None, None));
+            }
+            return Err("reasoningBudget must be an object".to_string());
+        };
+
+        let field = |names: &[&str]| -> Result<Option<u64>, String> {
+            for name in names {
+                if let Some(v) = obj.get(*name) {
+                    let n = v.as_u64().ok_or_else(|| {
+                        format!("reasoningBudget.{name} must be a non-negative integer")
+                    })?;
+                    return Ok(Some(n));
+                }
+            }
+            Ok(None)
+        };
+
+        let max_facts = field(&["maxFacts", "max-facts", "max_facts"])?;
+        let max_seconds = field(&["maxSeconds", "max-seconds", "max_seconds"])?;
+        let max_memory_mb = field(&["maxMemoryMb", "max-memory-mb", "max_memory_mb"])?;
+        Ok((max_facts, max_seconds, max_memory_mb))
+    }
+
+    /// Parse a single mode string.
+    ///
+    /// One canonical string per mode (case-insensitive); no synonyms. Reasoning
+    /// is a new feature with no backward-compat surface, so the accepted set is
+    /// kept deliberately small.
+    fn parse_single(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(Self::none()),
+            "rdfs" => Ok(Self {
+                rdfs: true,
+                ..Default::default()
+            }),
+            "owl2ql" => Ok(Self {
+                rdfs: true, // OWL2-QL implies RDFS for subclass expansion
+                owl2ql: true,
+                ..Default::default()
+            }),
+            "datalog" => Ok(Self {
+                datalog: true,
+                ..Default::default()
+            }),
+            "owl2rl" => Ok(Self {
+                owl2rl: true,
+                ..Default::default()
+            }),
+            "owl-datalog" => Ok(Self {
+                owl_datalog: true,
+                // owl-datalog is a superset of owl2rl - enable both
+                owl2rl: true,
+                ..Default::default()
+            }),
+            other => Err(format!(
+                "unknown reasoning mode '{other}', expected: none, rdfs, owl2ql, datalog, owl2rl, owl-datalog"
+            )),
+        }
+    }
+
+    /// Merge another ReasoningModes into this one (OR of flags)
+    fn merge(mut self, other: &Self) -> Self {
+        self.rdfs |= other.rdfs;
+        self.owl2ql |= other.owl2ql;
+        self.datalog |= other.datalog;
+        self.owl2rl |= other.owl2rl;
+        self.owl_datalog |= other.owl_datalog;
+        // explicit_none is only set by "none" alone, not merged
+        // rules are combined
+        self.rules.extend(other.rules.iter().cloned());
+        // budgets: first explicit value wins
+        self.max_memory_mb = self.max_memory_mb.or(other.max_memory_mb);
+        self.max_facts = self.max_facts.or(other.max_facts);
+        self.max_seconds = self.max_seconds.or(other.max_seconds);
+        self
+    }
+
+    /// Strictly validate config-declared reasoning mode strings.
+    ///
+    /// Mirrors [`Self::from_mode_strings`]'s per-item handling (strip the
+    /// `fluree:` namespace prefix, then parse) but returns the first
+    /// unrecognized mode as an error instead of warning and skipping. Used at
+    /// transaction time to reject a bad `f:reasoningModes` before it commits,
+    /// so a config typo fails loudly rather than silently disabling reasoning
+    /// at query time. The `Err` string names the offending mode and the
+    /// accepted set.
+    pub fn validate_mode_names(names: &[String]) -> Result<(), String> {
+        for name in names {
+            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
+            Self::parse_single(short)?;
+        }
+        Ok(())
+    }
+
+    /// Build from a list of mode name strings (e.g., from config graph).
+    ///
+    /// Accepts the same names as `parse_single`: "rdfs", "owl2ql",
+    /// "owl2rl", "datalog", "owl-datalog", "none".
+    /// Unknown names are logged as warnings and skipped.
+    pub fn from_mode_strings(names: &[String]) -> Self {
+        let mut modes = Self::default();
+        for name in names {
+            // Config reader returns full IRIs (e.g., "https://ns.flur.ee/db#rdfs").
+            // Strip known namespace prefix before parsing.
+            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
+            match Self::parse_single(short) {
+                Ok(single) => {
+                    if single.explicit_none {
+                        // "none" force-disables reasoning; return immediately.
+                        // merge() deliberately does not propagate explicit_none,
+                        // so we must handle it here.
+                        if names.len() > 1 {
+                            tracing::warn!(
+                                "Config reasoning modes contain 'none' alongside other modes; \
+                                 'none' takes precedence"
+                            );
+                        }
+                        return Self::none();
+                    }
+                    modes = modes.merge(&single);
+                }
+                Err(e) => {
+                    tracing::warn!(mode = %name, "Unknown reasoning mode in config: {e}");
+                }
+            }
+        }
+        modes
+    }
+
+    /// Check if query-time rules are provided
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
+}
+
+/// Reasoning configuration consumed by the rewriter. Solution modifiers
+/// (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) ride on [`Query`](super::Query)
+/// directly.
+#[derive(Debug, Clone, Default)]
+pub struct ReasoningConfig {
+    /// Reasoning modes for RDFS/OWL reasoning
+    ///
+    /// Controls pattern expansion based on class/property hierarchies.
+    /// Reasoning is opt-in: no mode runs unless explicitly requested by the
+    /// query (`"reasoning"` key / SPARQL pragma), the view builder, or a
+    /// ledger-config reasoning default.
+    pub modes: ReasoningModes,
+    /// Pre-resolved schema bundle flakes projected to `g_id=0`.
+    ///
+    /// Populated upstream (in `fluree-db-api`) from the ledger's
+    /// `f:schemaSource` and transitive `owl:imports` closure. When set, the
+    /// runner layers a [`SchemaBundleOverlay`](crate::schema_bundle::SchemaBundleOverlay)
+    /// over the query's base overlay for reasoning prep so that hierarchy
+    /// extraction and OWL axiom discovery see the full import closure.
+    ///
+    /// When `None`, reasoning reads schema from `db.g_id` directly.
+    pub schema_bundle: Option<Arc<SchemaBundleFlakes>>,
+    /// Pre-resolved local graph id from `f:rulesSource`.
+    ///
+    /// Populated upstream (in `fluree-db-api`) when the ledger
+    /// config points the datalog rule extractor at a non-default
+    /// graph. When `Some(g)`, `compute_derived_facts` extracts
+    /// `f:rule` flakes from graph `g`; the rules themselves still
+    /// execute against the query graph (`db.g_id`). When `None`,
+    /// extraction defaults to `db.g_id` — the legacy behaviour.
+    ///
+    /// Cross-ledger rules (where `f:rulesSource` carries
+    /// `f:ledger`) surface as resolved JSON-LD rule definitions
+    /// in [`ReasoningModes::rules`] before query execution; this
+    /// field stays `None` in that case.
+    pub rules_source_g_id: Option<fluree_db_core::GraphId>,
+}
+
+impl ReasoningConfig {
+    /// Create new execution options with defaults
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set reasoning modes
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use fluree_db_query::ir::{ReasoningConfig, ReasoningModes};
+    ///
+    /// let cfg = ReasoningConfig::new()
+    ///     .with_modes(ReasoningModes::rdfs().with_owl2ql());
+    /// assert!(cfg.modes.rdfs);
+    /// assert!(cfg.modes.owl2ql);
+    /// ```
+    pub fn with_modes(mut self, modes: ReasoningModes) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    /// Attach a pre-resolved schema bundle for reasoning.
+    ///
+    /// Populated upstream once per (ledger, `to_t`, schema-source) — see
+    /// `fluree_db_api::ontology_imports::resolve_schema_bundle`.
+    pub fn with_schema_bundle(mut self, bundle: Arc<SchemaBundleFlakes>) -> Self {
+        self.schema_bundle = Some(bundle);
+        self
+    }
+
+    /// Attach a pre-resolved local rules-source graph id.
+    pub fn with_rules_source_g_id(mut self, g_id: Option<fluree_db_core::GraphId>) -> Self {
+        self.rules_source_g_id = g_id;
+        self
+    }
+
+    /// Check if any reasoning mode is explicitly enabled
+    pub fn has_reasoning(&self) -> bool {
+        self.modes.has_any_enabled()
+    }
+
+    /// Check if reasoning is explicitly disabled
+    pub fn is_reasoning_disabled(&self) -> bool {
+        self.modes.is_disabled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================
+    // ReasoningConfig tests
+    // ========================
+
+    #[test]
+    fn test_default_options() {
+        let opts = ReasoningConfig::default();
+        // Default reasoning: nothing explicitly enabled
+        assert!(!opts.has_reasoning());
+        assert!(!opts.is_reasoning_disabled());
+    }
+
+    #[test]
+    fn test_reasoning_modes() {
+        // Default: no explicit reasoning
+        let opts = ReasoningConfig::new();
+        assert!(!opts.has_reasoning());
+        assert!(!opts.is_reasoning_disabled());
+
+        // With RDFS
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::rdfs());
+        assert!(opts.has_reasoning());
+        assert!(opts.modes.rdfs);
+        assert!(!opts.modes.owl2ql);
+
+        // With OWL2-QL (includes RDFS)
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::owl2ql());
+        assert!(opts.has_reasoning());
+        assert!(opts.modes.rdfs);
+        assert!(opts.modes.owl2ql);
+
+        // Explicit none
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::none());
+        assert!(!opts.has_reasoning());
+        assert!(opts.is_reasoning_disabled());
+    }
+
+    // ========================
+    // ReasoningModes tests
+    // ========================
+
+    #[test]
+    fn test_reasoning_modes_default() {
+        let modes = ReasoningModes::default();
+        assert!(!modes.rdfs);
+        assert!(!modes.owl2ql);
+        assert!(!modes.datalog);
+        assert!(!modes.owl2rl);
+        assert!(!modes.explicit_none);
+        assert!(!modes.has_any_enabled());
+        assert!(!modes.is_disabled());
+    }
+
+    #[test]
+    fn test_reasoning_modes_none() {
+        let modes = ReasoningModes::none();
+        assert!(!modes.rdfs);
+        assert!(!modes.owl2ql);
+        assert!(modes.explicit_none);
+        assert!(modes.is_disabled());
+    }
+
+    #[test]
+    fn test_reasoning_modes_rdfs() {
+        let modes = ReasoningModes::rdfs();
+        assert!(modes.rdfs);
+        assert!(!modes.owl2ql);
+        assert!(!modes.explicit_none);
+        assert!(modes.has_any_enabled());
+    }
+
+    #[test]
+    fn test_reasoning_modes_owl2ql() {
+        let modes = ReasoningModes::owl2ql();
+        assert!(modes.rdfs); // owl2ql implies rdfs
+        assert!(modes.owl2ql);
+        assert!(modes.has_any_enabled());
+    }
+
+    #[test]
+    fn test_reasoning_modes_builders() {
+        let modes = ReasoningModes::default()
+            .with_rdfs()
+            .with_owl2ql()
+            .with_datalog();
+        assert!(modes.rdfs);
+        assert!(modes.owl2ql);
+        assert!(modes.datalog);
+        assert!(!modes.owl2rl);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_string_none() {
+        let value = serde_json::json!("none");
+        let modes = ReasoningModes::from_json(&value).unwrap();
+        assert!(modes.explicit_none);
+        assert!(!modes.rdfs);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_string_rdfs() {
+        let value = serde_json::json!("rdfs");
+        let modes = ReasoningModes::from_json(&value).unwrap();
+        assert!(modes.rdfs);
+        assert!(!modes.owl2ql);
+        assert!(!modes.explicit_none);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_string_owl2ql() {
+        // Canonical spelling, case-insensitive.
+        for spelling in &["owl2ql", "OWL2QL", "Owl2Ql"] {
+            let value = serde_json::json!(spelling);
+            let modes = ReasoningModes::from_json(&value).unwrap();
+            assert!(modes.owl2ql, "Failed for spelling: {spelling}");
+            assert!(modes.rdfs, "OWL2QL should imply RDFS for: {spelling}");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_string_owl2rl() {
+        for spelling in &["owl2rl", "OWL2RL"] {
+            let value = serde_json::json!(spelling);
+            let modes = ReasoningModes::from_json(&value).unwrap();
+            assert!(modes.owl2rl, "Failed for spelling: {spelling}");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_modes_reject_noncanonical_spellings() {
+        // One canonical string per mode — former synonyms are now errors.
+        for bad in &[
+            "owl-ql",
+            "owlql",
+            "owl2-ql",
+            "owl-rl",
+            "owlrl",
+            "owl2-rl",
+            "owldatalog",
+        ] {
+            let value = serde_json::json!(bad);
+            assert!(
+                ReasoningModes::from_json(&value).is_err(),
+                "non-canonical spelling {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_array() {
+        let value = serde_json::json!(["rdfs", "owl2ql"]);
+        let modes = ReasoningModes::from_json(&value).unwrap();
+        assert!(modes.rdfs);
+        assert!(modes.owl2ql);
+        assert!(!modes.datalog);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_array_multiple() {
+        let value = serde_json::json!(["rdfs", "datalog", "owl2rl"]);
+        let modes = ReasoningModes::from_json(&value).unwrap();
+        assert!(modes.rdfs);
+        assert!(modes.datalog);
+        assert!(modes.owl2rl);
+        assert!(!modes.owl2ql);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_null() {
+        let value = serde_json::json!(null);
+        let modes = ReasoningModes::from_json(&value).unwrap();
+        assert!(!modes.rdfs);
+        assert!(!modes.explicit_none);
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_invalid_string() {
+        let value = serde_json::json!("invalid_mode");
+        let result = ReasoningModes::from_json(&value);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown reasoning mode"));
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_invalid_type() {
+        let value = serde_json::json!(123);
+        let result = ReasoningModes::from_json(&value);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be a string or array"));
+    }
+
+    #[test]
+    fn test_reasoning_modes_from_json_invalid_array_element() {
+        let value = serde_json::json!(["rdfs", 123]);
+        let result = ReasoningModes::from_json(&value);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must contain strings"));
+    }
+
+    #[test]
+    fn test_reasoning_budget_from_query_json() {
+        let query = serde_json::json!({
+            "reasoning": "owl2rl",
+            "reasoningBudget": {"maxFacts": 20_000_000, "maxSeconds": 300}
+        });
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert!(modes.owl2rl);
+        assert_eq!(modes.max_facts, Some(20_000_000));
+        assert_eq!(modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn test_reasoning_budget_partial_and_variant_keys() {
+        let query = serde_json::json!({"reasoningBudget": {"max-facts": 5}});
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert_eq!(modes.max_facts, Some(5));
+        assert_eq!(modes.max_seconds, None);
+
+        let query = serde_json::json!({"reasoningBudget": {"max_seconds": 10}});
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert_eq!(modes.max_facts, None);
+        assert_eq!(modes.max_seconds, Some(10));
+    }
+
+    #[test]
+    fn test_reasoning_budget_invalid_values_error() {
+        for bad in [
+            serde_json::json!({"reasoningBudget": {"maxFacts": -1}}),
+            serde_json::json!({"reasoningBudget": {"maxFacts": "lots"}}),
+            serde_json::json!({"reasoningBudget": [1, 2]}),
+        ] {
+            assert!(
+                ReasoningModes::from_query_json(&bad).is_err(),
+                "expected error for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_is_opt_in_by_default() {
+        // Default modes request nothing — reasoning must be explicitly enabled
+        // (no auto-RDFS, regardless of whether a schema hierarchy exists).
+        let modes = ReasoningModes::default();
+        assert!(!modes.has_any_enabled());
+        assert!(!modes.is_disabled());
+    }
+}

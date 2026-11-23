@@ -1,0 +1,724 @@
+# Insert
+
+Insert operations add new data to Fluree. This is the most common transaction type for creating new entities and relationships.
+
+## Basic Insert
+
+### Single Entity
+
+Insert a single entity with properties:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": {
+      "ex": "http://example.org/ns/",
+      "schema": "http://schema.org/"
+    },
+    "@graph": [
+      {
+        "@id": "ex:alice",
+        "@type": "schema:Person",
+        "schema:name": "Alice",
+        "schema:email": "alice@example.org",
+        "schema:age": 30
+      }
+    ]
+  }'
+```
+
+**Result:**
+```json
+{
+  "t": 1,
+  "timestamp": "2024-01-22T10:30:00.000Z",
+  "commit_id": "bafybeig...commitT1",
+  "flakes_added": 4,
+  "flakes_retracted": 0
+}
+```
+
+This creates 4 triples:
+```
+ex:alice rdf:type schema:Person
+ex:alice schema:name "Alice"
+ex:alice schema:email "alice@example.org"
+ex:alice schema:age 30
+```
+
+## Multiple Entities
+
+Insert multiple entities in one transaction:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "@type": "schema:Person",
+      "schema:name": "Alice"
+    },
+    {
+      "@id": "ex:bob",
+      "@type": "schema:Person",
+      "schema:name": "Bob"
+    },
+    {
+      "@id": "ex:carol",
+      "@type": "schema:Person",
+      "schema:name": "Carol"
+    }
+  ]
+}
+```
+
+**Benefits:**
+- Atomic: All entities created or none
+- Efficient: Single commit, single index update
+- Consistent: All entities at same transaction time
+
+## Insert with Relationships
+
+Create entities with relationships:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:company-a",
+      "@type": "schema:Organization",
+      "schema:name": "Acme Corp"
+    },
+    {
+      "@id": "ex:alice",
+      "@type": "schema:Person",
+      "schema:name": "Alice",
+      "schema:worksFor": { "@id": "ex:company-a" }
+    }
+  ]
+}
+```
+
+This creates:
+```
+ex:company-a rdf:type schema:Organization
+ex:company-a schema:name "Acme Corp"
+ex:alice rdf:type schema:Person
+ex:alice schema:name "Alice"
+ex:alice schema:worksFor ex:company-a
+```
+
+## Nested Objects
+
+Create nested structures:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "@type": "schema:Person",
+      "schema:name": "Alice",
+      "schema:address": {
+        "@id": "ex:alice-address",
+        "@type": "schema:PostalAddress",
+        "schema:streetAddress": "123 Main St",
+        "schema:addressLocality": "Springfield",
+        "schema:postalCode": "12345"
+      }
+    }
+  ]
+}
+```
+
+This creates two entities (alice and alice-address) linked by schema:address.
+
+## Multi-Valued Properties
+
+Add multiple values for a property:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "@type": "schema:Person",
+      "schema:name": "Alice",
+      "schema:email": ["alice@example.org", "alice@work.com"],
+      "schema:telephone": ["+1-555-0100", "+1-555-0101"]
+    }
+  ]
+}
+```
+
+Creates separate triples for each value:
+```
+ex:alice schema:email "alice@example.org"
+ex:alice schema:email "alice@work.com"
+ex:alice schema:telephone "+1-555-0100"
+ex:alice schema:telephone "+1-555-0101"
+```
+
+## Typed Literals
+
+### Dates
+
+```json
+{
+  "@id": "ex:alice",
+  "schema:birthDate": {
+    "@value": "1994-05-15",
+    "@type": "xsd:date"
+  }
+}
+```
+
+### Timestamps
+
+```json
+{
+  "@id": "ex:event",
+  "schema:startDate": {
+    "@value": "2024-01-22T10:30:00Z",
+    "@type": "xsd:dateTime"
+  }
+}
+```
+
+### Numbers
+
+```json
+{
+  "@id": "ex:product",
+  "schema:price": {
+    "@value": "29.99",
+    "@type": "xsd:decimal"
+  }
+}
+```
+
+### Booleans
+
+```json
+{
+  "@id": "ex:alice",
+  "schema:active": {
+    "@value": "true",
+    "@type": "xsd:boolean"
+  }
+}
+```
+
+Or use native JSON boolean:
+```json
+{
+  "@id": "ex:alice",
+  "schema:active": true
+}
+```
+
+## Language Tags
+
+Add language-tagged strings:
+
+```json
+{
+  "@id": "ex:alice",
+  "schema:name": {
+    "@value": "Alice",
+    "@language": "en"
+  },
+  "schema:description": [
+    { "@value": "Software engineer", "@language": "en" },
+    { "@value": "Ingénieure logicielle", "@language": "fr" },
+    { "@value": "Softwareingenieurin", "@language": "de" }
+  ]
+}
+```
+
+The language tag is part of a value's identity. Two language-tagged values
+that share the same string but differ in their `@language` (for example
+`"animal"@en` and `"animal"@fr`) are **distinct** facts and are both retained;
+they are not deduplicated against each other.
+
+## Blank Nodes
+
+Create entities without explicit IRIs:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "schema:address": {
+        "@type": "schema:PostalAddress",
+        "schema:streetAddress": "123 Main St"
+      }
+    }
+  ]
+}
+```
+
+Fluree generates a unique IRI for the blank node address, in the reserved
+`_:fdb-...` label space. Queries return that id, and it can be used later to
+address the node directly — see
+[Editing blank-node structures](update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids).
+
+## Adding to Existing Entities
+
+Add properties to existing entities:
+
+**Initial Insert (t=1):**
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "schema:name": "Alice"
+    }
+  ]
+}
+```
+
+**Add Email (t=2):**
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:alice",
+      "schema:email": "alice@example.org"
+    }
+  ]
+}
+```
+
+After t=2, ex:alice has both name and email.
+
+## Edge Annotations
+
+Attach metadata to a specific edge via an `@annotation` block on the object node-map. The annotation reifies the `(subject, predicate, object)` triple it sits under:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:worksFor": {
+    "@id": "ex:acme",
+    "@annotation": {
+      "ex:role": "Engineer",
+      "ex:since": { "@value": "2024-01-01", "@type": "xsd:date" }
+    }
+  }
+}
+```
+
+`@edge` is an alias for `@annotation`; the two are interchangeable.
+
+The annotation subject can be left anonymous (a blank node is minted) or pinned to an explicit IRI for stable identity:
+
+```json
+"@annotation": {
+  "@id": "ex:emp/alice-acme-2024",
+  "ex:role": "Engineer"
+}
+```
+
+**Multiple parallel annotations** on the same `(s, p, o)` edge are supported — assert two `@annotation` blocks on separate copies of the edge in the same transaction (each with its own `@id` to keep them distinct):
+
+```json
+{
+  "@graph": [
+    { "@id": "ex:alice", "ex:worksFor": {
+        "@id": "ex:acme",
+        "@annotation": { "@id": "ex:emp/2020", "ex:role": "Engineer" }
+    }},
+    { "@id": "ex:alice", "ex:worksFor": {
+        "@id": "ex:acme",
+        "@annotation": { "@id": "ex:emp/2024", "ex:role": "Manager" }
+    }}
+  ]
+}
+```
+
+Inline `@annotation` queries return one row per occurrence.
+
+**Annotated literal-valued edges** are supported — write the object as a JSON-LD value object so the annotation has a sibling key to attach to:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:name": {
+    "@value": "Alice",
+    "@annotation": { "ex:source": "ex:hr-system" }
+  }
+}
+```
+
+**Deferred shapes** error with explicit messages:
+
+- Annotations on list-occurrence triples (`@list` membership).
+- Reifiers for unasserted triples (`@reifies` must point at an asserted edge).
+- Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
+- Annotation-of-annotation (nested `@annotation` inside an annotation body).
+- `@reifies` on the insert side (use the inline `@annotation` form instead).
+- Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
+
+For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
+
+## Named graphs in JSON-LD
+
+A node's `@graph` names the graph it is written to, and the graph covers every node nested in it:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "ex:alice",
+  "@graph": "http://example.org/graphs/hr",
+  "ex:salary": 95000,
+  "ex:manager": { "@id": "ex:bob", "ex:name": "Bob" }
+}
+```
+
+Both `ex:alice`'s and `ex:bob`'s statements land in `http://example.org/graphs/hr`. A nested node's own `@graph` wins for its subtree; `"@graph": "default"` sends it to the default graph.
+
+The JSON-LD 1.1 named-graph form is accepted too: an object whose `@id` names the graph and whose `@graph` holds the nodes written to it.
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "http://example.org/graphs/hr",
+  "@graph": [
+    { "@id": "ex:alice", "ex:salary": 95000 },
+    { "@id": "ex:bob", "ex:salary": 90000 }
+  ]
+}
+```
+
+Graph names are absolute IRIs, or compact IRIs your `@context` expands; a relative name is resolved against the context's `@base`, and refused without one. `"default"` names the default graph, and `"config"` the ledger's config graph (see [Writing config data](../ledger-config/writing-config.md)).
+
+## Turtle and TriG
+
+`/insert` also takes RDF text. Turtle (`text/turtle`) is parsed straight to flakes. TriG (`application/trig`) adds graph blocks, which land in their named graphs; a `GRAPH <#txn-meta> { ... }` block becomes commit metadata instead:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  --data-binary '
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:name "Alice" .
+
+GRAPH <http://example.org/graphs/hr> {
+  ex:alice ex:salary 95000 .
+}'
+```
+
+A body with graph blocks is read as TriG even when sent as `text/turtle`. From the CLI, `fluree insert -f data.trig` does the same. See [Turtle and TriG](turtle.md) for the syntax, the TriG rules, and querying named graphs.
+
+A list, a Turtle `( … )` or the same list written out as `rdf:first` / `rdf:rest` triples over the document's own blank nodes (N-Triples has no `( … )`), is stored as a JSON-LD `@list` is. A second list on one subject and property, or one whose cells carry other triples, is stored as its triples.
+
+Inserting a list that a subject and property already hold, the same members in the same order, restates it, as inserting a stored fact does. A different list is a second list on the property, beside the first. To replace a list, upsert it.
+
+## Insert Semantics
+
+### Additive by Default
+
+Inserts are additive—they don't remove existing data:
+
+```text
+t=1: INSERT { ex:alice schema:name "Alice" }
+     Result: ex:alice has name "Alice"
+
+t=2: INSERT { ex:alice schema:age 30 }
+     Result: ex:alice has name "Alice" AND age 30
+```
+
+### Duplicate Prevention
+
+Inserting the same triple again is a no-op:
+
+```text
+t=1: INSERT { ex:alice schema:name "Alice" }
+t=2: INSERT { ex:alice schema:name "Alice" }
+     (No change—triple already exists)
+```
+
+A triple's identity includes its datatype and language tag, so values that
+differ only by language tag are not duplicates:
+
+```text
+INSERT { ex:alice schema:name "Alice"@en, "Alice"@fr }
+     Result: ex:alice has TWO name values (one per language tag)
+```
+
+### Multi-Value Handling
+
+Multiple values create multiple triples:
+
+```text
+t=1: INSERT { ex:alice schema:email "alice@example.org" }
+t=2: INSERT { ex:alice schema:email "alice@work.com" }
+     Result: ex:alice has TWO email values
+```
+
+## IRI Generation
+
+### Explicit IRIs
+
+Specify IRIs explicitly:
+
+```json
+{
+  "@id": "ex:user-12345",
+  "schema:name": "Alice"
+}
+```
+
+### UUID-Based IRIs
+
+Generate UUIDs for unique IRIs:
+
+```javascript
+const uuid = crypto.randomUUID();
+const entity = {
+  "@id": `ex:user-${uuid}`,
+  "schema:name": "Alice"
+};
+```
+
+### Content-Addressable IRIs
+
+Use content hashing for deterministic IRIs:
+
+```javascript
+const hash = sha256(JSON.stringify(data));
+const entity = {
+  "@id": `ex:entity-${hash}`,
+  ...data
+};
+```
+
+## Batch Inserts
+
+### Small Batches (Recommended)
+
+```json
+{
+  "@graph": [
+    { "@id": "ex:user-1", "schema:name": "Alice" },
+    { "@id": "ex:user-2", "schema:name": "Bob" },
+    { "@id": "ex:user-3", "schema:name": "Carol" }
+    // ... 100-1000 entities
+  ]
+}
+```
+
+### Large Imports
+
+For very large imports:
+
+```javascript
+const batchSize = 1000;
+for (let i = 0; i < entities.length; i += batchSize) {
+  const batch = entities.slice(i, i + batchSize);
+  await transact({ "@graph": batch });
+  
+  // Optional: wait for indexing
+  await sleep(1000);
+}
+```
+
+## Error Handling
+
+### Common Insert Errors
+
+**Invalid IRI:**
+```json
+{
+  "error": "ValidationError",
+  "message": "Invalid IRI format",
+  "code": "INVALID_IRI"
+}
+```
+
+**Type Mismatch:**
+```json
+{
+  "error": "TypeError",
+  "message": "Expected number, got string",
+  "code": "TYPE_ERROR"
+}
+```
+
+**Constraint Violation:**
+```json
+{
+  "error": "ConstraintViolation",
+  "message": "Unique constraint violated",
+  "code": "CONSTRAINT_VIOLATION"
+}
+```
+
+### Validation Before Insert
+
+Validate data before inserting:
+
+```javascript
+function validateEntity(entity) {
+  if (!entity['@id']) {
+    throw new Error('Entity must have @id');
+  }
+  if (!isValidIRI(entity['@id'])) {
+    throw new Error('Invalid IRI format');
+  }
+  // Additional validation...
+}
+```
+
+## Best Practices
+
+### 1. Use Meaningful IRIs
+
+Good:
+```json
+{ "@id": "ex:user-alice-12345" }
+```
+
+Bad:
+```json
+{ "@id": "ex:1" }
+```
+
+### 2. Always Include Type
+
+```json
+{
+  "@id": "ex:alice",
+  "@type": "schema:Person"
+}
+```
+
+### 3. Use Appropriate Datatypes
+
+```json
+{
+  "schema:age": 30,
+  "schema:price": 29.99,
+  "schema:active": true,
+  "schema:birthDate": { "@value": "1994-05-15", "@type": "xsd:date" }
+}
+```
+
+### 4. Batch Related Entities
+
+Insert related entities in same transaction:
+
+```json
+{
+  "@graph": [
+    { "@id": "ex:order-123", ... },
+    { "@id": "ex:order-item-1", ... },
+    { "@id": "ex:order-item-2", ... }
+  ]
+}
+```
+
+### 5. Use Consistent Namespaces
+
+Define and use consistent namespace prefixes:
+
+```json
+{
+  "@context": {
+    "app": "https://myapp.com/ns/",
+    "schema": "http://schema.org/"
+  }
+}
+```
+
+### 6. Include Metadata
+
+Add creation metadata:
+
+```json
+{
+  "@id": "ex:alice",
+  "schema:name": "Alice",
+  "app:createdAt": "2024-01-22T10:00:00Z",
+  "app:createdBy": "user-admin"
+}
+```
+
+### 7. Validate Before Insert
+
+Always validate:
+- JSON-LD syntax
+- IRI formats
+- Required fields
+- Type constraints
+
+## Performance Tips
+
+### 1. Batch Appropriately
+
+- Recommended: 100-1000 entities per batch
+- Too small: Many commits, slow
+- Too large: Memory pressure, long commits
+
+### 2. Monitor Indexing
+
+Track indexing lag after large inserts:
+
+```bash
+curl http://localhost:8090/v1/fluree/info/mydb:main
+# Check: t - index.t
+```
+
+### 3. Use Efficient IRIs
+
+Short IRIs are more efficient:
+
+Good: `ex:user-123`
+Less efficient: `https://example.org/very/long/path/user-123`
+
+### 4. Minimize Context Size
+
+Use compact contexts:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/ns/",
+    "schema": "http://schema.org/"
+  }
+}
+```
+
+## Related Documentation
+
+- [Overview](overview.md) - Transaction overview
+- [Upsert](upsert.md) - Replace mode inserts
+- [Turtle and TriG](turtle.md) - RDF text formats and named graphs
+- [Update](update-where-delete-insert.md) - Updating existing data
+- [Data Types](../concepts/datatypes.md) - Supported datatypes
+- [API Endpoints](../api/endpoints.md) - HTTP API details

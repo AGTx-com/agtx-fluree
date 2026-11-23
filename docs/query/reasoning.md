@@ -1,0 +1,466 @@
+# Query-Time Reasoning
+
+This page covers how to enable and use reasoning in your queries. For
+background concepts see [Reasoning and inference](../concepts/reasoning.md); for
+the full list of supported OWL/RDFS constructs see the
+[OWL & RDFS reference](../reference/owl-rdfs-support.md).
+
+## The `reasoning` parameter
+
+Add a `"reasoning"` key to any JSON-LD query to control which inference modes
+are active:
+
+### Single mode
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "select": ["?s"],
+  "where": {"@id": "?s", "@type": "ex:Person"},
+  "reasoning": "rdfs"
+}
+```
+
+### Multiple modes
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "@type": "ex:Person"},
+  "reasoning": ["rdfs", "owl2rl"]
+}
+```
+
+### Disable reasoning
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "@type": "ex:Person"},
+  "reasoning": "none"
+}
+```
+
+Use `"none"` to override any view- or ledger-wide reasoning defaults for
+this query (with no defaults configured, it is a no-op affirmation).
+
+### Valid mode strings
+
+Each mode has exactly one accepted string (case-insensitive):
+
+| String | Mode |
+|--------|------|
+| `"rdfs"` | RDFS subclass/subproperty expansion |
+| `"owl2ql"` | OWL 2 QL query rewriting (includes RDFS) |
+| `"owl2rl"` | OWL 2 RL forward-chaining materialization |
+| `"owl-datalog"` | OWL 2 RL plus datalog rule execution (superset of `owl2rl`) |
+| `"datalog"` | Datalog rule execution |
+| `"none"` | Disable all reasoning |
+
+### Inside `opts`
+
+The reasoning keys (`reasoning`, `rules`, `ontology`, `reasoningBudget` and
+`reasoningTime`) can also go inside the query's `opts` object. Each key is
+read from the top level when it is there and from `opts` otherwise, so
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "ex:p": "?o"},
+  "reasoningBudget": {"maxFacts": 20000000},
+  "opts": {"reasoning": "datalog"}
+}
+```
+
+runs datalog under that budget. When both carry the same key, the top
+level's value is used.
+
+## Default behavior
+
+Reasoning is **opt-in**. When the `reasoning` key is absent from a query, no
+reasoning runs — even if the data contains `rdfs:subClassOf` /
+`rdfs:subPropertyOf` hierarchies. Plain queries match asserted triples only,
+pay no reasoning-prep cost, and behave like other SPARQL engines under simple
+entailment.
+
+To enable reasoning without setting it per query, configure a default at the
+view level (`GraphDb::with_reasoning(...)` in the Rust API) or in the ledger
+configuration graph (`reasoningModes`). To override such a default for a
+single query, use `"reasoning": "none"`.
+
+> **Behavior change**: versions prior to this release auto-enabled RDFS when a
+> schema hierarchy existed in the data (though for imported ledgers the
+> auto-detection often silently failed). If you relied on automatic subclass /
+> subproperty expansion, add `"reasoning": "rdfs"` to your queries or set a
+> ledger default.
+
+## Examples
+
+The examples below assume this schema and data have been transacted:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#"
+  },
+  "insert": [
+    {"@id": "ex:Student", "rdfs:subClassOf": {"@id": "ex:Person"}},
+    {"@id": "ex:GradStudent", "rdfs:subClassOf": {"@id": "ex:Student"}},
+    {"@id": "ex:alice", "@type": "ex:GradStudent", "ex:name": "Alice"},
+    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"},
+
+    {"@id": "ex:livesWith", "@type": "owl:SymmetricProperty"},
+    {"@id": "ex:alice", "ex:livesWith": {"@id": "ex:bob"}},
+
+    {"@id": "ex:hasAncestor", "@type": "owl:TransitiveProperty"},
+    {"@id": "ex:carol", "ex:hasAncestor": {"@id": "ex:dave"}},
+    {"@id": "ex:dave", "ex:hasAncestor": {"@id": "ex:eve"}},
+
+    {"@id": "ex:hasMother", "owl:inverseOf": {"@id": "ex:childOf"}},
+    {"@id": "ex:frank", "ex:hasMother": {"@id": "ex:grace"}}
+  ]
+}
+```
+
+### RDFS: subclass expansion
+
+Query for all `ex:Person` instances — Alice is returned even though she was
+only typed as `ex:GradStudent`:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "select": ["?name"],
+  "where": {
+    "@id": "?s", "@type": "ex:Person",
+    "ex:name": "?name"
+  },
+  "reasoning": "rdfs"
+}
+```
+
+**Result:** `["Alice", "Bob"]`
+
+Without reasoning (or with `"reasoning": "none"`), only `"Bob"` is returned
+because Alice's explicit type is `GradStudent`, not `Person`.
+
+### OWL 2 RL: symmetric properties
+
+Query who lives with Bob — Alice is inferred even though only
+`alice livesWith bob` was asserted:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "select": ["?who"],
+  "where": {"@id": "ex:bob", "ex:livesWith": "?who"},
+  "reasoning": "owl2rl"
+}
+```
+
+**Result:** `["ex:alice"]`
+
+### OWL 2 RL: transitive properties
+
+Query for all ancestors of Carol — Eve is inferred through transitivity:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "select": ["?ancestor"],
+  "where": {"@id": "ex:carol", "ex:hasAncestor": "?ancestor"},
+  "reasoning": "owl2rl"
+}
+```
+
+**Result:** `["ex:dave", "ex:eve"]`
+
+### OWL 2 QL: inverse properties
+
+Query `childOf` — inferred from the `hasMother` / `inverseOf` declaration:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "select": ["?child"],
+  "where": {"@id": "ex:grace", "ex:childOf": "?child"},
+  "reasoning": "owl2ql"
+}
+```
+
+**Result:** `["ex:frank"]`
+
+### OWL 2 RL: domain and range inference
+
+If your schema declares `rdfs:domain` and `rdfs:range`:
+
+```json
+{
+  "insert": [
+    {"@id": "ex:teaches", "rdfs:domain": {"@id": "ex:Professor"},
+                          "rdfs:range": {"@id": "ex:Course"}},
+    {"@id": "ex:alice", "ex:teaches": {"@id": "ex:cs101"}}
+  ]
+}
+```
+
+Then with `"reasoning": "owl2rl"`:
+- `ex:alice rdf:type ex:Professor` is inferred (from domain)
+- `ex:cs101 rdf:type ex:Course` is inferred (from range)
+
+### Combined modes
+
+Enable RDFS + OWL 2 RL + Datalog together:
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "@type": "ex:Person"},
+  "reasoning": ["rdfs", "owl2rl", "datalog"],
+  "rules": [
+    {
+      "@context": {"ex": "http://example.org/"},
+      "where": {"@id": "?p", "ex:parent": {"ex:parent": "?gp"}},
+      "insert": {"@id": "?p", "ex:grandparent": {"@id": "?gp"}}
+    }
+  ]
+}
+```
+
+OWL 2 RL facts are materialized first, then Datalog rules run over the
+combined base + OWL data. OWL 2 RL materializes everything RDFS and OWL 2 QL
+query rewriting would add, so with `owl2rl` on the rewrite is skipped.
+
+Rule bodies don't use the `rdfs` and `owl2ql` rewrites. Under either mode
+without `owl2rl`, a program with a rule that negates or aggregates is
+refused: the rule would read an entailment the query sees as absent. Add
+`owl2rl`. See [Datalog rules](datalog-rules.md#negation).
+
+A rule that fails to parse or validate — a stored `f:rule` as much as a
+query-time one — fails the query with an error naming the rule and the
+offending construct. Rules are never skipped silently, because a reasoning
+query answered over a partial rule set is wrong in a way the caller cannot
+see. See [Datalog rules](datalog-rules.md#validation-a-rule-that-cannot-run-is-an-error).
+
+## SPARQL
+
+In SPARQL queries, reasoning is controlled via the Fluree-specific
+`PRAGMA reasoning` directive. Property paths (`+`, `*`, `^`) provide a
+complementary mechanism for navigating transitive and inverse relationships
+directly in the query pattern — see [SPARQL](sparql.md) for details.
+
+## Inline ontology per query
+
+In addition to ontology axioms stored in the ledger (via
+`f:schemaSource`), a query can supply **inline ontology axioms**
+via the top-level `ontology` field. The axioms are used only for
+this query's reasoning pass and never persist.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "select":    "?name",
+  "where":     {"@id": "?p", "@type": "ex:Person", "ex:name": "?name"},
+  "reasoning": "rdfs",
+  "ontology": {
+    "@context": {
+      "ex":   "http://example.org/ns/",
+      "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    },
+    "@id":             "ex:Employee",
+    "rdfs:subClassOf": {"@id": "ex:Person"}
+  }
+}
+```
+
+Semantics:
+
+- **Additive, not replacing.** Inline axioms layer on top of
+  whatever `f:schemaSource` configured for the ledger (same- or
+  cross-ledger). Both contribute to the bundle the reasoner sees.
+- **Transient.** Axioms never persist. The next query without
+  `ontology` runs against only the configured bundle.
+- **Reasoning mode still required.** Inline axioms don't enable
+  reasoning on their own — set `reasoning` so the engine actually
+  uses them.
+- **Namespace-scoped.** IRIs the snapshot already knows reuse
+  their codes; previously-unseen IRIs allocate request-scoped
+  codes that are discarded with the response — the on-disk
+  dictionary is untouched.
+- **No audit trail.** Without persistence, "which axioms drove
+  which result" can't be reconstructed from history. Store
+  long-lived ontologies in a graph and reference via
+  `f:schemaSource` if auditability matters.
+
+Use cases that fit well: testing a candidate ontology before
+committing it to the ledger, per-tenant axiom layers, exploratory
+analytics with hypothetical sub-class chains.
+
+## Interaction with ledger configuration
+
+If `f:reasoningDefaults` is set in the ledger configuration graph (see
+[Setting groups](../ledger-config/setting-groups.md)), those modes apply to
+every query that does not set `reasoning` itself. The per-query `reasoning`
+parameter can:
+
+- **Replace them** — a query that sets `reasoning` runs its own modes
+  instead. The two are not merged, so a query that wants a default mode and
+  another lists both.
+- **Disable all** — `"reasoning": "none"` runs with no reasoning.
+
+The `f:overrideControl` setting on the ledger config determines whether
+query-time overrides are allowed. See
+[Override control](../ledger-config/override-control.md) for details.
+
+## Materialization budget
+
+Materialization — OWL 2 RL and datalog rules alike — runs under a budget
+(default: 1,000,000 derived facts / 30 seconds). The limits are checked as
+work is dispatched rather than once a round, so a long round is bounded far
+more tightly than it used to be. They are not checked between every derived
+fact everywhere: an OWL 2 RL property chain, and the rules that produce
+`owl:sameAs`, each run to completion before the next check, so a single
+high-fan-out input can still carry a round past a limit before it is noticed.
+
+There is a third limit on the bytes those derived facts occupy. It has no
+default of its own: it is derived from the fact ceiling, at an allowance well
+above what an ordinary fact costs, so the **fact** cap is what binds on normal
+data and the memory cap only fires when facts are abnormally large — long
+IRIs, or big string and JSON literals. Raising `maxFacts` raises it with them.
+Both limits count only *derived* facts, not the base data the fixpoint reads. When the closure exceeds the budget it is
+**capped**: the query still answers, but over an incomplete closure —
+results may be missing entailments. A capped run is therefore surfaced, not
+just logged:
+
+- Tracked responses (`"opts": {"meta": true}` or the `fluree-track-*`
+  headers) carry a top-level `reasoning` block:
+
+  ```json
+  {
+    "status": 200,
+    "result": [...],
+    "reasoning": {
+      "capped": true,
+      "capped_reason": "facts",
+      "derived_facts": 1000000,
+      "iterations": 3,
+      "duration_ms": 12450
+    }
+  }
+  ```
+
+- The same JSON rides the `x-fdb-reasoning` response header.
+- `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
+  `"iterations"` (the fixpoint hit its round limit before converging).
+- `rules_fired` breaks the tally down per rule. It counts derived **facts**
+  per rule, not rule applications: a rule that matches a thousand rows and
+  derives one new fact from them counts once.
+- When datalog rules are capped, `capped_rules` names the rules that were
+  running when the cap fired and `pending_rules` the rules it kept from
+  running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
+  time they returned (see [Datalog rules](datalog-rules.md)).
+- The server logs a WARN per capped materialization.
+
+The budget is configurable at three levels (highest precedence first):
+
+1. **Per query** — JSON-LD `"reasoningBudget": {"maxFacts": 20000000,
+   "maxSeconds": 300, "maxMemoryMb": 512}`, or SPARQL
+   `# PRAGMA reasoning-max-facts: 20000000` /
+   `# PRAGMA reasoning-max-seconds: 300` /
+   `# PRAGMA reasoning-max-memory-mb: 512`. Subject to the ledger's
+   `f:overrideControl` on `f:reasoningDefaults`.
+2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
+   `f:reasoningMaxMemoryMb` in `f:reasoningDefaults` (see
+   [Setting groups](../ledger-config/setting-groups.md)).
+3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
+   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
+   environment variables.
+
+**The query's own limits apply too.** Materialization runs on the query's
+behalf, so cancelling the query — a client disconnect, or a query timeout —
+stops OWL 2 RL and datalog rule bodies mid-run, and the query fails with the
+cancellation rather than answering over a partial closure. The work counts
+toward the query's fuel: OWL 2 RL charges 0.001 fuel for each fact a round
+processes, and rule bodies are charged like any query, including the
+property paths a transitive-closure rule runs as. Only the
+query that computes a materialization pays for it; queries answered from the
+cached result do not, and a run that was cancelled or ran out of fuel caches
+nothing.
+
+### Memory a cached result holds
+
+A materialization is cached (see below), and while cached it holds its
+derived facts. Joins over derived facts add to that. The first reasoning
+query whose join reads a derived predicate through a batched lane translates
+that predicate's facts into the index's internal ids, about 40 bytes per
+fact, and the result keeps the translation for every later query reading it.
+A predicate can be translated twice: once in subject order, and, for joins
+that probe by object, its reference-valued facts again in object order. The
+translations are made only when a query needs them and are dropped with the
+result.
+
+The memory limit above covers both: a result's derived facts and its
+translations together stay within it. Both sizes are estimates. A translation
+that would take a result past the limit is not made. The join runs per row
+instead, with the same answer, only slower, and the server logs one WARN for
+that result. The warning names the phase, the estimated sizes, the limit and
+the derived-fact count.
+
+To provision for reasoning, plan for each cached result to hold up to its
+memory limit. Up to 16 results are cached at once, one for each distinct
+combination of database state, reasoning modes, rules and budget. If the
+warning appears:
+
+- if the host has memory to spare, raise the memory limit;
+- if it doesn't, run fewer distinct reasoning workloads at once;
+- or narrow the rules or queries, so less is derived or translated.
+
+## Performance considerations
+
+| Mode | Overhead | Caching |
+|------|----------|---------|
+| RDFS | Negligible — query rewriting only | N/A |
+| OWL 2 QL | Negligible — query rewriting only | N/A |
+| OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes + budget |
+| Datalog | Rule bodies run on the query executor; the first query materializes, later queries with the same rule set hit the cache | Same LRU cache as OWL 2 RL, keyed additionally on a content hash of the rule set (stored and query-time rules) |
+
+**Tips:**
+- Start with **RDFS** if you only need class/property hierarchies — it has
+  virtually zero overhead.
+- Use **OWL 2 QL** when you also need inverse properties and domain/range
+  inference but want to stay in the query-rewriting approach.
+- Use **OWL 2 RL** when you need the full rule set (transitive, symmetric,
+  functional properties, `owl:sameAs`, restrictions, property chains).
+- The materialization cache is invalidated when the underlying data changes
+  (new transactions), so the first query after a write will re-materialize.
+
+## Reasoning under access policy
+
+Reasoning composes with view policy, but mind the contract when both are on:
+
+- **OWL 2 QL** and **RDFS** rewrite the query and execute under your identity, so they are filtered like any normal query.
+- **OWL 2 RL** and **datalog** materialize derived facts into the query overlay; those facts are filtered by the **same per-flake view policy as base data**. A derived flake you may not view is dropped.
+- The engine filters a derived fact by its own `(subject, predicate, object)` — **not** by the base facts it was derived from. A rule or ontology axiom can therefore re-express hidden data under a viewable predicate (e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule deriving `ex:isHighEarner` from a hidden `ex:salary`) and the derived value will surface.
+- Materialized facts are computed once over all of the ledger's data and shared by every caller; the policy applies when rows are read, not while facts are derived.
+- The two approaches can therefore answer the same query differently under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing under `"rdfs"`, because the rewritten query scans the hidden `ex:ssn`. Under `"owl2rl"` it returns the value, because the derived `ex:identifier` fact is itself viewable.
+
+**If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden. Under OWL 2 RL and datalog, an `f:onClass` policy applies by the classes the query reasons to: denying a derived class hides every fact of its members, including asserted ones, and every derived fact of an asserted member. A graph crawl (`select {"?s": ["*"]}`) does not reason yet, and judges class policies on stored classes only.
+
+**Policy reads what the query reads.** In a reasoning query, class policies and `f:query` conditions see derived facts; a query without reasoning is judged on stored facts. Two consequences follow:
+
+- Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
+- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
+
+**Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
+
+## Related pages
+
+| Topic | Page |
+|-------|------|
+| Conceptual introduction | [Reasoning and inference](../concepts/reasoning.md) |
+| Custom inference rules | [Datalog rules](datalog-rules.md) |
+| Supported OWL & RDFS constructs | [OWL & RDFS reference](../reference/owl-rdfs-support.md) |
+| Ledger-wide reasoning config | [Setting groups](../ledger-config/setting-groups.md) |
+| Reasoning under access policy | [Policy in queries](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog) |

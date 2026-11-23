@@ -1,0 +1,652 @@
+// JSON-LD vs Turtle insert benchmarks.
+//
+// Measures throughput of sequential inserts using identical triples in both
+// serialization formats, across a matrix of transaction counts and node sizes.
+//
+// ## Data model
+//
+// ~10% Company nodes with `ex:employees` and `ex:customers` refs to Person
+// nodes within the same transaction.  ~90% Person nodes with scalar properties.
+// All data is fully deterministic (no RNG) for reproducibility and future
+// data-integrity tests.
+//
+// ## Matrix
+//
+//   formats:   jsonld, turtle, trig (the same Turtle body inside one
+//              `GRAPH <g> { … }` block — exercises the named-graph
+//              structured path, which Turtle and JSON-LD never touch),
+//              upsert_turtle (the Turtle bodies upserted into a fresh
+//              ledger: new subjects), upsert_turtle_replace (the same
+//              upserts over a ledger that already holds them: every
+//              subject's values are read and restated), and trig_mixed
+//              (TriG insert of each body with its first half in the
+//              default graph and its second half in a trailing block —
+//              the documents the streaming Turtle parse stops on)
+//   txn counts: 10, 100
+//   nodes/txn:  10, 100, 1000
+//
+// ## Running
+//
+//   cargo bench -p fluree-db-api --bench insert_formats
+//
+// Quick validation (1 iteration each, no stats):
+//
+//   cargo bench -p fluree-db-api --bench insert_formats -- --test
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support::gen::people::{
+    generate_txn_data, txn_data_to_jsonld, txn_data_to_turtle,
+};
+use fluree_bench_support::{
+    bench_runtime, current_profile, init_tracing_for_bench, next_ledger_alias,
+};
+use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
+use serde_json::Value as JsonValue;
+use tokio::runtime::Runtime;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Transaction counts to benchmark.
+const TXN_COUNTS_FULL: &[usize] = &[10, 100];
+
+/// Nodes per transaction to benchmark.
+const NODES_PER_TXN_FULL: &[usize] = &[10, 100, 1_000];
+
+/// Scale-driven slices. Tiny runs only the smallest matrix cell so the
+/// CI bench-gate stays under its wall-clock budget; nightly runs the
+/// full matrix (6 scenarios at the largest dimensions).
+fn matrix() -> (&'static [usize], &'static [usize]) {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..1]),
+        BenchScale::Small => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Medium => (TXN_COUNTS_FULL, &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Large => (TXN_COUNTS_FULL, NODES_PER_TXN_FULL),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type aliases
+// ---------------------------------------------------------------------------
+
+type BenchFluree = fluree_db_api::Fluree;
+type BenchLedger = fluree_db_api::LedgerState;
+
+// ---------------------------------------------------------------------------
+// Pre-generated bench data
+// ---------------------------------------------------------------------------
+//
+// `TxnData`, `PersonData`, `CompanyData`, `generate_txn_data`,
+// `txn_data_to_jsonld`, and `txn_data_to_turtle` were lifted into
+// `fluree_bench_support::gen::people` so other benches can reuse them.
+// `PregenData` is bench-specific (couples Fluree-side calibration) and
+// stays here.
+
+struct PregenData {
+    jsonld_txns: Vec<JsonValue>,
+    turtle_txns: Vec<String>,
+    /// `turtle_txns` with the body wrapped in a single named-graph block.
+    trig_txns: Vec<String>,
+    /// `turtle_txns` with the second half of the body in a trailing block.
+    trig_mixed_txns: Vec<String>,
+    /// `turtle_txns` with every statement in its own block, under extra
+    /// prefix declarations.
+    trig_blocks_txns: Vec<String>,
+    /// Total flakes produced by inserting all transactions (calibrated once).
+    total_flakes: u64,
+}
+
+/// Pre-generate all transaction data and do one calibration insert pass to
+/// count total flakes. The flake count is deterministic (same data every run)
+/// and identical for both formats, so one pass suffices.
+fn pregen(
+    rt: &Runtime,
+    fluree: &BenchFluree,
+    index_config: &IndexConfig,
+    txn_count: usize,
+    nodes_per_txn: usize,
+) -> PregenData {
+    let mut jsonld_txns = Vec::with_capacity(txn_count);
+    let mut turtle_txns = Vec::with_capacity(txn_count);
+    let mut trig_txns = Vec::with_capacity(txn_count);
+    let mut trig_mixed_txns = Vec::with_capacity(txn_count);
+    let mut trig_blocks_txns = Vec::with_capacity(txn_count);
+
+    for txn_idx in 0..txn_count {
+        let data = generate_txn_data(txn_idx, nodes_per_txn);
+        jsonld_txns.push(txn_data_to_jsonld(&data));
+        let turtle = txn_data_to_turtle(&data);
+        trig_txns.push(turtle_to_trig(&turtle));
+        trig_mixed_txns.push(turtle_to_trig_mixed(&turtle));
+        trig_blocks_txns.push(turtle_to_trig_blocks(&turtle));
+        turtle_txns.push(turtle);
+    }
+
+    // Calibration: insert all txns once via Turtle (cheapest path) to count flakes.
+    let total_flakes = rt.block_on(async {
+        let alias = next_ledger_alias("cal");
+        let mut ledger = fluree.create_ledger(&alias).await.unwrap();
+        let mut flakes = 0u64;
+        for txn in &turtle_txns {
+            let result = fluree
+                .insert_turtle_with_opts(
+                    ledger,
+                    txn,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    index_config,
+                    None,
+                )
+                .await
+                .unwrap();
+            flakes += result.receipt.flake_count as u64;
+            ledger = result.ledger;
+        }
+        flakes
+    });
+
+    PregenData {
+        jsonld_txns,
+        turtle_txns,
+        trig_txns,
+        trig_mixed_txns,
+        trig_blocks_txns,
+        total_flakes,
+    }
+}
+
+/// Wrap a Turtle document's statements in one `GRAPH <g> { … }` block,
+/// keeping the `@prefix` directives at document scope (TriG requires it).
+fn turtle_to_trig(turtle: &str) -> String {
+    let mut out = String::with_capacity(turtle.len() + 64);
+    let mut body = String::with_capacity(turtle.len());
+    for line in turtle.lines() {
+        if line.starts_with("@prefix") {
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out.push_str("GRAPH <http://example.org/ns/bench-graph> {\n");
+    out.push_str(&body);
+    out.push_str("}\n");
+    out
+}
+
+/// Keep the first half of a Turtle document's statements in the default
+/// graph and move the second half into one trailing `GRAPH <g> { … }` block.
+/// Statements are the blank-line-separated paragraphs `txn_data_to_turtle`
+/// writes, after its `@prefix` lines.
+fn turtle_to_trig_mixed(turtle: &str) -> String {
+    let (prefixes, body): (Vec<&str>, Vec<&str>) =
+        turtle.lines().partition(|l| l.starts_with("@prefix"));
+    let body = body.join("\n");
+    let statements: Vec<&str> = body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let split = statements.len() / 2;
+    let mut out = String::with_capacity(turtle.len() + 64);
+    for p in prefixes {
+        out.push_str(p);
+        out.push('\n');
+    }
+    for st in &statements[..split] {
+        out.push_str(st);
+        out.push_str("\n\n");
+    }
+    out.push_str("GRAPH <http://example.org/ns/bench-graph> {\n");
+    for st in &statements[split..] {
+        out.push_str(st);
+        out.push_str("\n\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Every statement of a Turtle document in its own `GRAPH <g> { … }` block,
+/// over ten graphs, with sixteen more prefix declarations than the document
+/// uses: the many-small-blocks shape, where per-block parser setup would
+/// dominate.
+fn turtle_to_trig_blocks(turtle: &str) -> String {
+    let (prefixes, body): (Vec<&str>, Vec<&str>) =
+        turtle.lines().partition(|l| l.starts_with("@prefix"));
+    let body = body.join("\n");
+    let mut out = String::with_capacity(turtle.len() * 2);
+    for p in prefixes {
+        out.push_str(p);
+        out.push('\n');
+    }
+    for i in 0..16 {
+        out.push_str(&format!(
+            "@prefix x{i}: <http://example.org/extra/{i}/> .\n"
+        ));
+    }
+    for (k, st) in body
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        out.push_str(&format!(
+            "GRAPH <http://example.org/ns/bench-graph-{}> {{\n{st}\n}}\n",
+            k % 10
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Insert runners
+// ---------------------------------------------------------------------------
+
+async fn run_jsonld_inserts(
+    fluree: &BenchFluree,
+    ledger: BenchLedger,
+    txns: &[JsonValue],
+    index_config: &IndexConfig,
+) -> BenchLedger {
+    let mut ledger = ledger;
+    for txn in txns {
+        let result = fluree
+            .insert_with_opts(
+                ledger,
+                txn,
+                TxnOpts::default(),
+                CommitOpts::default(),
+                index_config,
+            )
+            .await
+            .unwrap();
+        ledger = result.ledger;
+    }
+    ledger
+}
+
+async fn run_turtle_inserts(
+    fluree: &BenchFluree,
+    ledger: BenchLedger,
+    txns: &[String],
+    index_config: &IndexConfig,
+) -> BenchLedger {
+    let mut ledger = ledger;
+    for txn in txns {
+        let result = fluree
+            .insert_turtle_with_opts(
+                ledger,
+                txn,
+                TxnOpts::default(),
+                CommitOpts::default(),
+                index_config,
+                None,
+            )
+            .await
+            .unwrap();
+        ledger = result.ledger;
+    }
+    ledger
+}
+
+async fn run_turtle_upserts(
+    fluree: &BenchFluree,
+    ledger: BenchLedger,
+    txns: &[String],
+    index_config: &IndexConfig,
+) -> BenchLedger {
+    let mut ledger = ledger;
+    for txn in txns {
+        let result = fluree
+            .upsert_turtle_with_opts(
+                ledger,
+                txn,
+                TxnOpts::default(),
+                CommitOpts::default(),
+                index_config,
+            )
+            .await
+            .unwrap();
+        ledger = result.ledger;
+    }
+    ledger
+}
+
+/// TriG goes through the transact builder's `upsert_turtle`: the plain
+/// `insert_turtle_with_opts` path and the builder's `insert_turtle` fast path
+/// both skip `GRAPH`-block extraction. The ledger is addressed by alias, so no
+/// `LedgerState` is threaded through.
+async fn run_trig_inserts(
+    fluree: &BenchFluree,
+    alias: &str,
+    txns: &[String],
+    index_config: &IndexConfig,
+) {
+    for txn in txns {
+        fluree
+            .graph(alias)
+            .transact()
+            .upsert_turtle(txn)
+            .index_config(index_config.clone())
+            .commit()
+            .await
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
+struct ScenarioResult {
+    txn_count: usize,
+    nodes_per_txn: usize,
+    total_flakes: u64,
+    jsonld_ms: f64,
+    turtle_ms: f64,
+}
+
+fn format_flakes_per_sec(flakes: u64, ms: f64) -> String {
+    let per_sec = flakes as f64 / (ms / 1000.0);
+    if per_sec >= 1_000_000.0 {
+        format!("{:.2}M", per_sec / 1_000_000.0)
+    } else if per_sec >= 1_000.0 {
+        format!("{:.1}K", per_sec / 1_000.0)
+    } else {
+        format!("{per_sec:.0}")
+    }
+}
+
+fn print_summary(results: &[ScenarioResult]) {
+    eprintln!();
+    eprintln!("==========================================================================");
+    eprintln!("  INSERT BENCHMARK SUMMARY");
+    eprintln!("==========================================================================");
+    eprintln!(
+        "  {:>6} x {:>5}  {:>8}  {:>10} {:>10}  {:>12} {:>12}  {:>6}",
+        "txns", "nodes", "flakes", "jsonld", "turtle", "jsonld fl/s", "turtle fl/s", "ratio"
+    );
+    eprintln!("  {}", "-".repeat(82));
+
+    for r in results {
+        let jld_fps = format_flakes_per_sec(r.total_flakes, r.jsonld_ms);
+        let ttl_fps = format_flakes_per_sec(r.total_flakes, r.turtle_ms);
+        let ratio = r.jsonld_ms / r.turtle_ms;
+        eprintln!(
+            "  {:>6} x {:>5}  {:>8}  {:>8.1}ms {:>8.1}ms  {:>12} {:>12}  {:>5.2}x",
+            r.txn_count,
+            r.nodes_per_txn,
+            r.total_flakes,
+            r.jsonld_ms,
+            r.turtle_ms,
+            jld_fps,
+            ttl_fps,
+            ratio,
+        );
+    }
+
+    eprintln!("  {}", "-".repeat(82));
+    eprintln!("  ratio = jsonld_time / turtle_time (>1 means turtle is faster)");
+    eprintln!();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark
+// ---------------------------------------------------------------------------
+
+/// Time a single run of all inserts, returning elapsed milliseconds.
+fn time_jsonld_run(
+    rt: &Runtime,
+    fluree: &BenchFluree,
+    txns: &[JsonValue],
+    index_config: &IndexConfig,
+) -> f64 {
+    rt.block_on(async {
+        let alias = next_ledger_alias("sum-jld");
+        let ledger = fluree.create_ledger(&alias).await.unwrap();
+        let start = std::time::Instant::now();
+        let _ = run_jsonld_inserts(fluree, ledger, txns, index_config).await;
+        start.elapsed().as_secs_f64() * 1000.0
+    })
+}
+
+fn time_turtle_run(
+    rt: &Runtime,
+    fluree: &BenchFluree,
+    txns: &[String],
+    index_config: &IndexConfig,
+) -> f64 {
+    rt.block_on(async {
+        let alias = next_ledger_alias("sum-ttl");
+        let ledger = fluree.create_ledger(&alias).await.unwrap();
+        let start = std::time::Instant::now();
+        let _ = run_turtle_inserts(fluree, ledger, txns, index_config).await;
+        start.elapsed().as_secs_f64() * 1000.0
+    })
+}
+
+fn bench_insert_formats(c: &mut Criterion) {
+    init_tracing_for_bench();
+
+    let rt = bench_runtime();
+    // `build_memory()` spawns the ledger-cache event listener, so it must
+    // run inside the runtime even though it is synchronous.
+    let fluree = rt.block_on(async { FlureeBuilder::memory().build_memory() });
+
+    let index_config = IndexConfig {
+        reindex_min_bytes: 500_000_000,
+        reindex_max_bytes: 500_000_000,
+    };
+
+    let mut group = c.benchmark_group("insert_formats");
+    group.sample_size(current_profile().sample_size());
+
+    let mut summary: Vec<ScenarioResult> = Vec::new();
+
+    let (txn_counts, nodes_per_txn_arr) = matrix();
+    for &txn_count in txn_counts {
+        for &nodes_per_txn in nodes_per_txn_arr {
+            let total_nodes = txn_count * nodes_per_txn;
+
+            eprintln!(
+                "  [pregen] {txn_count} txns x {nodes_per_txn} nodes/txn = {total_nodes} total nodes ..."
+            );
+            let data = pregen(&rt, &fluree, &index_config, txn_count, nodes_per_txn);
+
+            eprintln!(
+                "  [calibrated] {} total flakes ({:.1} flakes/node)",
+                data.total_flakes,
+                data.total_flakes as f64 / total_nodes as f64
+            );
+
+            // Throughput in flakes so Criterion reports flakes/second.
+            group.throughput(Throughput::Elements(data.total_flakes));
+
+            let param_label = format!("{txn_count}txn_{nodes_per_txn}nodes");
+
+            // --- JSON-LD ---
+            group.bench_with_input(
+                BenchmarkId::new("jsonld", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("jld");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_jsonld_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.jsonld_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- Turtle ---
+            group.bench_with_input(
+                BenchmarkId::new("turtle", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("ttl");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.turtle_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- TriG (one named-graph block) ---
+            group.bench_with_input(BenchmarkId::new("trig", &param_label), &data, |b, data| {
+                b.iter(|| {
+                    let alias = next_ledger_alias("trig");
+                    rt.block_on(async {
+                        let _ = fluree.create_ledger(&alias).await.unwrap();
+                        run_trig_inserts(&fluree, &alias, &data.trig_txns, &index_config).await;
+                    });
+                });
+            });
+
+            // --- Turtle upsert, new subjects ---
+            group.bench_with_input(
+                BenchmarkId::new("upsert_turtle", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("ttl-up");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_upserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.turtle_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- Turtle upsert over the same data (read + restate) ---
+            group.bench_with_input(
+                BenchmarkId::new("upsert_turtle_replace", &param_label),
+                &data,
+                |b, data| {
+                    b.iter_batched(
+                        || {
+                            rt.block_on(async {
+                                let alias = next_ledger_alias("ttl-up-rep");
+                                let ledger = fluree.create_ledger(&alias).await.unwrap();
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.turtle_txns,
+                                    &index_config,
+                                )
+                                .await
+                            })
+                        },
+                        |ledger| {
+                            rt.block_on(async {
+                                black_box(
+                                    run_turtle_upserts(
+                                        &fluree,
+                                        ledger,
+                                        &data.turtle_txns,
+                                        &index_config,
+                                    )
+                                    .await,
+                                )
+                            })
+                        },
+                        criterion::BatchSize::PerIteration,
+                    );
+                },
+            );
+
+            // --- TriG insert: default graph + trailing block ---
+            group.bench_with_input(
+                BenchmarkId::new("trig_mixed", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("trig-mixed");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.trig_mixed_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // --- TriG insert: every statement in its own block ---
+            group.bench_with_input(
+                BenchmarkId::new("trig_blocks", &param_label),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let alias = next_ledger_alias("trig-blocks");
+                        rt.block_on(async {
+                            let ledger = fluree.create_ledger(&alias).await.unwrap();
+                            black_box(
+                                run_turtle_inserts(
+                                    &fluree,
+                                    ledger,
+                                    &data.trig_blocks_txns,
+                                    &index_config,
+                                )
+                                .await,
+                            )
+                        })
+                    });
+                },
+            );
+
+            // Collect a single timed run for the summary table.
+            let jsonld_ms = time_jsonld_run(&rt, &fluree, &data.jsonld_txns, &index_config);
+            let turtle_ms = time_turtle_run(&rt, &fluree, &data.turtle_txns, &index_config);
+            summary.push(ScenarioResult {
+                txn_count,
+                nodes_per_txn,
+                total_flakes: data.total_flakes,
+                jsonld_ms,
+                turtle_ms,
+            });
+        }
+    }
+
+    group.finish();
+
+    print_summary(&summary);
+}
+
+criterion_group!(benches, bench_insert_formats);
+criterion_main!(benches);

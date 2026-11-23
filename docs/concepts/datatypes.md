@@ -1,0 +1,569 @@
+# Datatypes and Typed Values
+
+Fluree enforces strong typing for all literal values, ensuring data consistency and enabling efficient indexing and querying. Every literal value has an explicit datatype, following RDF and XSD standards.
+
+## Core Principle: No Untyped Literals
+
+Unlike some databases that allow "plain" strings, Fluree requires every literal to have a datatype. This design provides:
+
+- **Type Safety**: Prevents type confusion in queries and applications
+- **Consistent Comparisons**: Typed values compare predictably
+- **Standards Compliance**: Follows RDF and SPARQL specifications
+- **Query Optimization**: Enables efficient indexing and query planning
+
+## XSD Datatypes
+
+Fluree supports the core XML Schema Definition (XSD) datatypes:
+
+### String Types
+
+```json
+{
+  "@context": {
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "ex": "http://example.org/ns/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:book1",
+      "ex:title": "The Great Gatsby",
+      "ex:author": {
+        "@value": "F. Scott Fitzgerald",
+        "@type": "xsd:string"
+      }
+    }
+  ]
+}
+```
+
+**xsd:string** is the default for plain string literals when no type is specified.
+
+### Numeric Types
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:product1",
+      "ex:price": {
+        "@value": "29.99",
+        "@type": "xsd:decimal"
+      },
+      "ex:quantity": {
+        "@value": "100",
+        "@type": "xsd:integer"
+      },
+      "ex:rating": {
+        "@value": "4.5",
+        "@type": "xsd:double"
+      }
+    }
+  ]
+}
+```
+
+Supported numeric types:
+- **xsd:integer**: Whole numbers (-∞, ∞)
+- **xsd:long**: 64-bit integers
+- **xsd:int**: 32-bit integers
+- **xsd:short**: 16-bit integers
+- **xsd:byte**: 8-bit integers
+- **xsd:decimal**: Arbitrary precision decimals
+- **xsd:double**: 64-bit floating point
+- **xsd:float**: 32-bit floating point
+
+#### Special Values: INF, -INF and NaN
+
+`xsd:double` and `xsd:float` include three special values, written `INF` (or
+`+INF`), `-INF` and `NaN`. A numeral too large for `xsd:double`, such as
+`"1e400"^^xsd:double`, is `INF` or `-INF`, as XSD 1.1 specifies. Other
+spellings such as `inf`, `Infinity` or `nan` are not values of these datatypes
+(see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
+
+`xsd:float` values are stored at double precision, so a numeral beyond the
+float range but within the double range, such as `"3.4e39"^^xsd:float`, keeps
+its value when written. The cast `xsd:float("3.4e39")` gives `INF`, so the two
+differ for such numerals.
+
+One exception keeps existing indexes reading as before. Bulk import in earlier
+versions stored `INF`, `-INF` and `NaN` in the index as the text `inf`, `-inf`
+and `NaN`. Under `xsd:double` or `xsd:float`:
+
+- Arithmetic, `SUM`, `AVG`, casts to `xsd:double` and `xsd:float`, and a
+  comparison inside a larger expression, such as `FILTER(?v > 1 || ?v < -1)`
+  or `BIND(?v > 1 AS ?b)`, read `inf` and `-inf` as `INF` and `-INF`, and
+  `NaN` as NaN.
+- To `isNumeric`, `ORDER BY`, `MIN`/`MAX`, and a `FILTER` that is a single
+  comparison, such as `FILTER(?v > 1)`, the text stays text.
+- One answer differs from earlier versions: `SUM` and `AVG` over `NaN` text
+  are `NaN`, as SPARQL specifies, where they were unbound.
+- The text `inf` cannot be told apart from a literal `"inf"^^xsd:double`
+  written today, which is not a value, so arithmetic and these aggregates read
+  that literal as `INF` too. `Infinity` and other spellings stay text.
+
+A full reindex of an index that bulk import built stores those values as
+numbers.
+
+Queries treat the special values as SPARQL specifies:
+
+- `INF` is greater, and `-INF` less, than every other number. Fluree compares
+  numbers exactly, so an integer or decimal beyond the double range is still
+  below `INF`. That is a choice: XPath would convert `10^400` to a double,
+  making it equal to `INF`.
+- No comparison holds for `NaN`: `=`, `<`, `>`, `<=` and `>=` are false and
+  `!=` is true, even between two NaNs. So `FILTER(?v = ?v)` drops NaN values.
+- A `NaN` literal in a pattern, as in `?s ex:v "NaN"^^xsd:double`, matches
+  stored NaN values, because patterns match terms.
+- `SUM` and `AVG` are `NaN` when a member is `NaN`, and `INF + -INF` is `NaN`.
+- `DISTINCT` and `GROUP BY` treat every NaN as one value.
+- `ORDER BY` places `NaN` after `INF` in ascending order. SPARQL leaves that
+  position to the implementation. `MIN` and `MAX` follow `ORDER BY`, so `MAX`
+  is `NaN` when a NaN is present.
+
+JSON-LD query results carry them as the strings `"INF"`, `"-INF"` and
+`"NaN"`, since JSON numbers cannot express them.
+
+### Boolean Type
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:user1",
+      "ex:isActive": {
+        "@value": "true",
+        "@type": "xsd:boolean"
+      },
+      "ex:hasVerifiedEmail": {
+        "@value": "false",
+        "@type": "xsd:boolean"
+      }
+    }
+  ]
+}
+```
+
+**xsd:boolean** accepts: `true`, `false`, `1`, `0`.
+
+### Date and Time Types
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:event1",
+      "ex:startDate": {
+        "@value": "2024-01-15",
+        "@type": "xsd:date"
+      },
+      "ex:startTime": {
+        "@value": "14:30:00Z",
+        "@type": "xsd:time"
+      },
+      "ex:createdAt": {
+        "@value": "2024-01-15T14:30:00Z",
+        "@type": "xsd:dateTime"
+      }
+    }
+  ]
+}
+```
+
+Temporal types:
+- **xsd:date**: Dates without time (e.g., `2024-01-15`)
+- **xsd:time**: Times without date (e.g., `14:30:00Z`)
+- **xsd:dateTime**: Full timestamps (e.g., `2024-01-15T14:30:00Z`)
+
+A `dateTime` or `time` is held to the microsecond: digits past the sixth fractional one are dropped the moment the value is read, in a write and in a query alike, so `"2024-01-15T14:30:00.123456789Z"` is the value `"2024-01-15T14:30:00.123456Z"`. A value written is then the value stored, before a restart and after one. A query constant written past the microsecond is held to the microsecond too, so it compares as the value written with it, for equality and ordering alike: a stored `…00.123456Z` is `=`, `<=` and `>=` `"…00.1234569Z"`, and not `<` or `>` it. See [Compatibility](../reference/compatibility.md).
+
+### Other XSD Types
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:resource1",
+      "ex:homepage": {
+        "@value": "https://example.com",
+        "@type": "xsd:anyURI"
+      },
+      "ex:duration": {
+        "@value": "PT1H30M",
+        "@type": "xsd:duration"
+      }
+    }
+  ]
+}
+```
+
+Additional types include:
+- **xsd:anyURI**: Web addresses and identifiers
+- **xsd:duration**: Time periods (ISO 8601 format)
+- **xsd:dayTimeDuration**, **xsd:yearMonthDuration**: The two `xsd:duration`
+  subtypes. Unlike `xsd:duration` these are totally ordered, so they sort and
+  compare. `xsd:dayTimeDuration` is also the type queries *produce* when
+  subtracting two temporal values — see
+  [Date/Time Arithmetic](../query/sparql.md#datetime-arithmetic).
+- **xsd:gYear**, **xsd:gMonth**, **xsd:gDay**: Partial date components
+
+## RDF Datatypes
+
+Beyond XSD, Fluree supports RDF-specific datatypes:
+
+### Language-Tagged Strings
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:book1",
+      "ex:title": {
+        "@value": "The Great Gatsby",
+        "@language": "en"
+      },
+      "ex:titel": {
+        "@value": "Der große Gatsby",
+        "@language": "de"
+      }
+    }
+  ]
+}
+```
+
+**rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
+
+> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows, and a FILTER comparison is term-exact on every surface. `FILTER(?name = "bob")` in SPARQL, `(= ?name "bob")` in a JSON-LD filter and `WHERE n.name = "bob"` in Cypher compare the `xsd:string` term `"bob"`, so none of them matches `"bob"@en` or `"bob"^^ex:T`; the same holds for `<`, `<=`, `>` and `>=`. To compare the text whatever the tag, use `STR(?name) = "bob"`; to match one tag, compare with `"bob"@en`. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` (or `{"@value": "25", "@type": "xsd:int"}`) matches `xsd:int` rows only, not the same number stored as `xsd:long`, and `"25"^^xsd:integer` written out matches `xsd:integer` rows only. Bare numeric literals (`25`, `25.0`, and a JSON number in a JSON-LD query) are the one lenient form — they match an equal value under any numeric datatype, so `25` finds `xsd:integer`, `xsd:long`, `xsd:int` and `xsd:double` values alike. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
+
+> **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
+
+### JSON Data
+
+```json
+{
+  "@graph": [
+    {
+      "@id": "ex:config1",
+      "ex:settings": {
+        "@value": "{\"theme\": \"dark\", \"notifications\": true}",
+        "@type": "@json"
+      }
+    }
+  ]
+}
+```
+
+**rdf:JSON** stores JSON data as typed literals. This is useful for storing complex structured data that doesn't fit the RDF model.
+
+A JSON literal is stored in canonical form, per [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). JSON-LD 1.1 requires this. Members are sorted by key, insignificant whitespace is dropped, and numbers are rendered as ECMAScript renders them.
+
+A literal's value is its text. Without canonical form, `{"a":1,"b":2}` and `{"b":2,"a":1}` would be two different facts. A delete, an upsert, or a merge that matched one would miss the other.
+
+Three consequences are worth knowing:
+
+- **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
+- **A JSON literal a query names or builds is canonicalized too.** `"[1, 2]"^^rdf:JSON`, `STRDT("[1, 2]", rdf:JSON)` and JSON-LD's `(str-dt "[1, 2]" rdf:JSON)` are each the stored `[1,2]`, in a pattern, a `VALUES` row, a `FILTER` or a `BIND`, and `STR` of one is `"[1,2]"`.
+- **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
+
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written, and it reads back as typed text (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
+
+Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
+
+Two things follow for a ledger with older values.
+
+- **Naming a value no longer matches it.** A literal in a `where`, a `delete`, or a `FILTER` is canonicalized before it is compared, so it misses a value stored under another spelling. Bind the value with a variable instead.
+- **Re-asserting a value can leave two of them.** An upsert writes the canonical spelling. If its delete names the old text, the delete misses and both spellings end up on the subject. Any duplicates the missing canonicalization already created stay as they are.
+
+Repair a subject by binding the old value and writing it back:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": {"@id": "ex:config", "ex:items": "?old"},
+  "delete": {"@id": "ex:config", "ex:items": "?old"},
+  "insert": {
+    "@id": "ex:config",
+    "ex:items": {"@value": [{"name": "alpha", "qty": 1}], "@type": "@json"}
+  }
+}
+```
+
+The `where` clause binds every spelling on that property, so this collapses duplicates as well. History keeps the original text; only the current state changes. `fluree validate` finds the properties worth repairing wherever a shape constrains them.
+
+### Geographic Data
+
+```json
+{
+  "@context": {
+    "geo": "http://www.opengis.net/ont/geosparql#",
+    "ex": "http://example.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:location1",
+      "ex:coordinates": {
+        "@value": "POINT(2.3522 48.8566)",
+        "@type": "geo:wktLiteral"
+      }
+    }
+  ]
+}
+```
+
+**geo:wktLiteral** stores geographic data in Well-Known Text (WKT) format. POINT geometries are automatically converted to an optimized binary encoding, while other geometry types (polygons, lines) are stored as strings.
+
+See [Geospatial](../indexing-and-search/geospatial.md) for complete documentation.
+
+### Vector Data
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:doc1",
+      "ex:embedding": {
+        "@value": [0.1, 0.2, 0.3, 0.4],
+        "@type": "@vector"
+      }
+    }
+  ]
+}
+```
+
+**@vector** (full IRI: `https://ns.flur.ee/db#embeddingVector`, prefix form: `f:embeddingVector`) stores numeric arrays as embedding vectors. Values are quantized to IEEE-754 f32 at ingest for compact storage and SIMD-accelerated similarity computation. A vector has 1 to 65,535 elements, and in each graph all the vectors of one property have the same length. In Turtle/SPARQL, use `f:embeddingVector` with the `^^` typed-literal syntax.
+
+Without this type annotation, plain JSON arrays are decomposed into individual RDF values where duplicates may be removed and ordering is lost.
+
+See [Vector Search](../indexing-and-search/vector-search.md) for complete documentation.
+
+### Fulltext Data
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/"
+  },
+  "@graph": [
+    {
+      "@id": "ex:article-1",
+      "ex:content": {
+        "@value": "Rust is a systems programming language focused on safety and performance",
+        "@type": "@fulltext"
+      }
+    }
+  ]
+}
+```
+
+**@fulltext** (full IRI: `https://ns.flur.ee/db#fullText`, prefix form: `f:fullText`) marks a string value for full-text search indexing. Values annotated with `@fulltext` are automatically analyzed (tokenized, stemmed, stopword-filtered) and indexed into per-predicate fulltext arenas during background index builds. This enables BM25-ranked relevance scoring via the `fulltext()` query function.
+
+Because the annotation *is* the stored datatype, tagged values are
+`f:fullText` literals rather than `xsd:string` — a custom datatype that
+external RDF consumers won't recognize. For standards-conformant data,
+prefer declaring searchable properties via `f:fullTextDefaults` in the
+ledger's `#config` graph, which full-text indexes plain `xsd:string` /
+`rdf:langString` values (with per-language analysis) without changing
+their datatypes.
+
+Without this type annotation, strings are stored as plain `xsd:string` values and support only exact matching and prefix queries -- not relevance-ranked full-text search.
+
+See [Inline Fulltext Search](../indexing-and-search/fulltext.md) for complete documentation.
+
+## Custom Datatypes
+
+Any IRI can serve as a datatype. A literal with a datatype Fluree does not
+recognize is stored with that datatype and returned exactly as written.
+
+```json
+{
+  "@context": {"unit": "http://example.org/unit/"},
+  "@id": "ex:room1",
+  "ex:area": {"@value": "42.5", "@type": "unit:SquareMetre"}
+}
+```
+
+In Turtle and SPARQL, use the `^^` syntax: `"42.5"^^unit:SquareMetre`.
+
+### Datatype Limit
+
+A ledger holds at most 16,369 distinct datatypes, plus 15 reserved ones that
+never count toward the limit. The reserved datatypes are `@id`,
+`xsd:string`, `xsd:boolean`, `xsd:integer`, `xsd:long`, `xsd:decimal`,
+`xsd:double`, `xsd:float`, `xsd:dateTime`, `xsd:date`, `xsd:time`,
+`rdf:langString`, `rdf:JSON`, `@vector`, and `@fulltext`. Every other
+datatype counts, including other XSD types such as `xsd:int` and
+`xsd:anyURI`.
+
+A datatype counts from the first write that uses it. It still counts after
+its data is retracted, because the index never releases a datatype's ID.
+
+A write that would pass the limit is refused, and the ledger is left
+unchanged:
+
+- Transactions and SPARQL updates fail with HTTP 422 and
+  `err:db/DatatypeLimitExceeded`. See [Common Errors](../troubleshooting/common-errors.md#datatype_limit_exceeded).
+- Pushed commits are refused with the same error.
+- A bulk import (`fluree create --from`) fails with a "datatype limit
+  exceeded" error.
+
+#### Upgrading and Downgrading
+
+Fluree 4.2.1 and earlier cannot index a ledger that holds more than 241
+non-reserved datatypes. Those releases still accept writes past that point,
+so such a ledger may already exist. Later releases index it with no
+migration.
+
+Rolling back to 4.2.1 or earlier affects any ledger that holds more than 241
+non-reserved datatypes. The older release can read the ledger's existing
+index, but its index builds can fail. When they do, new data stays in
+novelty, where queries are slower, and writes are refused once novelty
+reaches its size limit. Moving the ledger back to a newer release clears
+both.
+
+Vocabularies of units or currencies can define hundreds of datatypes. If
+data needs more distinct datatypes than the limit allows, record the unit
+in its own property instead of in the datatype:
+
+```turtle
+ex:room1 ex:area "42.5"^^xsd:decimal ;
+         ex:areaUnit unit:SquareMetre .
+```
+
+## Type Coercion and Compatibility
+
+### Automatic Type Promotion
+
+Fluree handles type compatibility intelligently:
+
+```sparql
+# This works - integer can be used where decimal is expected
+SELECT ?price
+WHERE {
+  ?product ex:price ?price .
+  FILTER(?price > 10.0)  # decimal comparison
+}
+```
+
+### Comparisons Between Incompatible Types
+
+When a filter compares values of incompatible types (e.g., a number and a string), the behavior depends on the operator:
+
+- **Equality** (`=`) returns `false` — values of different types are never equal
+- **Inequality** (`!=`) returns `true` — values of different types are never equal
+- **Ordering** (`<`, `<=`, `>`, `>=`) raises an error — ordering between incompatible types is undefined
+
+Numeric types (long, double, bigint, decimal) are mutually comparable via automatic promotion, so cross-numeric comparisons work as expected. Similarly, temporal types can be compared with string representations that parse to the same temporal type.
+
+### Text That Is Not a Value of Its Datatype
+
+A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
+built-in datatype but is not one of its values. Every transaction refuses it,
+naming the datatype in the error ("Cannot parse '2024-02-30' as xsd:date"),
+and commits nothing:
+
+- JSON-LD transactions and SPARQL UPDATE, wherever it is written as a
+  constant, in a DELETE as in an INSERT or a WHERE;
+- an update that builds one at run time (`STRDT`, JSON-LD `str-dt`), or that
+  copies one a ledger holds (`INSERT … WHERE`);
+- Turtle, TriG and N-Triples transactions, insert and upsert, graph insert
+  and graph sync.
+
+Bulk import (`fluree create --from`, `fluree graph import`) keeps it, as RDF
+allows, so a dataset from elsewhere loads in one pass: the literal is stored
+with its text and its datatype and reads back exactly as written, with its
+datatype (in JSON-LD results, `{"@value": "300", "@type": "xsd:byte"}`), but
+it is not a date or a number, so it never equals one. An `rdf:JSON` literal
+that is not JSON is kept as written too, and reads back as the typed literal
+it is, not as JSON: `"not json"^^rdf:JSON` in SPARQL results and RDF text,
+`{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`
+in JSON-LD. An `f:embeddingVector` literal that is not a vector fails the
+import, as it fails a transaction.
+
+To remove a stored one, bind it through a variable, or replace the
+property's values with an [upsert](../transactions/upsert.md) or a
+[graph sync](../transactions/sync.md):
+
+```sparql
+PREFIX ex: <http://example.org/>
+DELETE { ?s ex:date ?d }
+WHERE  { ?s ex:date ?d FILTER(STR(?d) = "2024-02-30") }
+```
+
+### Type Casting in Queries
+
+SPARQL provides functions for type conversion:
+
+```sparql
+SELECT ?name (xsd:string(?id) AS ?idString)
+WHERE {
+  ?person ex:name ?name ;
+          ex:id ?id .
+}
+```
+
+## Best Practices
+
+### Choosing Datatypes
+
+1. **Be Specific**: Use the most appropriate type for your data
+   - Use `xsd:integer` for whole numbers that will be used in calculations
+   - Use `xsd:string` for identifiers and labels
+   - Use `xsd:dateTime` for timestamps
+
+2. **Consider Query Patterns**: Choose types that support your intended queries
+   - Numeric types enable range queries and aggregations
+   - Date types enable temporal queries
+   - String types support text search
+
+3. **Standards Alignment**: Use standard datatypes where possible
+   - Prefer XSD types over custom types; a ledger has a
+     [limit on distinct datatypes](#datatype-limit)
+   - Use established vocabularies with well-defined ranges
+
+### Type Consistency
+
+1. **Consistent Usage**: Use the same datatype for equivalent properties across your data
+2. **Change Planning**: Plan for type changes as your data model evolves
+3. **Validation**: Validate data types at ingestion time
+
+### Performance Considerations
+
+1. **Index Efficiency**: Different types have different indexing characteristics
+   - Numeric types support efficient range queries
+   - String types support prefix and substring matching
+   - Date types enable temporal range queries
+
+2. **Storage Size**: Some types are more storage-efficient than others
+   - `xsd:integer` is more compact than `xsd:string`
+   - `xsd:boolean` is more efficient than string representations
+
+## Type System Architecture
+
+### Internal Representation
+
+Fluree stores all typed values with their datatype information:
+
+- **Value Storage**: The literal value as a string
+- **Type Metadata**: The datatype IRI
+- **Comparison Logic**: Type-aware comparison functions
+
+### Query Processing
+
+The type system affects query processing:
+
+- **Type Checking**: Ensures type compatibility in filters and joins
+- **Index Selection**: Chooses appropriate indexes based on types
+- **Result Formatting**: Formats results according to datatype rules
+
+### Standards Compliance
+
+Fluree's type system is fully compliant with:
+
+- **RDF 1.1 Concepts**: Literal typing requirements
+- **SPARQL 1.1**: Type promotion and compatibility rules
+- **XSD 1.1**: Datatype definitions and constraints
+- **JSON-LD 1.1**: Typed value syntax
+
+This strong typing foundation ensures data consistency, enables optimization, and maintains interoperability with the broader semantic web ecosystem.

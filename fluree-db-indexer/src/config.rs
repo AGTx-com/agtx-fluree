@@ -1,0 +1,834 @@
+//! Indexer configuration
+
+use crate::gc::{
+    DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
+};
+use async_trait::async_trait;
+use fluree_db_binary_index::LeafletCache;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Resolves the ledger's effective configured full-text property list at
+/// index-build time.
+///
+/// Background / incremental indexing runs can't see the live `LedgerConfig`
+/// through static `IndexerConfig` alone — a caller (typically the api layer)
+/// plugs in a concrete resolver via
+/// [`IndexerConfig::with_fulltext_config_provider`] so each build refreshes
+/// the set from the current ledger state.
+///
+/// Implementations should be cheap on the happy path (one privileged read of
+/// the config graph) and return an empty list when the ledger has no
+/// `f:fullTextDefaults`. Failures should log + return empty rather than
+/// propagate — a bad config read shouldn't block the whole indexing run.
+#[async_trait]
+pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
+    async fn fulltext_configured_properties(
+        &self,
+        ledger_id: &str,
+    ) -> Vec<ConfiguredFulltextProperty>;
+}
+
+/// Coverage envelope for caller-supplied attachment events.
+///
+/// Tells the indexer how to combine the supplied events with the base
+/// root's existing arena (when present). The wrong coverage label
+/// will either drop history (if `Authoritative` is asserted on a
+/// post-reload tail) or double-count rows (if `Augment` is supplied
+/// with already-indexed events that don't deduplicate cleanly), so
+/// providers must be precise.
+#[derive(Debug, Clone)]
+pub enum AttachmentEventCoverage {
+    /// Caller asserts `events` is the **complete** history of every
+    /// `f:reifies*` event the snapshot has ever observed. The indexer
+    /// rebuilds the arena from scratch from this set; the previous
+    /// arena is enumerated only for GC reachability.
+    ///
+    /// Safe only when the caller has seen every commit since
+    /// genesis (or at least since the predicate dictionary first
+    /// observed an `f:reifies*` SID). A long-running ledger with a
+    /// continuously populated `AttachmentNovelty` qualifies; an
+    /// `AttachmentNovelty` reconstructed by `LedgerState::load` from
+    /// post-index commits **does not** — `load_novelty` only walks
+    /// commits with `t > snapshot.t`.
+    Authoritative(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller has events but can't guarantee full-history coverage.
+    /// The indexer concatenates `events` with the previous arena's
+    /// events, deduplicates by `(edge, ann, t, op)` tuple, and
+    /// rebuilds. The dedup step makes this correct regardless of
+    /// whether the caller's events overlap the previous arena.
+    ///
+    /// Safe default for orchestrator-driven providers that read the
+    /// running `AttachmentNovelty.iter_event_pairs()` — that
+    /// overlay's coverage shifts between "full history" (for a
+    /// continuously running ledger) and "post-index tail" (after a
+    /// reload or eviction), and the merge-and-dedupe path stays
+    /// correct in both shapes.
+    Augment(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller couldn't produce events this pass. Indexer treats as
+    /// delta-unknown — when the base root carries an arena, the new
+    /// root drops it (recording old leaves as replaced for GC) and
+    /// hydration falls back to scan until the next pass.
+    Unknown,
+}
+
+/// Per-ledger attachment-events resolver for arena sealing on the
+/// background-indexer path.
+///
+/// Implementations (typically in the api layer) resolve a ledger ID
+/// to a coverage envelope at job-dispatch time. The indexer takes
+/// the resulting [`AttachmentEventCoverage`] and stamps it into a
+/// per-job `IndexerConfig.attachment_events`.
+///
+/// **Return semantics:**
+/// - `Some(Authoritative(events))`: full history; indexer rebuilds
+///   from scratch.
+/// - `Some(Augment(events))`: partial coverage; indexer merges with
+///   previous arena's events and dedupes.
+/// - `Some(Unknown)` or `None`: defensive drop (treated identically).
+///
+/// Implementations should be cheap on the happy path (one privileged
+/// read of the running ledger state) and return
+/// `Some(Unknown)` / `None` rather than panic when the ledger isn't
+/// loaded — a missing ledger shouldn't block the indexing run; the
+/// defensive drop covers correctness.
+#[async_trait]
+pub trait AttachmentEventsProvider: std::fmt::Debug + Send + Sync {
+    async fn attachment_events(
+        &self,
+        ledger_id: &fluree_db_core::LedgerId,
+    ) -> Option<AttachmentEventCoverage>;
+}
+
+/// Scope of a configured full-text property entry.
+///
+/// Mirrors the `f:targetGraph` sentinels used in config graph writes:
+/// - `AnyGraph` comes from a ledger-wide `f:fullTextDefaults` — the
+///   property applies to every graph in the ledger.
+/// - `DefaultGraph` is a per-graph override whose `f:targetGraph` is
+///   `f:defaultGraph` (or omitted) — scoped to `g_id = 0` only.
+/// - `TxnMetaGraph` is a per-graph override whose `f:targetGraph` is
+///   `f:txnMetaGraph` — scoped to the ledger's txn-meta graph
+///   (`g_id = 1`, pre-reserved in the graph dict).
+/// - `NamedGraph(iri)` is a per-graph override targeting a user graph by
+///   its canonical IRI.
+///
+/// Keeping these distinct lets the indexer route scoping precisely:
+/// the hook's `any_graph` tier covers `AnyGraph`; the `per_graph` tier
+/// covers the rest with the correct `GraphId`.
+#[derive(Debug, Clone)]
+pub enum ConfiguredFulltextScope {
+    AnyGraph,
+    DefaultGraph,
+    TxnMetaGraph,
+    NamedGraph(String),
+}
+
+/// One entry in the per-indexing-run configured full-text property set.
+#[derive(Debug, Clone)]
+pub struct ConfiguredFulltextProperty {
+    pub scope: ConfiguredFulltextScope,
+    pub property_iri: String,
+}
+
+/// Late-bound resolver for the shared read cache to warm on write.
+///
+/// The background indexer worker is constructed before the api's
+/// `LedgerManager` (which owns the process-shared `LeafletCache`) exists, so
+/// the api plugs in a resolver that yields that cache once it's available.
+/// Returns `None` until then — and always in separate-machine deployments,
+/// where the worker cannot reach the query server's cache.
+pub trait WarmCacheSource: std::fmt::Debug + Send + Sync {
+    /// The shared read cache to seed on write, or `None` if unavailable.
+    fn warm_cache(&self) -> Option<Arc<LeafletCache>>;
+}
+
+/// Configuration for index building
+#[derive(Debug, Clone)]
+pub struct IndexerConfig {
+    /// Target estimated bytes per leaf node
+    ///
+    /// Leaves will be sized to approximately this many bytes during splits.
+    /// Default: 187,500 (half of the legacy default overflow-bytes)
+    pub leaf_target_bytes: u64,
+
+    /// Maximum estimated bytes per leaf node
+    ///
+    /// Leaves split when they exceed this threshold.
+    /// Default: 375,000 (legacy default overflow-bytes)
+    pub leaf_max_bytes: u64,
+
+    /// Target number of children per branch node
+    ///
+    /// Branches will split when they exceed this threshold.
+    /// Default: 100
+    pub branch_target_children: usize,
+
+    /// Maximum number of children per branch node
+    ///
+    /// Hard limit to prevent oversized branches.
+    /// Default: 200
+    pub branch_max_children: usize,
+
+    /// Old index versions always retained, whatever their age: an optional
+    /// floor under the age guard.
+    ///
+    /// After each index refresh, the old versions past this many in the
+    /// prev-index chain become eligible for GC once the age guard
+    /// (`gc_min_time_mins`) has passed.
+    /// Default: 0, so the age guard alone decides below the ceiling.
+    pub gc_max_old_indexes: u32,
+
+    /// Minimum age in minutes before an index version can be garbage collected.
+    ///
+    /// Even if an index exceeds `gc_max_old_indexes`, it won't be deleted until
+    /// it's at least this old. This prevents deleting indexes that concurrent
+    /// queries might still be using.
+    /// Default: 15 minutes
+    pub gc_min_time_mins: u32,
+
+    /// Retained old index versions past which `gc_min_time_mins` is overridden
+    /// and versions are collected regardless of age. `None` sets no ceiling.
+    /// Default: 10 ([`DEFAULT_HARD_MAX_OLD_INDEXES`]).
+    ///
+    /// Bounds the chain of a ledger that publishes faster than the age guard,
+    /// which would otherwise keep every version inside it. It never reaches a
+    /// version `gc_max_old_indexes` keeps, so a ceiling at or below the floor
+    /// is raised to it. Overriding the guard
+    /// can release artifacts a query that started against an older version
+    /// still needs, and the ceiling bounds versions rather than bytes; see
+    /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`].
+    pub gc_hard_max_old_indexes: Option<u32>,
+
+    /// How often the worker re-sweeps for ledgers whose indexing has stalled.
+    ///
+    /// A ledger is swept only if it is behind (`commit_t > index_t`) **and** its
+    /// `commit_t` has not moved since the previous sweep. A ledger that is still
+    /// committing is already served by the post-commit trigger; one that is
+    /// stuck is frozen by definition. Without the second condition a periodic
+    /// sweep would force an extra index build per behind ledger per interval,
+    /// because `catch_up_sweep`'s predicate alone matches most ledgers on a
+    /// busy deployment.
+    ///
+    /// The sweep costs one `all_records()` listing per tick, which is O(ledgers)
+    /// rather than O(1): a directory walk for file storage, a LIST plus a read
+    /// per branch for object stores.
+    ///
+    /// `Duration::ZERO` disables the periodic re-sweep. It does **not** disable
+    /// the sweep [`BackgroundIndexerWorker::run`] performs at start-up — that
+    /// one is a deadlock fix, not a tuning knob. To turn both off, see
+    /// [`catchup_sweeps_enabled`](Self::catchup_sweeps_enabled).
+    ///
+    /// Neither sweep can honour `reindex_min_bytes`: `NsRecord` carries no
+    /// novelty byte count, so "behind" is the only predicate available and a
+    /// ledger the soft threshold deliberately left unindexed is built anyway
+    /// once a sweep reaches it. The post-commit trigger does gate on
+    /// `should_reindex`, so this is the one path that bypasses the operator's
+    /// batching — an index build per behind ledger on every process start, plus
+    /// one per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
+    ///
+    /// The same tick runs a collector pass over every ledger whose chain may
+    /// exceed retention, one ledger at a time, and once at start-up. That is
+    /// what collects a ledger that stops publishing; see [`crate::gc`].
+    ///
+    /// Default: 300 s.
+    pub catchup_interval: Duration,
+
+    /// Whether this worker owns catch-up for its nameservice.
+    ///
+    /// Both sweeps — the one [`BackgroundIndexerWorker::run`] performs at
+    /// start-up and the periodic re-sweep — are skipped when this is `false`.
+    /// Post-commit triggers, `trigger_if_idle`, and every `IndexerHandle`
+    /// operation (admin reindex, cancel, maintenance holds) keep working, so a
+    /// non-sweeping worker is still a fully functional indexer for work that is
+    /// asked for explicitly.
+    ///
+    /// This exists because a process can run more than one worker against the
+    /// same nameservice, and catch-up must have exactly one owner. Raft is that
+    /// case: every node runs a node-scope worker built by the api layer, and the
+    /// leader additionally runs a leader-scope worker wired to the event bus.
+    /// If both swept, the leader would queue and build each behind ledger twice
+    /// — the two workers hold independent `states` maps, so `trigger_if_idle`
+    /// cannot see the other's claim — and followers would start initiating
+    /// builds that publish through a nameservice which, under raft, proposes to
+    /// the state machine. Indexing is leader-only by design.
+    ///
+    /// Distinct from `catchup_interval == ZERO`, deliberately. That is an
+    /// operator tuning knob and leaves the start-up sweep alone, because the
+    /// start-up sweep is the deadlock fix. This is a statement about deployment
+    /// topology — who owns catch-up — and turns off both.
+    ///
+    /// Default: `true`.
+    pub catchup_sweeps_enabled: bool,
+
+    /// Memory budget (bytes) for the run-sort buffer during index building.
+    ///
+    /// This total is split evenly across all sort orders (SPOT, PSOT, POST, OPST).
+    /// Larger budgets produce fewer spill files and speed up the merge phase at
+    /// the cost of higher peak memory. For bulk imports of 1 GB+, 1–2 GB is
+    /// recommended.
+    ///
+    /// Default: 256 MB.
+    pub run_budget_bytes: usize,
+
+    /// Base directory for binary index artifacts.
+    ///
+    /// Ephemeral build artifacts (run files, dicts) are stored under:
+    /// `{data_dir}/{alias_path}/tmp_import/{session_id}/`
+    ///
+    /// Durable index files are stored under:
+    /// `{data_dir}/{alias_path}/index/`
+    ///
+    /// If `None`, defaults to `{system_temp_dir}/fluree-index`. For production
+    /// deployments, this should always be set to a persistent directory.
+    pub data_dir: Option<PathBuf>,
+
+    /// Whether incremental indexing is enabled.
+    ///
+    /// When `true`, `build_index_for_ledger` will attempt to incrementally
+    /// update the existing index by merging only new commits into affected
+    /// leaves. Falls back to full rebuild on failure.
+    ///
+    /// Default: `true`
+    pub incremental_enabled: bool,
+
+    /// Maximum number of commits to process incrementally.
+    ///
+    /// If the gap between `index_t` and `commit_t` exceeds this, a full
+    /// rebuild is used instead. Larger windows increase the number of
+    /// touched leaves and reduce the incremental advantage.
+    ///
+    /// Default: 10,000
+    pub incremental_max_commits: usize,
+
+    /// Maximum number of concurrent (graph, order) branch updates during
+    /// incremental indexing.
+    ///
+    /// Each branch update fetches affected leaves from CAS, merges novelty,
+    /// and uploads new blobs. Higher concurrency speeds up multi-graph
+    /// ledgers at the cost of more peak memory (one decoded leaf set per
+    /// in-flight task).
+    ///
+    /// Default: 4 (one per sort order in a single-graph workload)
+    pub incremental_max_concurrency: usize,
+
+    /// Global budget of concurrent leaf/sidecar CAS uploads during incremental
+    /// Phase 2, shared across ALL (graph, order) branch-update tasks.
+    ///
+    /// Unlike [`incremental_max_concurrency`](Self::incremental_max_concurrency),
+    /// which bounds how many branch-update tasks run at once, this bounds the
+    /// total number of in-flight `put`s for new leaf/sidecar blobs across the
+    /// whole fold. A single semaphore enforces it so a skewed workload (most
+    /// leaves landing in one order-task) still parallelizes its uploads without
+    /// multiplying outer×inner concurrency.
+    ///
+    /// Default: 16.
+    pub incremental_leaf_upload_concurrency: usize,
+
+    /// Target rows per leaflet (FLI3).
+    ///
+    /// This is primarily a build-format tuning knob. Smaller values produce
+    /// more leaflets (and therefore more leaves) for the same dataset, which
+    /// can be useful for tests that need multi-leaf coverage with small data.
+    ///
+    /// Default: 25,000.
+    pub leaflet_rows: usize,
+
+    /// Leaflets per leaf file (FLI3).
+    ///
+    /// Default: 10.
+    pub leaflets_per_leaf: usize,
+
+    /// Maximum cumulative commit bytes to load during an incremental
+    /// commit-chain walk. If the walk exceeds this budget, incremental
+    /// indexing aborts and the caller falls back to a full rebuild.
+    ///
+    /// Typically set to the ledger's `reindex_max_bytes` so that the
+    /// in-memory commit buffer never grows beyond the novelty threshold.
+    ///
+    /// `None` means no limit (backwards-compatible default).
+    pub incremental_max_commit_bytes: Option<usize>,
+
+    /// Edge-annotation attachment events to seal into the new arena.
+    ///
+    /// `Some(coverage)` carries an [`AttachmentEventCoverage`]
+    /// envelope that tells the indexer how to combine the events
+    /// with the base root's existing arena:
+    ///
+    /// - `Authoritative(events)`: caller has the complete history;
+    ///   the indexer rebuilds the arena from scratch from this set.
+    /// - `Augment(events)`: caller has partial events; the indexer
+    ///   merges with the previous arena's events, dedupes by
+    ///   `(edge, ann, t, op)`, and rebuilds.
+    /// - `Unknown`: caller couldn't produce events; defensive drop.
+    ///
+    /// `None` is treated identically to `Some(Unknown)`.
+    ///
+    /// Direct callers (CLI tools, tests, custom orchestrators with a
+    /// snapshot in hand) populate this field directly. The
+    /// `BackgroundIndexerWorker` path uses
+    /// [`Self::attachment_events_provider`] to resolve coverage
+    /// per-ledger at job-dispatch time.
+    pub attachment_events: Option<AttachmentEventCoverage>,
+
+    /// Per-ledger attachment-events resolver for orchestrator paths.
+    ///
+    /// `BackgroundIndexerWorker` holds a single `IndexerConfig` for
+    /// its lifetime, so `attachment_events` (a per-job value) can't
+    /// be set on the static config. The worker calls this provider
+    /// at job dispatch time to fetch the running ledger's
+    /// `AttachmentNovelty.iter_event_pairs()` and stamps the result
+    /// into a per-job clone of the config before invoking the
+    /// indexer. `None` (the default) yields the M2a behavior:
+    /// arenas are not sealed via the background path.
+    ///
+    /// See `attachment_events` for the delta-unknown semantics that
+    /// apply when this provider returns `None` for a given ledger.
+    pub attachment_events_provider: Option<Arc<dyn AttachmentEventsProvider>>,
+
+    /// Maximum number of *existing* subjects whose `rdf:type` set may change in
+    /// a single incremental batch before incremental indexing aborts and defers
+    /// to a full rebuild. Re-typing (or deleting) an existing subject forces a
+    /// base-index re-scan to move its class-scoped property/ref stats (issue
+    /// #1266); above this count, recomputing class stats from scratch via the
+    /// rebuild SPOT pass is cheaper and simpler. Counts only subjects that
+    /// existed in the base index (new-subject inserts are free). A floor: a
+    /// base index with more typed subjects raises it to an eighth of them,
+    /// since the rebuild's cost grows with the index. Default
+    /// [`DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS`].
+    pub incremental_retype_max_subjects: usize,
+
+    /// Configured full-text properties for this indexing run.
+    ///
+    /// Caller-computed (typically by `fluree-db-api` resolving the ledger's
+    /// `f:fullTextDefaults`) and passed in so the indexer can seed its
+    /// `FulltextHookConfig` without cross-layer config reads. Empty by
+    /// default — when empty, only the `@fulltext` datatype path contributes
+    /// entries, preserving the pre-config behavior.
+    ///
+    /// For steady-state (background / CLI incremental) indexing, prefer
+    /// [`fulltext_config_provider`](Self::fulltext_config_provider) so each
+    /// run refreshes this list from the live ledger config.
+    pub fulltext_configured_properties: Vec<ConfiguredFulltextProperty>,
+
+    /// Optional callback that re-resolves full-text configured properties
+    /// at the start of each index build. When present,
+    /// [`build_index_for_record`](crate::build_index_for_record) calls this
+    /// first and overwrites `fulltext_configured_properties` with the
+    /// result, so background/incremental runs pick up config changes that
+    /// happened after the process started.
+    ///
+    /// `None` by default. The api layer wires its own resolver via
+    /// [`IndexerConfig::with_fulltext_config_provider`].
+    pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
+
+    /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
+    /// ascending by `t`, supplied by the nameservice's commit-CID index.
+    ///
+    /// Transient per-build data, not durable config: it lets incremental
+    /// indexing skip the serial commit-DAG walk and fetch bodies in parallel.
+    /// `None` means "no index available" — the indexer walks the DAG as
+    /// before. Populated only by the NS-aware entry point
+    /// (`build_index_for_ledger_with_tracker`); other entries leave it `None`.
+    pub pending_commit_cids: Option<Vec<(i64, fluree_db_core::ContentId)>>,
+
+    /// Force the serial commit-DAG walk baseline by skipping the commit-CID
+    /// index fast path. When `true`, the NS-aware entry point leaves
+    /// `pending_commit_cids` unset so discovery falls back to the serial walk.
+    /// Used to A/B the fast path against its baseline on the same backlog.
+    pub force_serial_commit_walk: bool,
+
+    /// Late-bound resolver for the shared read cache to warm on write — see
+    /// [`WarmCacheSource`].
+    ///
+    /// When it yields a cache (co-located deployments), the incremental build
+    /// seeds that cache with the leaflets it just wrote (decoded under
+    /// `ColumnSet::ALL`) so the query server's immediate read of a freshly
+    /// rewritten leaf hits the cache instead of re-reading + re-decoding from
+    /// disk. `None` (default) = off. Not build output, so excluded from config
+    /// identity.
+    pub warm_cache_source: Option<Arc<dyn WarmCacheSource>>,
+}
+
+/// Default run-sort budget: 256 MB.
+pub const DEFAULT_RUN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default max commits for incremental indexing.
+pub const DEFAULT_INCREMENTAL_MAX_COMMITS: usize = 10_000;
+
+/// Default max concurrency for incremental branch updates.
+pub const DEFAULT_INCREMENTAL_MAX_CONCURRENCY: usize = 4;
+
+/// Default global budget of concurrent leaf/sidecar uploads in incremental
+/// Phase 2.
+pub const DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY: usize = 16;
+
+/// Default cap on existing-subject `rdf:type` changes per incremental batch
+/// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
+pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
+
+/// Default interval for the worker's stalled-ledger re-sweep.
+///
+/// A safety net, not a scheduler: healthy ledgers are indexed on commit long
+/// before a sweep would notice them, and the stall condition needs two
+/// observations, so detection is up to twice this. Kept well above the 30 s
+/// retry-backoff ceiling so a sweep never races a build that is already
+/// retrying.
+pub const DEFAULT_CATCHUP_INTERVAL_SECS: u64 = 300;
+
+impl Default for IndexerConfig {
+    fn default() -> Self {
+        Self {
+            leaf_target_bytes: 187_500,
+            leaf_max_bytes: 375_000,
+            branch_target_children: 100,
+            branch_max_children: 200,
+            gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
+            gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
+            run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
+            data_dir: None,
+            incremental_enabled: true,
+            incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
+            incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
+            leaflet_rows: 25_000,
+            leaflets_per_leaf: 10,
+            incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            fulltext_configured_properties: Vec::new(),
+            fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
+            warm_cache_source: None,
+        }
+    }
+}
+
+impl IndexerConfig {
+    /// Where binary index artifacts are cached on local disk.
+    ///
+    /// Sited under [`data_dir`](Self::data_dir) so the cache survives restarts
+    /// and is shared by every reader on this instance. With no `data_dir` it
+    /// falls back to the system temp directory, which a short-lived process
+    /// still benefits from within its own run.
+    pub fn artifact_cache_dir(&self) -> PathBuf {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("binary_artifact_cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache"))
+    }
+
+    /// Create a new configuration with custom values
+    pub fn new(
+        leaf_target_bytes: u64,
+        leaf_max_bytes: u64,
+        branch_target_children: usize,
+        branch_max_children: usize,
+    ) -> Self {
+        Self {
+            leaf_target_bytes,
+            leaf_max_bytes,
+            branch_target_children,
+            branch_max_children,
+            gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
+            gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
+            run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
+            data_dir: None,
+            incremental_enabled: true,
+            incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
+            incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
+            leaflet_rows: 25_000,
+            leaflets_per_leaf: 10,
+            incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            fulltext_configured_properties: Vec::new(),
+            fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
+            warm_cache_source: None,
+        }
+    }
+
+    /// Create a configuration optimized for small datasets
+    pub fn small() -> Self {
+        Self {
+            leaf_target_bytes: 50_000,
+            leaf_max_bytes: 100_000,
+            branch_target_children: 20,
+            branch_max_children: 40,
+            gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
+            gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
+            run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
+            data_dir: None,
+            incremental_enabled: true,
+            incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
+            incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
+            leaflet_rows: 25_000,
+            leaflets_per_leaf: 10,
+            incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            fulltext_configured_properties: Vec::new(),
+            fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
+            warm_cache_source: None,
+        }
+    }
+
+    /// Create a configuration optimized for large datasets
+    pub fn large() -> Self {
+        Self {
+            leaf_target_bytes: 750_000,
+            leaf_max_bytes: 1_500_000,
+            branch_target_children: 200,
+            branch_max_children: 400,
+            gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
+            gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: Some(DEFAULT_HARD_MAX_OLD_INDEXES),
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
+            run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
+            data_dir: None,
+            incremental_enabled: true,
+            incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
+            incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
+            leaflet_rows: 25_000,
+            leaflets_per_leaf: 10,
+            incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            fulltext_configured_properties: Vec::new(),
+            fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
+            warm_cache_source: None,
+        }
+    }
+
+    /// Attach a full-text config provider so each index build re-resolves
+    /// `fulltext_configured_properties` from the live ledger state.
+    ///
+    /// Prefer this over [`fulltext_configured_properties`](Self::fulltext_configured_properties)
+    /// for long-lived indexer handles (background worker / CLI), which
+    /// otherwise carry a stale snapshot of the config across the whole
+    /// process lifetime.
+    pub fn with_fulltext_config_provider(
+        mut self,
+        provider: Arc<dyn FulltextConfigProvider>,
+    ) -> Self {
+        self.fulltext_config_provider = Some(provider);
+        self
+    }
+
+    /// Attach a per-ledger attachment-events resolver. The
+    /// `BackgroundIndexerWorker` calls the provider at job dispatch
+    /// time; direct callers (CLI, tests) typically populate
+    /// `attachment_events` instead.
+    pub fn with_attachment_events_provider(
+        mut self,
+        provider: Arc<dyn AttachmentEventsProvider>,
+    ) -> Self {
+        self.attachment_events_provider = Some(provider);
+        self
+    }
+
+    /// Attach a late-bound resolver for the shared read cache to warm on write.
+    /// Only co-located deployments plug this in; separate-machine indexers leave
+    /// it unset (they can't reach the query server's cache).
+    pub fn with_warm_cache_source(mut self, source: Arc<dyn WarmCacheSource>) -> Self {
+        self.warm_cache_source = Some(source);
+        self
+    }
+
+    pub fn with_leaflet_rows(mut self, rows: usize) -> Self {
+        self.leaflet_rows = rows.max(1);
+        self
+    }
+
+    pub fn with_leaflets_per_leaf(mut self, n: usize) -> Self {
+        self.leaflets_per_leaf = n.max(1);
+        self
+    }
+
+    /// Builder method to set the stalled-ledger re-sweep interval.
+    ///
+    /// [`Duration::ZERO`] disables the periodic re-sweep; the start-up sweep
+    /// runs regardless. See [`IndexerConfig::catchup_interval`].
+    pub fn with_catchup_interval(mut self, interval: Duration) -> Self {
+        self.catchup_interval = interval;
+        self
+    }
+
+    /// Builder method to set whether this worker owns catch-up sweeps.
+    ///
+    /// See [`IndexerConfig::catchup_sweeps_enabled`]. Pass `false` for a worker
+    /// that shares a nameservice with another worker that already sweeps.
+    pub fn with_catchup_sweeps(mut self, enabled: bool) -> Self {
+        self.catchup_sweeps_enabled = enabled;
+        self
+    }
+
+    /// Builder method to set GC max old indexes
+    pub fn with_gc_max_old_indexes(mut self, max_old: u32) -> Self {
+        self.gc_max_old_indexes = max_old;
+        self
+    }
+
+    /// Builder method to set GC min time in minutes
+    pub fn with_gc_min_time_mins(mut self, min_time: u32) -> Self {
+        self.gc_min_time_mins = min_time;
+        self
+    }
+
+    /// Builder method to set the GC version ceiling; `None` removes it.
+    pub fn with_gc_hard_max_old_indexes(mut self, ceiling: Option<u32>) -> Self {
+        self.gc_hard_max_old_indexes = ceiling;
+        self
+    }
+
+    /// Builder method to set the run-sort memory budget.
+    ///
+    /// For bulk imports of 1 GB+, use 1–2 GB (e.g., `1024 * 1024 * 1024`).
+    pub fn with_run_budget_bytes(mut self, bytes: usize) -> Self {
+        self.run_budget_bytes = bytes;
+        self
+    }
+
+    /// Builder method to set the data directory for binary index artifacts
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Builder method to enable or disable incremental indexing
+    pub fn with_incremental_enabled(mut self, enabled: bool) -> Self {
+        self.incremental_enabled = enabled;
+        self
+    }
+
+    /// Builder method to set the maximum commit window for incremental indexing
+    pub fn with_incremental_max_commits(mut self, max_commits: usize) -> Self {
+        self.incremental_max_commits = max_commits;
+        self
+    }
+
+    /// Builder method to set the maximum concurrency for incremental branch updates
+    pub fn with_incremental_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.incremental_max_concurrency = max_concurrency.max(1);
+        self
+    }
+
+    /// Builder method to set the global leaf/sidecar upload concurrency budget
+    /// for incremental Phase 2.
+    pub fn with_incremental_leaf_upload_concurrency(mut self, budget: usize) -> Self {
+        self.incremental_leaf_upload_concurrency = budget.max(1);
+        self
+    }
+
+    /// Builder method to set the per-batch cap on existing-subject `rdf:type`
+    /// changes before incremental indexing defers to a full rebuild (#1266).
+    pub fn with_incremental_retype_max_subjects(mut self, max_subjects: usize) -> Self {
+        self.incremental_retype_max_subjects = max_subjects;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = IndexerConfig::default();
+        assert_eq!(config.leaf_target_bytes, 187_500);
+        assert_eq!(config.leaf_max_bytes, 375_000);
+        assert_eq!(config.branch_target_children, 100);
+        assert_eq!(config.branch_max_children, 200);
+        assert_eq!(config.gc_max_old_indexes, DEFAULT_MAX_OLD_INDEXES);
+        assert_eq!(config.gc_min_time_mins, DEFAULT_MIN_TIME_GARBAGE_MINS);
+        assert!(config.incremental_enabled);
+        assert_eq!(
+            config.incremental_max_commits,
+            DEFAULT_INCREMENTAL_MAX_COMMITS
+        );
+        assert_eq!(
+            config.incremental_max_concurrency,
+            DEFAULT_INCREMENTAL_MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn test_small_config() {
+        let config = IndexerConfig::small();
+        assert_eq!(config.leaf_target_bytes, 50_000);
+        assert_eq!(config.gc_max_old_indexes, DEFAULT_MAX_OLD_INDEXES);
+        assert!(config.incremental_enabled);
+    }
+
+    #[test]
+    fn test_large_config() {
+        let config = IndexerConfig::large();
+        assert_eq!(config.leaf_target_bytes, 750_000);
+        assert_eq!(config.gc_max_old_indexes, DEFAULT_MAX_OLD_INDEXES);
+        assert!(config.incremental_enabled);
+    }
+
+    #[test]
+    fn test_gc_config_builders() {
+        let config = IndexerConfig::default()
+            .with_gc_max_old_indexes(10)
+            .with_gc_min_time_mins(60)
+            .with_gc_hard_max_old_indexes(Some(40));
+        assert_eq!(config.gc_max_old_indexes, 10);
+        assert_eq!(config.gc_min_time_mins, 60);
+        assert_eq!(config.gc_hard_max_old_indexes, Some(40));
+
+        for preset in [
+            IndexerConfig::default(),
+            IndexerConfig::small(),
+            IndexerConfig::large(),
+        ] {
+            assert_eq!(preset.gc_hard_max_old_indexes, Some(10));
+        }
+        let unbounded = IndexerConfig::default().with_gc_hard_max_old_indexes(None);
+        assert_eq!(unbounded.gc_hard_max_old_indexes, None);
+    }
+
+    #[test]
+    fn test_incremental_config_builders() {
+        let config = IndexerConfig::default()
+            .with_incremental_enabled(false)
+            .with_incremental_max_commits(500)
+            .with_incremental_max_concurrency(8);
+        assert!(!config.incremental_enabled);
+        assert_eq!(config.incremental_max_commits, 500);
+        assert_eq!(config.incremental_max_concurrency, 8);
+
+        // Concurrency is clamped to at least 1.
+        let config2 = IndexerConfig::default().with_incremental_max_concurrency(0);
+        assert_eq!(config2.incremental_max_concurrency, 1);
+    }
+}

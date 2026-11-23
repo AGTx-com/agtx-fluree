@@ -1,0 +1,87 @@
+#[path = "support/mod.rs"]
+mod support;
+
+#[path = "it_arena_literal_keys.rs"]
+mod it_arena_literal_keys;
+#[path = "it_bounded_overlay_translation.rs"]
+mod it_bounded_overlay_translation;
+#[path = "it_differential_fastpath.rs"]
+mod it_differential_fastpath;
+#[path = "it_filter_pushdown_operators.rs"]
+mod it_filter_pushdown_operators;
+#[path = "it_jsonld_join_batched_lane.rs"]
+mod it_jsonld_join_batched_lane;
+#[path = "it_materializer_decode_errors.rs"]
+mod it_materializer_decode_errors;
+#[path = "it_nested_select_modifiers.rs"]
+mod it_nested_select_modifiers;
+#[path = "it_query_agent_json.rs"]
+mod it_query_agent_json;
+#[path = "it_query_aggregates.rs"]
+mod it_query_aggregates;
+#[path = "it_query_connection.rs"]
+mod it_query_connection;
+#[path = "it_query_dataset.rs"]
+mod it_query_dataset;
+#[path = "it_query_datatype.rs"]
+mod it_query_datatype;
+#[path = "it_query_explain_native.rs"]
+mod it_query_explain_native;
+#[path = "it_query_expression_semantics.rs"]
+mod it_query_expression_semantics;
+#[path = "it_query_filter_scope.rs"]
+mod it_query_filter_scope;
+#[path = "it_query_fuel_bound_object.rs"]
+mod it_query_fuel_bound_object;
+#[path = "it_query_fulltext.rs"]
+mod it_query_fulltext;
+#[path = "it_query_geo.rs"]
+mod it_query_geo;
+#[path = "it_query_geo_search.rs"]
+mod it_query_geo_search;
+#[path = "it_query_graph_names.rs"]
+mod it_query_graph_names;
+#[path = "it_query_grouping.rs"]
+mod it_query_grouping;
+#[path = "it_query_jsonld.rs"]
+mod it_query_jsonld;
+#[path = "it_query_jsonld_basic.rs"]
+mod it_query_jsonld_basic;
+#[path = "it_query_jsonld_compound.rs"]
+mod it_query_jsonld_compound;
+#[path = "it_query_jsonld_grouped_projection.rs"]
+mod it_query_jsonld_grouped_projection;
+#[path = "it_query_list_functions.rs"]
+mod it_query_list_functions;
+#[path = "it_query_misc.rs"]
+mod it_query_misc;
+#[path = "it_query_optional_encoded_bindings.rs"]
+mod it_query_optional_encoded_bindings;
+#[path = "it_query_optional_hashjoin.rs"]
+mod it_query_optional_hashjoin;
+#[path = "it_query_post_order_limit.rs"]
+mod it_query_post_order_limit;
+#[path = "it_query_property.rs"]
+mod it_query_property;
+#[path = "it_query_rdf_list_parity.rs"]
+mod it_query_rdf_list_parity;
+#[path = "it_query_result_cache.rs"]
+mod it_query_result_cache;
+#[path = "it_query_reverse.rs"]
+mod it_query_reverse;
+#[path = "it_query_self_loop_star_join.rs"]
+mod it_query_self_loop_star_join;
+#[path = "it_query_typed_json.rs"]
+mod it_query_typed_json;
+#[path = "it_query_vocab_id_compaction.rs"]
+mod it_query_vocab_id_compaction;
+#[path = "it_query_wildcard_system_facts.rs"]
+mod it_query_wildcard_system_facts;
+#[path = "it_reserved_graph_contract.rs"]
+mod it_reserved_graph_contract;
+#[path = "it_service_cross_ledger_iri.rs"]
+mod it_service_cross_ledger_iri;
+#[path = "it_union_fact_identity.rs"]
+mod it_union_fact_identity;
+#[path = "it_unordered_output_order.rs"]
+mod it_unordered_output_order;

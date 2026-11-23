@@ -1,0 +1,5458 @@
+//! SPARQL Lowering.
+//!
+//! This module lowers the SPARQL AST to the query algebra defined in
+//! `fluree-db-query`. This involves:
+//!
+//! - Prefix expansion (resolving prefixed names to full IRIs)
+//! - IRI encoding via `IriEncoder` trait
+//! - Variable registration via `VarRegistry`
+//! - Graph pattern lowering to `Pattern`
+//! - Expression lowering to `Expression`
+//!
+//! ## Usage
+//!
+//! ```
+//! use fluree_db_sparql::{parse_sparql, lower_sparql};
+//! use fluree_db_query::parse::encode::MemoryEncoder;
+//! use fluree_db_query::var_registry::VarRegistry;
+//!
+//! let output = parse_sparql("SELECT ?name WHERE { ?s <http://example.org/name> ?name }");
+//! let ast = output.ast.unwrap();
+//!
+//! let mut encoder = MemoryEncoder::with_common_namespaces();
+//! encoder.add_namespace("http://example.org/", 100);
+//! let mut vars = VarRegistry::new();
+//! let query = lower_sparql(&ast, &encoder, &mut vars).unwrap();
+//! ```
+//!
+//! ## Integration
+//!
+//! After lowering, the query can be executed by the existing
+//! `fluree-db-query` execution pipeline.
+//!
+//! ## Module Structure
+//!
+//! Lowering logic is split across focused submodules:
+//!
+//! - [`term`] — Variables, IRIs, literals, blank nodes
+//! - [`expression`] — Filter expressions and function calls
+//! - [`aggregate`] — Aggregate extraction and HAVING
+//! - [`pattern`] — Graph pattern dispatch (BGP, OPTIONAL, UNION, etc.)
+//! - [`path`] — Property path lowering
+//! - [`rdf_star`] — RDF-star quoted triple expansion
+//! - [`ask`] — ASK query lowering
+//! - [`construct`] — CONSTRUCT query lowering
+//! - [`select`] — SELECT clause, solution modifiers, subqueries
+
+mod aggregate;
+mod annotation;
+mod ask;
+mod construct;
+mod describe;
+mod error;
+mod expression;
+mod path;
+mod pattern;
+mod rdf_star;
+mod select;
+mod term;
+
+pub use error::{LowerError, Result};
+
+use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
+use crate::ast::GraphPattern;
+
+use fluree_db_query::ir::Pattern;
+use fluree_db_query::ir::{PostValues, Query, QueryOutput, ReasoningConfig};
+
+use self::select::BaseModifiers;
+use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::var_registry::{VarId, VarRegistry};
+
+use fluree_graph_json_ld::{parse_context, ParsedContext};
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Lower a SPARQL AST to a Query.
+///
+/// This produces a `Query` that can be directly executed by the
+/// fluree-db-query engine via `ExecutableQuery`.
+///
+/// # Arguments
+///
+/// * `ast` - The parsed SPARQL AST
+/// * `encoder` - IRI encoder for converting IRIs to Sids
+/// * `vars` - Variable registry (caller provides to enable sharing across subqueries)
+///
+/// # Returns
+///
+/// A `Query` ready for execution, or a `LowerError`.
+pub fn lower_sparql<E: IriEncoder>(
+    ast: &SparqlAst,
+    encoder: &E,
+    vars: &mut VarRegistry,
+) -> Result<Query> {
+    lower_sparql_with_source(ast, encoder, vars, None)
+}
+
+/// Lower a SPARQL AST to a Query, with optional source text for SERVICE body capture.
+///
+/// When `source_text` is provided, SERVICE patterns will capture the original SPARQL
+/// text for their body, enabling remote execution without an IR-to-SPARQL serializer.
+pub fn lower_sparql_with_source<E: IriEncoder>(
+    ast: &SparqlAst,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    source_text: Option<&str>,
+) -> Result<Query> {
+    let span = tracing::debug_span!("sparql_lower");
+    let _guard = span.enter();
+
+    tracing::debug!("lowering SPARQL AST to query algebra");
+
+    let mut ctx = LoweringContext::new(ast, encoder, vars, source_text);
+    let mut result = ctx.lower();
+    if let Ok(query) = &mut result {
+        query.include_system_facts = ast.pragmas.include_system_facts.unwrap_or(false);
+        query.union_default_graph = ast.pragmas.union_default_graph;
+    }
+
+    match &result {
+        Ok(query) => {
+            tracing::debug!(
+                pattern_count = query.patterns.len(),
+                var_count = vars.len(),
+                "SPARQL lowering completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SPARQL lowering failed");
+        }
+    }
+
+    // Mirror the JSON-LD read-side firewall
+    // (`fluree_db_query::parse::reject_user_authored_reifies_in_query`):
+    // user queries naming `f:reifies*` IRIs directly are rejected
+    // so system facts can't be enumerated through the user surface.
+    // The opt-in `opts.includeSystemFacts: true` (`# PRAGMA
+    // include-system-facts: true`) only relaxes the variable-predicate scan filter — direct mention is the
+    // contract-level boundary, identical for SPARQL and JSON-LD.
+    if let Ok(query) = &result {
+        reject_direct_reifies_in_patterns(&query.patterns)?;
+        // The trailing VALUES clause is kept out of `patterns`; its rows get
+        // the same check as an in-WHERE VALUES block's.
+        if let Some(post_values) = &query.post_values {
+            reject_direct_reifies_in_patterns(&post_values.to_patterns())?;
+        }
+    }
+
+    result
+}
+
+/// The `Query::post_values` of a level whose trailing VALUES clause
+/// ([`LoweringContext::lower_trailing_values`]) is `values`: the join after
+/// the WHERE tree, then the level's generated `binds`, so they read the VALUES
+/// variables (as in a sub-SELECT). Without a trailing VALUES, the binds end
+/// the WHERE.
+fn post_values_then(
+    values: Option<Pattern>,
+    binds: Vec<(VarId, fluree_db_query::ir::Expression)>,
+    patterns: &mut Vec<Pattern>,
+) -> Option<PostValues> {
+    match values {
+        Some(Pattern::Values { vars, rows }) => Some(PostValues {
+            vars,
+            rows,
+            then: binds,
+        }),
+        _ => {
+            patterns.extend(select::LoweredSelectLevel::bind_patterns(binds));
+            None
+        }
+    }
+}
+
+/// Prefix → namespace map from the prologue (namespaces base-resolved).
+type PrefixMap = HashMap<Arc<str>, Arc<str>>;
+
+/// Build the prologue environment: the prefix → namespace map and the BASE.
+///
+/// A PREFIX namespace may itself be a relative IRI reference (`PREFIX : <>`,
+/// `PREFIX : <#>`); per SPARQL 1.1 §4.1.1 it resolves against the query BASE.
+/// Resolution happens once here (prepare-time) so every prefixed-name
+/// expansion sees an absolute namespace. Without a BASE, relative namespaces
+/// stay as written.
+///
+/// Deliberate simplifications in loosely-specified territory (PR-1454
+/// review): `prologue.base` is the single FINAL base (last declaration
+/// wins), so a relative PREFIX namespace declared textually BEFORE the
+/// BASE still resolves against it, and a second relative BASE is not
+/// chained against the first. Redeclared prefixes resolve last-wins via
+/// the map insert below.
+fn prologue_environment(prologue: &crate::ast::Prologue) -> (PrefixMap, Option<Arc<str>>) {
+    let base = prologue.base.as_ref().map(|b| b.iri.clone());
+
+    let mut prefixes = HashMap::new();
+    for decl in &prologue.prefixes {
+        let ns: Arc<str> = match &base {
+            Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
+                Arc::from(fluree_vocab::iri::resolve_iri(base, &decl.iri))
+            }
+            _ => decl.iri.clone(),
+        };
+        prefixes.insert(decl.prefix.clone(), ns);
+    }
+
+    (prefixes, base)
+}
+
+/// A query's `FROM` / `FROM NAMED` clause with every IRI prefix-expanded and
+/// base-resolved (same semantics as constant IRIs in the query body).
+///
+/// Produced by [`resolve_dataset_clause`]. Consumers (dataset construction —
+/// see the burn-down roadmap's PR-G2) receive absolute graph IRIs and never
+/// re-implement prologue handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDatasetClause {
+    /// `FROM <iri>` graphs (union forms the default graph).
+    pub default_graphs: Vec<Arc<str>>,
+    /// `FROM NAMED <iri>` graphs.
+    pub named_graphs: Vec<Arc<str>>,
+    /// Fluree `FROM <from> TO <to>` history-range extension endpoint.
+    pub to_graph: Option<Arc<str>>,
+}
+
+/// Resolve the query's dataset clause (`FROM` / `FROM NAMED`) IRIs against
+/// the prologue: prefixed names expand, relative references resolve against
+/// `BASE` (RFC 3986 §5). Returns `None` when the query has no dataset clause.
+///
+/// This is resolution plumbing only — it does not execute or authorize
+/// dataset clauses. Single-ledger `GraphDb` queries still reject FROM/FROM
+/// NAMED at the API layer (`validate_sparql_for_view`); when that guard is
+/// replaced by within-ledger dataset construction, the construction must
+/// consume these resolved IRIs rather than the raw AST strings.
+pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetClause>> {
+    let clause = match &ast.body {
+        QueryBody::Select(q) => q.dataset.as_ref(),
+        QueryBody::Ask(q) => q.dataset.as_ref(),
+        QueryBody::Describe(q) => q.dataset.as_ref(),
+        QueryBody::Construct(q) => q.dataset.as_ref(),
+        QueryBody::Update(_) => None,
+    };
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+
+    let (prefixes, base) = prologue_environment(&ast.prologue);
+    let expand = |iri: &crate::ast::term::Iri| -> Result<Arc<str>> {
+        match &iri.value {
+            // A dataset IRI written in full is taken as written (BASE-resolved
+            // when relative). `FROM <mydb:main>` names a ledger even when the
+            // query also declares a `mydb:` prefix, so the misused-prefix check
+            // that pattern IRIs get does not apply to a dataset clause. A
+            // ledger address that names its branch or a time (`my_db:main`,
+            // `mydb@t:3`) is no relative reference, so BASE leaves it as
+            // written too; a bare name is one, and BASE resolves it.
+            crate::ast::term::IriValue::Full(s) => Ok(match base.as_deref() {
+                Some(base)
+                    if !fluree_vocab::iri::is_absolute_iri(s)
+                        && !fluree_db_core::DatasetRef::is_address_with_branch_or_time(s) =>
+                {
+                    Arc::from(fluree_vocab::iri::resolve_iri(base, s))
+                }
+                _ => Arc::clone(s),
+            }),
+            // `FROM ledger:main` with no `ledger:` prefix declared names the
+            // ledger address as written; a declared prefix expands.
+            crate::ast::term::IriValue::Prefixed { prefix, local }
+                if !prefixes.contains_key(prefix) =>
+            {
+                Ok(Arc::from(format!("{prefix}:{local}")))
+            }
+            crate::ast::term::IriValue::Prefixed { .. } => {
+                term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+            }
+        }
+    };
+
+    Ok(Some(ResolvedDatasetClause {
+        default_graphs: clause
+            .default_graphs
+            .iter()
+            .map(expand)
+            .collect::<Result<Vec<_>>>()?,
+        named_graphs: clause
+            .named_graphs
+            .iter()
+            .map(expand)
+            .collect::<Result<Vec<_>>>()?,
+        to_graph: clause.to_graph.as_ref().map(expand).transpose()?,
+    }))
+}
+
+/// Walk every triple pattern reachable from `patterns` (recursing
+/// through container patterns) and reject any whose predicate slot is
+/// a system-controlled `f:reifies*` IRI/SID. Called by
+/// `lower_sparql_with_source` after lowering succeeds.
+///
+/// Patterns built via the IR-level `expand_edge_annotation_patterns`
+/// pass also produce `f:reifies*` triples, but that pass runs at
+/// execution time on top of `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget`, *after* this firewall. SPARQL has no
+/// surface that produces those container variants today, so any
+/// `f:reifies*` triple visible here came from user input.
+fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_vocab::reifies_iris;
+
+    fn is_reifies_ref(p: &Ref) -> bool {
+        match p {
+            Ref::Sid(sid) => fluree_db_core::is_reserved_reifies_predicate(sid),
+            Ref::Iri(iri) => reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn reject_predicate_string(predicate: String) -> LowerError {
+        LowerError::not_implemented(
+            format!(
+                "predicate '{predicate}' is system-controlled; \
+                 read edge annotations through SPARQL-star \
+                 quoted-triple annotation syntax rather than \
+                 naming f:reifies* directly"
+            ),
+            (0..0).into(),
+        )
+    }
+
+    // A VALUES row binding that resolves to an `f:reifies*` IRI: the
+    // user is trying to smuggle a system-controlled predicate in as
+    // data (e.g. `VALUES ?p { f:reifiesSubject } . ?s ?p ?o`) so a
+    // later variable-predicate scan binds it to a constant and leaks
+    // the internal bundle. Returns the offending IRI for the message.
+    fn reifies_values_binding(b: &fluree_db_query::Binding) -> Option<String> {
+        use fluree_db_query::Binding;
+        match b {
+            Binding::Sid { sid, .. } if fluree_db_core::is_reserved_reifies_predicate(sid) => {
+                Some(format!("{sid}"))
+            }
+            Binding::IriMatch {
+                primary_sid, iri, ..
+            } if fluree_db_core::is_reserved_reifies_predicate(primary_sid)
+                || reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()) =>
+            {
+                Some(iri.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    // Exhaustive over `Pattern` so adding a new variant forces a
+    // firewall decision rather than silently slipping through. The
+    // previous wildcard arm let `PropertyPath` (which carries a
+    // predicate Sid) bypass the check — e.g.
+    // `?s f:reifiesSubject+ ?o` was accepted, exposing the
+    // system-controlled chain through transitive paths.
+    fn walk(patterns: &[Pattern]) -> Result<()> {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Triple(tp) => {
+                    if is_reifies_ref(&tp.p) {
+                        let predicate = match &tp.p {
+                            Ref::Iri(iri) => iri.as_ref().to_string(),
+                            Ref::Sid(sid) => format!("{sid}"),
+                            _ => "<f:reifies*>".to_string(),
+                        };
+                        return Err(reject_predicate_string(predicate));
+                    }
+                }
+                Pattern::PropertyPath(pp) => {
+                    if let Some(reserved) = pp
+                        .predicates
+                        .iter()
+                        .find(|p| fluree_db_core::is_reserved_reifies_predicate(p))
+                    {
+                        return Err(reject_predicate_string(format!("{reserved}")));
+                    }
+                }
+                // ShortestPath also carries a predicate Sid; apply the same
+                // firewall (no SPARQL surface produces it today, but stay safe).
+                // The wildcard form (`predicate: None`) excludes `f:reifies*`
+                // in the operator's edge-set.
+                Pattern::ShortestPath(sp) => {
+                    if let Some(pred) = &sp.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(pred) {
+                            return Err(reject_predicate_string(format!("{pred}")));
+                        }
+                    }
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner) => walk(inner)?,
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        walk(branch)?;
+                    }
+                }
+                Pattern::Graph { patterns, .. } => walk(patterns)?,
+                Pattern::Service(sp) => walk(&sp.patterns)?,
+                Pattern::Subquery(sq) => walk(&sq.patterns)?,
+                Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                    walk(body)?;
+                }
+                Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
+                // VALUES carries no predicate slot, but its row DATA can
+                // bind a variable to an `f:reifies*` IRI which a later
+                // `?s ?p ?o` scan then resolves to a constant predicate,
+                // leaking the internal bundle. Reject the IRI here.
+                Pattern::Values { rows, .. } => {
+                    for row in rows {
+                        for binding in row {
+                            if let Some(iri) = reifies_values_binding(binding) {
+                                return Err(reject_predicate_string(iri));
+                            }
+                        }
+                    }
+                }
+                // Pattern types that don't carry an arbitrary triple
+                // predicate — adapters / search calls / leaf nodes.
+                // f:reifies* predicates can't appear inside them.
+                Pattern::Filter(_)
+                | Pattern::ListView(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
+                | Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    walk(patterns)
+}
+
+/// Context for lowering operations.
+///
+/// Maintains prefix mappings and provides methods for lowering each AST type.
+/// Methods are split across submodules but all operate on this shared context.
+struct LoweringContext<'a, E> {
+    ast: &'a SparqlAst,
+    encoder: &'a E,
+    vars: &'a mut VarRegistry,
+    /// Prefix → IRI namespace mapping from prologue
+    prefixes: HashMap<Arc<str>, Arc<str>>,
+    /// Base IRI for relative IRI resolution
+    base: Option<Arc<str>>,
+    /// Aggregate expression → alias variable mapping (for HAVING)
+    aggregate_aliases: Option<HashMap<String, VarId>>,
+    /// Cache of lowered aggregate-input expressions that have been desugared to a
+    /// pre-aggregation `BIND(expr AS ?__agg_expr_N)` variable.
+    ///
+    /// Key is a span-free structural string of the input expression.
+    agg_expr_binds: HashMap<String, VarId>,
+    /// Monotonic counter for generating aggregate-input bind variables (`?__agg_expr_0`, `?__agg_expr_1`, …).
+    agg_counter: u32,
+    /// Monotonic counter for generating intermediate property-path join variables (`?__pp0`, `?__pp1`, …).
+    pp_counter: u32,
+    /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
+    order_counter: u32,
+    /// Original SPARQL source text (for extracting SERVICE body text).
+    source_text: Option<&'a str>,
+}
+
+impl<'a, E: IriEncoder> LoweringContext<'a, E> {
+    fn new(
+        ast: &'a SparqlAst,
+        encoder: &'a E,
+        vars: &'a mut VarRegistry,
+        source_text: Option<&'a str>,
+    ) -> Self {
+        let (prefixes, base) = prologue_environment(&ast.prologue);
+
+        Self {
+            ast,
+            encoder,
+            vars,
+            prefixes,
+            base,
+            aggregate_aliases: None,
+            agg_expr_binds: HashMap::new(),
+            agg_counter: 0,
+            pp_counter: 0,
+            order_counter: 0,
+            source_text,
+        }
+    }
+
+    /// Build the query's `ReasoningConfig` from the `# PRAGMA reasoning: ...`
+    /// directive, if present.
+    ///
+    /// Mirrors the JSON-LD `"reasoning"` option: no pragma means
+    /// `ReasoningConfig::default()` (ledger/config defaults apply); an
+    /// explicit pragma sets the query-level modes, which take precedence
+    /// under `DefaultUnlessQueryOverrides`. Unknown mode names error.
+    fn reasoning_config(&self) -> Result<ReasoningConfig> {
+        use fluree_db_query::ir::ReasoningModes;
+
+        let mut modes = match &self.ast.pragmas.reasoning {
+            None => ReasoningModes::default(),
+            Some(mode_strs) => {
+                if mode_strs.is_empty() {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "expected at least one mode: none, rdfs, owl2ql, owl2rl, datalog, owl-datalog",
+                        self.ast.span,
+                    ));
+                }
+                if mode_strs.len() > 1 && mode_strs.iter().any(|m| m.eq_ignore_ascii_case("none")) {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "'none' cannot be combined with other modes",
+                        self.ast.span,
+                    ));
+                }
+
+                let value = if mode_strs.len() == 1 {
+                    serde_json::Value::String(mode_strs[0].clone())
+                } else {
+                    serde_json::Value::Array(
+                        mode_strs
+                            .iter()
+                            .map(|m| serde_json::Value::String(m.clone()))
+                            .collect(),
+                    )
+                };
+                ReasoningModes::from_json(&value)
+                    .map_err(|e| LowerError::invalid_pragma("reasoning", e, self.ast.span))?
+            }
+        };
+
+        // Budget pragmas don't flip any mode flag — they only take effect
+        // when a reasoning mode runs (from this query or a ledger default).
+        modes.max_facts = self.budget_pragma_value(
+            "reasoning-max-facts",
+            self.ast.pragmas.reasoning_max_facts.as_deref(),
+        )?;
+        modes.max_seconds = self.budget_pragma_value(
+            "reasoning-max-seconds",
+            self.ast.pragmas.reasoning_max_seconds.as_deref(),
+        )?;
+        modes.max_memory_mb = self.budget_pragma_value(
+            "reasoning-max-memory-mb",
+            self.ast.pragmas.reasoning_max_memory_mb.as_deref(),
+        )?;
+        if let Some(raw) = self.ast.pragmas.reasoning_time.as_deref() {
+            modes.evaluation_time = Some(
+                fluree_db_core::temporal::DateTime::parse(raw.trim()).map_err(|e| {
+                    LowerError::invalid_pragma(
+                        "reasoning-time",
+                        format!("expected an ISO 8601 datetime: {e}"),
+                        self.ast.span,
+                    )
+                })?,
+            );
+        }
+
+        if modes == ReasoningModes::default() {
+            return Ok(ReasoningConfig::default());
+        }
+        Ok(ReasoningConfig::new().with_modes(modes))
+    }
+
+    /// Validate a `# PRAGMA reasoning-max-*: <n>` value as a non-negative integer.
+    fn budget_pragma_value(&self, name: &'static str, raw: Option<&str>) -> Result<Option<u64>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        raw.parse::<u64>().map(Some).map_err(|_| {
+            LowerError::invalid_pragma(name, "expected a non-negative integer", self.ast.span)
+        })
+    }
+
+    /// Main entry point for lowering.
+    fn lower(&mut self) -> Result<Query> {
+        match &self.ast.body {
+            QueryBody::Select(select_query) => {
+                // Lower WHERE clause patterns
+                let mut patterns = self.lower_graph_pattern(&select_query.where_clause.pattern)?;
+
+                // Lower SELECT clause to get selected variables
+                let select = self.lower_select_clause(&select_query.select)?;
+
+                let values =
+                    self.lower_trailing_values(select_query.values.as_deref(), &mut patterns)?;
+
+                // Solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/
+                // HAVING/aggregates) and SELECT expressions (e.g.
+                // `(SHA512(?x) AS ?hash)`). The WHERE-side pieces (GROUP BY and
+                // aggregate-input BINDs, SELECT BINDs of an ungrouped level, a
+                // HAVING-as-Filter) land on `patterns`; SELECT Extends ride in
+                // the grouping phase. Expression-based ORDER BY binds ride on
+                // `Query.order_binds` (a dedicated post-grouping stage in the
+                // operator tree) so they evaluate uniformly with or without
+                // grouping.
+                let level = self.lower_select_level(
+                    &select_query.select,
+                    &select_query.modifiers,
+                    &mut patterns,
+                    values.as_ref(),
+                )?;
+                let post_values = post_values_then(values, level.binds, &mut patterns);
+                let star_projection = level.star_projection;
+                let grouping = level.grouping;
+                let BaseModifiers {
+                    limit,
+                    offset,
+                    ordering,
+                    order_binds,
+                    // Consumed in `lower_solution_modifiers` (lowered into
+                    // `order_binds` after aggregate hoisting); empty here.
+                    deferred_order_exprs: _,
+                } = level.base;
+                let distinct = level.distinct;
+
+                // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
+                let ctx = self.build_jsonld_context()?;
+
+                // SELECT * should behave like "wildcard select" for JSON-LD-style outputs.
+                // This lets formatters emit object rows keyed by variable name.
+                //
+                // SPARQL solution sequences are tabular by spec — every
+                // `SELECT ?x` is a sequence of single-column rows, not a list
+                // of bare values. Projection shape is `Tuple` (the default of
+                // the `select`/`select_one` helpers).
+                //
+                // `SELECT *` of a grouping level (an aggregate only in HAVING or
+                // ORDER BY) projects its GROUP BY keys — none, for implicit
+                // grouping (§18.2.4.4) — rather than every WHERE variable, which
+                // after grouping would be per-group lists.
+                let output = match (&select_query.select.variables, distinct, star_projection) {
+                    (SelectVariables::Star, true, Some(keys)) => QueryOutput::select_distinct(keys),
+                    (SelectVariables::Star, false, Some(keys)) => QueryOutput::select_all(keys),
+                    (SelectVariables::Star, true, None) => QueryOutput::wildcard_distinct(),
+                    (SelectVariables::Star, false, None) => QueryOutput::wildcard(),
+                    (_, true, _) => QueryOutput::select_distinct(select),
+                    (_, false, _) => QueryOutput::select_all(select),
+                };
+
+                Ok(Query {
+                    context: ctx,
+                    orig_context: None, // SPARQL doesn't originate from JSON context
+                    output,
+                    patterns,
+                    grouping,
+                    ordering,
+                    order_binds,
+                    limit,
+                    offset,
+                    reasoning: self.reasoning_config()?,
+                    post_values,
+                    include_system_facts: false,
+                    union_default_graph: None,
+                    cypher_vocab: None,
+                    unmatched_optional: Default::default(),
+                    rdf_list_view: false,
+                })
+            }
+            QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
+            QueryBody::Ask(ask_query) => self.lower_ask(ask_query),
+            QueryBody::Describe(describe_query) => self.lower_describe(describe_query),
+            QueryBody::Update(_) => Err(LowerError::unsupported_form("UPDATE", self.ast.span)),
+        }
+    }
+
+    /// Lower a query form's trailing VALUES clause (`ValuesClause`, after the
+    /// solution modifiers). It is returned rather than appended to `patterns`
+    /// so that it lands in `Query::post_values`, where the WHERE planner
+    /// cannot reorder it relative to OPTIONAL/UNION; see [`post_values_then`].
+    fn lower_trailing_values(
+        &mut self,
+        values: Option<&GraphPattern>,
+        patterns: &mut Vec<Pattern>,
+    ) -> Result<Option<Pattern>> {
+        let Some(values) = values else {
+            return Ok(None);
+        };
+        let mut values_ir = self.lower_graph_pattern(values)?;
+        // A trailing VALUES clause always lowers to exactly one Pattern::Values.
+        if values_ir.len() == 1 && matches!(values_ir[0], Pattern::Values { .. }) {
+            Ok(Some(values_ir.remove(0)))
+        } else {
+            // Fallback: shouldn't happen, but keep patterns inline.
+            patterns.extend(values_ir);
+            Ok(None)
+        }
+    }
+
+    /// Build a JSON-LD ParsedContext from the SPARQL prologue.
+    ///
+    /// This is used only for result formatting (IRI compaction), not for parsing.
+    /// Delegates to `build_jsonld_context_value` for the raw JSON value, then
+    /// parses it into a `ParsedContext`.
+    fn build_jsonld_context(&self) -> Result<ParsedContext> {
+        let value = self.build_jsonld_context_value();
+        // Context parsing should not fail for simple prefix maps; if it does,
+        // fall back to an empty context (formatters will emit full IRIs).
+        match parse_context(&value) {
+            Ok(ctx) => Ok(ctx),
+            Err(_) => Ok(ParsedContext::default()),
+        }
+    }
+
+    /// Re-render the query's prologue as SPARQL declaration text, for prepending
+    /// to a remote SERVICE sub-query (see `ServicePattern::source_prologue`).
+    ///
+    /// Rendered from the resolved environment, not sliced from the source, which
+    /// buys three things: a relative `PREFIX` IRI arrives already resolved against
+    /// `BASE` (`prologue_environment` does that), the body's own bytes are never
+    /// touched so a literal that merely *looks* like a CURIE is safe, and the
+    /// output is independent of how the author spaced or cased the original.
+    ///
+    /// Prefixes are emitted in sorted order so the outgoing query text is
+    /// deterministic — `self.prefixes` is a `HashMap`. Every declared prefix is
+    /// forwarded, not just the ones the body uses: an unused `PREFIX` is legal
+    /// SPARQL, and deciding "used" would mean parsing the body slice again.
+    ///
+    /// Returns an empty string when the query declared no prologue.
+    fn render_prologue_sparql(&self) -> String {
+        let mut out = String::new();
+        if let Some(base) = &self.base {
+            out.push_str("BASE <");
+            out.push_str(base);
+            out.push_str(">\n");
+        }
+        let mut prefixes: Vec<(&Arc<str>, &Arc<str>)> = self.prefixes.iter().collect();
+        prefixes.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
+        for (prefix, iri) in prefixes {
+            out.push_str("PREFIX ");
+            out.push_str(prefix);
+            out.push_str(": <");
+            out.push_str(iri);
+            out.push_str(">\n");
+        }
+        out
+    }
+
+    /// Build a JSON-LD context object from the SPARQL prologue.
+    fn build_jsonld_context_value(&self) -> serde_json::Value {
+        use serde_json::{Map, Value as JsonValue};
+
+        let mut obj = Map::new();
+
+        // BASE becomes @base and (for parity) @vocab when present.
+        if let Some(base) = &self.base {
+            obj.insert(
+                "@base".to_string(),
+                JsonValue::String(base.as_ref().to_string()),
+            );
+            obj.insert(
+                "@vocab".to_string(),
+                JsonValue::String(base.as_ref().to_string()),
+            );
+        }
+
+        // PREFIX declarations map directly to JSON-LD prefix entries.
+        for (prefix, iri) in &self.prefixes {
+            obj.insert(
+                prefix.as_ref().to_string(),
+                JsonValue::String(iri.as_ref().to_string()),
+            );
+        }
+
+        JsonValue::Object(obj)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_core::Sid;
+    use fluree_db_query::ir::triple::{Ref, Term};
+    use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
+    use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
+    use fluree_db_query::parse::encode::MemoryEncoder;
+    use fluree_db_query::sort::SortDirection;
+    use fluree_db_query::var_registry::VarId;
+
+    /// View aggregates of a lowered Query as a flat Vec of references.
+    fn aggregates_of(query: &Query) -> Vec<&AggregateSpec> {
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::aggregates)
+            .collect()
+    }
+
+    /// View GROUP BY keys of a lowered Query.
+    fn group_by_of(query: &Query) -> Vec<VarId> {
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::group_by_vars)
+            .collect()
+    }
+
+    /// View HAVING expression of a lowered Query.
+    fn having_of(query: &Query) -> Option<&Expression> {
+        query.grouping.as_ref().and_then(Grouping::having)
+    }
+
+    fn test_encoder() -> MemoryEncoder {
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        encoder.add_namespace("http://schema.org/", 101);
+        encoder.add_namespace("http://xmlns.com/foaf/0.1/", 102);
+        encoder
+    }
+
+    // ------------------------------------------------------------------
+    // Remote SERVICE prologue forwarding.
+    //
+    // `ServicePattern::source_body` is a verbatim slice of the SERVICE block, so
+    // it stops short of the query's PREFIX / BASE declarations. Shipping it bare
+    // changed what the query meant at the remote — loudly for a prefixed name
+    // ("Undefined prefix"), and silently for a relative IRI, which resolved
+    // against a different base and matched a different predicate.
+    // ------------------------------------------------------------------
+
+    /// Collect every SERVICE pattern reachable from `patterns`, at any depth.
+    ///
+    /// Walks the nesting containers, not just the top level: the prologue lives
+    /// on `LoweringContext` so it *should* reach a nested SERVICE identically —
+    /// but "should" is what let the original bug survive, since the body slice
+    /// was captured correctly in every position too. Ordered outermost-first,
+    /// then in pattern order, so a two-SERVICE query has a stable [0]/[1].
+    fn collect_services(patterns: &[Pattern]) -> Vec<fluree_db_query::ir::ServicePattern> {
+        let mut found = Vec::new();
+        for p in patterns {
+            match p {
+                Pattern::Service(s) => {
+                    found.push(s.clone());
+                    found.extend(collect_services(&s.patterns));
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner)
+                | Pattern::Graph {
+                    patterns: inner, ..
+                } => found.extend(collect_services(inner)),
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        found.extend(collect_services(branch));
+                    }
+                }
+                Pattern::Subquery(sub) => found.extend(collect_services(&sub.patterns)),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Lower `sparql` and return every SERVICE pattern in it, at any depth.
+    fn lower_services(sparql: &str) -> Vec<fluree_db_query::ir::ServicePattern> {
+        let ast = parse_sparql(sparql).ast.expect("parse");
+        let mut vars = VarRegistry::new();
+        let query = lower_sparql_with_source(&ast, &test_encoder(), &mut vars, Some(sparql))
+            .expect("lower");
+        collect_services(&query.patterns)
+    }
+
+    /// Lower `sparql` and return its single SERVICE pattern (at any depth).
+    fn lower_one_service(sparql: &str) -> fluree_db_query::ir::ServicePattern {
+        let mut services = lower_services(sparql);
+        assert_eq!(services.len(), 1, "expected exactly one SERVICE pattern");
+        services.pop().unwrap()
+    }
+
+    /// Assert a SERVICE ships a sub-query whose body resolves to `expected`
+    /// predicates and that carries the prologue those names need.
+    fn assert_prologue_reaches(
+        service: &fluree_db_query::ir::ServicePattern,
+        expected: &[Ref],
+        what: &str,
+    ) {
+        let sent = service
+            .remote_query_text()
+            .unwrap_or_else(|| panic!("{what}: no remote query text"));
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "{what}: remote must resolve the body to the same predicates we do"
+        );
+        assert_eq!(predicates_of(&sent), expected, "{what}: {sent}");
+    }
+
+    /// The predicate `Ref`s of every triple in a pattern list, in order.
+    fn predicate_refs(patterns: &[Pattern]) -> Vec<Ref> {
+        patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(t) => Some(t.p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Lower a standalone query and return its triple predicates.
+    fn predicates_of(sparql: &str) -> Vec<Ref> {
+        let ast = parse_sparql(sparql).ast.expect("remote parse");
+        let mut vars = VarRegistry::new();
+        let q = lower_sparql_with_source(&ast, &test_encoder(), &mut vars, Some(sparql))
+            .expect("remote lower");
+        predicate_refs(&q.patterns)
+    }
+
+    /// A prefixed name in a SERVICE body must arrive at the remote with the
+    /// declaration that defines it. Without the prologue the remote rejects the
+    /// sub-query outright: `Undefined prefix 'ex'`.
+    #[test]
+    fn remote_service_query_forwards_prefix_declarations() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { ?s ex:local ?o . \
+             SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o . ?o ex:q \"x\" } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+
+        // Meaning first: the remote must be able to lower what we send, and must
+        // land on the same predicates we did. This is the loud failure mode —
+        // without the prologue `predicates_of` panics with `Undefined prefix
+        // 'ex'` (the LOWERER rejects it; the parser accepts it silently).
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "remote must resolve the body to the same predicates we do"
+        );
+        assert!(
+            sent.contains("PREFIX ex: <http://example.org/>"),
+            "prologue must be forwarded: {sent}"
+        );
+        // ...and those are real encoded SIDs, not an accidental both-sides-broken
+        // match: `ex:` maps to namespace 100 in `test_encoder`.
+        assert_eq!(
+            predicates_of(&sent),
+            vec![Ref::Sid(Sid::new(100, "p")), Ref::Sid(Sid::new(100, "q"))]
+        );
+    }
+
+    /// The silent half: a relative IRI resolves against the parent's BASE. With
+    /// the prologue dropped it fell back to the empty namespace (code 0) — no
+    /// error, just a different predicate and therefore wrong results.
+    #[test]
+    fn remote_service_query_forwards_base_for_relative_iris() {
+        let service = lower_one_service(
+            "BASE <http://example.org/>\n\
+             SELECT * WHERE { ?s <local> ?o . \
+             SERVICE <fluree:remote:conn/db:main> { ?s <p> ?o } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+
+        // Meaning first. This is the SILENT failure mode: without BASE the remote
+        // still lowers cleanly, but `<p>` lands in namespace 0 (the empty
+        // namespace) instead of 100 (`http://example.org/`) — a different
+        // predicate, no error, wrong results.
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "remote must resolve <p> against the same base we do"
+        );
+        assert_eq!(predicates_of(&sent), vec![Ref::Sid(Sid::new(100, "p"))]);
+        assert!(
+            sent.contains("BASE <http://example.org/>"),
+            "BASE must be forwarded: {sent}"
+        );
+    }
+
+    /// Why the fix forwards declarations instead of rewriting the body: the body
+    /// is shipped byte-for-byte, so a literal whose *text* looks like a CURIE or
+    /// a relative IRI is untouched. A naive string expansion would corrupt these.
+    #[test]
+    fn remote_service_query_does_not_rewrite_literals() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { \
+             SERVICE <fluree:remote:conn/db:main> { ?s ex:p \"ex:p is not a curie\" } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+        assert!(
+            sent.contains("\"ex:p is not a curie\""),
+            "literal text must survive verbatim: {sent}"
+        );
+    }
+
+    /// `SERVICE SILENT` is the shape that converts the loud remote failure into a
+    /// quiet one — a dropped prologue there yields an empty result instead of an
+    /// error, so it is the position where the bug is *least* visible and most
+    /// worth pinning.
+    #[test]
+    fn remote_service_silent_query_forwards_prologue() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { \
+             SERVICE SILENT <fluree:remote:conn/db:main> { ?s ex:p ?o } }",
+        );
+        assert!(service.silent, "expected SERVICE SILENT");
+        assert_prologue_reaches(&service, &[Ref::Sid(Sid::new(100, "p"))], "SERVICE SILENT");
+    }
+
+    /// A SERVICE nested inside OPTIONAL / UNION / a sub-SELECT gets the same
+    /// prologue: it comes off the lowering context, not off the position.
+    #[test]
+    fn nested_remote_service_query_forwards_prologue() {
+        let cases = [
+            (
+                "OPTIONAL",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { ?s ex:local ?x . \
+                 OPTIONAL { SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+            (
+                "UNION",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { { ?s ex:local ?x } UNION \
+                 { SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+            (
+                "sub-SELECT",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { { SELECT ?s ?o WHERE { \
+                 SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } } }",
+            ),
+            (
+                "GRAPH",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { GRAPH <http://example.org/g> { \
+                 SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+        ];
+        for (label, src) in cases {
+            let service = lower_one_service(src);
+            assert_prologue_reaches(&service, &[Ref::Sid(Sid::new(100, "p"))], label);
+        }
+    }
+
+    /// Two SERVICE clauses in one query: both ship, and both carry the prologue.
+    #[test]
+    fn multiple_remote_services_each_forward_prologue() {
+        let services = lower_services(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX other: <http://other.example/>\n\
+             SELECT * WHERE { \
+             SERVICE <fluree:remote:conn/a:main> { ?s ex:p ?o } . \
+             SERVICE <fluree:remote:conn/b:main> { ?o other:q ?z } }",
+        );
+        assert_eq!(services.len(), 2, "expected two SERVICE patterns");
+        assert_prologue_reaches(
+            &services[0],
+            &[Ref::Sid(Sid::new(100, "p"))],
+            "first SERVICE",
+        );
+        // `other:` resolves through a namespace the test encoder does not know,
+        // so it lands in the overflow/unregistered namespace — what matters is
+        // that BOTH sub-queries resolve identically to their local lowering.
+        assert_prologue_reaches(
+            &services[1],
+            &predicate_refs(&services[1].patterns),
+            "second SERVICE",
+        );
+        for (i, s) in services.iter().enumerate() {
+            let sent = s.remote_query_text().unwrap();
+            assert!(
+                sent.contains("PREFIX ex: <http://example.org/>")
+                    && sent.contains("PREFIX other: <http://other.example/>"),
+                "SERVICE {i} must carry the full prologue: {sent}"
+            );
+        }
+    }
+
+    /// A query with no prologue ships exactly what it shipped before: the fix
+    /// adds declarations, it does not restructure the sub-query.
+    #[test]
+    fn remote_service_query_without_prologue_is_unchanged() {
+        let service = lower_one_service(
+            "SELECT * WHERE { SERVICE <fluree:remote:conn/db:main> { ?s <http://example.org/p> ?o } }",
+        );
+        assert_eq!(
+            service.remote_query_text().unwrap(),
+            "SELECT * WHERE { ?s <http://example.org/p> ?o }"
+        );
+    }
+
+    /// Multiple declarations are forwarded, in a deterministic (sorted) order —
+    /// `prefixes` is a HashMap, so unsorted output would make the outgoing query
+    /// text vary run to run.
+    #[test]
+    fn remote_service_query_prologue_is_deterministic() {
+        let src = "PREFIX zz: <http://example.org/z/>\n\
+                   PREFIX aa: <http://example.org/a/>\n\
+                   BASE <http://base.example/>\n\
+                   SELECT * WHERE { SERVICE <fluree:remote:conn/db:main> { ?s aa:p ?o } }";
+        let first = lower_one_service(src).remote_query_text().unwrap();
+        for _ in 0..4 {
+            assert_eq!(lower_one_service(src).remote_query_text().unwrap(), first);
+        }
+        assert!(
+            first.starts_with(
+                "BASE <http://base.example/>\n\
+                 PREFIX aa: <http://example.org/a/>\n\
+                 PREFIX zz: <http://example.org/z/>\n"
+            ),
+            "{first}"
+        );
+    }
+
+    #[test]
+    fn anonymous_bnode_vars_stay_disjoint_from_user_labels() {
+        // pr-1453 follow-up (same class as the transact-side fix):
+        // anonymous blank nodes minted `_:b{N}` variable names, which live
+        // inside the user label namespace — here the anon mints at
+        // vars.len() == 2, so a user-written _:b2 in the same scope
+        // silently unified with it, joining two independent existentials.
+        // The `_:[]{N}` namespace cannot be written as a BLANK_NODE_LABEL.
+        let (query, _vars) = lower_query_with_vars(
+            "SELECT * WHERE { _:b2 <http://example.org/p> ?o . [] <http://example.org/p> ?o }",
+        )
+        .expect("lowers");
+        let subject_var = |p: &Pattern| match p {
+            Pattern::Triple(t) => match &t.s {
+                Ref::Var(v) => *v,
+                other => panic!("expected var subject, got {other:?}"),
+            },
+            other => panic!("expected triple, got {other:?}"),
+        };
+        assert_ne!(
+            subject_var(&query.patterns[0]),
+            subject_var(&query.patterns[1]),
+            "a user label _:b2 must not unify with an anonymous [] blank node"
+        );
+    }
+
+    fn first_triple(query: &Query) -> &fluree_db_query::ir::TriplePattern {
+        query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp),
+                _ => None,
+            })
+            .expect("a triple pattern")
+    }
+
+    /// String objects carry their term identity into the scan; bare
+    /// numerics stay unconstrained (lenient across numeric subtypes).
+    #[test]
+    fn triple_object_literals_carry_string_term_constraints() {
+        use fluree_db_core::DatatypeConstraint;
+        use fluree_vocab::{namespaces::XSD, xsd_names};
+
+        let tagged = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\"@en }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&tagged).dtc,
+            Some(DatatypeConstraint::LangTag("en".into()))
+        );
+
+        let plain =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\" }")
+                .unwrap();
+        assert_eq!(
+            first_triple(&plain).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let typed = lower_query(
+            "PREFIX ex: <http://example.org/> \
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT ?s WHERE { ?s ex:name \"bob\"^^xsd:string }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&typed).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let numeric =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:age 25 }")
+                .unwrap();
+        assert_eq!(first_triple(&numeric).dtc, None);
+
+        // Property-path endpoints take the same rule.
+        fn walk<'a>(ps: &'a [Pattern], out: &mut Vec<&'a fluree_db_query::ir::TriplePattern>) {
+            for p in ps {
+                match p {
+                    Pattern::Triple(tp) => out.push(tp),
+                    Pattern::Union(arms) => arms.iter().for_each(|a| walk(a, out)),
+                    _ => {}
+                }
+            }
+        }
+        let path = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:a|ex:b \"bob\"@fr }",
+        )
+        .unwrap();
+        let mut triples = Vec::new();
+        walk(&path.patterns, &mut triples);
+        assert!(
+            triples.len() >= 2,
+            "both alternation arms lowered to triples"
+        );
+        for tp in triples {
+            assert_eq!(tp.dtc, Some(DatatypeConstraint::LangTag("fr".into())));
+        }
+    }
+
+    /// A datatype IRI whose namespace is not registered lowers to the
+    /// EMPTY-namespace full-IRI Sid — a constraint no stored row carries,
+    /// so the pattern matches nothing (#1686). The old fallback rewrote it
+    /// to `xsd:string`, silently matching every plain-string row. Both
+    /// term-identity sites take the same rule: triple-pattern constraints
+    /// and VALUES rows.
+    #[test]
+    fn unregistered_datatype_lowers_to_match_nothing_sid() {
+        use fluree_db_core::DatatypeConstraint;
+        use fluree_db_query::binding::Binding;
+        use fluree_vocab::namespaces::EMPTY;
+
+        let bogus = "http://no-such-namespace.example.com/NoSuchType";
+        let expected_sid = Sid::new(EMPTY, bogus);
+
+        let pattern = lower_query(&format!(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE {{ ?s ex:p \"a\"^^<{bogus}> }}"
+        ))
+        .unwrap();
+        assert_eq!(
+            first_triple(&pattern).dtc,
+            Some(DatatypeConstraint::Explicit(expected_sid.clone())),
+            "triple-pattern constraint must name the unregistered IRI, not xsd:string"
+        );
+
+        let values = lower_query(&format!(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ?s WHERE {{ VALUES ?o {{ \"a\"^^<{bogus}> }} ?s ex:p ?o }}"
+        ))
+        .unwrap();
+        let row_binding = values
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Values { rows, .. } => rows.first().and_then(|r| r.first()),
+                _ => None,
+            })
+            .expect("a VALUES row");
+        match row_binding {
+            Binding::Lit { dtc, .. } => assert_eq!(
+                dtc,
+                &DatatypeConstraint::Explicit(expected_sid),
+                "VALUES row must carry the unregistered IRI, not xsd:string"
+            ),
+            other => panic!("expected literal binding, got {other:?}"),
+        }
+
+        // Control: a datatype in a REGISTERED namespace keeps its canonical
+        // Sid (the fix must not widen to registered custom datatypes).
+        let custom = lower_query(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ?s WHERE { ?s ex:p \"z\"^^ex:Custom }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&custom).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(100, "Custom"))),
+            "registered namespaces still resolve to their canonical Sid"
+        );
+    }
+
+    /// A typed `rdf:JSON` constant lowers once to the canonical JSON value a
+    /// write stores, in a FILTER, a triple pattern and a VALUES row, so it is
+    /// the stored term by plain equality. Text that is not JSON stays a
+    /// string, `STRDT` in an expression.
+    #[test]
+    fn a_json_constant_lowers_to_its_canonical_value() {
+        use fluree_db_core::FlakeValue;
+        use fluree_db_query::binding::Binding;
+        use fluree_db_query::ir::Function;
+
+        let query = |lexical: &str, body: &str| {
+            lower_query(&format!(
+                "PREFIX ex: <http://example.org/> \
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT ?s WHERE {{ {} }}",
+                body.replace("LIT", &format!("'{lexical}'^^rdf:JSON"))
+            ))
+            .unwrap()
+        };
+        let filter_constant = |lexical: &str| {
+            let q = query(lexical, "?s ex:p ?o FILTER(?o = LIT)");
+            match q.patterns.iter().find_map(|p| match p {
+                Pattern::Filter(e) => Some(e.clone()),
+                _ => None,
+            }) {
+                Some(Expression::Call {
+                    func: Function::Eq,
+                    mut args,
+                }) => args.pop().unwrap(),
+                other => panic!("expected an = filter, got {other:?}"),
+            }
+        };
+        let canonical = FlakeValue::Json("[1,2]".into());
+
+        assert!(
+            matches!(filter_constant("[1, 2]"), Expression::Const(ref v) if *v == canonical),
+            "FILTER constant"
+        );
+        assert!(
+            matches!(
+                filter_constant("not json"),
+                Expression::Call {
+                    func: Function::StrDt,
+                    ..
+                }
+            ),
+            "text that is not JSON"
+        );
+        assert_eq!(
+            first_triple(&query("[1, 2]", "?s ex:p LIT")).o,
+            Term::Value(canonical.clone()),
+            "triple-pattern object"
+        );
+        let values = query("[1, 2]", "VALUES ?o { LIT } ?s ex:p ?o");
+        let row = values
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Values { rows, .. } => rows.first().and_then(|r| r.first()),
+                _ => None,
+            })
+            .expect("a VALUES row");
+        assert!(
+            matches!(row, Binding::Lit { val, .. } if *val == canonical),
+            "VALUES row: {row:?}"
+        );
+    }
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        lower_query_with_vars(sparql).map(|(q, _)| q)
+    }
+
+    fn construct_template(sparql: &str) -> fluree_db_query::ir::ConstructTemplate {
+        match lower_query(sparql).expect("lowers").output {
+            QueryOutput::Construct(t) => t,
+            other => panic!("expected CONSTRUCT, got {other:?}"),
+        }
+    }
+
+    /// `GRAPH` blocks set each template triple's graph; triples outside any
+    /// block stay in the default graph.
+    #[test]
+    fn construct_template_graph_blocks() {
+        let t = construct_template(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:a ?o . GRAPH ex:g { ?s ex:b ?o } GRAPH ?g { ?s ex:c ?o } ?s ex:d ?o }
+             WHERE { GRAPH ?g { ?s ?p ?o } }",
+        );
+        assert_eq!(t.patterns().len(), 4);
+        assert!(t.names_graphs());
+        assert!(t.graph(0).is_none());
+        assert!(
+            matches!(t.graph(1), Some(Ref::Iri(iri)) if iri.as_ref() == "http://example.org/g"),
+            "{t:?}"
+        );
+        assert!(matches!(t.graph(2), Some(Ref::Var(_))), "{t:?}");
+        assert!(t.graph(3).is_none());
+
+        // A template that opens with a GRAPH block.
+        let first = construct_template(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { GRAPH ex:g { ?s ex:b ?o } ?s ex:a ?o } WHERE { ?s ex:a ?o }",
+        );
+        assert!(first.graph(0).is_some(), "{first:?}");
+        assert!(first.graph(1).is_none(), "{first:?}");
+
+        let plain = construct_template("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+        assert!(
+            !plain.names_graphs(),
+            "no graph metadata without GRAPH blocks"
+        );
+    }
+
+    /// Annotation tails and `rdf:reifies` in a template become reifier
+    /// attachments on the triple they annotate.
+    #[test]
+    fn construct_template_annotations() {
+        let t = construct_template(
+            "PREFIX ex: <http://example.org/>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             CONSTRUCT { ?s ex:p ?o ~ ?r {| ex:q 1 |} . ?r2 rdf:reifies <<( ?s ex:t ?o )>> }
+             WHERE { ?s ex:p ?o ; ex:t ?o . ?r ex:x ?o . ?r2 ex:y ?o }",
+        );
+        // ?s ex:p ?o, the body triple ?r ex:q 1, then ?s ex:t ?o.
+        assert_eq!(t.patterns().len(), 3, "{:?}", t.patterns());
+        assert_eq!(t.reifications().len(), 2);
+        assert_eq!(t.reifications()[0].triple, 0);
+        assert_eq!(t.reifications()[1].triple, 2);
+        assert_eq!(t.patterns()[1].s, t.reifications()[0].reifier);
+    }
+
+    fn lower_query_with_vars(sparql: &str) -> Result<(Query, VarRegistry)> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let ast = output.ast.unwrap();
+        let encoder = test_encoder();
+        let mut vars = VarRegistry::new();
+        let query = lower_sparql(&ast, &encoder, &mut vars)?;
+        Ok((query, vars))
+    }
+
+    // =========================================================================
+    // Numeric literal lowering
+    // =========================================================================
+
+    fn object_of(query: &Query, idx: usize) -> &Term {
+        let Pattern::Triple(t) = &query.patterns[idx] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[idx]);
+        };
+        &t.o
+    }
+
+    #[test]
+    fn test_overflowing_integer_literal_promotes_to_bigint() {
+        // xsd:integer is unbounded; beyond i64 must promote, not corrupt.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial 123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_negative_overflowing_integer_literal_promotes_to_bigint() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial -123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "-123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_typed_overflowing_integer_literal_promotes_to_bigint() {
+        // Typed lexical form: xsd:integer is unbounded, so this must promote,
+        // not error.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:serial \"123456789012345678901234567890\"^^xsd:integer }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for typed overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_bare_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 19.99 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "19.99");
+    }
+
+    #[test]
+    fn test_negative_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:delta -0.5 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "-0.5");
+    }
+
+    #[test]
+    fn test_typed_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:price \"1234567890123456789.0123456789\"^^xsd:decimal }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        // Round-tripping through f64 would lose these digits
+        assert_eq!(d.to_string(), "1234567890123456789.0123456789");
+    }
+
+    #[test]
+    fn test_double_literal_stays_double() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 1.5e2 }",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                object_of(&query, 0),
+                Term::Value(fluree_db_core::FlakeValue::Double(_))
+            ),
+            "exponent-form literal is xsd:double, got {:?}",
+            object_of(&query, 0)
+        );
+    }
+
+    #[test]
+    fn test_filter_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price ?p . FILTER(?p > 10.25) }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "FILTER constant should be an exact decimal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Double(10.25)"),
+            "FILTER constant must not round-trip through f64: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_values_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?p WHERE { VALUES ?p { 19.99 } ?s ex:price ?p }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "VALUES constant should be an exact decimal: {rendered}"
+        );
+    }
+
+    // =========================================================================
+    // Basic SELECT tests
+    // =========================================================================
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri() {
+        // Mirrors the JSON-LD read-side firewall: SPARQL queries that
+        // mention `f:reifies*` IRIs directly are rejected at lower
+        // time so users can't enumerate system facts through the
+        // query surface. The opt-in `opts.includeSystemFacts: true`
+        // (JSON-LD only) does not relax this — it only relaxes the
+        // variable-predicate scan filter.
+        let err = lower_query(
+            "PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann ?s WHERE { ?ann f:reifiesSubject ?s }",
+        )
+        .expect_err("direct f:reifiesSubject mention must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifies"),
+            "expected system-controlled rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri_inside_optional() {
+        // Recurse-into-container check: nested mentions inside
+        // OPTIONAL (and by extension UNION/MINUS/etc.) must also be
+        // caught by the post-lower walk.
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann WHERE { ?ann ex:role \"Engineer\" \
+              OPTIONAL { ?ann f:reifiesObject ?o } }",
+        )
+        .expect_err("nested f:reifies* mention must be rejected");
+        assert!(err.to_string().contains("system-controlled"));
+    }
+
+    #[test]
+    fn test_simple_select() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE { ?s ex:name ?name }",
+        )
+        .unwrap();
+
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+    }
+
+    #[test]
+    fn test_select_star() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?s ex:name ?name }",
+        )
+        .unwrap();
+
+        // SELECT * should produce Wildcard projection
+        assert!(query.output.is_wildcard());
+    }
+
+    #[test]
+    fn test_multiple_patterns() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?age WHERE {
+               ?s ex:name ?name .
+               ?s ex:age ?age
+             }",
+        )
+        .unwrap();
+
+        assert_eq!(query.output.projected_vars().unwrap().len(), 3);
+        assert_eq!(query.patterns.len(), 2);
+    }
+
+    // =========================================================================
+    // Pattern tests
+    // =========================================================================
+
+    #[test]
+    fn test_optional_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?age WHERE {
+               ?s ex:name ?name .
+               OPTIONAL { ?s ex:age ?age }
+             }",
+        )
+        .unwrap();
+
+        // Should have: Triple, Optional
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[1], Pattern::Optional(_)));
+    }
+
+    #[test]
+    fn test_union_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               { ?s ex:firstName ?name } UNION { ?s ex:lastName ?name }
+             }",
+        )
+        .unwrap();
+
+        // Should have a Union pattern
+        assert!(!query.patterns.is_empty());
+        let has_union = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Union(_)));
+        assert!(has_union, "Expected Union pattern");
+    }
+
+    #[test]
+    fn test_filter_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?age WHERE {
+               ?s ex:age ?age .
+               FILTER(?age > 18)
+             }",
+        )
+        .unwrap();
+
+        // Should have: Triple, Filter
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern");
+    }
+
+    #[test]
+    fn test_bind_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?upper WHERE {
+               ?s ex:name ?name .
+               BIND(UCASE(?name) AS ?upper)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern");
+    }
+
+    #[test]
+    fn test_bind_pattern_unbound_predicate() {
+        // Regression: BIND must be preserved when triple has unbound predicate (?p).
+        // Uses no space around + (i.e. ?o+10) to test that the lexer correctly
+        // tokenizes + as a separate Plus operator rather than consuming it as
+        // part of a signed integer literal.
+        let query = lower_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?z
+             {
+               ?s ?p ?o .
+               BIND(?o+10 AS ?z)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(
+            has_bind,
+            "Expected Bind pattern in lowered query, got patterns: {:?}",
+            query.patterns
+        );
+    }
+
+    #[test]
+    fn test_bind10_scoping() {
+        // W3C bind10: BIND(4 AS ?z) { ?s :p ?v . FILTER(?v = ?z) }
+        // The inner { } creates a scope boundary; ?z from outer BIND is
+        // NOT visible inside. The inner group should lower to a Subquery
+        // whose SELECT does NOT include ?z.
+        let query = lower_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?s ?v ?z
+             {
+               BIND(4 AS ?z)
+               {
+                 ?s :p ?v . FILTER(?v = ?z)
+               }
+             }",
+        )
+        .unwrap();
+
+        // Should have a Bind and a Subquery
+        assert!(
+            query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { .. })),
+            "Expected Bind pattern"
+        );
+        let subquery = query
+            .patterns
+            .iter()
+            .find(|p| matches!(p, Pattern::Subquery(_)));
+        assert!(
+            subquery.is_some(),
+            "Expected Subquery pattern for nested group"
+        );
+
+        if let Some(Pattern::Subquery(sq)) = subquery {
+            // ?z should NOT be in the subquery's select (it's only in FILTER, not bound)
+            let z_var = query
+                .patterns
+                .iter()
+                .find_map(|p| {
+                    if let Pattern::Bind { var, .. } = p {
+                        Some(*var)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(
+                !sq.select.contains(&z_var),
+                "Subquery SELECT should NOT contain ?z (VarId {:?}), but got select: {:?}",
+                z_var,
+                sq.select
+            );
+        }
+    }
+
+    #[test]
+    fn test_values_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?x WHERE {
+               ?s ex:value ?x .
+               VALUES ?x { 1 2 3 }
+             }",
+        )
+        .unwrap();
+
+        let has_values = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Values { .. }));
+        assert!(has_values, "Expected Values pattern");
+    }
+
+    // =========================================================================
+    // Expression tests
+    // =========================================================================
+
+    #[test]
+    fn test_comparison_operators() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?age WHERE {
+               ?s ex:age ?age .
+               FILTER(?age >= 18 && ?age <= 65)
+             }",
+        )
+        .unwrap();
+
+        // Should parse and lower the AND of comparisons
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter);
+    }
+
+    #[test]
+    fn test_function_calls() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               ?s ex:name ?name .
+               FILTER(STRLEN(?name) > 5)
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter);
+    }
+
+    // =========================================================================
+    // Prefix resolution tests
+    // =========================================================================
+
+    #[test]
+    fn test_prefix_resolution() {
+        let query = lower_query(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+             SELECT ?s ?name WHERE { ?s foaf:name ?name }",
+        )
+        .unwrap();
+
+        // Should successfully resolve foaf prefix
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Triple(tp) = &query.patterns[0] {
+            if let Ref::Sid(sid) = &tp.p {
+                assert_eq!(sid.namespace_code, 102); // foaf namespace
+                assert_eq!(sid.name.as_ref(), "name");
+            } else {
+                panic!("Expected Sid for predicate");
+            }
+        } else {
+            panic!("Expected Triple pattern");
+        }
+    }
+
+    #[test]
+    fn test_undefined_prefix_error() {
+        let result = lower_query("SELECT ?s ?name WHERE { ?s unknown:name ?name }");
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            LowerError::UndefinedPrefix { .. }
+        ));
+    }
+
+    #[test]
+    fn test_unknown_namespace_produces_fallback_sid() {
+        // An unregistered namespace is benign: lowering keeps it as a raw IRI
+        // so execution can still handle cross-ledger / non-local references.
+        let query = lower_query(
+            "PREFIX other: <http://other.example.org/>
+             SELECT ?s ?name WHERE { ?s other:name ?name }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Triple(tp) = &query.patterns[0] {
+            if let Ref::Iri(iri) = &tp.p {
+                assert_eq!(iri.as_ref(), "http://other.example.org/name");
+            } else {
+                panic!("Expected raw IRI for predicate");
+            }
+        } else {
+            panic!("Expected Triple pattern");
+        }
+    }
+
+    #[test]
+    fn test_misused_prefix_syntax_error() {
+        // Common mistake: wrapping prefixed name in angle brackets <prefix:local>
+        // This should give a helpful error message explaining the issue
+        let result = lower_query(
+            "PREFIX hsc: <http://example.org/schema/>
+             SELECT ?name WHERE { <hsc:product/123> hsc:name ?name }",
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LowerError::MisusedPrefixSyntax { .. }),
+            "Expected MisusedPrefixSyntax error, got: {err:?}"
+        );
+
+        // Verify the error message contains helpful information
+        let msg = err.to_string();
+        assert!(
+            msg.contains("angle brackets"),
+            "Error should mention angle brackets: {msg}"
+        );
+        assert!(
+            msg.contains("http://example.org/schema/product/123"),
+            "Error should show the expanded IRI: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_prefixed_name_with_slash() {
+        // Test that prefixed names with '/' in the local part work
+        // e.g., hsc:product/123 should expand to http://example.org/schema/product/123
+        let result = lower_query(
+            "PREFIX hsc: <http://example.org/>
+             SELECT ?name WHERE { hsc:product/123 hsc:name ?name }",
+        );
+
+        // If this fails at parse time, we need to update the lexer
+        // If this fails at lowering time, we need to check prefix expansion
+        match &result {
+            Ok(query) => {
+                // Success - verify the pattern was created
+                assert_eq!(query.patterns.len(), 1);
+                println!("Prefixed name with slash works!");
+            }
+            Err(e) => {
+                println!("Prefixed name with slash failed: {e:?}");
+                panic!("Expected prefixed name with '/' to work, got error: {e}");
+            }
+        }
+    }
+
+    // =========================================================================
+    // MINUS Pattern Tests
+    // =========================================================================
+
+    #[test]
+    fn test_minus_pattern() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:a ?o MINUS { ?s ex:b ?o } }",
+        )
+        .unwrap();
+
+        // Should have Triple, Minus patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Minus(_)));
+
+        // Check the MINUS contains a triple
+        if let Pattern::Minus(inner) = &query.patterns[1] {
+            assert_eq!(inner.len(), 1);
+            assert!(matches!(inner[0], Pattern::Triple(_)));
+        } else {
+            panic!("Expected Minus pattern");
+        }
+    }
+
+    // =========================================================================
+    // EXISTS/NOT EXISTS Tests
+    // =========================================================================
+
+    #[test]
+    fn test_filter_exists() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:a ?o . FILTER EXISTS { ?s ex:b ?val } }",
+        )
+        .unwrap();
+
+        // Should have Triple, Exists patterns
+        let has_exists = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Exists(_)));
+        assert!(has_exists, "Expected Exists pattern");
+    }
+
+    #[test]
+    fn test_filter_not_exists() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:a ?o . FILTER NOT EXISTS { ?s ex:deleted true } }",
+        )
+        .unwrap();
+
+        // Should have Triple, NotExists patterns
+        let has_not_exists = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::NotExists(_)));
+        assert!(has_not_exists, "Expected NotExists pattern");
+    }
+
+    #[test]
+    fn test_filter_not_exists_unknown_predicate_does_not_error() {
+        // Regression guard: unknown predicate IRIs must not fail lowering.
+        // They should remain as raw IRIs and naturally produce no matches at runtime.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:a ?o .
+               FILTER NOT EXISTS { ?s <http://unknown.example/ns/does-not-exist> ?x }
+             }",
+        )
+        .unwrap();
+
+        let mut saw_not_exists = false;
+        for p in &query.patterns {
+            if let Pattern::NotExists(inner) = p {
+                saw_not_exists = true;
+                assert!(
+                    inner.iter().any(|ip| matches!(ip, Pattern::Triple(_))),
+                    "Expected NOT EXISTS inner pattern to contain a triple"
+                );
+
+                for ip in inner {
+                    if let Pattern::Triple(tp) = ip {
+                        if let Ref::Iri(iri) = &tp.p {
+                            if iri.as_ref() == "http://unknown.example/ns/does-not-exist" {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(saw_not_exists, "Expected NotExists pattern");
+        panic!("Expected NOT EXISTS predicate to remain as raw IRI");
+    }
+
+    // =========================================================================
+    // New Function Tests
+    // =========================================================================
+
+    #[test]
+    fn test_string_functions_regex() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE { ?s ex:name ?name . FILTER(REGEX(?name, \"^A\")) }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern with REGEX");
+    }
+
+    #[test]
+    fn test_string_functions_concat() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?full WHERE {
+               ?s ex:first ?f .
+               ?s ex:last ?l .
+               BIND(CONCAT(?f, \" \", ?l) AS ?full)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with CONCAT");
+    }
+
+    #[test]
+    fn test_string_functions_strbefore_strafter() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:name ?name . FILTER(STRBEFORE(?name, \"@\") != \"\") }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter);
+
+        let query2 = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:name ?name . FILTER(STRAFTER(?name, \"@\") != \"\") }",
+        )
+        .unwrap();
+
+        let has_filter2 = query2
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter2);
+    }
+
+    #[test]
+    fn test_string_functions_replace() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?clean WHERE {
+               ?s ex:text ?text .
+               BIND(REPLACE(?text, \"\\\\s+\", \" \") AS ?clean)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with REPLACE");
+    }
+
+    #[test]
+    fn test_datetime_functions() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:created ?dt .
+               FILTER(YEAR(?dt) = 2024)
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with YEAR function");
+    }
+
+    #[test]
+    fn test_datetime_function_now() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:expires ?dt .
+               FILTER(?dt > NOW())
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with NOW function");
+    }
+
+    #[test]
+    fn test_rdf_term_functions_lang() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               ?s ex:name ?name .
+               FILTER(LANG(?name) = \"en\")
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with LANG function");
+    }
+
+    #[test]
+    fn test_rdf_term_functions_datatype() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s ?val WHERE {
+               ?s ex:value ?val .
+               FILTER(DATATYPE(?val) = xsd:integer)
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with DATATYPE function");
+    }
+
+    // =========================================================================
+    // CONSTRUCT Query Tests
+    // =========================================================================
+
+    #[test]
+    fn test_construct_basic() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:newProp ?o } WHERE { ?s ex:oldProp ?o }",
+        )
+        .unwrap();
+
+        // Verify output is Construct
+        let template = query
+            .output
+            .construct_template()
+            .expect("should be Construct");
+        assert_eq!(template.patterns().len(), 1);
+
+        // Verify WHERE patterns are lowered
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+    }
+
+    #[test]
+    fn test_construct_multiple_template_triples() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT {
+               ?s ex:name ?name .
+               ?s ex:type ex:Person
+             }
+             WHERE { ?s ex:oldName ?name }",
+        )
+        .unwrap();
+
+        let template = query
+            .output
+            .construct_template()
+            .expect("should be Construct");
+        assert_eq!(template.patterns().len(), 2);
+    }
+
+    #[test]
+    fn test_construct_where_shorthand() {
+        // CONSTRUCT WHERE { ... } uses WHERE patterns as template
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT WHERE { ?s ex:name ?name }",
+        )
+        .unwrap();
+
+        let template = query
+            .output
+            .construct_template()
+            .expect("should be Construct");
+        // Template should contain the WHERE patterns
+        assert_eq!(template.patterns().len(), 1);
+    }
+
+    #[test]
+    fn test_construct_with_limit_offset() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:p ?o }
+             WHERE { ?s ex:q ?o }
+             LIMIT 10 OFFSET 5",
+        )
+        .unwrap();
+
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
+    }
+
+    #[test]
+    fn test_construct_with_order_by() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:p ?o }
+             WHERE { ?s ex:q ?o }
+             ORDER BY ?o",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+    }
+
+    #[test]
+    fn test_construct_empty_select() {
+        // CONSTRUCT queries don't project - select_vars() should be None
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?s ex:p ?o } WHERE { ?s ex:q ?o }",
+        )
+        .unwrap();
+
+        // CONSTRUCT doesn't project variables like SELECT does
+        assert!(query.output.projected_vars().is_none());
+    }
+
+    // =========================================================================
+    // ASK Query Tests
+    // =========================================================================
+
+    #[test]
+    fn test_ask_basic() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             ASK { ?s ex:name \"Alice\" }",
+        )
+        .unwrap();
+
+        assert!(matches!(query.output, QueryOutput::Ask));
+        assert_eq!(query.limit, Some(1), "ASK should inject LIMIT 1");
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+    }
+
+    #[test]
+    fn test_ask_multiple_patterns() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             ASK { ?s ex:name ?name . ?s ex:age ?age }",
+        )
+        .unwrap();
+
+        assert!(matches!(query.output, QueryOutput::Ask));
+        assert_eq!(query.patterns.len(), 2);
+    }
+
+    #[test]
+    fn test_ask_with_filter() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             ASK { ?s ex:age ?age FILTER(?age > 30) }",
+        )
+        .unwrap();
+
+        assert!(matches!(query.output, QueryOutput::Ask));
+        // Patterns: Triple + Filter
+        assert!(query.patterns.len() >= 2);
+    }
+
+    #[test]
+    fn test_ask_keeps_offset_and_caps_limit() {
+        // ASK is whether a solution remains after OFFSET and LIMIT: OFFSET
+        // applies, and the limit is at most 1 (`LIMIT 0` stays 0).
+        for (modifiers, limit, offset) in [
+            ("", Some(1), None),
+            ("OFFSET 3", Some(1), Some(3)),
+            ("LIMIT 0", Some(0), None),
+            ("LIMIT 5 OFFSET 2", Some(1), Some(2)),
+        ] {
+            let query = lower_query(&format!(
+                "PREFIX ex: <http://example.org/> ASK {{ ?s ex:name ?n }} {modifiers}"
+            ))
+            .unwrap();
+            assert_eq!((query.limit, query.offset), (limit, offset), "{modifiers}");
+        }
+    }
+
+    #[test]
+    fn test_trailing_values_after_every_query_form() {
+        // `Query ::= Prologue ( SelectQuery | ConstructQuery | DescribeQuery |
+        // AskQuery ) ValuesClause`: ASK and CONSTRUCT carry it as
+        // `post_values`, as SELECT does.
+        for sparql in [
+            "ASK { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+            "CONSTRUCT { ?s ex:p ?n } WHERE { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+            "CONSTRUCT WHERE { ?s ex:name ?n } VALUES ?n { \"Alice\" }",
+        ] {
+            let query = lower_query(&format!("PREFIX ex: <http://example.org/> {sparql}"))
+                .unwrap_or_else(|e| panic!("{e:?}: {sparql}"));
+            let post_values = query.post_values.as_ref().expect(sparql);
+            assert_eq!(post_values.rows.len(), 1, "{sparql}");
+        }
+        // DESCRIBE joins it inside its target subquery.
+        let query =
+            lower_query("PREFIX ex: <http://example.org/> DESCRIBE ?s VALUES ?s { ex:a ex:b }")
+                .unwrap();
+        assert!(matches!(query.output, QueryOutput::Construct(_)));
+        let Pattern::Subquery(sq) = &query.patterns[0] else {
+            panic!(
+                "expected the describe target subquery: {:?}",
+                query.patterns
+            );
+        };
+        assert!(
+            matches!(&sq.patterns[..], [Pattern::Values { rows, .. }] if rows.len() == 2),
+            "{:?}",
+            sq.patterns
+        );
+    }
+
+    // =========================================================================
+    // Extended expression tests (Phase 9b)
+    // =========================================================================
+
+    #[test]
+    fn test_arithmetic_expression() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?total WHERE {
+               ?s ex:price ?price .
+               ?s ex:qty ?qty .
+               FILTER(?price * ?qty > 100)
+             }",
+        )
+        .unwrap();
+
+        // Should have Triple, Triple, Filter patterns
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern with arithmetic");
+    }
+
+    #[test]
+    fn test_unary_negation() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?val WHERE {
+               ?s ex:value ?val .
+               FILTER(-?val < 0)
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern with unary negation");
+    }
+
+    #[test]
+    fn test_in_expression() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?status WHERE {
+               ?s ex:status ?status .
+               FILTER(?status IN (\"active\", \"pending\"))
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern with IN expression");
+    }
+
+    #[test]
+    fn test_not_in_expression() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?status WHERE {
+               ?s ex:status ?status .
+               FILTER(?status NOT IN (\"deleted\", \"archived\"))
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter pattern with NOT IN expression");
+    }
+
+    #[test]
+    fn test_if_expression() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?label WHERE {
+               ?s ex:value ?val .
+               BIND(IF(?val > 0, \"positive\", \"non-positive\") AS ?label)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with IF expression");
+    }
+
+    #[test]
+    fn test_complex_arithmetic() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:a ?a .
+               ?s ex:b ?b .
+               ?s ex:c ?c .
+               FILTER((?a + ?b) * ?c > 100)
+             }",
+        )
+        .unwrap();
+
+        // Should parse complex arithmetic without error
+        assert_eq!(query.output.projected_vars().unwrap().len(), 1);
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter);
+    }
+
+    // =========================================================================
+    // Solution Modifiers Tests
+    // =========================================================================
+
+    #[test]
+    fn test_limit() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:p ?o } LIMIT 10",
+        )
+        .unwrap();
+
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, None);
+    }
+
+    #[test]
+    fn test_offset() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:p ?o } OFFSET 5",
+        )
+        .unwrap();
+
+        assert_eq!(query.offset, Some(5));
+        assert_eq!(query.limit, None);
+    }
+
+    #[test]
+    fn test_limit_offset() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:p ?o } LIMIT 10 OFFSET 5",
+        )
+        .unwrap();
+
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
+    }
+
+    #[test]
+    fn test_distinct() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT DISTINCT ?s WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        assert!(query.output.is_distinct());
+    }
+
+    #[test]
+    fn test_order_by_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY ?o",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        assert_eq!(query.ordering[0].direction, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn test_order_by_desc() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY DESC(?o)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
+    }
+
+    #[test]
+    fn test_order_by_bracketed_var() {
+        // ORDER BY ASC((?var)) with extra parentheses should work
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY ASC((?o))",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        assert_eq!(query.ordering[0].direction, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn test_order_by_expression_desugars_to_order_bind() {
+        // `ORDER BY (?o + 1)` desugars to a synthetic `(?__order_by_N, expr)`
+        // carried on `query.order_binds` and sorts on that synthetic var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY (?o + 1)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(
+            vars.name(sort_var).starts_with("?__order_by_"),
+            "expected synthetic ORDER BY var, got: {}",
+            vars.name(sort_var)
+        );
+        // The desugared bind rides on `order_binds`, never in WHERE patterns.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected an order bind for the ORDER BY expression"
+        );
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "ORDER BY bind must not leak into WHERE patterns"
+        );
+        assert!(
+            query.grouping.is_none(),
+            "no aggregation expected for this query"
+        );
+    }
+
+    #[test]
+    fn test_order_by_desc_expression() {
+        // The BSBM ratio shape: ORDER BY DESC(expr) , ?var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?a ?b WHERE { ?s ex:a ?a . ?s ex:b ?b }
+             ORDER BY DESC(?a / ?b) ?s",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 2);
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
+        // First key is the synthetic expression var, second is the bare ?s.
+        assert!(vars.name(query.ordering[0].var).starts_with("?__order_by_"));
+        assert_eq!(vars.name(query.ordering[1].var), "?s");
+    }
+
+    #[test]
+    fn test_order_by_expression_over_aggregate_uses_order_bind() {
+        // `ORDER BY DESC(?c * 2)` over an aggregate output is carried on
+        // `order_binds` (a dedicated post-grouping stage), not in WHERE patterns
+        // and not in the aggregation stage's own post-binds.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(?c * 2)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(vars.name(sort_var).starts_with("?__order_by_"));
+
+        // Carried on order_binds.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected the aggregate-referencing ORDER BY to be an order bind"
+        );
+        // Not a WHERE bind, and not in the grouping phase's post-binds.
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "order bind must not be a pre-WHERE bind"
+        );
+        let grouping = query.grouping.as_ref().expect("aggregation expected");
+        assert!(
+            !grouping.binds().any(|(var, _)| *var == sort_var),
+            "order bind must not be merged into the aggregation post-binds"
+        );
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_dedups_with_select_alias() {
+        // `ORDER BY DESC(COUNT(?s))` reuses the SELECT alias's aggregate, so
+        // exactly one aggregate is computed and the order bind references it.
+        let (query, _vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregates_of(&query).len(),
+            1,
+            "COUNT(?s) must not be computed twice"
+        );
+        assert_eq!(query.order_binds.len(), 1, "expected one ORDER BY bind");
+        assert_eq!(query.ordering.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_hoisted_when_not_selected() {
+        // `ORDER BY DESC(COUNT(?s))` with no aggregate in SELECT hoists a new
+        // aggregate into the grouping phase with a synthetic output var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1, "expected one hoisted aggregate");
+        assert!(vars.name(aggs[0].output_var).starts_with("?__inline_agg_"));
+        assert_eq!(query.order_binds.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
+    }
+
+    #[test]
+    fn test_group_by_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type } GROUP BY ?type",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+    }
+
+    #[test]
+    fn test_group_by_bracketed_var() {
+        // GROUP BY (?var) with parentheses should work
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type } GROUP BY (?type)",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+    }
+
+    #[test]
+    fn test_group_by_expression_desugars_to_bind() {
+        // Expression GROUP BY: `GROUP BY (?x + 1 AS ?y)` desugars to
+        // `BIND(?x + 1 AS ?y)` in patterns + `GROUP BY ?y` in options.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ex:p ?x } GROUP BY (?x + 1 AS ?y)",
+        )
+        .unwrap();
+
+        // GROUP BY should contain one variable (the alias ?y)
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // Patterns should contain a Bind for the expression, targeting the same variable
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var));
+        assert!(has_bind, "expected a BIND pattern from expression GROUP BY");
+    }
+
+    #[test]
+    fn test_group_by_expression_no_alias_generates_synthetic_var() {
+        // GROUP BY (expr) without AS ?alias should generate a synthetic variable
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(?s) AS ?cnt) WHERE { ?s ex:p ?x } GROUP BY (?x + 1)",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // The synthetic variable name starts with ?__group_expr_
+        let var_name = vars.name(group_var);
+        assert!(
+            var_name.starts_with("?__group_expr_"),
+            "expected synthetic variable name, got: {var_name}"
+        );
+
+        // Should have a BIND pattern targeting the synthetic variable
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var));
+        assert!(
+            has_bind,
+            "expected a BIND pattern for synthetic GROUP BY expression"
+        );
+    }
+
+    #[test]
+    fn test_group_by_expression_reuses_matching_select_alias() {
+        // Field P0: `SELECT (LCASE(?cur) AS ?k) ... GROUP BY (LCASE(?cur))` must
+        // group on ?k (the SELECT alias), NOT on a fresh synthetic var. Grouping
+        // on a synthetic var left ?k as an ungrouped per-row variable, which the
+        // formatter then exploded into one row per input binding (LIMIT ignored).
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+             WHERE { ?s ex:currency ?cur } GROUP BY (LCASE(?cur))",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // The group key is the SELECT alias ?k, not a synthetic ?__group_expr_N.
+        assert_eq!(vars.name(group_var), "?k");
+
+        // Exactly one BIND targets ?k (the SELECT pre-bind); GROUP BY adds none.
+        let binds_to_k = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var))
+            .count();
+        assert_eq!(
+            binds_to_k, 1,
+            "expected exactly one BIND to the shared group/alias var"
+        );
+
+        // No synthetic group-expression var should have been created.
+        let has_synthetic = query.patterns.iter().any(
+            |p| matches!(p, Pattern::Bind { var, .. } if vars.name(*var).starts_with("?__group_expr_")),
+        );
+        assert!(!has_synthetic, "no synthetic group var should be generated");
+    }
+
+    /// Whether `var` is bound by a WHERE `BIND` of `query`.
+    fn is_where_bind(query: &Query, var: VarId) -> bool {
+        query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { var: v, .. } if *v == var))
+    }
+
+    /// The per-group Extend outputs of `query`, in evaluation order.
+    fn extend_vars(query: &Query) -> Vec<VarId> {
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::binds)
+            .map(|(v, _)| *v)
+            .collect()
+    }
+
+    #[test]
+    fn grouped_select_expression_is_a_per_group_extend() {
+        // #1978: an aggregate-free SELECT expression over a GROUP BY key is an
+        // Extend after aggregation (SPARQL 1.1 §18.2.4.4), not a WHERE bind that
+        // survives grouping as a per-group list.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) (COUNT(?e) AS ?n)
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+        )
+        .unwrap();
+        let seg = vars.get("?seg").expect("?seg registered");
+        assert!(!is_where_bind(&query, seg), "must not be a WHERE bind");
+        assert_eq!(extend_vars(&query), vec![seg]);
+    }
+
+    #[test]
+    fn grouped_select_expression_is_an_extend_for_every_grouping_form() {
+        for (label, sparql) in [
+            (
+                "implicit via a SELECT aggregate",
+                "SELECT (\"x\" AS ?c) (COUNT(*) AS ?n) WHERE { ?e ex:area ?a }",
+            ),
+            (
+                "implicit via a HAVING-only aggregate",
+                "SELECT (\"x\" AS ?c) WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1)",
+            ),
+            (
+                "implicit via an ORDER BY-only aggregate",
+                "SELECT (\"x\" AS ?c) WHERE { ?e ex:area ?a } ORDER BY DESC(COUNT(?e))",
+            ),
+            (
+                "dedup-only GROUP BY",
+                "SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?c) \
+                 WHERE { ?e ex:area ?a } GROUP BY ?a",
+            ),
+        ] {
+            let (query, vars) =
+                lower_query_with_vars(&format!("PREFIX ex: <http://example.org/>\n{sparql}"))
+                    .unwrap();
+            let c = vars.get("?c").expect("?c registered");
+            assert!(
+                !is_where_bind(&query, c),
+                "{label}: must not be a WHERE bind"
+            );
+            assert_eq!(extend_vars(&query), vec![c], "{label}");
+        }
+    }
+
+    #[test]
+    fn ungrouped_select_expression_stays_a_where_bind() {
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x (SHA512(?x) AS ?h) WHERE { ?s ex:p ?x }",
+        )
+        .unwrap();
+        let h = vars.get("?h").expect("?h registered");
+        assert!(is_where_bind(&query, h));
+        assert!(query.grouping.is_none());
+    }
+
+    #[test]
+    fn grouped_select_extends_run_in_select_order() {
+        // A compound-aggregate item and an alias chain: one list, SELECT order,
+        // so ?t (reading ?np1) runs after ?np1 in both shapes.
+        for sparql in [
+            "SELECT ?a (COUNT(?e) AS ?n) ((COUNT(?e) + 1) AS ?np1) ((?np1 * 10) AS ?t) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+            "SELECT ?a (COUNT(?e) AS ?n) ((?n + 1) AS ?np1) ((?np1 * 10) AS ?t) \
+             WHERE { ?e ex:area ?a } GROUP BY ?a",
+        ] {
+            let (query, vars) =
+                lower_query_with_vars(&format!("PREFIX ex: <http://example.org/>\n{sparql}"))
+                    .unwrap();
+            let np1 = vars.get("?np1").expect("?np1");
+            let t = vars.get("?t").expect("?t");
+            assert_eq!(extend_vars(&query), vec![np1, t], "{sparql}");
+            assert!(!is_where_bind(&query, t) && !is_where_bind(&query, np1));
+        }
+    }
+
+    #[test]
+    fn select_star_under_implicit_grouping_projects_nothing() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1)",
+        )
+        .unwrap();
+        assert_eq!(query.output.projected_vars(), Some(Vec::new()));
+        assert!(!query.output.is_wildcard());
+
+        // An ungrouped `SELECT *` keeps the wildcard.
+        let query =
+            lower_query("PREFIX ex: <http://example.org/> SELECT * WHERE { ?e ex:area ?a }")
+                .unwrap();
+        assert!(query.output.is_wildcard());
+    }
+
+    #[test]
+    fn grouped_sub_select_expression_is_a_per_group_extend() {
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?seg ?n WHERE {
+               { SELECT (IF(?a = \"Net\", \"network\", \"other\") AS ?seg) (COUNT(?e) AS ?n)
+                 WHERE { ?e ex:area ?a } GROUP BY ?a }
+             }",
+        )
+        .unwrap();
+        let seg = vars.get("?seg").expect("?seg");
+        let sq = query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Subquery(sq) => Some(sq),
+                _ => None,
+            })
+            .expect("sub-SELECT");
+        assert!(
+            !sq.patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == seg)),
+            "must not be a WHERE bind of the sub-SELECT"
+        );
+        let binds: Vec<VarId> = sq
+            .grouping
+            .iter()
+            .flat_map(Grouping::binds)
+            .map(|(v, _)| *v)
+            .collect();
+        assert_eq!(binds, vec![seg]);
+
+        // `SELECT *` of an implicitly grouped sub-SELECT exports nothing.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?a WHERE { { SELECT * WHERE { ?e ex:area ?a } HAVING (COUNT(*) > 1) } }",
+        )
+        .unwrap();
+        let Some(Pattern::Subquery(sq)) = query.patterns.first() else {
+            panic!("sub-SELECT expected: {:?}", query.patterns);
+        };
+        assert!(sq.select.is_empty(), "{:?}", sq.select);
+    }
+
+    #[test]
+    fn test_group_by_bracketed_var_produces_no_bind() {
+        // GROUP BY (?var) should NOT produce a BIND pattern — just unwrap the parens
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type } GROUP BY (?type)",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(
+            !has_bind,
+            "bracketed variable GROUP BY should not produce a BIND"
+        );
+    }
+
+    #[test]
+    fn test_having() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type } GROUP BY ?type HAVING (?cnt > 5)",
+        )
+        .unwrap();
+
+        assert!(having_of(&query).is_some());
+    }
+
+    #[test]
+    fn test_all_modifiers() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT DISTINCT ?type WHERE { ?s ex:type ?type }
+             GROUP BY ?type
+             HAVING (?cnt > 0)
+             ORDER BY ?type
+             LIMIT 10
+             OFFSET 5",
+        )
+        .unwrap();
+
+        assert!(query.output.is_distinct());
+        assert_eq!(group_by_of(&query).len(), 1);
+        assert!(having_of(&query).is_some());
+        assert_eq!(query.ordering.len(), 1);
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
+    }
+
+    // =========================================================================
+    // Aggregate Extraction Tests (Step 6 & 7)
+    // =========================================================================
+
+    #[test]
+    fn test_aggregate_count_with_alias() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(?s) AS ?count) WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::Count(_)));
+    }
+
+    #[test]
+    fn test_aggregate_count_distinct() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+    }
+
+    #[test]
+    fn test_aggregate_count_distinct_bracketed_var() {
+        // COUNT(DISTINCT(?var)) with extra parentheses around the variable
+        // is valid SPARQL and should be treated the same as COUNT(DISTINCT ?var)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(DISTINCT(?s)) AS ?count) WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some()); // Should have resolved the variable
+    }
+
+    #[test]
+    fn test_aggregate_count_distinct_bracketed_var_with_whitespace() {
+        // COUNT(DISTINCT( ?var )) with whitespace inside parentheses
+        // Whitespace is stripped by the lexer, so this should work identically
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ( COUNT( DISTINCT( ?s ) ) AS ?count ) WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some());
+    }
+
+    #[test]
+    fn test_distinct_flag_count_vs_sum() {
+        // COUNT(DISTINCT) lowers to the dedicated AggregateFn::CountDistinct
+        // variant (its streaming state uses a HashSet rather than a counter).
+        // SUM(DISTINCT) lowers to AggregateFn::Sum with `distinct: true` —
+        // dedup happens at execution time via HashSet filtering in
+        // apply_aggregate.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(DISTINCT ?s) AS ?c) (SUM(DISTINCT ?v) AS ?t)
+             WHERE { ?s ex:val ?v }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 2);
+
+        let count_agg = aggregates_of(&query)[0];
+        assert!(matches!(count_agg.function, AggregateFn::CountDistinct(_)));
+
+        let sum_agg = aggregates_of(&query)[1];
+        assert!(matches!(
+            sum_agg.function,
+            AggregateFn::Sum(_, InputSemantics::Set)
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_sum_bracketed_var() {
+        // SUM((?var)) with extra parentheses
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (SUM((?val)) AS ?total) WHERE { ?s ex:value ?val }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        assert!(matches!(
+            aggregates_of(&query)[0].function,
+            AggregateFn::Sum(..)
+        ));
+        assert!(aggregates_of(&query)[0].function.input_var().is_some());
+    }
+
+    #[test]
+    fn test_aggregate_sum() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (SUM(?val) AS ?total) WHERE { ?s ex:value ?val }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        assert!(matches!(
+            aggregates_of(&query)[0].function,
+            AggregateFn::Sum(..)
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_over_expression_desugars_to_bind() {
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (SUM(YEAR(?dt)) AS ?sum) WHERE { ?s ex:created ?dt }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::Sum(..)));
+
+        let input_var = agg
+            .function
+            .input_var()
+            .expect("expected aggregate input var");
+        let input_name = vars.name(input_var);
+        assert!(
+            input_name.starts_with("?__agg_expr_"),
+            "expected synthetic aggregate-input var, got: {input_name}"
+        );
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == input_var));
+        assert!(
+            has_bind,
+            "expected a pre-aggregation BIND for the input expression"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_avg() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (AVG(?val) AS ?average) WHERE { ?s ex:value ?val }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        assert!(matches!(
+            aggregates_of(&query)[0].function,
+            AggregateFn::Avg(..)
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_min_max() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (MIN(?val) AS ?minVal) (MAX(?val) AS ?maxVal) WHERE { ?s ex:value ?val }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 2);
+        assert!(matches!(
+            aggregates_of(&query)[0].function,
+            AggregateFn::Min(_)
+        ));
+        assert!(matches!(
+            aggregates_of(&query)[1].function,
+            AggregateFn::Max(_)
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_group_concat() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (GROUP_CONCAT(?name; SEPARATOR=\", \") AS ?names) WHERE { ?s ex:name ?name }",
+        )
+        .unwrap();
+
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1);
+        match &aggs[0].function {
+            AggregateFn::GroupConcat { separator, .. } => {
+                assert_eq!(separator, ", ");
+            }
+            _ => panic!("Expected GroupConcat"),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_sample() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (SAMPLE(?name) AS ?sampleName) WHERE { ?s ex:name ?name }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        assert!(matches!(
+            aggregates_of(&query)[0].function,
+            AggregateFn::Sample(_)
+        ));
+    }
+
+    #[test]
+    fn test_count_star() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?count) WHERE { ?s ex:p ?o }",
+        )
+        .unwrap();
+
+        // Verify COUNT(*) aggregate was created
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
+        assert!(matches!(agg.function, AggregateFn::CountAll));
+        assert!(
+            agg.function.input_var().is_none(),
+            "COUNT(*) should have no input var"
+        );
+    }
+
+    #[test]
+    fn test_auto_group_by_with_aggregate() {
+        // When aggregates present but no explicit GROUP BY,
+        // non-aggregate SELECT vars should be auto-added to GROUP BY
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?count) WHERE { ?s ex:type ?type }",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        // ?type should be auto-added to GROUP BY
+        assert_eq!(group_by_of(&query).len(), 1);
+    }
+
+    #[test]
+    fn test_explicit_group_by_not_modified() {
+        // When explicit GROUP BY present, don't auto-populate
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?count) WHERE { ?s ex:type ?type } GROUP BY ?type",
+        )
+        .unwrap();
+
+        assert_eq!(aggregates_of(&query).len(), 1);
+        // Only the explicit GROUP BY var, not duplicated
+        assert_eq!(group_by_of(&query).len(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_with_mixed_select() {
+        // Mix of plain vars and aggregates
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?cat ?brand (COUNT(?product) AS ?cnt) (AVG(?price) AS ?avgPrice)
+             WHERE { ?product ex:category ?cat ; ex:brand ?brand ; ex:price ?price }",
+        )
+        .unwrap();
+
+        // 2 aggregates: COUNT and AVG
+        assert_eq!(aggregates_of(&query).len(), 2);
+        // 2 non-aggregate vars auto-added to GROUP BY: ?cat, ?brand
+        assert_eq!(group_by_of(&query).len(), 2);
+    }
+
+    // =========================================================================
+    // Property Path Tests
+    // =========================================================================
+
+    #[test]
+    fn test_property_path_one_or_more() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?ancestor WHERE { ?s ex:parent+ ?ancestor }",
+        )
+        .unwrap();
+
+        // Should have one PropertyPath pattern
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::PropertyPath(_)));
+
+        // Verify the modifier
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(matches!(pp.modifier, PathModifier::OneOrMore));
+        } else {
+            panic!("Expected PropertyPath pattern");
+        }
+    }
+
+    #[test]
+    fn test_property_path_zero_or_more() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?member WHERE { ?s ex:hasMember* ?member }",
+        )
+        .unwrap();
+
+        // Should have one PropertyPath pattern
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::PropertyPath(_)));
+
+        // Verify the modifier
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(matches!(pp.modifier, PathModifier::ZeroOrMore));
+        } else {
+            panic!("Expected PropertyPath pattern");
+        }
+    }
+
+    #[test]
+    fn test_property_path_with_bound_subject() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?descendant WHERE { ex:alice ex:parent+ ?descendant }",
+        )
+        .unwrap();
+
+        // Verify subject is bound
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(pp.subject.is_bound());
+            assert!(!pp.object.is_bound());
+        } else {
+            panic!("Expected PropertyPath pattern");
+        }
+    }
+
+    #[test]
+    fn test_property_path_with_bound_object() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?ancestor WHERE { ?ancestor ex:parent+ ex:bob }",
+        )
+        .unwrap();
+
+        // Verify object is bound
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(!pp.subject.is_bound());
+            assert!(pp.object.is_bound());
+        } else {
+            panic!("Expected PropertyPath pattern");
+        }
+    }
+
+    #[test]
+    fn test_property_path_both_constants_is_reachability() {
+        // Both endpoints constant is a reachability test, not an error: it
+        // lowers to a PropertyPath whose both-Sid arm emits one empty solution
+        // iff a path exists (W3C `:a :p+ :b`).
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:parent+ ex:bob }",
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert!(pp.subject.is_bound() && pp.object.is_bound());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?child WHERE { ?child ^ex:parent ?parent }",
+        )
+        .unwrap();
+
+        // Inverse compiles to a Triple with subject/object swapped
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Triple(tp) = &query.patterns[0] {
+            // ^ex:parent swaps: triple is (?parent, ex:parent, ?child)
+            assert!(tp.o.is_var()); // ?child in object position
+            assert!(tp.s.is_var()); // ?parent in subject position
+            assert!(tp.p.is_iri());
+        } else {
+            panic!(
+                "Expected Triple pattern for inverse path, got {:?}",
+                query.patterns[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_one_or_more() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ex:b ^ex:knows+ ?x }",
+        )
+        .unwrap();
+
+        // ^p+ → PropertyPathPattern with swapped subject/object
+        // Original: s=ex:b, o=?x  →  pp.subject=?x, pp.object=ex:b
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(matches!(pp.modifier, PathModifier::OneOrMore));
+            assert!(!pp.subject.is_bound()); // ?x (original object)
+            assert!(pp.object.is_bound()); // ex:b (original subject)
+        } else {
+            panic!(
+                "Expected PropertyPath pattern for ^p+, got {:?}",
+                query.patterns[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_zero_or_more() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ex:b ^ex:knows* ?x }",
+        )
+        .unwrap();
+
+        // ^p* → PropertyPathPattern with swapped subject/object
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::PropertyPath(pp) = &query.patterns[0] {
+            assert!(matches!(pp.modifier, PathModifier::ZeroOrMore));
+            assert!(!pp.subject.is_bound()); // ?x (original object)
+            assert!(pp.object.is_bound()); // ex:b (original subject)
+        } else {
+            panic!(
+                "Expected PropertyPath pattern for ^p*, got {:?}",
+                query.patterns[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_transitive_both_constants_is_reachability() {
+        // `:a ^:p+ :b` both-constant inverse transitive is also a reachability
+        // test (lowers to a PropertyPath with swapped, both-bound endpoints).
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ^ex:knows+ ex:bob }",
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(&query.patterns[0], Pattern::PropertyPath(_)));
+    }
+
+    #[test]
+    fn test_property_path_sequence_two_step() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?grandchild WHERE { ?s ex:parent/ex:parent ?grandchild }",
+        )
+        .unwrap();
+
+        // Sequence compiles to 2 triple patterns joined by ?__pp0
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Triple(_)));
+
+        // First triple: ?s → ?__pp0
+        if let Pattern::Triple(tp) = &query.patterns[0] {
+            assert!(tp.s.is_var()); // ?s
+            assert!(tp.p.is_iri());
+            assert!(tp.o.is_var()); // ?__pp0
+        }
+        // Second triple: ?__pp0 → ?grandchild
+        if let Pattern::Triple(tp) = &query.patterns[1] {
+            assert!(tp.s.is_var()); // ?__pp0
+            assert!(tp.p.is_iri());
+            assert!(tp.o.is_var()); // ?grandchild
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternative() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?related WHERE { ?s ex:friend|ex:colleague ?related }",
+        )
+        .unwrap();
+
+        // Alternative compiles to Union of triple branches
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            assert!(matches!(branches[0][0], Pattern::Triple(_)));
+            assert!(matches!(branches[1][0], Pattern::Triple(_)));
+        } else {
+            panic!(
+                "Expected Union pattern for alternative path, got {:?}",
+                query.patterns[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternative_with_inverse() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?related WHERE { ?s ex:friend|^ex:colleague ?related }",
+        )
+        .unwrap();
+
+        // Alternative with inverse: Union of two branches
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            // First branch: forward ex:friend → (?s, ex:friend, ?related)
+            if let Pattern::Triple(tp) = &branches[0][0] {
+                assert!(tp.s.is_var());
+                assert!(tp.o.is_var());
+            } else {
+                panic!("Expected Triple in first branch");
+            }
+            // Second branch: inverse ex:colleague → (?related, ex:colleague, ?s)
+            if let Pattern::Triple(tp) = &branches[1][0] {
+                assert!(tp.s.is_var()); // ?related
+                assert!(tp.o.is_var()); // ?s
+            } else {
+                panic!("Expected Triple in second branch");
+            }
+        } else {
+            panic!("Expected Union pattern, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternative_three_way() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?related WHERE { ?s ex:a|ex:b|ex:c ?related }",
+        )
+        .unwrap();
+
+        // Three-way alternative flattens to Union with 3 branches
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 3);
+            for branch in branches {
+                assert!(matches!(branch[0], Pattern::Triple(_)));
+            }
+        } else {
+            panic!("Expected Union pattern, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternation_transitive_lowers_to_multi_predicate() {
+        // `(a|b)+` is an alternation-transitive path: the closure follows an
+        // edge of either predicate per hop. Lowers to one PropertyPath carrying
+        // both predicates.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s (ex:a|ex:b)+ ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert_eq!(pp.predicates.len(), 2, "both branches traversed: {pp:?}");
+                assert!(pp.single_predicate().is_none());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_property_path_rdf_type() {
+        // Test a+ where a is the rdf:type shorthand
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ex:thing a+ ?type }",
+        )
+        .unwrap();
+
+        // Should lower to PropertyPath with rdf:type predicate
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(query.patterns[0], Pattern::PropertyPath(_)));
+    }
+
+    #[test]
+    fn test_property_path_with_filter() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?ancestor WHERE {
+               ?s ex:parent+ ?ancestor .
+               FILTER(?ancestor != ex:root)
+             }",
+        )
+        .unwrap();
+
+        // Should have PropertyPath and Filter patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::PropertyPath(_)));
+        assert!(matches!(query.patterns[1], Pattern::Filter(_)));
+    }
+
+    #[test]
+    fn test_property_path_in_optional() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?ancestor WHERE {
+               ?s ex:name ?name .
+               OPTIONAL { ?s ex:parent+ ?ancestor }
+             }",
+        )
+        .unwrap();
+
+        // Should have Triple and Optional patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Optional(_)));
+
+        // Check that Optional contains a PropertyPath
+        if let Pattern::Optional(inner) = &query.patterns[1] {
+            assert_eq!(inner.len(), 1);
+            assert!(matches!(inner[0], Pattern::PropertyPath(_)));
+        } else {
+            panic!("Expected Optional pattern");
+        }
+    }
+
+    // =========================================================================
+    // Subquery Tests
+    // =========================================================================
+
+    #[test]
+    fn test_subquery_basic() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?age WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s ?age WHERE { ?s ex:age ?age } }
+             }",
+        )
+        .unwrap();
+
+        // Should have Triple and Subquery patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Subquery(_)));
+
+        // Check the subquery structure
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.select.len(), 2); // ?s and ?age
+            assert_eq!(sq.patterns.len(), 1); // One triple pattern
+            assert!(matches!(sq.patterns[0], Pattern::Triple(_)));
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_limit() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s WHERE { ?s ex:type ex:Person } LIMIT 10 }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has limit
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.limit, Some(10));
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_limit_offset() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?score WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s ?score WHERE { ?s ex:score ?score } LIMIT 5 OFFSET 10 }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has limit and offset
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.limit, Some(5));
+            assert_eq!(sq.offset, Some(10));
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_select_star_populates_select_list() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               { SELECT * WHERE { ?s ex:name ?name } }
+             }",
+        )
+        .unwrap();
+
+        let sub = query.patterns.iter().find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        });
+        let sub = sub.expect("Expected Subquery pattern");
+
+        // `SELECT *` should select all variables referenced in the subquery patterns.
+        // We don't assert exact order here; just that the important vars are present.
+        assert!(
+            sub.select.len() >= 2,
+            "Expected SELECT * subquery to include ?s and ?name in select list"
+        );
+    }
+
+    #[test]
+    fn test_subquery_with_order_by() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s WHERE { ?s ex:age ?age } ORDER BY ?age }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has order_by
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.ordering.len(), 1, "Expected 1 ORDER BY spec");
+            assert_eq!(
+                sq.ordering[0].direction,
+                SortDirection::Ascending,
+                "Expected ascending order"
+            );
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_order_by_desc() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s WHERE { ?s ex:age ?age } ORDER BY DESC(?age) }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has order_by with descending direction
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.ordering.len(), 1, "Expected 1 ORDER BY spec");
+            assert_eq!(
+                sq.ordering[0].direction,
+                SortDirection::Descending,
+                "Expected descending order"
+            );
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_multiple_order_by() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:name ?name .
+               { SELECT ?s ?age ?score WHERE { ?s ex:age ?age . ?s ex:score ?score } ORDER BY ?age DESC(?score) }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has multiple order_by specs
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert_eq!(sq.ordering.len(), 2, "Expected 2 ORDER BY specs");
+            assert_eq!(
+                sq.ordering[0].direction,
+                SortDirection::Ascending,
+                "First should be ascending"
+            );
+            assert_eq!(
+                sq.ordering[1].direction,
+                SortDirection::Descending,
+                "Second should be descending"
+            );
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_distinct() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?type WHERE {
+               ?s ex:name ?name .
+               { SELECT DISTINCT ?s ?type WHERE { ?s ex:type ?type } }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery has distinct
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            assert!(sq.distinct);
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_nested_in_optional() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?score WHERE {
+               ?s ex:name ?name .
+               OPTIONAL {
+                 { SELECT ?s ?score WHERE { ?s ex:score ?score } }
+               }
+             }",
+        )
+        .unwrap();
+
+        // Should have Triple and Optional patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Optional(_)));
+
+        // Check that Optional contains a Subquery
+        if let Pattern::Optional(inner) = &query.patterns[1] {
+            assert_eq!(inner.len(), 1);
+            assert!(matches!(inner[0], Pattern::Subquery(_)));
+        } else {
+            panic!("Expected Optional pattern");
+        }
+    }
+
+    #[test]
+    fn test_subquery_with_filter() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?topScore WHERE {
+               ?s ex:name ?name .
+               {
+                 SELECT ?s ?topScore WHERE {
+                   ?s ex:score ?topScore .
+                   FILTER(?topScore > 90)
+                 }
+               }
+             }",
+        )
+        .unwrap();
+
+        // Check the subquery contains patterns
+        if let Pattern::Subquery(sq) = &query.patterns[1] {
+            // Should have Triple and Filter patterns
+            assert_eq!(sq.patterns.len(), 2);
+            assert!(matches!(sq.patterns[0], Pattern::Triple(_)));
+            assert!(matches!(sq.patterns[1], Pattern::Filter(_)));
+        } else {
+            panic!("Expected Subquery pattern");
+        }
+    }
+
+    // =========================================================================
+    // Newly Implemented Function Tests
+    // =========================================================================
+
+    #[test]
+    fn test_function_str() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?strVal WHERE {
+               ?s ex:value ?val .
+               BIND(STR(?val) AS ?strVal)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with STR function");
+    }
+
+    #[test]
+    fn test_function_substr() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?part WHERE {
+               ?s ex:name ?name .
+               BIND(SUBSTR(?name, 2, 3) AS ?part)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with SUBSTR function");
+    }
+
+    #[test]
+    fn test_function_encode_for_uri() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?encoded WHERE {
+               ?s ex:label ?label .
+               BIND(ENCODE_FOR_URI(?label) AS ?encoded)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(
+            has_bind,
+            "Expected Bind pattern with ENCODE_FOR_URI function"
+        );
+    }
+
+    #[test]
+    fn test_function_langmatches() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name WHERE {
+               ?s ex:name ?name .
+               FILTER(LANGMATCHES(LANG(?name), \"en\"))
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with LANGMATCHES function");
+    }
+
+    #[test]
+    fn test_function_sameterm() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE {
+               ?s ex:a ?a .
+               ?s ex:b ?b .
+               FILTER(SAMETERM(?a, ?b))
+             }",
+        )
+        .unwrap();
+
+        let has_filter = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_)));
+        assert!(has_filter, "Expected Filter with SAMETERM function");
+    }
+
+    #[test]
+    fn test_function_md5() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?hash WHERE {
+               ?s ex:data ?data .
+               BIND(MD5(?data) AS ?hash)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with MD5 function");
+    }
+
+    #[test]
+    fn test_function_sha1() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?hash WHERE {
+               ?s ex:data ?data .
+               BIND(SHA1(?data) AS ?hash)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with SHA1 function");
+    }
+
+    #[test]
+    fn test_function_sha256() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?hash WHERE {
+               ?s ex:data ?data .
+               BIND(SHA256(?data) AS ?hash)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with SHA256 function");
+    }
+
+    #[test]
+    fn test_function_sha384() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?hash WHERE {
+               ?s ex:data ?data .
+               BIND(SHA384(?data) AS ?hash)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with SHA384 function");
+    }
+
+    #[test]
+    fn test_function_sha512() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?hash WHERE {
+               ?s ex:data ?data .
+               BIND(SHA512(?data) AS ?hash)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with SHA512 function");
+    }
+
+    #[test]
+    fn test_function_uuid() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?id WHERE {
+               ?s ex:name ?name .
+               BIND(UUID() AS ?id)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with UUID function");
+    }
+
+    #[test]
+    fn test_function_struuid() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?id WHERE {
+               ?s ex:name ?name .
+               BIND(STRUUID() AS ?id)
+             }",
+        )
+        .unwrap();
+
+        let has_bind = query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Bind { .. }));
+        assert!(has_bind, "Expected Bind pattern with STRUUID function");
+    }
+
+    // =========================================================================
+    // Property Path Sequence Tests
+    // =========================================================================
+
+    #[test]
+    fn test_property_path_sequence_three_step() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?great WHERE { ?s ex:parent/ex:parent/ex:parent ?great }",
+        )
+        .unwrap();
+
+        // 3-step sequence → 3 triple patterns, 2 join variables
+        assert_eq!(query.patterns.len(), 3);
+        for p in &query.patterns {
+            assert!(matches!(p, Pattern::Triple(_)));
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_with_inverse() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?name WHERE { ?s ^ex:friend/ex:name ?name }",
+        )
+        .unwrap();
+
+        // 2-step: ^ex:friend then ex:name → 2 triples
+        assert_eq!(query.patterns.len(), 2);
+
+        // First triple: inverse means (?__pp0, ex:friend, ?s)
+        if let Pattern::Triple(tp) = &query.patterns[0] {
+            assert!(tp.s.is_var()); // ?__pp0
+            assert!(tp.p.is_iri());
+            assert!(tp.o.is_var()); // ?s
+        }
+        // Second triple: forward (?__pp0, ex:name, ?name)
+        if let Pattern::Triple(tp) = &query.patterns[1] {
+            assert!(tp.s.is_var()); // ?__pp0
+            assert!(tp.p.is_iri());
+            assert!(tp.o.is_var()); // ?name
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_with_rdf_type() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             SELECT ?type WHERE { ?s ex:knows/rdf:type ?type }",
+        )
+        .unwrap();
+
+        // 2-step: ex:knows then rdf:type
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Triple(_)));
+    }
+
+    #[test]
+    fn test_property_path_sequence_in_optional() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?name ?gp WHERE {
+               ?s ex:name ?name .
+               OPTIONAL { ?s ex:parent/ex:parent ?gp }
+             }",
+        )
+        .unwrap();
+
+        // The sequence expands to 2 triple patterns inside the OPTIONAL.
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        if let Pattern::Optional(inner) = &query.patterns[1] {
+            assert_eq!(inner.len(), 2);
+            assert!(matches!(inner[0], Pattern::Triple(_)));
+            assert!(matches!(inner[1], Pattern::Triple(_)));
+        } else {
+            panic!("Expected Optional pattern");
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_transitive_step_allowed() {
+        // Transitive modifier inside a sequence step should work
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ex:parent+/ex:name ?x }",
+        )
+        .unwrap();
+
+        // Should lower to: PropertyPath(?s, ex:parent, +, ?__pp0), Triple(?__pp0, ex:name, ?x)
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::PropertyPath(_)));
+        assert!(matches!(query.patterns[1], Pattern::Triple(_)));
+    }
+
+    #[test]
+    fn test_property_path_sequence_with_alternative_step_distributes() {
+        // (ex:a|ex:b)/ex:name → Union of two two-step chains
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s (ex:a|ex:b)/ex:name ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+
+            // Each branch should have 2 triple patterns
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch.len(),
+                    2,
+                    "Branch {} should have 2 triple patterns, got {}",
+                    i,
+                    branch.len()
+                );
+                assert!(
+                    matches!(branch[0], Pattern::Triple(_)),
+                    "Branch {i} pattern 0 should be Triple"
+                );
+                assert!(
+                    matches!(branch[1], Pattern::Triple(_)),
+                    "Branch {i} pattern 1 should be Triple"
+                );
+            }
+        } else {
+            panic!("Expected Pattern::Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    // =========================================================================
+    // Sequence-in-Alternative Property Path Tests
+    // =========================================================================
+
+    #[test]
+    fn test_property_path_alternative_with_sequence_branches() {
+        // ex:friend/ex:name | ex:colleague/ex:name
+        // Each branch is a two-step sequence → Union of two triple-chains
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?name WHERE { ?s (ex:friend/ex:name)|(ex:colleague/ex:name) ?name }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+
+            // Each branch should have 2 triple patterns (two-step chain)
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch.len(),
+                    2,
+                    "Branch {} should have 2 triple patterns, got {}",
+                    i,
+                    branch.len()
+                );
+                assert!(
+                    matches!(branch[0], Pattern::Triple(_)),
+                    "Branch {i} pattern 0 should be Triple"
+                );
+                assert!(
+                    matches!(branch[1], Pattern::Triple(_)),
+                    "Branch {i} pattern 1 should be Triple"
+                );
+            }
+        } else {
+            panic!("Expected Union pattern, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternative_mixed_simple_and_sequence() {
+        // ex:name | ex:friend/ex:name — one simple IRI, one sequence
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?name WHERE { ?s ex:name|(ex:friend/ex:name) ?name }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            // First branch: single triple (simple IRI)
+            assert_eq!(branches[0].len(), 1);
+            assert!(matches!(branches[0][0], Pattern::Triple(_)));
+            // Second branch: two triples (sequence chain)
+            assert_eq!(branches[1].len(), 2);
+            assert!(matches!(branches[1][0], Pattern::Triple(_)));
+            assert!(matches!(branches[1][1], Pattern::Triple(_)));
+        } else {
+            panic!("Expected Union pattern, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_alternative_three_way_with_sequence() {
+        // ex:name | ex:friend/ex:name | ^ex:colleague
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?val WHERE { ?s ex:name|(ex:friend/ex:name)|^ex:colleague ?val }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 3);
+            // Branch 0: simple IRI → 1 triple
+            assert_eq!(branches[0].len(), 1);
+            // Branch 1: sequence → 2 triples
+            assert_eq!(branches[1].len(), 2);
+            // Branch 2: inverse → 1 triple
+            assert_eq!(branches[2].len(), 1);
+        } else {
+            panic!("Expected Union pattern, got {:?}", query.patterns[0]);
+        }
+    }
+
+    // =========================================================================
+    // Alternative-in-Sequence Distribution Tests
+    // =========================================================================
+
+    #[test]
+    fn test_property_path_sequence_middle_alternative() {
+        // ex:a/(ex:b|ex:c)/ex:d → Union of 2 three-step chains
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ex:a/(ex:b|ex:c)/ex:d ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+
+            // Each branch should be a 3-step chain (3 triples)
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch.len(),
+                    3,
+                    "Branch {} should have 3 triple patterns, got {}",
+                    i,
+                    branch.len()
+                );
+                for (j, pat) in branch.iter().enumerate() {
+                    assert!(
+                        matches!(pat, Pattern::Triple(_)),
+                        "Branch {i} pattern {j} should be Triple"
+                    );
+                }
+            }
+        } else {
+            panic!("Expected Pattern::Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_multiple_alternatives() {
+        // (ex:a|ex:b)/(ex:c|ex:d) → Union of 4 two-step chains
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s (ex:a|ex:b)/(ex:c|ex:d) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 4);
+
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch.len(),
+                    2,
+                    "Branch {} should have 2 triple patterns, got {}",
+                    i,
+                    branch.len()
+                );
+            }
+        } else {
+            panic!("Expected Pattern::Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_alternative_with_inverse() {
+        // (ex:a|^ex:b)/ex:c → Union of 2 chains, one with inverse
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s (ex:a|^ex:b)/ex:c ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+
+            // Both branches should have 2 triples
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(branch.len(), 2, "Branch {i} should have 2 triple patterns");
+            }
+
+            // Branch 0 first triple: forward — subject is a var (the ?s)
+            if let Pattern::Triple(t0) = &branches[0][0] {
+                assert!(
+                    t0.s.is_var(),
+                    "Branch 0 first triple subject should be a var"
+                );
+                // Predicate should be ex:a
+                assert_eq!(t0.p.as_iri(), Some("http://example.org/a"));
+            }
+
+            // Branch 1 first triple: inverse — object is the ?s var (swapped)
+            if let Pattern::Triple(t1) = &branches[1][0] {
+                assert!(
+                    matches!(&t1.o, Term::Var(_)),
+                    "Branch 1 first triple object should be a var (inverse)"
+                );
+                // Predicate should be ex:b
+                assert_eq!(t1.p.as_iri(), Some("http://example.org/b"));
+            }
+        } else {
+            panic!("Expected Pattern::Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_sequence_expansion_limit() {
+        // Build (a0|b0)/(a1|b1)/(a2|b2)/(a3|b3)/(a4|b4)/(a5|b5)/(a6|b6)
+        // 2^7 = 128 > 64 limit
+        let predicates: String = (0..7)
+            .map(|i| format!("(ex:a{i}|ex:b{i})"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let sparql =
+            format!("PREFIX ex: <http://example.org/>\nSELECT ?x WHERE {{ ?s {predicates} ?x }}");
+        let result = lower_query(&sparql);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expands to 128") && msg.contains("limit 64"),
+            "Unexpected error: {msg}",
+        );
+    }
+
+    // ======================================================================
+    // Inverse of complex paths
+    // ======================================================================
+
+    #[test]
+    fn test_property_path_inverse_of_sequence() {
+        // ^(ex:a/ex:b) → 2 triples with predicates reversed (b, a),
+        // each with swapped s/o (inverse)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(ex:a/ex:b) ?x }",
+        )
+        .unwrap();
+
+        // Rewrite: Sequence([^b, ^a]) → 2 triple patterns
+        assert_eq!(query.patterns.len(), 2);
+        assert!(matches!(query.patterns[0], Pattern::Triple(_)));
+        assert!(matches!(query.patterns[1], Pattern::Triple(_)));
+
+        // Predicates in reversed order: b, a
+        if let Pattern::Triple(tp0) = &query.patterns[0] {
+            assert_eq!(
+                tp0.p.as_iri(),
+                Some("http://example.org/b"),
+                "First predicate should be ex:b (reversed), got {:?}",
+                tp0.p
+            );
+        }
+        if let Pattern::Triple(tp1) = &query.patterns[1] {
+            assert_eq!(
+                tp1.p.as_iri(),
+                Some("http://example.org/a"),
+                "Second predicate should be ex:a (reversed), got {:?}",
+                tp1.p
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_of_alternative() {
+        // ^(ex:a|ex:b) → Union of 2 branches, each with swapped s/o
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(ex:a|ex:b) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(branch.len(), 1, "Branch {i} should have 1 triple");
+                assert!(
+                    matches!(&branch[0], Pattern::Triple(_)),
+                    "Branch {i} should be a Triple"
+                );
+            }
+        } else {
+            panic!("Expected Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_of_three_step_sequence() {
+        // ^(ex:a/ex:b/ex:c) → 3 triples, predicates reversed (c, b, a)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(ex:a/ex:b/ex:c) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 3);
+        let expected_preds = [
+            "http://example.org/c",
+            "http://example.org/b",
+            "http://example.org/a",
+        ];
+        for (i, exp) in expected_preds.iter().enumerate() {
+            if let Pattern::Triple(tp) = &query.patterns[i] {
+                assert_eq!(
+                    tp.p.as_iri(),
+                    Some(*exp),
+                    "Step {}: expected predicate {}, got {:?}",
+                    i,
+                    exp,
+                    tp.p
+                );
+            } else {
+                panic!("Step {}: expected Triple, got {:?}", i, query.patterns[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_property_path_inverse_of_sequence_with_alternative() {
+        // ^(ex:a/(ex:b|ex:c)) →
+        //   Rewrite: Sequence([Alternative([^b, ^c]), ^a])
+        //   Distribution: Union of 2 two-step chains
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(ex:a/(ex:b|ex:c)) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(branch.len(), 2, "Branch {i} should have 2 triples");
+            }
+        } else {
+            panic!("Expected Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_property_path_double_inverse_in_sequence() {
+        // ^(^ex:a/ex:b) → Sequence([^b, a])
+        // The ^ex:a step: Inverse(Inverse(a)) cancels to a (forward)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(^ex:a/ex:b) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 2);
+        // Step 0: ^b (reversed, inverted) — inverse triple
+        if let Pattern::Triple(tp0) = &query.patterns[0] {
+            assert_eq!(
+                tp0.p.as_iri(),
+                Some("http://example.org/b"),
+                "First predicate should be ex:b, got {:?}",
+                tp0.p
+            );
+        }
+        // Step 1: a (^(^a) cancelled to forward a)
+        if let Pattern::Triple(tp1) = &query.patterns[1] {
+            assert_eq!(
+                tp1.p.as_iri(),
+                Some("http://example.org/a"),
+                "Second predicate should be ex:a, got {:?}",
+                tp1.p
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_path_double_inverse_in_alternative() {
+        // ^(ex:a|^ex:b) → Alternative([^a, b])
+        // The ^ex:b branch: Inverse(Inverse(b)) cancels to b (forward)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ?s ^(ex:a|^ex:b) ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        if let Pattern::Union(branches) = &query.patterns[0] {
+            assert_eq!(branches.len(), 2);
+            // Branch 0: ^a — inverse triple (?x, a, ?s)
+            if let Pattern::Triple(tp0) = &branches[0][0] {
+                assert_eq!(
+                    tp0.p.as_iri(),
+                    Some("http://example.org/a"),
+                    "Branch 0 predicate should be ex:a, got {:?}",
+                    tp0.p
+                );
+                // Inverse: subject should be ?x (the object var), object should be ?s
+                // (swapped compared to forward)
+            }
+            // Branch 1: b — forward triple (?s, b, ?x)
+            if let Pattern::Triple(tp1) = &branches[1][0] {
+                assert_eq!(
+                    tp1.p.as_iri(),
+                    Some("http://example.org/b"),
+                    "Branch 1 predicate should be ex:b, got {:?}",
+                    tp1.p
+                );
+                // Forward: subject should be ?s, object should be ?x (not swapped)
+            }
+        } else {
+            panic!("Expected Union, got {:?}", query.patterns[0]);
+        }
+    }
+
+    #[test]
+    fn test_existing_inverse_transitive_unchanged() {
+        // ^ex:knows+ should still produce PropertyPathPattern (no regression)
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE { ex:b ^ex:knows+ ?x }",
+        )
+        .unwrap();
+
+        assert_eq!(query.patterns.len(), 1);
+        assert!(
+            matches!(query.patterns[0], Pattern::PropertyPath(_)),
+            "Expected PropertyPath, got {:?}",
+            query.patterns[0]
+        );
+    }
+
+    // =========================================================================
+    // M4.3 — RDF 1.2 annotation lowering
+    // =========================================================================
+
+    #[test]
+    fn m43_annotation_block_lowers_to_edge_annotation_with_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("lower should succeed");
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert_eq!(body.len(), 1, "one annotation entry → one body triple");
+                assert!(
+                    matches!(annotation, Ref::Var(_)),
+                    "anonymous reifier mints var"
+                );
+                match &body[0] {
+                    Pattern::Triple(tp) => {
+                        // Body triple's subject is the annotation reifier var.
+                        match (&tp.s, annotation) {
+                            (Ref::Var(a), Ref::Var(b)) => assert_eq!(a, b),
+                            _ => panic!("body subject should match annotation ref"),
+                        }
+                    }
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_plain_string_literal_object_carries_xsd_string_dtc() {
+        // Plain string literal on the base edge of an annotated triple.
+        // `edge.dtc` must be Some(Explicit(xsd:string)) so the scan
+        // matches only xsd:string flakes — not, say, a custom-typed
+        // string with the same lexical value.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:name \"Alice\" {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
+                match &edge.dtc {
+                    Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                    other => panic!("plain string base edge must have Explicit dtc, got {other:?}"),
+                }
+                // Annotation body entry should also carry dtc for its
+                // string literal value.
+                match &body[0] {
+                    Pattern::Triple(tp) => match &tp.dtc {
+                        Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                        other => {
+                            panic!("body string literal must have Explicit dtc, got {other:?}")
+                        }
+                    },
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_lang_tagged_literal_object_carries_lang_dtc() {
+        // Language-tagged literal on the base edge. `edge.dtc` must be
+        // Some(LangTag("fr")) so same-lexical literals in different
+        // languages do not cross-match.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:label \"chat\"@fr {| ex:source \"lex\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                    assert_eq!(tag.as_ref(), "fr");
+                }
+                other => panic!("lang-tagged base edge must have LangTag dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_typed_literal_object_carries_typed_dtc() {
+        // Typed literal — integer in this case. The constraint must be
+        // Some(Explicit(<xsd:integer sid>)) so scans don't cross
+        // datatypes.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:age 30 {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                other => panic!("typed literal base edge must have Explicit dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_iri_reifier_resolves_to_iri_ref() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ex:rel {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(
+                    matches!(annotation, Ref::Iri(_) | Ref::Sid(_)),
+                    "explicit IRI reifier resolves to a constant ref, got {annotation:?}"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_var_reifier_resolves_to_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_empty_block_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, .. } => assert!(body.is_empty()),
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_bare_tilde_reifier_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert!(body.is_empty());
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_rdf_reifies_lowers_to_annotation_target_with_empty_body() {
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }",
+        )
+        .unwrap();
+        // The pattern list contains exactly one AnnotationTarget. Sibling
+        // triples about ?ann (none in this query) would join via the
+        // standard executor — the AnnotationTarget itself carries no body.
+        let n = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        assert_eq!(n, 1, "expected exactly one AnnotationTarget IR pattern");
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty(), "M4.3 emits empty body");
+            }
+        }
+    }
+
+    #[test]
+    fn m43_sibling_triples_about_reifier_stay_in_outer_scope() {
+        // ?ann ex:role "Engineer" must remain a regular Pattern::Triple
+        // alongside the AnnotationTarget — NOT folded into body.
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+               ?ann ex:role \"Engineer\" .
+             }",
+        )
+        .unwrap();
+        let n_target = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        let n_triple = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_)))
+            .count();
+        assert_eq!(n_target, 1);
+        assert_eq!(n_triple, 1, "sibling stays as outer Pattern::Triple");
+        // And the body of AnnotationTarget is empty.
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn m43_rebound_rdf_prefix_with_reifies_is_rejected_at_lower_time() {
+        // The parser recognizes `rdf:reifies` lexically. If the user
+        // rebinds `rdf:` to a non-standard namespace, the resulting
+        // IRI is NOT the standard rdf:reifies and must be rejected by
+        // the lower step. Mirrors the JSON-LD path's strict-IRI rule.
+        let err = lower_query(
+            "PREFIX rdf: <http://example.org/fake-rdf#>
+             PREFIX ex:  <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:a ex:b ex:c )>> .
+             }",
+        )
+        .expect_err("rebound rdf:reifies must be rejected at lower time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not resolve to rdf:reifies"),
+            "expected prefix-rejection diagnostic, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // M4.5 — CONSTRUCT boundary
+    // =========================================================================
+
+    #[test]
+    fn m45_construct_with_annotation_in_template_preserves_reifier() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} }
+             WHERE { ex:alice ex:worksFor ex:acme }",
+        )
+        .expect("annotation in CONSTRUCT template should lower");
+        let template = query.output.construct_template().unwrap();
+        assert_eq!(template.patterns().len(), 2);
+        assert_eq!(template.reifications().len(), 1);
+        let attachment = &template.reifications()[0];
+        assert_eq!(attachment.triple, 0);
+        assert_eq!(template.patterns()[1].s, attachment.reifier);
+        let reifier = attachment.reifier.as_var().unwrap();
+        assert_eq!(template.bnode_vars.len(), 1);
+        assert!(template.bnode_vars.contains(&reifier));
+        assert!(!template.names_graphs());
+    }
+
+    #[test]
+    fn m45_construct_without_annotation_in_template_works_with_annotation_where() {
+        // Annotation in WHERE filters the matches; template projects only
+        // ordinary triples. This must succeed.
+        lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?p ex:knows ex:acme }
+             WHERE { ?p ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("CONSTRUCT-without-annotation-in-template + annotation-in-WHERE should lower");
+    }
+
+    #[test]
+    fn m43_does_not_trip_user_authored_reifies_firewall() {
+        // An @annotation lowering legitimately produces internal
+        // f:reifies* fan-out at execute time via
+        // expand_edge_annotation_patterns. The firewall must NOT
+        // reject it at lower time, because the f:reifies* triples
+        // don't appear in the IR yet.
+        let result = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"x\" |} . }",
+        );
+        assert!(
+            result.is_ok(),
+            "lower should not be rejected by the firewall"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pragma_tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_query::parse::encode::MemoryEncoder;
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        let mut vars = VarRegistry::new();
+        lower_sparql(&output.ast.unwrap(), &encoder, &mut vars)
+    }
+
+    #[test]
+    fn pragma_reasoning_owl2rl_sets_query_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s a ex:Student }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert!(query.reasoning.has_reasoning());
+    }
+
+    /// Every query form carries the pragma into the IR the executor reads.
+    #[test]
+    fn pragma_include_system_facts_reaches_every_query_form() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            let on = lower_query(&format!("# PRAGMA include-system-facts: true\n{form}")).unwrap();
+            assert!(on.include_system_facts, "{form}");
+            let off = lower_query(form).unwrap();
+            assert!(!off.include_system_facts, "{form}");
+        }
+    }
+
+    /// Every query form carries the request's union switch into the IR, and
+    /// a query without the pragma leaves it to the ledger.
+    #[test]
+    fn pragma_union_default_graph_reaches_every_query_form() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            for on in [true, false] {
+                let query =
+                    lower_query(&format!("# PRAGMA union-default-graph: {on}\n{form}")).unwrap();
+                assert_eq!(query.union_default_graph, Some(on), "{form}");
+            }
+            assert_eq!(
+                lower_query(form).unwrap().union_default_graph,
+                None,
+                "{form}"
+            );
+        }
+    }
+
+    /// Every query form reads a list's members as values of its property;
+    /// SPARQL has no way to ask for its RDF cells.
+    #[test]
+    fn every_query_form_reads_list_members() {
+        for form in [
+            "SELECT * WHERE { ?s ?p ?o }",
+            "ASK { ?s ?p ?o }",
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "DESCRIBE ?s WHERE { ?s ?p ?o }",
+        ] {
+            assert!(!lower_query(form).unwrap().rdf_list_view, "{form}");
+        }
+    }
+
+    #[test]
+    fn pragma_reasoning_none_disables() {
+        let query = lower_query(
+            "# PRAGMA reasoning: none
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.is_reasoning_disabled());
+    }
+
+    #[test]
+    fn pragma_reasoning_multi_mode_merges() {
+        let query = lower_query(
+            "# PRAGMA reasoning: rdfs, datalog
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.rdfs);
+        assert!(query.reasoning.modes.datalog);
+        assert!(!query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn no_pragma_leaves_default_config() {
+        let query = lower_query("SELECT * WHERE { ?s ?p ?o }").unwrap();
+        assert!(!query.reasoning.has_reasoning());
+    }
+
+    #[test]
+    fn pragma_reasoning_applies_to_ask() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             ASK { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn pragma_reasoning_unknown_mode_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: owl3xl
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_empty_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_none_combined_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: none, rdfs
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_sets_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             # PRAGMA reasoning-max-facts: 20000000
+             # PRAGMA reasoning-max-seconds: 300
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert_eq!(query.reasoning.modes.max_facts, Some(20_000_000));
+        assert_eq!(query.reasoning.modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_without_mode_is_carried() {
+        // A budget pragma alone doesn't enable reasoning, but it must survive
+        // lowering so a ledger-config default mode runs under it.
+        let query = lower_query(
+            "# PRAGMA reasoning-max-facts: 5
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(!query.reasoning.modes.has_any_enabled());
+        assert_eq!(query.reasoning.modes.max_facts, Some(5));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_invalid_number_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning-max-facts: lots
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+
+        let err = lower_query(
+            "# PRAGMA reasoning-max-seconds:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod base_resolution_tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_core::FlakeValue;
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_db_query::ir::{Expression, Function, GraphName, Pattern};
+    use fluree_db_query::parse::encode::MemoryEncoder;
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let ast = output.ast.unwrap();
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        let mut vars = VarRegistry::new();
+        lower_sparql(&ast, &encoder, &mut vars)
+    }
+
+    #[test]
+    fn base_resolves_constant_graph_iri_at_lowering() {
+        // The `graph-exist` mechanism: `GRAPH <data-g1.ttl>` under a document
+        // BASE lowers to the absolute registry-key IRI.
+        let query = lower_query(
+            "BASE <http://example.org/tests/query.rq>
+             SELECT * WHERE { GRAPH <data-g1.ttl> { ?s ?p ?o } }",
+        )
+        .unwrap();
+
+        let Pattern::Graph { name, .. } = &query.patterns[0] else {
+            panic!("expected graph pattern, got {:?}", query.patterns[0]);
+        };
+        let GraphName::Iri(iri) = name else {
+            panic!("expected constant graph name, got {name:?}");
+        };
+        assert_eq!(iri.as_ref(), "http://example.org/tests/data-g1.ttl");
+    }
+
+    #[test]
+    fn base_resolves_iri_function_constant_argument() {
+        // Expression-semantics D8 / W3C iri01: IRI()/URI() constant string
+        // arguments are base-resolved by a lowering-time constant fold.
+        let query = lower_query(
+            "BASE <http://example.org/>
+             SELECT (IRI(\"iri\") AS ?i) (URI(\"uri\") AS ?u) WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+
+        let folded: Vec<String> = collect_iri_call_constants(&query);
+        assert_eq!(
+            folded,
+            vec![
+                "http://example.org/iri".to_string(),
+                "http://example.org/uri".to_string()
+            ]
+        );
+    }
+
+    /// Collect the constant string arguments of every `Function::Iri` call in
+    /// SELECT-expression binds (order of appearance).
+    fn collect_iri_call_constants(query: &Query) -> Vec<String> {
+        let mut out = Vec::new();
+        for pattern in &query.patterns {
+            let Pattern::Bind { expr, .. } = pattern else {
+                continue;
+            };
+            if let Expression::Call { func, args } = expr {
+                if matches!(func, Function::Iri) {
+                    if let Some(Expression::Const(FlakeValue::String(s))) = args.first() {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base_resolves_relative_prefix_namespace() {
+        // W3C base-prefix-2 shape: `PREFIX : <#>` resolves against BASE
+        // before prefixed-name expansion.
+        let query = lower_query(
+            "BASE <http://example.org/x/>
+             PREFIX : <#>
+             SELECT * WHERE { ?s :p ?o }",
+        )
+        .unwrap();
+
+        let Pattern::Triple(t) = &query.patterns[0] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[0]);
+        };
+        let Ref::Iri(p) = &t.p else {
+            panic!("expected un-encoded IRI predicate, got {:?}", t.p);
+        };
+        assert_eq!(p.as_ref(), "http://example.org/x/#p");
+    }
+
+    #[test]
+    fn no_base_keeps_relative_iris_verbatim() {
+        // Without BASE, relative references keep the historical passthrough
+        // (ledger-local names).
+        let query = lower_query("SELECT * WHERE { GRAPH <local-graph> { ?s ?p ?o } }").unwrap();
+
+        let Pattern::Graph { name, .. } = &query.patterns[0] else {
+            panic!("expected graph pattern, got {:?}", query.patterns[0]);
+        };
+        let GraphName::Iri(iri) = name else {
+            panic!("expected constant graph name, got {name:?}");
+        };
+        assert_eq!(iri.as_ref(), "local-graph");
+    }
+
+    #[test]
+    fn resolve_dataset_clause_expands_and_base_resolves() {
+        // PR-G2 plumbing: FROM / FROM NAMED IRIs come back prefix-expanded
+        // and base-resolved; the guard that rejects execution is elsewhere.
+        let output = parse_sparql(
+            "BASE <http://example.org/tests/query.rq>
+             PREFIX g: <http://example.org/graphs/>
+             SELECT * FROM <data-g1.ttl> FROM NAMED g:g2 WHERE { ?s ?p ?o }",
+        );
+        let ast = output.ast.expect("parse");
+
+        let resolved = resolve_dataset_clause(&ast).unwrap().expect("clause");
+        assert_eq!(
+            resolved
+                .default_graphs
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["http://example.org/tests/data-g1.ttl"]
+        );
+        assert_eq!(
+            resolved
+                .named_graphs
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["http://example.org/graphs/g2"]
+        );
+        assert_eq!(resolved.to_graph, None);
+    }
+
+    /// Under a `BASE`, a ledger address that names its branch or a time is
+    /// no relative reference, so it is taken as written; a bare name is one,
+    /// and BASE resolves it, as it resolves `data-g1.ttl`.
+    #[test]
+    fn base_leaves_an_address_with_a_branch_or_time_as_written() {
+        let clause = |from: &str| {
+            let output = parse_sparql(&format!(
+                "BASE <http://example.org/tests/> SELECT * FROM <{from}> WHERE {{ ?s ?p ?o }}"
+            ));
+            let ast = output.ast.expect("parse");
+            let resolved = resolve_dataset_clause(&ast).unwrap().expect("clause");
+            resolved.default_graphs[0].to_string()
+        };
+        for as_written in [
+            "my_db:main",
+            "mydb@t:3",
+            "my_db:main@t:3",
+            "tenant/db@t:3",
+            "my_db:main#config",
+            "mydb@t:abc",
+        ] {
+            assert_eq!(clause(as_written), as_written, "{as_written}");
+        }
+        for (relative, resolved) in [
+            ("mydb", "http://example.org/tests/mydb"),
+            ("data-g1.ttl", "http://example.org/tests/data-g1.ttl"),
+            ("#g", "http://example.org/tests/#g"),
+        ] {
+            assert_eq!(clause(relative), resolved, "{relative}");
+        }
+    }
+
+    #[test]
+    fn resolve_dataset_clause_none_without_clause() {
+        let output = parse_sparql("SELECT * WHERE { ?s ?p ?o }");
+        let ast = output.ast.expect("parse");
+        assert_eq!(resolve_dataset_clause(&ast).unwrap(), None);
+    }
+}

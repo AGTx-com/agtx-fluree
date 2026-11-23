@@ -1,0 +1,756 @@
+//! R2RML Provider Traits
+//!
+//! These traits define the interface for loading R2RML mappings and
+//! accessing underlying Iceberg tables during query execution.
+
+use crate::error::Result;
+use async_trait::async_trait;
+use fluree_db_tabular::ColumnBatch;
+use futures::stream::Stream;
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// A streamed sequence of column batches from a table scan.
+///
+/// Batches arrive as data files are read and decoded, so a consumer that
+/// materializes and aggregates incrementally holds only O(in-flight files)
+/// in memory instead of the whole table. The stream is `'static` + `Send` so
+/// an operator can own it across `next_batch` calls.
+pub type ColumnBatchStream = Pin<Box<dyn Stream<Item = Result<ColumnBatch>> + Send + Sync>>;
+
+// Re-export from fluree-db-r2rml for convenience
+pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+// The dialect-neutral plan a whole block lowers to (see `sql_lane`).
+pub use fluree_db_tabular::plan::{PushdownCapabilities, RelPlan, RelSource};
+pub use fluree_db_tabular::BatchSchema;
+
+/// Comparison operator for a pushed-down scan filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    /// Set membership (`?x IN (c1..cN)`), lowered from a `FILTER … IN` or a
+    /// single-var `VALUES` block. The filter's `value` is a [`ScanValue::Set`];
+    /// the provider builds an Iceberg `Expression::In`, which keeps a file iff
+    /// ANY member could lie within the file's column bounds (a superset — the
+    /// in-engine FILTER / VALUES join still enforces exact membership). Never
+    /// paired with a scalar `value`; never mapped to a scalar `ComparisonOp`.
+    In,
+}
+
+/// A literal value for a pushed-down scan filter.
+///
+/// Limited to types that prune safely against Iceberg column min/max bounds and
+/// that the Arrow row filter can evaluate: date/int/bool, strings (lexicographic,
+/// e.g. equality on a name/code column), plus double and decimal — the last two
+/// gated by `FLUREE_ICEBERG_NUMERIC_STATS` and only ever produced from a numeric
+/// FILTER predicate (see `to_scan_value`). A missed push is never wrong: the
+/// in-engine FILTER remains the authority.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanValue {
+    Bool(bool),
+    Int(i64),
+    /// Days since 1970-01-01 (matches Iceberg date storage).
+    Date(i32),
+    /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
+    Str(String),
+    /// An `xsd:double`/`xsd:float` value — pushed against a physically-`double`
+    /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
+    /// Iceberg compare treats a NaN operand as incomparable → keep).
+    Double(f64),
+    /// A decimal value as its unscaled i128 and scale (mirrors
+    /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
+    /// may differ and is normalized during comparison. There is deliberately no
+    /// precision: a literal has none, and the column's own `decimal(p, s)` is
+    /// what any consumer that needs one must use.
+    Decimal {
+        unscaled: i128,
+        scale: i8,
+    },
+    /// A raw column value recovered by reversing a subject template (bound-subject
+    /// pushdown). The physical type is unknown here — it is resolved against the
+    /// Iceberg field type when the pushdown predicate is built, and the pushdown is
+    /// skipped for field types not yet supported. The R2RML operator still enforces
+    /// the subject equality, so a skipped or imperfect push is never wrong.
+    TemplateKey(String),
+    /// A bounded set of values for a [`ScanCmpOp::In`] membership filter: from
+    /// a `FILTER … IN` or single-var `VALUES` (scalar members), or from subject
+    /// IRIs reversed through a subject template (`TemplateKey` members, one set
+    /// per key column). Never a nested `Set`. It is never wrapped in an
+    /// [`ObjectConstant`] (a constant object is a single scalar term), so the
+    /// scalar-only match sites treat it defensively as "not a scalar constant".
+    Set(Vec<ScanValue>),
+    /// An `xsd:dateTime` value as microseconds since the Unix epoch, carrying
+    /// whether the source literal was timezone-AWARE (item 10). `tz = true` (an
+    /// explicit offset, e.g. `…Z`/`+05:00`) means the micros are in the UTC frame
+    /// and only push against a physically-`timestamptz` column; `tz = false` (a
+    /// naive literal) means wall-clock micros and only push against a physically
+    /// `timestamp` column. The frame is matched at pushdown-build time so the
+    /// micros are directly comparable to the Iceberg manifest bounds; a mismatch
+    /// declines the push (the in-engine FILTER stays the authority). Pruning is
+    /// MANIFEST-level only — see the row-group note in `fluree-db-iceberg`.
+    Timestamp {
+        micros: i64,
+        tz: bool,
+    },
+}
+
+/// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the
+/// R2RML operator so results are correct regardless of scan pushdown.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectConstant {
+    /// A literal object — loose value match (string/integer/boolean/date). Emits
+    /// a scan filter for row-group + row pruning in addition to operator enforcement.
+    Scalar(ScanValue),
+    /// A bound IRI object — exact IRI match, e.g. a reference to a parent entity
+    /// (`?s edw:geography <geo/1>`). Compared against the materialized IRI; the
+    /// column-level scan filter is not applied to these yet (a FK-key pushdown
+    /// needs subject-template reversal), so only the operator enforces them.
+    Iri(String),
+    /// A decimal / arbitrary-precision integer object — numeric (scale-insensitive)
+    /// match, so `9.99` matches a column materialized as `9.990`. Operator-enforced
+    /// only (no scan pushdown yet, which would need decimal-aware Iceberg predicates).
+    Decimal(bigdecimal::BigDecimal),
+    /// A double (xsd:double / xsd:float) object — exact f64 value match.
+    /// Operator-enforced only (no scan pushdown yet).
+    Double(f64),
+}
+
+/// A predicate pushed down to the Iceberg scan for file pruning.
+///
+/// Resolved to a concrete table column (the R2RML operator maps the query
+/// variable → predicate IRI → column). The provider turns this into an Iceberg
+/// `Expression` for conservative file-level min/max pruning; the in-engine
+/// FILTER still runs, so a missed push is only a perf loss, never wrong results.
+#[derive(Debug, Clone)]
+pub struct ScanFilter {
+    pub column: String,
+    pub op: ScanCmpOp,
+    pub value: ScanValue,
+}
+
+/// The data files a scan with some filters would read and skip, from its scan
+/// plan alone ([`R2rmlTableProvider::scan_file_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanFileCounts {
+    /// Files the scan would read.
+    pub selected: u64,
+    /// Files the filters let it skip.
+    pub pruned: u64,
+}
+
+/// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
+/// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
+/// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
+/// `lower_bound(sort_column)` ascending), keeps a running k-th bound, and stops
+/// once no unread file can beat it — reading far fewer than the whole table.
+///
+/// A pure perf optimization: the scan still streams a strict SUPERSET of the true
+/// top-k (it only skips files that provably cannot contribute), and the
+/// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
+/// Ignored by the provider unless `sort_column` resolves to a pushable scalar
+/// column of the scanned table — and, for `ascending`, unless that column is
+/// REQUIRED (non-nullable) in the Iceberg schema, since SPARQL orders unbound
+/// values FIRST under ASC and a nullable column could hide an unread top-k row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTopK {
+    /// The primary sort column (an R2RML-mapped table column name).
+    pub sort_column: String,
+    /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
+    pub k: usize,
+    /// `true` for an `ASC` sort (admitted only for a required column; the provider
+    /// re-checks nullability), `false` for `DESC`.
+    pub ascending: bool,
+    /// How the engine orders the column's terms. The provider prunes by the
+    /// column's bounds only when the physical type's bounds sort the same way:
+    /// an un-annotated column's `"10"` sorts before `"9"`, which no integer bound
+    /// does, and an `xsd:integer` over a string column's `"9"` bound sits above
+    /// its `"100"`.
+    pub order: TermOrder,
+    /// The columns a row must hold non-null to yield a solution (the
+    /// subject's, and each same-subject star member's). A row with a NULL in
+    /// one is dropped after the scan, so the bound counts only rows non-null
+    /// in all of them; a provider that cannot check one of them must not
+    /// prune.
+    pub required_columns: Vec<String>,
+}
+
+/// The order the engine sorts an object map's terms in, from its datatype. A
+/// datatype with none of these (`xsd:time`, `xsd:gYear`, a custom IRI) is
+/// never offered to a scan as a top-k.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermOrder {
+    /// By code point: an un-annotated or `xsd:string` literal (the rendered
+    /// cell), a language-tagged literal, an IRI.
+    Lexical,
+    /// By number: the `xsd:integer` family, `xsd:decimal`, `xsd:double`,
+    /// `xsd:float`.
+    Numeric,
+    /// `xsd:date`, by day.
+    Date,
+    /// `xsd:dateTime`, by instant.
+    Instant,
+    /// `xsd:boolean`, false before true.
+    Boolean,
+}
+
+/// The table state a time-pinned graph-source query reads, in the source
+/// format's own terms (an Iceberg snapshot id or commit time), as opposed to
+/// the Fluree `t` the scan methods' `as_of_t` carries.
+///
+/// A pin applies to every table of the source for the whole query, so a scan
+/// and a count cannot read different snapshots. An instant selects the latest
+/// snapshot committed at or before it; an instant before the oldest retained
+/// snapshot, or an unknown id, is an error — never the current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTime {
+    /// An exact snapshot by the source format's own identifier.
+    SnapshotId(i64),
+    /// The latest snapshot committed at or before this instant, epoch
+    /// milliseconds.
+    AsOfTimestampMs(i64),
+}
+
+/// Provider for compiled R2RML mappings.
+///
+/// This trait is used by the R2RML operator to load mappings at query time.
+/// Implementations typically consult the nameservice graph source records and cache
+/// compiled mappings.
+///
+/// Note: Uses `?Send` for compatibility with Iceberg storage layer which
+/// is designed for WASM compatibility. The query engine handles this by
+/// executing R2RML operations within a single task.
+#[async_trait]
+pub trait R2rmlProvider: Debug + Send + Sync {
+    /// Check if a graph source has an R2RML mapping.
+    ///
+    /// This is a lightweight check that doesn't load the full mapping.
+    /// Used by GraphOperator to determine if patterns should be rewritten
+    /// to R2RML scans.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph_source_id` - The graph source alias (e.g., "openflights-gs:main")
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the graph source exists and has an R2RML mapping,
+    /// `Ok(false)` if the id names no graph source (including an IRI that is
+    /// no graph-source id at all, and a dropped source).
+    ///
+    /// # Errors
+    ///
+    /// Two kinds, and callers tell them apart, so an implementor must return
+    /// the right one:
+    ///
+    /// - The id names a graph source that no query reads as a graph: a mapped
+    ///   source with no mapping, an index source (BM25, vector, geo), or a
+    ///   family this build has no reader for. The error must be one for which
+    ///   [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    ///   is true. A query that names such a source in its text fails with it;
+    ///   a `GRAPH ?g` whose `?g` took the IRI from data reads the IRI as a
+    ///   graph outside the dataset and yields no rows for that binding. An
+    ///   `Ok(false)` here would query the source as an empty native graph, and
+    ///   any other error would fail a query whose data merely mentions it.
+    /// - The answer cannot be determined, for example because the nameservice
+    ///   is unavailable. This must NOT be an unreadable-source error: every
+    ///   caller fails the query rather than reading a graph source as an empty
+    ///   native graph.
+    ///
+    /// A provider that serves only mapped sources it holds (a test double, a
+    /// provisional mapping) never names an unreadable source and need not
+    /// return the first kind.
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> Result<bool>;
+
+    /// Get the compiled R2RML mapping for a graph source alias.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph_source_id` - The graph source alias (e.g., "openflights-gs:main")
+    /// * `as_of_t` - The transaction time for time-travel queries.
+    ///
+    /// In dataset (multi-ledger) mode, there is no meaningful "dataset t".
+    /// Callers should pass `None` unless the query provides an unambiguous
+    /// as-of anchor.
+    ///
+    /// # Returns
+    ///
+    /// The compiled mapping, or an error if the graph source doesn't exist or
+    /// the mapping couldn't be loaded. A mapping that defines no
+    /// `rr:TriplesMap` is an error for which
+    /// [`QueryError::is_unreadable_graph_source`](crate::error::QueryError::is_unreadable_graph_source)
+    /// is true: [`Self::has_r2rml_mapping`] cannot see an empty mapping
+    /// without compiling it, so the data-bound `GRAPH ?g` arm relies on this
+    /// error to yield no rows for such a source.
+    async fn compiled_mapping(
+        &self,
+        graph_source_id: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Arc<CompiledR2rmlMapping>>;
+
+    /// Per-table build watermark for a materialize (twin) build: the pinned
+    /// snapshot of every table this provider has loaded for `graph_source_id`
+    /// during the current build. Returns EMPTY by default; a real Iceberg-backed
+    /// provider overrides it to report its catalog session's pins. The bulk
+    /// builder fails loud when this is empty for a non-empty table set, so a
+    /// provider that forgets to override cannot publish an unstamped twin.
+    fn build_watermark(
+        &self,
+        graph_source_id: &str,
+    ) -> std::collections::HashMap<String, TableWatermark> {
+        let _ = graph_source_id;
+        std::collections::HashMap::new()
+    }
+
+    /// MAJOR-2 (#1529 review): assert the snapshots read during a materialize build
+    /// are trustworthy — every table stayed on ONE `metadata_location`, and pinning
+    /// is actually in effect. Returns `Err(R2rmlError::BuildSnapshotIntegrity)` when a
+    /// build must be refused. Default: `Ok` — a non-Iceberg / test provider has no
+    /// moving-snapshot hazard. A real Iceberg-backed provider overrides this to
+    /// refuse when the loadTable cache is disabled (pinning is then a no-op) or when
+    /// a table yielded a second distinct `metadata_location` mid-build (the source
+    /// committed and the twin's stamped watermark would not describe its contents).
+    fn verify_build_snapshot_integrity(
+        &self,
+        graph_source_id: &str,
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        let _ = graph_source_id;
+        Ok(())
+    }
+}
+
+/// The pinned snapshot of one Iceberg table at build time — the twin's per-table
+/// watermark entry (DEC-003). `metadata_location` is the authoritative pin (it
+/// uniquely identifies the table state and is always available); `snapshot_id` /
+/// `sequence_number` are the Iceberg snapshot identifiers captured from the
+/// parsed table metadata (typed `Option`, best-effort), which the delta-sync
+/// (Deliverable 3) snapshot diff needs.
+///
+/// Serializable so the twin's completion stamp can carry the watermark vector as
+/// JSON in a commit's `txn_meta`, and delta-sync can read it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableWatermark {
+    /// Iceberg `metadata.json` location pinned for this table this build.
+    pub metadata_location: String,
+    /// Current snapshot id of the pinned metadata, if parsed.
+    pub snapshot_id: Option<i64>,
+    /// Sequence number of the current snapshot, if parsed.
+    pub sequence_number: Option<i64>,
+}
+
+/// The row order a table scan owes the query above it.
+///
+/// A query with no ORDER BY may return its rows in any order, but a client
+/// paging it with LIMIT/OFFSET needs every execution to return them in the same
+/// order, or the pages skip and repeat rows. A scan therefore emits a fixed
+/// order unless the planner has shown that no slice in the query can observe
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanOrder {
+    /// The same rows in the same order on every execution over one snapshot.
+    /// The default: whatever cannot prove otherwise asks for this.
+    #[default]
+    Deterministic,
+    /// Any order, e.g. as the table's file reads finish. Chosen only for a query
+    /// with no LIMIT or OFFSET anywhere in it.
+    Any,
+}
+
+/// Provider for scanning Iceberg tables underlying R2RML graph sources.
+///
+/// This trait is separated from `R2rmlProvider` to allow different
+/// implementations for mapping loading vs table access. In practice,
+/// both may be implemented by the same struct.
+///
+/// Note: Uses `?Send` for compatibility with Iceberg storage layer which
+/// is designed for WASM compatibility. The query engine handles this by
+/// executing R2RML operations within a single task.
+#[async_trait]
+pub trait R2rmlTableProvider: Debug + Send + Sync {
+    /// Scan an Iceberg table and return column batches.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph_source_id` - The graph source alias
+    /// * `table_name` - The logical table name from the R2RML mapping
+    /// * `projection` - Column names to project (for pushdown)
+    /// * `as_of_t` - Transaction time for snapshot selection.
+    ///
+    /// In dataset (multi-ledger) mode, there is no meaningful "dataset t".
+    /// Callers should pass `None` unless the query provides an unambiguous
+    /// as-of anchor.
+    ///
+    /// # Returns
+    ///
+    /// A [`ColumnBatchStream`] yielding column batches as data files are read,
+    /// so a streaming consumer never holds the whole table in memory.
+    /// `filters` are conservative pushdown predicates (resolved to columns) for
+    /// Iceberg file pruning. Implementations may ignore them (correctness is
+    /// preserved by the in-engine FILTER) but honoring them skips data files.
+    /// `topk`, when set, is a single-column DESC `ORDER BY … LIMIT` directive
+    /// (PR-5): the implementation MAY read only the files that can hold the top-k
+    /// and stream a superset of them; ignoring it is always correct (the sort
+    /// above is authoritative).
+    async fn scan_table(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> Result<ColumnBatchStream>;
+
+    /// [`Self::scan_table`] under an explicit [`ScanOrder`], for the query
+    /// whose cancellation and memory handle is `memory`. `scan_table` owes
+    /// [`ScanOrder::Deterministic`]; a provider that can stream faster in
+    /// [`ScanOrder::Any`] overrides this, and the default ignores the order and
+    /// scans deterministically.
+    ///
+    /// Data the provider holds before the stream hands it on (files decoded
+    /// ahead of the consumer) is the query's memory: a provider that reads
+    /// ahead records it on `memory`'s counter (see
+    /// [`MemoryCharge`](fluree_db_core::MemoryCharge)) and releases it as the
+    /// stream yields it or drops. The default reads nothing ahead and ignores
+    /// it, as does a caller that passes a disabled handle.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+        order: ScanOrder,
+        memory: &fluree_db_core::QueryCancellation,
+    ) -> Result<ColumnBatchStream> {
+        let _ = (order, memory);
+        self.scan_table(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+        )
+        .await
+    }
+
+    /// The table's exact live row count from Iceberg manifest metadata — **when,
+    /// and only when, it provably equals a full-scan count** of the rows a bare
+    /// `COUNT(*)` would produce. Lets the fused-aggregate COUNT shortcut answer
+    /// from the manifest `record_count` sum instead of decoding every data file.
+    ///
+    /// `non_null_cols` are the columns that must be non-null for a row to be
+    /// counted (the subject-template key columns + any projected object columns).
+    /// Returns `Some(n)` only if: (1) the snapshot carries **no delete
+    /// manifests** (a merge-on-read delete would make the record_count sum an
+    /// over-count), and (2) **every** `non_null_col` is provably zero-null from
+    /// the manifest stats — an absent/unknown null count is treated as unknown,
+    /// NOT zero. Otherwise returns `Ok(None)` and the caller falls back to the
+    /// scan (which is delete/null-correct). The default is `Ok(None)`, so a
+    /// provider without manifest metadata (or a non-Iceberg source) always falls
+    /// back to the scan.
+    async fn table_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        non_null_cols: &[String],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
+        Ok(None)
+    }
+
+    /// The keys the source itself reports for `table_name`: each a list of
+    /// column names, by their current names, no two of the table's live rows
+    /// agree on (rows with a NULL in any of them aside). A caller unites them
+    /// with the keys the mapping declares
+    /// ([`fluree_db_r2rml::TableKeys::with_reported`]) to decide whether a
+    /// map's subjects are unique and its rows can skip deduplication
+    /// ([`fluree_db_r2rml::TriplesMap::subject_unique_under`]).
+    ///
+    /// Report only what the source guarantees for the snapshot `as_of_t`
+    /// selects; a key that may not hold makes queries return duplicate
+    /// solutions. `Ok(None)` reports none (the default): every map over the
+    /// table is then deduplicated unless the mapping declares a key, which is
+    /// always correct.
+    async fn table_keys(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<Vec<Vec<String>>>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// The table's row count when the provider already holds it (a cached scan
+    /// plan, say), without reading anything to learn it. A caller deciding
+    /// whether a table is small enough to cache whole asks first. `Ok(None)`
+    /// when the provider does not know (the default).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let _ = (graph_source_id, table_name, as_of_t);
+        Ok(None)
+    }
+
+    /// How many data files a scan of `table_name` with `filters` would read and
+    /// skip, from its scan plan alone: no data file is read. A caller pushing
+    /// keys asks before paying for a keyed read whether it skips anything.
+    /// `Ok(None)` when the provider cannot tell (the default).
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        as_of_t: Option<i64>,
+    ) -> Result<Option<ScanFileCounts>> {
+        let _ = (graph_source_id, table_name, filters, as_of_t);
+        Ok(None)
+    }
+
+    /// What this provider can execute for a whole pushed-down block over
+    /// `graph_source_id`, or `None` when the source cannot run a
+    /// [`RelPlan`] (an Iceberg source, or no source at all). Consulted once at
+    /// open by the SQL pushdown lane before it lowers anything.
+    async fn pushdown_capabilities(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<Option<PushdownCapabilities>> {
+        let _ = graph_source_id;
+        Ok(None)
+    }
+
+    /// The probed column schema of one relation of `graph_source_id`, for a
+    /// provider that can execute plans (it caches the probe). The lowering
+    /// asks only for relations a typed literal has to be compared against.
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &RelSource,
+    ) -> Result<Option<Arc<BatchSchema>>> {
+        let _ = (graph_source_id, source);
+        Ok(None)
+    }
+
+    /// Execute one pushed-down block and stream its rows. Returns the
+    /// statement actually sent (for the query log and explain output) with
+    /// the stream. Only called when [`Self::pushdown_capabilities`] was
+    /// `Some`; the default refuses.
+    async fn execute_plan(
+        &self,
+        graph_source_id: &str,
+        plan: &RelPlan,
+    ) -> Result<(String, ColumnBatchStream)> {
+        let _ = plan;
+        Err(crate::error::QueryError::Internal(format!(
+            "graph source '{graph_source_id}' cannot execute a pushed-down plan"
+        )))
+    }
+
+    /// Warm the per-query catalog session + caches for a known set of tables
+    /// CONCURRENTLY, so a following *serial* scan loop (which resolves one table
+    /// per `scan_table`) overlaps the per-table `loadTable` GETs instead of
+    /// summing them. Side-effect-only: returns nothing, and a resolution failure
+    /// here MUST be swallowed by the implementation — the real scan re-resolves
+    /// and surfaces any error — so this only ever removes latency, never changes
+    /// results or error behavior. Callers gate it on
+    /// [`super::parallel_catalog_resolution_enabled`]. The default is a no-op (a
+    /// provider without a remote catalog has nothing to warm).
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        let _ = (graph_source_id, table_names);
+    }
+
+    /// Pin every read of `graph_source_id` in this query to `time`. Called
+    /// before execution for each time-specified source in the dataset; the
+    /// provider then selects that state in `scan_table` and `table_row_count`
+    /// alike. The default REFUSES: a provider that cannot honor a pin must not
+    /// let the query proceed against its current state.
+    fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> Result<()> {
+        let _ = time;
+        Err(crate::error::QueryError::UnsupportedFeature(format!(
+            "graph source '{graph_source_id}' does not support time-pinned reads"
+        )))
+    }
+}
+
+// =============================================================================
+// No-Op Providers (for when GraphSourcePublisher isn't available)
+// =============================================================================
+
+/// A no-op R2RML provider that always returns false/errors.
+///
+/// This is used when the nameservice doesn't support GraphSourcePublisher,
+/// allowing queries to execute without R2RML support. If R2RML features are
+/// actually needed, an error will be returned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOpR2rmlProvider;
+
+impl NoOpR2rmlProvider {
+    /// Create a new no-op provider.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl R2rmlProvider for NoOpR2rmlProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> Result<bool> {
+        // Always return false - no R2RML mappings available
+        Ok(false)
+    }
+
+    async fn compiled_mapping(
+        &self,
+        graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> Result<Arc<CompiledR2rmlMapping>> {
+        Err(crate::error::QueryError::Internal(format!(
+            "R2RML provider not available for graph source '{graph_source_id}'. \
+             This Fluree instance does not support graph source operations."
+        )))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for NoOpR2rmlProvider {
+    async fn scan_table(
+        &self,
+        graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> Result<ColumnBatchStream> {
+        Err(crate::error::QueryError::Internal(format!(
+            "R2RML table scanning not available for graph source '{graph_source_id}'. \
+             This Fluree instance does not support graph source operations."
+        )))
+    }
+}
+
+/// The keys that decide whether a map over `table_name` can skip removing
+/// duplicate solutions: what the mapping declares on the table (`f:key`),
+/// united with what the source reports ([`R2rmlTableProvider::table_keys`]).
+/// Pass the result to [`fluree_db_r2rml::TriplesMap::subject_unique_under`].
+///
+/// **The only way a lane obtains table keys for a uniqueness decision.** Never
+/// read [`CompiledR2rmlMapping::declared_keys`] directly for one: the
+/// provider's `table_keys` is also where a declared key is checked against the
+/// table's schema (a column the table lacks, a floating-point or nested
+/// column) and the query refused, so a lane that read the declaration itself
+/// would trust a key the table cannot hold.
+pub async fn effective_table_keys(
+    provider: &dyn R2rmlTableProvider,
+    mapping: &CompiledR2rmlMapping,
+    graph_source_id: &str,
+    table_name: &str,
+    as_of_t: Option<i64>,
+) -> Result<fluree_db_r2rml::TableKeys> {
+    let reported = provider
+        .table_keys(graph_source_id, table_name, as_of_t)
+        .await?;
+    Ok(mapping.declared_keys(table_name).with_reported(reported))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_r2rml::{TableKeys, TriplesMap};
+
+    /// Reports `reported` for every table, or refuses when it is `Err`.
+    #[derive(Debug)]
+    struct KeyedProvider {
+        reported: std::result::Result<Option<Vec<Vec<String>>>, String>,
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for KeyedProvider {
+        async fn scan_table(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> Result<ColumnBatchStream> {
+            unreachable!("keys are not read from rows")
+        }
+
+        async fn table_keys(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _as_of_t: Option<i64>,
+        ) -> Result<Option<Vec<Vec<String>>>> {
+            self.reported
+                .clone()
+                .map_err(crate::error::QueryError::InvalidQuery)
+        }
+    }
+
+    fn mapping() -> CompiledR2rmlMapping {
+        CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("<#Current>", "sets.customers_current")
+                .with_subject_template("http://example.org/customer/{customer_id}")
+                .with_declared_key(["customer_id"]),
+            TriplesMap::new("<#History>", "sets.customers_history")
+                .with_subject_template("http://example.org/customer/{customer_id}"),
+        ])
+    }
+
+    async fn keys(provider: &KeyedProvider, table: &str) -> Result<TableKeys> {
+        effective_table_keys(provider, &mapping(), "gs", table, None).await
+    }
+
+    #[tokio::test]
+    async fn effective_keys_unite_declared_and_reported() {
+        let none = KeyedProvider { reported: Ok(None) };
+        assert_eq!(
+            keys(&none, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"]])
+        );
+        assert!(keys(&none, "sets.customers_history")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let reported = KeyedProvider {
+            reported: Ok(Some(vec![vec!["row_id".to_string()]])),
+        };
+        assert_eq!(
+            keys(&reported, "sets.customers_current").await.unwrap(),
+            TableKeys::new([["customer_id"], ["row_id"]])
+        );
+        assert_eq!(
+            keys(&reported, "sets.customers_history").await.unwrap(),
+            TableKeys::new([["row_id"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_refusal_is_the_lane_s_refusal() {
+        // A declared key the provider finds unusable refuses the query; the
+        // declaration alone is never handed back in its place.
+        let refusing = KeyedProvider {
+            reported: Err("a key names column \"score\" of type Float64".to_string()),
+        };
+        let err = keys(&refusing, "sets.customers_current")
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains("Float64"), "{err}");
+    }
+}

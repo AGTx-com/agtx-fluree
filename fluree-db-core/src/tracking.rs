@@ -1,0 +1,880 @@
+//! Query/transaction execution tracking
+//!
+//! Internal accumulator stores **micro-fuel** (1 fuel = 1000 micro-fuel).
+//! The user-facing fuel value is decimal: micro-fuel / 1000, rounded to 3 places.
+//!
+//! All `TrackingOptions::max_fuel` and `FuelExceededError` field values are
+//! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
+//! user-facing decimal representations.
+
+use crate::clock::Instant;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use thiserror::Error;
+
+/// Conversion factor between fuel and micro-fuel.
+pub const MICRO_FUEL_PER_FUEL: u64 = 1000;
+
+/// Round a fuel value to 3 decimal places (matches the user-facing precision).
+#[inline]
+pub fn round_fuel(fuel: f64) -> f64 {
+    (fuel * 1000.0).round() / 1000.0
+}
+
+/// Convert micro-fuel to fuel (rounded to 3 decimals).
+#[inline]
+pub fn micro_to_fuel(micro: u64) -> f64 {
+    round_fuel(micro as f64 / MICRO_FUEL_PER_FUEL as f64)
+}
+
+/// Convert a decimal fuel value to micro-fuel (rounded).
+#[inline]
+pub fn fuel_to_micro(fuel: f64) -> u64 {
+    (fuel * MICRO_FUEL_PER_FUEL as f64).round().max(0.0) as u64
+}
+
+/// Fuel schedule — the central, named source for the engine's structural fuel
+/// charges: the query floor, I/O "touches", the per-row/per-flake rate, and the
+/// transaction baseline. All values are **micro-fuel** (1 fuel = 1000 micro-fuel).
+///
+/// Not (yet) centralized here: per-call expression/function micro-charges
+/// (1–5 µf for hashing, UUID, geo, vector, fulltext, etc.) and R2RML row
+/// charges, which are applied inline at their `eval`/r2rml sites. The public
+/// cost ladder in `docs/query/tracking-and-fuel.md` lists all of them.
+///
+/// To re-scale a charge defined here, change it once and every call site picks
+/// it up. History: I/O "touches" were rescaled from 1000 µf (1.000 fuel) to
+/// 10 µf (0.010 fuel) so scan-dominated queries report fuel proportionate to a
+/// transaction's flat baseline. The per-row/per-flake rate (1 µf) is the floor
+/// of the integer unit and was left unchanged.
+pub mod schedule {
+    /// One-time floor charged once at query entry (before parsing). Guarantees
+    /// a fuel-tracked query reports at least 1.000 fuel and that parse/plan
+    /// errors still reflect a non-zero cost.
+    pub const QUERY_FLOOR_MICRO_FUEL: u64 = 1000;
+
+    /// Per index-leaflet batch read during a binary cursor scan, charged once
+    /// per batch returned regardless of cache state.
+    pub const INDEX_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per persisted forward-dict decode (id → value) during result
+    /// materialization.
+    pub const DICT_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Base charge per history-scan leaflet. Per-row costs (base rows +
+    /// in-range sidecar rows, at [`PER_ROW_MICRO_FUEL`] each) are added on top
+    /// at the call site.
+    pub const HISTORY_LEAF_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per row/flake materialized from in-memory state: `db.range` flakes,
+    /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
+    /// applies to staged flakes during transactions and bulk imports, where it
+    /// is charged as a raw count (`flakes.len()`) at those call sites, and to
+    /// rows handled by the fused join lanes (`PropertyJoinOperator` scan/probe
+    /// drains, `ValuesOperator` join input), charged per batch/chunk at the
+    /// existing cancellation boundaries — never per iteration inside the merge
+    /// loops (hot-loop purity).
+    pub const PER_ROW_MICRO_FUEL: u64 = 1;
+
+    /// Transaction/commit baseline, charged once per `stage` and once per
+    /// bulk-import commit chunk.
+    pub const TXN_BASELINE_MICRO_FUEL: u64 = 10_000;
+
+    /// Per successful indexer CAS write. Charged once per `put`, `put_with_id`,
+    /// or `content_write_bytes` call made by the indexer. For `IndexLeaf` writes
+    /// an additional charge of this same rate is applied per *re-encoded*
+    /// leaflet inside the leaf (passthrough leaflets are byte-copied and not
+    /// charged).
+    pub const INDEX_CAS_WRITE_MICRO_FUEL: u64 = 1000;
+}
+
+/// Tracking options parsed from query `opts`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackingOptions {
+    pub track_time: bool,
+    pub track_fuel: bool,
+    pub track_policy: bool,
+    /// Micro-fuel limit. None or Some(0) = unlimited.
+    pub max_fuel: Option<u64>,
+}
+
+impl TrackingOptions {
+    /// Parse tracking options from a JSON `opts` object value.
+    ///
+    /// Expected shapes:
+    /// - `"opts": {"meta": true}` enables all tracking
+    /// - `"opts": {"meta": {"time": true, "fuel": true, "policy": true}}` selective
+    /// - `"opts": {"max-fuel": 1000}` (decimal allowed) implicitly enables fuel tracking
+    ///
+    /// Also accepts camel/snake variants for max-fuel (`max_fuel`, `maxFuel`).
+    pub fn from_opts_value(opts: Option<&JsonValue>) -> Self {
+        let Some(opts) = opts.and_then(|v| v.as_object()) else {
+            return Self::default();
+        };
+
+        let meta = opts.get("meta");
+        let max_fuel = opts
+            .get("max-fuel")
+            .or_else(|| opts.get("max_fuel"))
+            .or_else(|| opts.get("maxFuel"))
+            .and_then(serde_json::Value::as_f64)
+            .map(fuel_to_micro);
+
+        let track_all = matches!(meta, Some(JsonValue::Bool(true)));
+        let meta_obj = meta.and_then(|v| v.as_object());
+
+        let meta_flag = |k: &str| -> bool {
+            meta_obj
+                .and_then(|m| m.get(k))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+
+        Self {
+            track_time: track_all || meta_flag("time"),
+            track_fuel: max_fuel.is_some() || track_all || meta_flag("fuel"),
+            track_policy: track_all || meta_flag("policy"),
+            max_fuel,
+        }
+    }
+
+    #[inline]
+    pub fn any_enabled(&self) -> bool {
+        self.track_time || self.track_fuel || self.track_policy
+    }
+
+    /// Returns tracking options with all tracking enabled (time, fuel, policy).
+    ///
+    /// This is the default for "tracked" query endpoints where the user expects
+    /// tracking information in the response.
+    pub fn all_enabled() -> Self {
+        Self {
+            track_time: true,
+            track_fuel: true,
+            track_policy: true,
+            max_fuel: None,
+        }
+    }
+}
+
+/// Policy execution statistics: `{:executed N :allowed M}`
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyStats {
+    pub executed: u64,
+    pub allowed: u64,
+}
+
+/// Policy-enforcement state for a request.
+///
+/// Answers the question [`PolicyStats`] cannot: whether policy governed the
+/// request at all. The per-policy stats are populated only when a policy
+/// actually *executes*, so an empty map means either "enforcement was active
+/// but no policy ran" or "the request ran unenforced" — the two states a caller
+/// most needs separated.
+///
+/// Ledger data does participate in producing it: the effective view-policy set
+/// is assembled from stored `f:AccessPolicy` nodes, selected through the
+/// identity's own `f:policyClass` assignments. What it never reflects is the
+/// data the query reads or the query itself. Three properties make it safe to
+/// report:
+///
+/// - **Query-independent.** It is settled when the view is built, before
+///   execution, and is identical for every query issued under the same policy
+///   context — so it cannot be varied to probe for a row.
+/// - **Constant per caller and ledger.** It changes only when the ledger's
+///   policy configuration or the caller's own policy assignments change, not
+///   when data is written.
+/// - **Self-describing only.** You must already be acting as an identity to
+///   see its enforcement state, so it discloses your own authorization
+///   posture and nothing about anyone else's data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEnforcement {
+    /// Always `true` when this record is present: the request executed under a
+    /// non-root policy context.
+    pub enforced: bool,
+    /// `true` when the effective view-policy set is empty and `default-allow`
+    /// is false — no data flake could have been returned under this request's
+    /// policy configuration.
+    ///
+    /// Not the same as "no rows were returned": schema flakes (`rdf:type` with
+    /// a schema-class object, `rdfs:subClassOf`, `rdfs:subPropertyOf`,
+    /// `rdfs:domain`, `rdfs:range`) bypass policy, so a query over the ontology
+    /// can still produce rows.
+    pub denies_all_data: bool,
+    /// Policies whose `f:query` could not be evaluated for this request and
+    /// therefore denied their targets: a graph source (Iceberg / SQL) has no
+    /// graph to run a policy query against. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluable_policies: Vec<String>,
+    /// Triples maps of a graph source (Iceberg / SQL) whose subjects other
+    /// maps can also mint with other classes, where a class-targeted view
+    /// policy's decision depended on those classes: a row is shown only when
+    /// every class set its subject could hold allows it, so some rows a
+    /// native ledger would show may be hidden. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undecidable_class_maps: Vec<String>,
+}
+
+/// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
+#[derive(Debug, Clone, Error)]
+#[error("Fuel limit exceeded")]
+pub struct FuelExceededError {
+    /// Micro-fuel consumed when the limit was hit.
+    pub used_micro_fuel: u64,
+    /// Configured micro-fuel limit.
+    pub limit_micro_fuel: u64,
+}
+
+impl FuelExceededError {
+    /// User-facing fuel decimal (rounded to 3 places).
+    pub fn used_fuel(&self) -> f64 {
+        micro_to_fuel(self.used_micro_fuel)
+    }
+    /// User-facing fuel decimal (rounded to 3 places).
+    pub fn limit_fuel(&self) -> f64 {
+        micro_to_fuel(self.limit_micro_fuel)
+    }
+}
+
+struct TrackerInner {
+    // Time tracking
+    start_time: Option<Instant>,
+
+    // Fuel tracking (micro-fuel internally)
+    fuel_total: AtomicU64,
+    fuel_limit: u64, // 0 = unlimited
+
+    // Policy tracking
+    policy_stats: RwLock<HashMap<String, PolicyStats>>,
+
+    // Whether a non-root policy context governed this request, recorded once
+    // from the prepared view (see `Tracker::record_policy_enforcement`).
+    policy_enforcement: RwLock<Option<PolicyEnforcement>>,
+
+    // Reasoning materialization outcome (recorded by query prepare when a
+    // reasoning mode ran). Not gated by an option: a capped materialization
+    // is a correctness signal, so any enabled tracker reports it.
+    reasoning: RwLock<Option<ReasoningTally>>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order,
+    /// capped at [`STATEMENT_REPORT_CAP`].
+    statements: RwLock<Vec<PushedStatement>>,
+    /// Statements sent past the cap, so a truncated report says so rather
+    /// than reading as the whole story.
+    statements_elided: AtomicU64,
+
+    options: TrackingOptions,
+}
+
+/// Execution tracker.
+///
+/// When disabled, this is a single `None` pointer (cheap to clone and pass around).
+#[derive(Clone, Default)]
+pub struct Tracker(Option<Arc<TrackerInner>>);
+
+impl std::fmt::Debug for Tracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracker")
+            .field("enabled", &self.is_enabled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Tracker {
+    /// Create a tracker from options. Returns a disabled tracker if no tracking is enabled.
+    pub fn new(options: TrackingOptions) -> Self {
+        if !options.any_enabled() {
+            return Self(None);
+        }
+
+        Self(Some(Arc::new(TrackerInner {
+            start_time: options.track_time.then(Instant::now),
+            fuel_total: AtomicU64::new(0),
+            fuel_limit: options.max_fuel.unwrap_or(0),
+            policy_stats: RwLock::new(HashMap::new()),
+            policy_enforcement: RwLock::new(None),
+            reasoning: RwLock::new(None),
+            statements: RwLock::new(Vec::new()),
+            statements_elided: AtomicU64::new(0),
+            options,
+        })))
+    }
+
+    /// Disabled tracker (zero overhead beyond a null check at call sites).
+    #[inline]
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    #[inline]
+    pub fn tracks_fuel(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(|i| i.options.track_fuel)
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn tracks_policy(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(|i| i.options.track_policy)
+            .unwrap_or(false)
+    }
+
+    /// Consume `units` of micro-fuel.
+    ///
+    /// Allows total consumption up to and including the limit; errors when the
+    /// total would strictly exceed the limit.
+    #[inline]
+    pub fn consume_fuel(&self, units: u64) -> Result<(), FuelExceededError> {
+        let Some(inner) = &self.0 else {
+            return Ok(());
+        };
+        if !inner.options.track_fuel || units == 0 {
+            return Ok(());
+        }
+
+        let new_total = inner.fuel_total.fetch_add(units, Ordering::Relaxed) + units;
+        if inner.fuel_limit > 0 && new_total > inner.fuel_limit {
+            return Err(FuelExceededError {
+                used_micro_fuel: new_total,
+                limit_micro_fuel: inner.fuel_limit,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record a policy evaluation attempt (increments for every policy considered).
+    #[inline]
+    pub fn policy_executed(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+
+        if let Ok(mut stats) = inner.policy_stats.write() {
+            stats.entry(policy_id.to_string()).or_default().executed += 1;
+        }
+    }
+
+    /// Record a policy allow decision (only when that policy grants access).
+    #[inline]
+    pub fn policy_allowed(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+
+        if let Ok(mut stats) = inner.policy_stats.write() {
+            stats.entry(policy_id.to_string()).or_default().allowed += 1;
+        }
+    }
+
+    /// Record that a non-root policy context governed this request.
+    ///
+    /// Called once, from the prepared view, before execution. Gated on
+    /// `track_policy` so the state is reported only on the same opt-in surface
+    /// as [`PolicyStats`]. Callers pass `None` for a root/unenforced context,
+    /// which leaves the field absent — the caller's output is then unchanged
+    /// from before this signal existed.
+    ///
+    /// A request that spans several graphs must pass one already-aggregated
+    /// value (see `DataSetDb::policy_enforcement`): repeated calls merge
+    /// conservatively, so a graph that was never recorded cannot weaken
+    /// `denies_all_data`.
+    pub fn record_policy_enforcement(&self, state: Option<PolicyEnforcement>) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy {
+            return;
+        }
+        let Some(state) = state else {
+            return;
+        };
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            // A dataset query prepares several views; keep the most restrictive
+            // reading so `denies_all_data` means "every graph denied".
+            *slot = Some(match slot.take() {
+                Some(prev) => {
+                    let mut unevaluable_policies = prev.unevaluable_policies;
+                    for id in state.unevaluable_policies {
+                        if !unevaluable_policies.contains(&id) {
+                            unevaluable_policies.push(id);
+                        }
+                    }
+                    let mut undecidable_class_maps = prev.undecidable_class_maps;
+                    for map in state.undecidable_class_maps {
+                        if !undecidable_class_maps.contains(&map) {
+                            undecidable_class_maps.push(map);
+                        }
+                    }
+                    PolicyEnforcement {
+                        enforced: true,
+                        denies_all_data: prev.denies_all_data && state.denies_all_data,
+                        unevaluable_policies,
+                        undecidable_class_maps,
+                    }
+                }
+                None => state,
+            });
+        }
+    }
+
+    /// Record a policy whose `f:query` could not be evaluated for this request
+    /// (see [`PolicyEnforcement::unevaluable_policies`]). Recorded during
+    /// execution, so it merges into whatever enforcement state the prepared
+    /// view already stamped.
+    pub fn record_unevaluable_policy(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
+                state.unevaluable_policies.push(policy_id.to_string());
+            }
+        }
+    }
+
+    /// Record a triples map whose rows a class-targeted view policy decided
+    /// over every class set its subjects could hold (see
+    /// [`PolicyEnforcement::undecidable_class_maps`]).
+    pub fn record_undecidable_class_map(&self, triples_map: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || triples_map.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state
+                .undecidable_class_maps
+                .iter()
+                .any(|m| m == triples_map)
+            {
+                state.undecidable_class_maps.push(triples_map.to_string());
+            }
+        }
+    }
+
+    /// Record the outcome of an OWL2-RL materialization for this request.
+    ///
+    /// Last write wins (a request runs at most one materialization per
+    /// prepared query; dataset queries record the primary graph's run).
+    pub fn record_reasoning(&self, tally: ReasoningTally) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if let Ok(mut slot) = inner.reasoning.write() {
+            *slot = Some(tally);
+        }
+    }
+
+    /// Record a statement the SQL pushdown lane sent to `source`, so the
+    /// response reports what ran remotely.
+    pub fn record_statement(&self, source: &str, sql: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        // Bounded: outer bindings chunk at 2,000 rows and a statement may run
+        // to `statement_max_bytes` (1 MiB), so an unbounded tally over a large
+        // seed set retains tens of MiB and echoes all of it in the response.
+        // The first `STATEMENT_REPORT_CAP` are what a reader needs to see the
+        // shape; the rest are counted, never silently dropped.
+        if let Ok(mut slot) = inner.statements.write() {
+            if slot.len() >= STATEMENT_REPORT_CAP {
+                inner.statements_elided.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            slot.push(PushedStatement {
+                source: source.to_string(),
+                sql: sql.to_string(),
+            });
+        }
+    }
+
+    /// Read fuel consumed so far, in micro-fuel, without finalizing.
+    ///
+    /// Lock-free: a single relaxed load of the fuel counter. Safe to call
+    /// concurrently from another task (e.g. a streaming heartbeat) while the
+    /// query executes — it never contends the per-flake `fetch_add` on the hot
+    /// path. Unlike [`tally`](Self::tally) it takes no locks and allocates
+    /// nothing. Returns `None` when fuel tracking is disabled.
+    #[inline]
+    pub fn current_micro_fuel(&self) -> Option<u64> {
+        let inner = self.0.as_ref()?;
+        inner
+            .options
+            .track_fuel
+            .then(|| inner.fuel_total.load(Ordering::Relaxed))
+    }
+
+    /// Read fuel consumed so far as a user-facing decimal (rounded to 3 places).
+    ///
+    /// See [`current_micro_fuel`](Self::current_micro_fuel) for the
+    /// concurrency/cost guarantees. Returns `None` when fuel tracking is
+    /// disabled.
+    #[inline]
+    pub fn current_fuel(&self) -> Option<f64> {
+        self.current_micro_fuel().map(micro_to_fuel)
+    }
+
+    /// Roll the fuel counter back to a snapshot taken earlier with
+    /// [`current_micro_fuel`](Self::current_micro_fuel).
+    ///
+    /// For retry frames — the residency drain/fetch/re-run loops — whose
+    /// round re-runs a *pure* function and discards the failed round's work:
+    /// without the rollback, N rounds charge N× the fuel of one round, and a
+    /// query near its budget can fail `FuelExceeded` merely for having missed
+    /// residency N times. Caller invariants: `snapshot` must be a value this
+    /// counter actually held, and the caller must be the counter's sole fuel
+    /// writer for the rolled-back span (the store would silently erase a
+    /// concurrent `consume_fuel`). No-op when fuel tracking is disabled.
+    pub fn restore_micro_fuel(&self, snapshot: u64) {
+        if let Some(inner) = &self.0 {
+            if inner.options.track_fuel {
+                inner.fuel_total.store(snapshot, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Finalize tracking into a serializable tally.
+    pub fn tally(&self) -> Option<TrackingTally> {
+        let inner = self.0.as_ref()?;
+
+        Some(TrackingTally {
+            time: inner.start_time.map(|t| format_time_ms(t.elapsed())),
+            fuel: inner
+                .options
+                .track_fuel
+                .then(|| micro_to_fuel(inner.fuel_total.load(Ordering::Relaxed))),
+            policy: if inner.options.track_policy {
+                inner.policy_stats.read().ok().map(|m| m.clone())
+            } else {
+                None
+            },
+            policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
+            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            sql: inner
+                .statements
+                .read()
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.clone()),
+            sql_elided: match inner.statements_elided.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            },
+        })
+    }
+}
+
+/// Tracking tally returned on completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingTally {
+    /// Formatted time string like `"12.34ms"`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Total fuel consumed (decimal, rounded to 3 places).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    /// Policy stats: `{policy-id -> {executed, allowed}}`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<HashMap<String, PolicyStats>>,
+    /// Whether policy governed this request, and whether its configuration
+    /// grants no view of the data at all. Present only when the request ran
+    /// under a non-root policy context; absent means unenforced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<PolicyEnforcement>,
+    /// Reasoning materialization outcome, when a reasoning mode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in the order
+    /// they ran. Absent when no block was pushed down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<PushedStatement>>,
+    /// Statements sent beyond the reported cap. Present only when `sql` is a
+    /// prefix rather than the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
+}
+
+/// How many pushed statements a tracked response lists before it starts
+/// counting instead.
+pub const STATEMENT_REPORT_CAP: usize = 64;
+
+/// One statement the SQL pushdown lane sent to a graph source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushedStatement {
+    /// The graph source the statement ran against.
+    pub source: String,
+    pub sql: String,
+}
+
+/// Outcome of an OWL2-RL materialization, reported per request.
+///
+/// `capped: true` means the closure hit its budget before reaching fixpoint —
+/// query results may be missing entailments. Clients should treat capped
+/// results as incomplete, not merely slow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningTally {
+    /// Whether materialization was capped before reaching fixpoint.
+    pub capped: bool,
+    /// Why materialization was capped (e.g. budget kind), if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_reason: Option<String>,
+    /// Number of facts derived.
+    pub derived_facts: u64,
+    /// Fixpoint iterations performed.
+    pub iterations: u64,
+    /// Wall-clock materialization time in milliseconds. For a cached
+    /// materialization this reports the original computation, not this
+    /// request's (near-zero) cache hit.
+    pub duration_ms: u64,
+    /// Datalog rules the cap cut short while they ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capped_rules: Vec<String>,
+    /// Datalog rules that never ran because the cap fired first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_rules: Vec<String>,
+    /// The time datalog rule bodies evaluated `NOW()` and `TODAY()` at, when
+    /// a rule called either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_time: Option<String>,
+}
+
+fn format_time_ms(duration: Duration) -> String {
+    let ms = duration.as_secs_f64() * 1000.0;
+    format!("{ms:.2}ms")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule::*;
+    use super::*;
+
+    fn fuel_tracker(max_fuel: Option<u64>) -> Tracker {
+        Tracker::new(TrackingOptions {
+            track_fuel: true,
+            max_fuel,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn query_floor_reports_one_fuel() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.0));
+    }
+
+    #[test]
+    fn restore_micro_fuel_rolls_back_a_discarded_round() {
+        // The residency retry frames re-run a PURE round and discard the
+        // failed attempt's work; restoring to a snapshot makes N rounds
+        // charge like one, so a near-budget query cannot fail FuelExceeded
+        // merely for having missed residency N times.
+        let t = fuel_tracker(Some(100));
+        t.consume_fuel(40).unwrap();
+        let snapshot = t.current_micro_fuel().unwrap();
+
+        // A failed round charges 50; without the rollback the next (final)
+        // round's 50 would blow the 100 budget at 140.
+        t.consume_fuel(50).unwrap();
+        t.restore_micro_fuel(snapshot);
+        assert_eq!(t.current_micro_fuel(), Some(40));
+
+        // The successful round's charge stands, inside budget.
+        t.consume_fuel(50).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(90));
+    }
+
+    #[test]
+    fn restore_micro_fuel_is_inert_when_fuel_tracking_is_off() {
+        let disabled = Tracker::disabled();
+        disabled.restore_micro_fuel(0); // must not panic
+        assert_eq!(disabled.current_micro_fuel(), None);
+
+        let no_fuel = Tracker::new(TrackingOptions {
+            track_policy: true,
+            ..Default::default()
+        });
+        no_fuel.restore_micro_fuel(7);
+        assert_eq!(no_fuel.current_micro_fuel(), None);
+    }
+
+    #[test]
+    fn index_dict_history_touches_are_one_hundredth_fuel() {
+        for touch in [
+            INDEX_TOUCH_MICRO_FUEL,
+            DICT_TOUCH_MICRO_FUEL,
+            HISTORY_LEAF_TOUCH_MICRO_FUEL,
+        ] {
+            let t = fuel_tracker(None);
+            t.consume_fuel(touch).unwrap();
+            assert_eq!(t.tally().unwrap().fuel, Some(0.01), "touch={touch}");
+        }
+    }
+
+    #[test]
+    fn floor_plus_one_touch_reports_one_point_zero_one() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    #[test]
+    fn floor_exceeds_max_fuel_below_one() {
+        // max-fuel: 0.5 leaves no room for the 1.000 floor.
+        let t = fuel_tracker(Some(fuel_to_micro(0.5)));
+        let err = t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap_err();
+        assert_eq!(err.limit_fuel(), 0.5);
+        assert_eq!(err.used_fuel(), 1.0);
+    }
+
+    #[test]
+    fn max_fuel_one_admits_floor_but_not_a_touch() {
+        // max-fuel: 1 permits exactly the floor; the next persisted touch fails.
+        let t = fuel_tracker(Some(fuel_to_micro(1.0)));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert!(t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).is_err());
+    }
+
+    #[test]
+    fn current_fuel_reflects_running_total_without_finalizing() {
+        let t = fuel_tracker(None);
+        assert_eq!(t.current_micro_fuel(), Some(0));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(QUERY_FLOOR_MICRO_FUEL));
+        assert_eq!(t.current_fuel(), Some(1.0));
+        // Reading does not finalize: the tally still sees the same total and
+        // further consumption keeps accumulating.
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_fuel(), Some(1.01));
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    fn policy_tracker() -> Tracker {
+        Tracker::new(TrackingOptions {
+            track_policy: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn policy_enforcement_absent_when_never_recorded() {
+        // The unenforced (anonymous) request: policy tracking asked for, no
+        // policy context built, so the tally reports the empty stats map and
+        // nothing else — byte-identical to the output before this signal.
+        let t = policy_tracker();
+        t.record_policy_enforcement(None);
+        let tally = t.tally().unwrap();
+        assert_eq!(tally.policy, Some(HashMap::new()));
+        assert_eq!(tally.policy_enforcement, None);
+    }
+
+    #[test]
+    fn policy_enforcement_reports_recorded_state() {
+        let t = policy_tracker();
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
+        }));
+        assert_eq!(
+            t.tally().unwrap().policy_enforcement,
+            Some(PolicyEnforcement {
+                enforced: true,
+                denies_all_data: true,
+                unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn policy_enforcement_requires_policy_tracking() {
+        // Opt-in: a time-only tracker reports neither policy surface.
+        let t = Tracker::new(TrackingOptions {
+            track_time: true,
+            ..Default::default()
+        });
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
+        }));
+        let tally = t.tally().unwrap();
+        assert_eq!(tally.policy, None);
+        assert_eq!(tally.policy_enforcement, None);
+    }
+
+    #[test]
+    fn repeated_policy_enforcement_records_merge_conservatively() {
+        // One graph granting nothing and another granting something must not
+        // report whole-request denial.
+        let t = policy_tracker();
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+            unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
+        }));
+        t.record_policy_enforcement(Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data: false,
+            unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
+        }));
+        assert_eq!(
+            t.tally().unwrap().policy_enforcement,
+            Some(PolicyEnforcement {
+                enforced: true,
+                denies_all_data: false,
+                unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn current_fuel_none_when_disabled_or_untracked() {
+        // Fully disabled tracker.
+        assert_eq!(Tracker::disabled().current_micro_fuel(), None);
+        assert_eq!(Tracker::disabled().current_fuel(), None);
+        // Enabled tracker, but fuel not among the tracked dimensions.
+        let time_only = Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: false,
+            ..Default::default()
+        });
+        assert_eq!(time_only.current_micro_fuel(), None);
+    }
+}

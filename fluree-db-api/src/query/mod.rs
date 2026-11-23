@@ -1,0 +1,892 @@
+mod bm25;
+pub mod builder;
+mod connection;
+#[cfg(feature = "credential")]
+mod credential;
+mod graph_source;
+pub(crate) mod helpers;
+pub mod multi;
+pub mod nameservice_builder;
+pub mod result_cache;
+
+use fluree_db_core::VerifiedIdentity;
+use serde_json::Value as JsonValue;
+use std::fmt;
+use std::sync::Arc;
+
+use crate::{
+    format, Batch, FormatterConfig, FuelExceededError, GraphDb, OverlayProvider, PolicyContext,
+    PolicyStats, Tracker, TrackingTally, VarRegistry,
+};
+
+use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_core::{GraphDbRef, LedgerSnapshot};
+
+use fluree_db_query::ir::QueryOutput;
+
+/// Optional execution controls for query builders and embedders.
+#[derive(Clone, Default)]
+pub struct QueryExecutionOptions {
+    /// Cooperative cancellation handle passed through to query operators.
+    pub cancellation: Option<fluree_db_core::QueryCancellation>,
+    /// Render R2RML `RefObjectMap` objects by templating the parent IRI from the
+    /// child row's own FK columns, skipping the parent-table scan and its
+    /// referential (dangling-FK) existence check. Default `false` — R2RML-faithful
+    /// semantics, where a dangling FK yields no triple. Enabled ONLY by the
+    /// graph-source subgraph-crawl ("View Instances"/browse) path, where scanning
+    /// every FK-parent table just to render ref IRIs is the dominant cost and
+    /// referential integrity is assumed. A matched (non-dangling) row renders a
+    /// byte-identical IRI either way; the relaxation only affects a present-but-
+    /// dangling FK (templated instead of omitted). A type-mismatched FK/PK — whose
+    /// stringified child value never equals the parent key — is treated as
+    /// dangling, so the templated IRI may not resolve to a real parent subject.
+    pub trust_fk_refs: bool,
+    /// Make every graph-source table scan emit a fixed row order, even when the
+    /// query has no LIMIT or OFFSET, for a caller that pages the answer itself.
+    /// Without it, a query with no slice may stream a table's rows as its file
+    /// reads finish. Set by the graph-source crawl, which applies its subject
+    /// OFFSET after the query.
+    pub deterministic_scans: bool,
+    /// Read lists as RDF does: a list is its owner's edge to a head cell and
+    /// a chain of `rdf:first`/`rdf:rest` cells (`fluree_db_query::list_view`),
+    /// so a CONSTRUCT writes it back as the list. Set only by the Graph Store
+    /// `GET`; every query surface reads a list's members as values.
+    rdf_list_view: bool,
+    /// Auth-layer-verified identity of the caller, used only for
+    /// `f:overrideControl` (`f:IdentityRestricted`) checks on the query path.
+    ///
+    /// Query routes parse [`crate::GovernanceOptions`] from the request JSON
+    /// inside the API, and the reasoning / datalog override gate has no
+    /// governance struct at all, so this is how the verified identity travels
+    /// from the request boundary to those checks. The API stamps it onto every
+    /// `GovernanceOptions` it parses and reads it at the reasoning choke point.
+    /// Same contract as `GovernanceOptions::server_identity`: set by an auth
+    /// layer, never derived from the request body or headers.
+    pub server_identity: Option<VerifiedIdentity>,
+    /// SPARQL parameters: variable name → JSON-LD value, substituted into the
+    /// parsed query before lowering (see [`fluree_db_sparql::substitute_params`]).
+    params: Option<Arc<fluree_db_sparql::ParamMap>>,
+    /// The caller's own parse of the request's SPARQL text, read instead of
+    /// parsing it again (see [`Self::with_sparql_parse`]).
+    sparql_parse: Option<helpers::SharedSparqlParse>,
+    lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
+    /// The view the query runs on was loaded from the query's own dataset (the
+    /// connection path's one-ledger shortcut), so the view does not read the
+    /// query's dataset keys again.
+    pub(crate) view_is_the_dataset: bool,
+    /// A time per ledger that the query's host fixed (a multi-query envelope's
+    /// snapshot): the connection path reads each dataset member of one of these
+    /// ledgers that names no time of its own at it
+    /// ([`DatasetSpec::read_unpinned_at`](crate::DatasetSpec::read_unpinned_at)).
+    pub(crate) ledger_times: Option<Arc<crate::dataset::LedgerTimes>>,
+}
+
+impl fmt::Debug for QueryExecutionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueryExecutionOptions")
+            .field("cancellation", &self.cancellation)
+            .field("trust_fk_refs", &self.trust_fk_refs)
+            .field("deterministic_scans", &self.deterministic_scans)
+            .field("rdf_list_view", &self.rdf_list_view)
+            .field("server_identity", &self.server_identity)
+            .field("params", &self.params)
+            .field("has_sparql_parse", &self.sparql_parse.is_some())
+            .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
+            .field("ledger_times", &self.ledger_times)
+            .finish()
+    }
+}
+
+impl QueryExecutionOptions {
+    /// Hash the options that can change a query's answer, for the
+    /// query-result cache. `Err` names one it cannot key.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            cancellation: _,
+            trust_fk_refs,
+            deterministic_scans,
+            rdf_list_view,
+            server_identity,
+            params,
+            // Derived from the query text, which the cache keys on already.
+            sparql_parse: _,
+            lifecycle_guard: _,
+            view_is_the_dataset,
+            ledger_times,
+        } = self;
+        if ledger_times.is_some() {
+            return Err("pinned ledger times");
+        }
+        trust_fk_refs.hash(h);
+        deterministic_scans.hash(h);
+        rdf_list_view.hash(h);
+        view_is_the_dataset.hash(h);
+        server_identity
+            .as_ref()
+            .map(VerifiedIdentity::as_str)
+            .hash(h);
+        match params {
+            None => 0u8.hash(h),
+            Some(params) => {
+                1u8.hash(h);
+                result_cache::hash_json(params.as_ref(), h).map_err(|_| "parameters")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create empty execution options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach a cooperative cancellation handle.
+    pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Enable child-templated `RefObjectMap` rendering (skip FK-parent scans).
+    /// See [`QueryExecutionOptions::trust_fk_refs`]. Set only by the graph-source
+    /// crawl/browse path.
+    pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
+        self.trust_fk_refs = trust;
+        self
+    }
+
+    /// Make graph-source scans emit a fixed row order whatever the query's
+    /// shape. See [`QueryExecutionOptions::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
+        self
+    }
+
+    /// Read lists as their RDF cells (see [`QueryExecutionOptions`]'s
+    /// `rdf_list_view`). Set only by the Graph Store `GET`.
+    #[doc(hidden)]
+    pub fn with_rdf_list_view(mut self, on: bool) -> Self {
+        self.rdf_list_view = on;
+        self
+    }
+
+    /// Whether the query reads lists as their RDF cells.
+    pub(crate) fn rdf_list_view(&self) -> bool {
+        self.rdf_list_view
+    }
+
+    /// Attach the auth-layer-verified caller identity for override control.
+    /// See [`QueryExecutionOptions::server_identity`]. Only an auth layer
+    /// should call this.
+    pub fn with_server_identity(mut self, identity: VerifiedIdentity) -> Self {
+        self.server_identity = Some(identity);
+        self
+    }
+
+    /// Bind SPARQL variables to values for this query: each named variable
+    /// (`?name` or `$name`) is replaced by its value wherever it appears. A
+    /// name the query does not mention is an error, as are parameters on a
+    /// JSON-LD query.
+    pub fn with_params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.params = (!params.is_empty()).then(|| Arc::new(params));
+        self
+    }
+
+    /// Hand over the caller's parse of the query's SPARQL text (a server
+    /// reads the parse to route the request), so running it does not parse
+    /// the text again. Read only for that exact text; any other is parsed.
+    pub fn with_sparql_parse(mut self, parse: helpers::SharedSparqlParse) -> Self {
+        self.sparql_parse = Some(parse);
+        self
+    }
+
+    /// The handed-over parse, if any (see [`Self::with_sparql_parse`]).
+    pub(crate) fn sparql_parse(&self) -> Option<&helpers::SparqlParse> {
+        self.sparql_parse.as_deref()
+    }
+
+    /// Parse and validate `sparql` and substitute `params`, reading the
+    /// handed-over parse when it is of this exact text (see
+    /// [`Self::with_sparql_parse`]). A run path that holds options parses
+    /// through here, so it cannot skip the hand-off.
+    pub(crate) fn parse_sparql(
+        &self,
+        sparql: &str,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> crate::Result<fluree_db_sparql::SparqlAst> {
+        helpers::parse_and_validate_sparql_from(self.sparql_parse(), sparql, params)
+    }
+
+    /// The SPARQL parameters for `input`; JSON-LD queries take none.
+    pub(crate) fn sparql_params(
+        &self,
+        input: &crate::view::QueryInput<'_>,
+    ) -> crate::Result<Option<&fluree_db_sparql::ParamMap>> {
+        match (&self.params, input) {
+            (Some(_), crate::view::QueryInput::JsonLd(_)) => Err(crate::ApiError::invalid_query(
+                "parameters apply to SPARQL queries; a JSON-LD query takes its values in the query",
+            )),
+            (params, _) => Ok(params.as_deref()),
+        }
+    }
+
+    /// Attach an opaque guard that lives as long as these execution options.
+    ///
+    /// This is intended for adapters that need a runtime-specific cancellation
+    /// task to stay alive while the query runs without making `fluree-db-api`
+    /// depend on that runtime.
+    #[doc(hidden)]
+    pub fn with_lifecycle_guard<G>(mut self, guard: G) -> Self
+    where
+        G: Send + Sync + 'static,
+    {
+        self.lifecycle_guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Mark the view the query runs on as loaded from the query's own dataset
+    /// (see [`QueryExecutionOptions::view_is_the_dataset`]).
+    pub(crate) fn on_the_datasets_view(mut self) -> Self {
+        self.view_is_the_dataset = true;
+        self
+    }
+
+    /// Read the dataset's unpinned members of these ledgers at their times
+    /// (see [`QueryExecutionOptions::ledger_times`]).
+    pub(crate) fn reading_ledgers_at(mut self, times: Arc<crate::dataset::LedgerTimes>) -> Self {
+        self.ledger_times = Some(times);
+        self
+    }
+}
+
+/// Result of a query execution
+pub struct QueryResult {
+    /// Variable registry mapping names to IDs
+    pub vars: VarRegistry,
+    /// Effective "as-of" time boundary for this result when one meaningful `t` exists.
+    ///
+    /// Single-ledger queries populate this with the view's `t`. Multi-ledger dataset
+    /// queries leave it as `None` because there is no shared ledger-local transaction
+    /// number that can be reported or reused safely across ledgers.
+    pub t: Option<i64>,
+    /// Novelty overlay used during execution (for hydration formatting).
+    ///
+    /// Most query execution runs against `LedgerSnapshot + Novelty` (range_with_overlay). Hydration formatting
+    /// must use the same overlay to see unindexed flakes in memory-backed tests.
+    pub novelty: Option<std::sync::Arc<dyn OverlayProvider>>,
+    /// Parsed JSON-LD context from the query (for IRI compaction in formatters)
+    pub context: crate::ParsedContext,
+    /// Original JSON context from the query (for CONSTRUCT output)
+    pub orig_context: Option<JsonValue>,
+    /// Query output specification (projection, construct template, ASK, or wildcard).
+    pub output: QueryOutput,
+    /// Result batches
+    pub batches: Vec<Batch>,
+    /// Graph-scoped binary index view for late materialization of encoded bindings.
+    ///
+    /// When present, formatters decode `Binding::EncodedLit` values through
+    /// `BinaryGraphView::decode_value` — routing per-graph specialty kinds (NUM_BIG,
+    /// VECTOR_ID) through the correct arenas.  When absent, all bindings must
+    /// already be fully materialized.
+    pub binary_graph: Option<BinaryGraphView>,
+    /// True when this result came from the R2RML / graph-source execution path
+    /// (`query_view_with_r2rml_options`). The `sparql_json` formatter uses this to
+    /// CURIE-compact graph-source raw `Binding::Iri` predicate/type IRIs so virtual
+    /// output matches native's `Binding::Sid` compaction (F9). Native queries and
+    /// mixed-dataset paths not routed through that method leave it false → today's
+    /// raw rendering is unchanged.
+    pub from_graph_source: bool,
+    /// Non-fatal notes about how the query was read (see
+    /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
+    /// result.
+    pub advisories: Vec<crate::QueryAdvisory>,
+}
+
+impl std::fmt::Debug for QueryResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResult")
+            .field("t", &self.t)
+            .field("output", &self.output)
+            .field("select_len", &self.output.projected_vars_or_empty().len())
+            .field("batches_len", &self.batches.len())
+            .field("has_binary_graph", &self.binary_graph.is_some())
+            .field("has_novelty", &self.novelty.is_some())
+            .field("has_hydration", &self.output.has_hydration())
+            .finish()
+    }
+}
+
+/// Query response with optional tracking (top-level siblings).
+#[derive(Debug, serde::Serialize)]
+pub struct TrackedQueryResponse {
+    pub status: u16,
+    pub result: JsonValue,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+    /// Whether a non-root policy context governed this request. Absent means
+    /// the request ran unenforced — which `policy: {}` alone cannot tell you.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<fluree_db_core::PolicyEnforcement>,
+    /// OWL2-RL materialization outcome (present when a reasoning mode ran).
+    /// `reasoning.capped == true` means the result set may be incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<fluree_db_core::ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<fluree_db_core::PushedStatement>>,
+    /// Statements sent beyond the reported cap, when `sql` is a prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
+}
+
+impl TrackedQueryResponse {
+    /// Create a successful response with optional tracking tally
+    pub fn success(result: JsonValue, tally: Option<TrackingTally>) -> Self {
+        match tally {
+            Some(TrackingTally {
+                time,
+                fuel,
+                policy,
+                policy_enforcement,
+                reasoning,
+                sql,
+                sql_elided,
+            }) => Self {
+                status: 200,
+                result,
+                time,
+                fuel,
+                policy,
+                policy_enforcement,
+                reasoning,
+                sql,
+                sql_elided,
+            },
+            None => Self {
+                status: 200,
+                result,
+                time: None,
+                fuel: None,
+                policy: None,
+                policy_enforcement: None,
+                reasoning: None,
+                sql: None,
+                sql_elided: None,
+            },
+        }
+    }
+}
+
+/// Error response with optional tracking (top-level siblings).
+#[derive(Debug, serde::Serialize)]
+pub struct TrackedErrorResponse {
+    pub status: u16,
+    pub error: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+    /// See [`TrackedQueryResponse::policy_enforcement`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<fluree_db_core::PolicyEnforcement>,
+}
+
+impl TrackedErrorResponse {
+    /// Create an error response with optional tracking tally
+    pub fn new(status: u16, error: impl Into<String>, tally: Option<TrackingTally>) -> Self {
+        match tally {
+            Some(TrackingTally {
+                time,
+                fuel,
+                policy,
+                policy_enforcement,
+                ..
+            }) => Self {
+                status,
+                error: error.into(),
+                time,
+                fuel,
+                policy,
+                policy_enforcement,
+            },
+            None => Self {
+                status,
+                error: error.into(),
+                time: None,
+                fuel: None,
+                policy: None,
+                policy_enforcement: None,
+            },
+        }
+    }
+
+    /// An engine error, answering the status [`crate::ApiError::status_code`]
+    /// gives it, so a tracked request answers what the same request untracked
+    /// does. The message is the error's own.
+    pub fn from_api<E>(err: E, tally: Option<TrackingTally>) -> Self
+    where
+        E: std::fmt::Display + Into<crate::ApiError>,
+    {
+        let error = err.to_string();
+        Self::new(err.into().status_code(), error, tally)
+    }
+
+    /// Create a fuel exceeded error response
+    pub fn fuel_exceeded(err: &FuelExceededError, tally: Option<TrackingTally>) -> Self {
+        Self::new(400, err.to_string(), tally)
+    }
+}
+
+impl QueryResult {
+    /// Get total row count across all batches
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(fluree_db_query::Batch::len).sum()
+    }
+
+    /// Check if results are empty
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty() || self.row_count() == 0
+    }
+
+    /// Format as JSON-LD Query JSON (default - array rows)
+    ///
+    /// Returns simple JSON values with compact IRIs using the @context prefixes.
+    /// Rows are arrays aligned to the select order.
+    pub fn to_jsonld(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::jsonld();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// Format as SPARQL 1.1 Query Results JSON
+    ///
+    /// Returns W3C standard format with `{"head": {"vars": [...]}, "results": {"bindings": [...]}}`.
+    /// `uri` values are absolute IRIs — the format carries no prefix map, so a
+    /// CURIE in one could not be expanded back (issue #45). A display caller that
+    /// wants compaction formats with
+    /// `FormatterConfig::sparql_json().with_compact_iris()` instead.
+    pub fn to_sparql_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::sparql_json();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// Format as TypedJson (always include explicit datatype)
+    ///
+    /// Every value includes `@type` annotation, even for inferable types.
+    pub fn to_typed_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::typed_json();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// Format as Cypher JSON (Neo4j-compatible tabular, native scalars).
+    ///
+    /// See [`Self::to_cypher_json_async`]; this sync variant is for results
+    /// without encoded bindings / hydration.
+    pub fn to_cypher_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::cypher_json();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// The Cypher tabular result (columns + rows) with RDF-faithful cell
+    /// values — the pre-flattening form of [`Self::to_cypher_json`]. Value-
+    /// typed transports (Bolt) map datatypes from these cells directly.
+    pub fn to_cypher_table(
+        &self,
+        snapshot: &LedgerSnapshot,
+    ) -> format::Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+        format::format_cypher_table(self, &self.context, snapshot)
+    }
+
+    /// The typed Cypher tabular result: node refs hydrate into
+    /// [`format::cypher_typed::CypherNode`] (labels + properties fetched
+    /// from `view` at format time), relationship/path/temporal values stay
+    /// typed. Under a view policy, hydration filters each subject's raw
+    /// SPOT fetch through the view's enforcer before rendering.
+    pub async fn to_cypher_typed_table(
+        &self,
+        view: &crate::view::GraphDb,
+    ) -> format::Result<(Vec<String>, Vec<Vec<format::cypher_typed::CypherCell>>)> {
+        format::format_cypher_typed_table(self, &self.context, view).await
+    }
+
+    /// Format as AgentJson (LLM/agent-optimized envelope)
+    ///
+    /// Returns an envelope with schema header, compact object rows, and pagination metadata.
+    /// Use `to_agent_json_with_config` for byte budget and resume query support.
+    pub fn to_agent_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::agent_json();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// Format as AgentJson with full configuration
+    ///
+    /// Accepts a pre-built `FormatterConfig` for byte budget, SPARQL text, and ISO timestamp.
+    ///
+    /// ```ignore
+    /// let config = FormatterConfig::agent_json()
+    ///     .with_max_bytes(32768)
+    ///     .with_agent_json_context(AgentJsonContext {
+    ///         sparql_text: Some(sparql.to_string()),
+    ///         from_count: 1,
+    ///         iso_timestamp: Some("2026-03-26T14:30:00Z".to_string()),
+    ///         ..Default::default()
+    ///     });
+    /// let json = result.to_agent_json_with_config(snapshot, &config)?;
+    /// ```
+    pub fn to_agent_json_with_config(
+        &self,
+        snapshot: &LedgerSnapshot,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results(self, &self.context, snapshot, config)
+    }
+
+    /// Format CONSTRUCT query results as JSON-LD graph
+    ///
+    /// Returns `{"@context": {...}, "@graph": [...]}` format.
+    /// Only valid for CONSTRUCT queries (select_mode == Construct).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if this is not a CONSTRUCT query result.
+    pub fn to_construct(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        if !matches!(self.output, QueryOutput::Construct(_)) {
+            return Err(format::FormatError::InvalidBinding(
+                "to_construct() only valid for CONSTRUCT queries".to_string(),
+            ));
+        }
+        let config = FormatterConfig::jsonld();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
+    /// Format with custom configuration
+    pub fn format(
+        &self,
+        snapshot: &LedgerSnapshot,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results(self, &self.context, snapshot, config)
+    }
+
+    // ========================================================================
+    // TSV formatting (high-performance path)
+    // ========================================================================
+
+    /// Format as tab-separated values (high-performance path).
+    ///
+    /// Bypasses JSON DOM construction entirely. IRIs are compacted via `@context`.
+    pub fn to_tsv(&self, snapshot: &LedgerSnapshot) -> format::Result<String> {
+        format::delimited::format_tsv(self, snapshot)
+    }
+
+    /// Format as TSV bytes (high-performance path for server use).
+    ///
+    /// Returns raw `Vec<u8>` suitable for direct HTTP response body.
+    pub fn to_tsv_bytes(&self, snapshot: &LedgerSnapshot) -> format::Result<Vec<u8>> {
+        format::delimited::format_tsv_bytes(self, snapshot)
+    }
+
+    /// Format as TSV string with a row limit (for benchmark/preview).
+    ///
+    /// Returns `(tsv_string, total_row_count)`.
+    pub fn to_tsv_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+    ) -> format::Result<(String, usize)> {
+        format::delimited::format_tsv_limited(self, snapshot, limit)
+    }
+
+    /// Format as TSV bytes with a row limit (for server benchmark/preview).
+    ///
+    /// Returns `(tsv_bytes, total_row_count)`.
+    pub fn to_tsv_bytes_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+    ) -> format::Result<(Vec<u8>, usize)> {
+        format::delimited::format_tsv_bytes_limited(self, snapshot, limit)
+    }
+
+    // ========================================================================
+    // CSV formatting (high-performance path)
+    // ========================================================================
+
+    /// Format as comma-separated values (high-performance path).
+    ///
+    /// Bypasses JSON DOM construction entirely. IRIs are compacted via `@context`.
+    /// Uses RFC 4180 quoting for values containing commas, quotes, or newlines.
+    pub fn to_csv(&self, snapshot: &LedgerSnapshot) -> format::Result<String> {
+        format::delimited::format_csv(self, snapshot)
+    }
+
+    /// Format as CSV bytes (high-performance path for server use).
+    ///
+    /// Returns raw `Vec<u8>` suitable for direct HTTP response body.
+    pub fn to_csv_bytes(&self, snapshot: &LedgerSnapshot) -> format::Result<Vec<u8>> {
+        format::delimited::format_csv_bytes(self, snapshot)
+    }
+
+    /// Format as CSV string with a row limit (for benchmark/preview).
+    ///
+    /// Returns `(csv_string, total_row_count)`.
+    pub fn to_csv_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+    ) -> format::Result<(String, usize)> {
+        format::delimited::format_csv_limited(self, snapshot, limit)
+    }
+
+    /// Format as CSV bytes with a row limit (for server benchmark/preview).
+    ///
+    /// Returns `(csv_bytes, total_row_count)`.
+    /// Format as TSV or CSV bytes under an explicit config (`config.format`
+    /// selects the delimiter).
+    ///
+    /// [`Self::to_csv_bytes`] and friends serialize the W3C `text/csv` /
+    /// `text/tab-separated-values` profile, with absolute IRIs. Reach for this
+    /// only to render for human display, passing
+    /// [`FormatterConfig::with_compact_iris`] to restore `@context` compaction
+    /// (the CLI's #1466 contract).
+    pub fn to_delimited_bytes(
+        &self,
+        snapshot: &LedgerSnapshot,
+        config: &FormatterConfig,
+    ) -> format::Result<Vec<u8>> {
+        let delimiter =
+            format::delimited::Delimiter::from_format(config.format).ok_or_else(|| {
+                format::FormatError::InvalidBinding(format!(
+                    "{:?} is not a delimited format",
+                    config.format
+                ))
+            })?;
+        format::delimited::format_bytes(self, snapshot, delimiter, config)
+    }
+
+    /// Row-limited [`Self::to_delimited_bytes`], as a string. Returns
+    /// `(text, total_row_count)`.
+    pub fn to_delimited_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+        config: &FormatterConfig,
+    ) -> format::Result<(String, usize)> {
+        let delimiter =
+            format::delimited::Delimiter::from_format(config.format).ok_or_else(|| {
+                format::FormatError::InvalidBinding(format!(
+                    "{:?} is not a delimited format",
+                    config.format
+                ))
+            })?;
+        format::delimited::format_limited(self, snapshot, delimiter, limit, config)
+    }
+
+    pub fn to_csv_bytes_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+    ) -> format::Result<(Vec<u8>, usize)> {
+        format::delimited::format_csv_bytes_limited(self, snapshot, limit)
+    }
+
+    // ========================================================================
+    // Async formatting methods (required for hydration queries)
+    // ========================================================================
+
+    /// Format as JSON-LD Query JSON with async DB access
+    ///
+    /// This is the async version of `to_jsonld()`. Required for hydration
+    /// queries which need to fetch additional data from the database during
+    /// formatting. For regular SELECT queries, the sync version works fine.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = fluree.query(&ledger, &json!({
+    ///     "select": {"?person": ["*", {"ex:friend": ["*"]}]},
+    ///     "where": {"@id": "?person", "@type": "ex:User"}
+    /// })).await?;
+    ///
+    /// // Hydration requires async formatting
+    /// let json = result.to_jsonld_async(ledger.as_graph_db_ref(0)).await?;
+    /// ```
+    pub async fn to_jsonld_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
+        let config = FormatterConfig::jsonld();
+        format::format_results_async(self, &self.context, db, &config, None, None).await
+    }
+
+    /// Format as TypedJson with async DB access
+    ///
+    /// Async version of `to_typed_json()`. Required for hydration queries
+    /// which need to fetch additional data from the database during formatting.
+    /// Every literal value includes explicit `@type` annotation.
+    pub async fn to_typed_json_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
+        let config = FormatterConfig::typed_json();
+        format::format_results_async(self, &self.context, db, &config, None, None).await
+    }
+
+    /// Format as Cypher JSON (Neo4j-compatible tabular, native scalars).
+    ///
+    /// `{"results":[{"columns":[…],"data":[{"row":[…],"meta":[…]}]}]}` with
+    /// native-scalar values — `xsd:date` as a bare ISO string, longs as bare
+    /// numbers — for openCypher / LDBC tooling. Async to support encoded
+    /// bindings; mirrors `to_jsonld_async`.
+    pub async fn to_cypher_json_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
+        let config = FormatterConfig::cypher_json();
+        format::format_results_async(self, &self.context, db, &config, None, None).await
+    }
+
+    /// Format with custom configuration (async version)
+    ///
+    /// Async version of `format()`. Required for hydration queries.
+    pub async fn format_async(
+        &self,
+        db: GraphDbRef<'_>,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(self, &self.context, db, config, None, None).await
+    }
+
+    /// Format against a view, filtered by whatever policy that view carries.
+    ///
+    /// Prefer this over [`Self::format_async`] and [`Self::format_async_with_policy`]
+    /// whenever a `&GraphDb` is in hand. Those take a `GraphDbRef`, which does not
+    /// carry policy, so the caller has to remember to pass it separately; three of
+    /// the sites that forgot were the hydration bypasses fixed in #1935.
+    pub async fn format_async_for_view(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            None,
+        )
+        .await
+    }
+
+    /// Tracked twin of [`Self::format_async_for_view`]: hydration counts fuel and
+    /// policy against `tracker`.
+    pub async fn format_async_for_view_tracked(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            Some(tracker),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // Policy-aware async formatting methods
+    // ========================================================================
+
+    /// Format as JSON-LD Query JSON with policy filtering (async version)
+    ///
+    /// When `policy` is provided, hydration queries filter flakes according to
+    /// view policies during formatting. This ensures that nested objects fetched
+    /// during hydration also respect policy restrictions.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Compose a policy-wrapped view, then query it.
+    /// let db = fluree_db_api::GraphDb::from_ledger_state(&ledger).with_policy(Arc::new(policy_ctx.clone()));
+    /// let result = fluree.query(&db, &query).await?;
+    /// // Hydration formatting also applies policy
+    /// let json = result.to_jsonld_async_with_policy(db.as_graph_db_ref(), &policy_ctx).await?;
+    /// ```
+    pub async fn to_jsonld_async_with_policy(
+        &self,
+        db: GraphDbRef<'_>,
+        policy: &PolicyContext,
+    ) -> format::Result<JsonValue> {
+        let config = FormatterConfig::jsonld();
+        format::format_results_async(self, &self.context, db, &config, Some(policy), None).await
+    }
+
+    /// Format with custom configuration and policy filtering (async version)
+    ///
+    /// Combines custom formatting options with policy-aware hydration.
+    pub async fn format_async_with_policy(
+        &self,
+        db: GraphDbRef<'_>,
+        config: &FormatterConfig,
+        policy: &PolicyContext,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(self, &self.context, db, config, Some(policy), None).await
+    }
+
+    /// Tracked async JSON-LD formatting (hydration counts fuel/policy).
+    pub async fn to_jsonld_async_tracked(
+        &self,
+        db: GraphDbRef<'_>,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        let config = FormatterConfig::jsonld();
+        format::format_results_async(self, &self.context, db, &config, None, Some(tracker)).await
+    }
+
+    /// Tracked async JSON-LD formatting with policy (hydration counts fuel/policy).
+    pub async fn to_jsonld_async_with_policy_tracked(
+        &self,
+        db: GraphDbRef<'_>,
+        policy: &PolicyContext,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        let config = FormatterConfig::jsonld();
+        format::format_results_async(
+            self,
+            &self.context,
+            db,
+            &config,
+            Some(policy),
+            Some(tracker),
+        )
+        .await
+    }
+
+    /// Tracked async formatting with custom config (hydration counts fuel).
+    pub async fn format_async_tracked(
+        &self,
+        db: GraphDbRef<'_>,
+        config: &FormatterConfig,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(self, &self.context, db, config, None, Some(tracker)).await
+    }
+
+    /// Tracked async formatting with custom config and policy.
+    pub async fn format_async_with_policy_tracked(
+        &self,
+        db: GraphDbRef<'_>,
+        config: &FormatterConfig,
+        policy: &PolicyContext,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(self, &self.context, db, config, Some(policy), Some(tracker))
+            .await
+    }
+}

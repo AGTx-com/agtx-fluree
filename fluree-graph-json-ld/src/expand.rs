@@ -1,0 +1,2074 @@
+use crate::context::{Container, ContextEntry, ParsedContext, TypeValue};
+use crate::error::{JsonLdError, Result};
+use crate::iri::{self, UnresolvedIriDisposition};
+use serde_json::{json, Map, Value as JsonValue};
+use std::borrow::Cow;
+
+/// Check if a value is a variable (starts with ?)
+fn is_variable(s: &str) -> bool {
+    s.starts_with('?')
+}
+
+/// Attempts exact match with a compact-iri in context.
+/// Returns (full_iri, context_entry) if successful.
+fn match_exact(compact_iri: &str, context: &ParsedContext) -> Option<(String, ContextEntry)> {
+    context.get(compact_iri).map(|entry| {
+        let iri = entry
+            .id
+            .clone()
+            .or_else(|| entry.reverse.clone())
+            .unwrap_or_else(|| compact_iri.to_string());
+        (iri, entry.clone())
+    })
+}
+
+/// Attempts prefix match with a compact-iri.
+/// Returns (full_iri, context_entry) if successful.
+fn match_prefix(compact_iri: &str, context: &ParsedContext) -> Option<(String, ContextEntry)> {
+    iri::parse_prefix(compact_iri).and_then(|(prefix, suffix)| {
+        context.get(&prefix).and_then(|entry| {
+            entry.id.as_ref().map(|prefix_iri| {
+                let full_iri = format!("{prefix_iri}{suffix}");
+                (full_iri, entry.clone())
+            })
+        })
+    })
+}
+
+/// Uses default vocab/base if compact-iri doesn't look like an IRI.
+/// Returns (full_iri, context_entry) if successful.
+fn match_default(
+    compact_iri: &str,
+    context: &ParsedContext,
+    vocab: bool,
+) -> Option<(String, ContextEntry)> {
+    if is_variable(compact_iri) {
+        return Some((compact_iri.to_string(), ContextEntry::default()));
+    }
+
+    let default_match = if vocab {
+        context.vocab.as_ref()
+    } else {
+        context.base.as_ref()
+    };
+
+    default_match.and_then(|default| {
+        if !iri::any_iri(compact_iri) && !compact_iri.starts_with('@') {
+            let full_iri = format!("{default}{compact_iri}");
+            Some((
+                full_iri.clone(),
+                ContextEntry {
+                    id: Some(full_iri),
+                    ..Default::default()
+                },
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// Expand details: returns (expanded_iri, context_entry)
+/// If vocab is true, uses @vocab for properties/classes.
+/// If vocab is false, uses @base for @id values.
+pub fn details(
+    compact_iri: &str,
+    context: &ParsedContext,
+    vocab: bool,
+) -> (String, Option<ContextEntry>) {
+    // Try exact match first
+    if let Some((iri, entry)) = match_exact(compact_iri, context) {
+        return (iri, Some(entry));
+    }
+
+    // Try prefix match
+    if let Some((iri, entry)) = match_prefix(compact_iri, context) {
+        return (iri, Some(entry));
+    }
+
+    // Try default vocab/base
+    if let Some((iri, entry)) = match_default(compact_iri, context, vocab) {
+        return (iri, Some(entry));
+    }
+
+    // No match - return as-is
+    if compact_iri.starts_with('@') {
+        (
+            compact_iri.to_string(),
+            Some(ContextEntry {
+                id: Some(compact_iri.to_string()),
+                ..Default::default()
+            }),
+        )
+    } else {
+        (compact_iri.to_string(), None)
+    }
+}
+
+/// Expand a single IRI
+pub fn iri(compact_iri: &str, context: &ParsedContext, vocab: bool) -> String {
+    details(compact_iri, context, vocab).0
+}
+
+/// Reject an unresolved IRI if it looks like a compact IRI with a missing prefix.
+fn guard_unresolved(value: &str) -> Result<()> {
+    if let UnresolvedIriDisposition::RejectLikelyCompact { prefix } =
+        iri::check_unresolved_iri(value)
+    {
+        Err(JsonLdError::UnresolvedCompactIri {
+            value: value.to_string(),
+            prefix,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Like [`details`] but rejects unresolved compact-looking IRIs.
+///
+/// Use this at JSON-LD boundaries where every IRI position should either
+/// resolve through `@context` or be a recognisable absolute IRI.
+pub fn details_checked(
+    compact_iri: &str,
+    context: &ParsedContext,
+    vocab: bool,
+) -> Result<(String, Option<ContextEntry>)> {
+    let result = details(compact_iri, context, vocab);
+    if result.1.is_none() {
+        guard_unresolved(&result.0)?;
+    }
+    Ok(result)
+}
+
+/// Like [`iri`] but rejects unresolved compact-looking IRIs.
+pub fn iri_checked(compact_iri: &str, context: &ParsedContext, vocab: bool) -> Result<String> {
+    let (expanded, entry) = details(compact_iri, context, vocab);
+    if entry.is_none() {
+        guard_unresolved(&expanded)?;
+    }
+    Ok(expanded)
+}
+
+// ── Internal dispatch: strict=true → checked, strict=false → unchecked ──
+
+fn iri_dispatch(s: &str, ctx: &ParsedContext, vocab: bool, strict: bool) -> Result<String> {
+    if strict {
+        iri_checked(s, ctx, vocab)
+    } else {
+        Ok(iri(s, ctx, vocab))
+    }
+}
+
+fn details_dispatch(
+    s: &str,
+    ctx: &ParsedContext,
+    vocab: bool,
+    strict: bool,
+) -> Result<(String, Option<ContextEntry>)> {
+    if strict {
+        details_checked(s, ctx, vocab)
+    } else {
+        Ok(details(s, ctx, vocab))
+    }
+}
+
+/// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
+/// relative to `@vocab`, else to `@base`. `None` for a term defined as
+/// `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    match details(s, ctx, true) {
+        (_, Some(entry)) if entry.null_mapping => Ok(None),
+        (expanded, Some(_)) => Ok(Some(expanded)),
+        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+    }
+}
+
+/// A `@type` value's IRI; `None` for a term defined as `null`.
+fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
+}
+
+/// Detect a context-coerced `@vector` declaration (long or shorthand form).
+fn is_vector_type(type_val: Option<&TypeValue>) -> bool {
+    matches!(
+        type_val,
+        Some(TypeValue::Iri(t))
+            if t == "@vector" || t == fluree_vocab::fluree::EMBEDDING_VECTOR
+    )
+}
+
+/// Check if map is a @list container
+fn is_list_item(map: &Map<String, JsonValue>) -> bool {
+    (map.contains_key("@list") || map.contains_key("list"))
+        && (map.len() == 1
+            || (map.len() == 2 && (map.contains_key("@index") || map.contains_key("index"))))
+}
+
+/// Check if map is a @set container
+fn is_set_item(map: &Map<String, JsonValue>) -> bool {
+    (map.contains_key("@set") || map.contains_key("set"))
+        && (map.len() == 1
+            || (map.len() == 2 && (map.contains_key("@index") || map.contains_key("index"))))
+}
+
+/// Parse a value based on its type and context info
+fn parse_node_value(
+    value: &JsonValue,
+    entry: Option<&ContextEntry>,
+    context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<Vec<JsonValue>> {
+    guard_depth(path)?;
+    let type_val = entry.and_then(|e| e.type_.as_ref());
+    let id_val = entry.and_then(|e| e.id.as_deref());
+
+    match value {
+        JsonValue::Null => Ok(vec![]),
+
+        // A term typed `@json` makes its whole value one JSON literal,
+        // whatever its shape. A string `@value` on a JSON literal is read
+        // as an already serialized document, so a string goes in serialized:
+        // `"hello"` is the JSON string, not the text `hello`.
+        _ if type_val == Some(&TypeValue::Json) => {
+            let literal = match value {
+                JsonValue::String(_) => JsonValue::String(crate::normalize::normalize(value)),
+                _ => value.clone(),
+            };
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), literal);
+            obj.insert("@type".to_string(), json!("@json"));
+            Ok(vec![JsonValue::Object(obj)])
+        }
+
+        JsonValue::Bool(b) => {
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), json!(*b));
+            if let Some(TypeValue::Iri(t)) = type_val {
+                obj.insert("@type".to_string(), json!(t));
+            }
+            Ok(vec![JsonValue::Object(obj)])
+        }
+
+        JsonValue::Number(n) => {
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), JsonValue::Number(n.clone()));
+            if let Some(TypeValue::Iri(t)) = type_val {
+                obj.insert("@type".to_string(), json!(t));
+            }
+            Ok(vec![JsonValue::Object(obj)])
+        }
+
+        JsonValue::String(s) => {
+            // Check for @id or @type expansion
+            if id_val == Some("@id") || id_val == Some("@type") {
+                return Ok(vec![json!(iri_dispatch(s, context, false, strict)?)]);
+            }
+
+            // Check if type is @id (value should be expanded as IRI)
+            if type_val == Some(&TypeValue::Id) {
+                let mut obj = Map::new();
+                obj.insert(
+                    "@id".to_string(),
+                    json!(iri_dispatch(s, context, false, strict)?),
+                );
+                return Ok(vec![JsonValue::Object(obj)]);
+            }
+
+            if type_val == Some(&TypeValue::Vocab) {
+                return Ok(vocab_value_iri(s, context, strict)?
+                    .map(|iri| json!({"@id": iri}))
+                    .into_iter()
+                    .collect());
+            }
+
+            let mut obj = Map::new();
+            obj.insert("@value".to_string(), json!(s));
+
+            // A term's datatype excludes any language, the default one
+            // included; a term's own `@language`, even `null`, overrides
+            // the default.
+            if let Some(TypeValue::Iri(t)) = type_val {
+                obj.insert("@type".to_string(), json!(t));
+            } else if let Some(lang) = match entry.and_then(|e| e.language.as_ref()) {
+                Some(term_language) => term_language.as_ref(),
+                None => context.language.as_ref(),
+            } {
+                obj.insert("@language".to_string(), json!(lang));
+            }
+
+            Ok(vec![JsonValue::Object(obj)])
+        }
+
+        JsonValue::Array(arr) => {
+            // Context-coerced `@vector` (or `f:embeddingVector`) array values
+            // expand to ONE value-object whose `@value` is the array — matching
+            // the explicit `{"@value": [...], "@type": "@vector"}` form. Without
+            // this, the array would be split into N scalar @value objects, each
+            // tagged with the vector datatype, which downstream commits as
+            // VECTOR_ID flakes pointing at scalar arena handles (storage corruption).
+            if is_vector_type(type_val) {
+                let mut obj = Map::new();
+                obj.insert("@value".to_string(), JsonValue::Array(arr.clone()));
+                obj.insert(
+                    "@type".to_string(),
+                    json!(fluree_vocab::fluree::EMBEDDING_VECTOR),
+                );
+                return Ok(vec![JsonValue::Object(obj)]);
+            }
+
+            let mut results = Vec::new();
+            for (i, item) in arr.iter().enumerate() {
+                let item_path = path.index(i);
+
+                if let JsonValue::Array(_) = item {
+                    return Err(JsonLdError::NestedSequence {
+                        idx: item_path.to_vec(),
+                    });
+                }
+
+                let expanded = if item.is_object() {
+                    let map = item.as_object().unwrap();
+                    if map.contains_key("@value") || map.contains_key("value") {
+                        parse_node_value(item, entry, context, &item_path, strict)?
+                    } else {
+                        vec![expand_node_internal(item, context, &item_path, strict)?]
+                    }
+                } else {
+                    parse_node_value(item, entry, context, &item_path, strict)?
+                };
+                results.extend(expanded);
+            }
+
+            // Check if container is @list
+            if let Some(e) = entry {
+                if let Some(ref containers) = e.container {
+                    if containers.contains(&Container::List) {
+                        let mut obj = Map::new();
+                        obj.insert("@list".to_string(), JsonValue::Array(results));
+                        return Ok(vec![JsonValue::Object(obj)]);
+                    }
+                }
+            }
+
+            Ok(results)
+        }
+
+        JsonValue::Object(map) => {
+            // Check for @list
+            if is_list_item(map) {
+                let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
+                let list_path = path.key("@list");
+                let expanded = parse_node_value(list_val, entry, context, &list_path, strict)?;
+                let mut obj = Map::new();
+                obj.insert("@list".to_string(), JsonValue::Array(expanded));
+                return Ok(vec![JsonValue::Object(obj)]);
+            }
+
+            // Check for @set (flatten it)
+            if is_set_item(map) {
+                let set_val = map.get("@set").or_else(|| map.get("set")).unwrap();
+                return parse_node_value(set_val, entry, context, &path.key("@set"), strict);
+            }
+
+            // Check for @value
+            if map.contains_key("@value") || map.contains_key("value") {
+                return parse_value_object(map, entry, context, path, strict);
+            }
+
+            // Check for @container: @language
+            if let Some(e) = entry {
+                if let Some(ref containers) = e.container {
+                    if containers.contains(&Container::Language) {
+                        let mut results = Vec::new();
+                        for (lang, v) in map {
+                            let values = match v {
+                                JsonValue::Array(arr) => arr.clone(),
+                                _ => vec![v.clone()],
+                            };
+                            for val in values {
+                                let val_str = if let JsonValue::Object(m) = &val {
+                                    m.get("@value")
+                                        .or_else(|| m.get("value"))
+                                        .and_then(|v| v.as_str())
+                                        .map(std::string::ToString::to_string)
+                                } else {
+                                    val.as_str().map(std::string::ToString::to_string)
+                                };
+
+                                if let Some(s) = val_str {
+                                    let mut obj = Map::new();
+                                    obj.insert("@value".to_string(), json!(s));
+                                    obj.insert("@language".to_string(), json!(lang));
+                                    results.push(JsonValue::Object(obj));
+                                }
+                            }
+                        }
+                        return Ok(results);
+                    }
+                }
+            }
+
+            // `@container: @index`: the keys only index the values, which
+            // expand as the property's values.
+            if let Some(e) = entry.filter(|e| {
+                e.container
+                    .as_ref()
+                    .is_some_and(|c| c.contains(&Container::Index))
+            }) {
+                // The keys would become values of the index property;
+                // refused rather than dropped.
+                if let Some(property) = &e.index {
+                    return Err(JsonLdError::InvalidContext {
+                        message: format!(
+                            "a property-valued @index (\"{property}\") is not supported"
+                        ),
+                    });
+                }
+                let unindexed = ContextEntry {
+                    container: e.container.as_ref().map(|containers| {
+                        containers
+                            .iter()
+                            .filter(|c| **c != Container::Index)
+                            .cloned()
+                            .collect()
+                    }),
+                    ..e.clone()
+                };
+                let mut results = Vec::new();
+                for (index, item) in map {
+                    results.extend(parse_node_value(
+                        item,
+                        Some(&unindexed),
+                        context,
+                        &path.key(index),
+                        strict,
+                    )?);
+                }
+                return Ok(results);
+            }
+
+            // Otherwise, expand as nested node
+            let ctx = if let Some(e) = entry {
+                if let Some(ref nested) = e.context {
+                    let mut merged = context.clone();
+                    apply_scoped_context(&mut merged, nested);
+                    Cow::Owned(merged)
+                } else {
+                    Cow::Borrowed(context)
+                }
+            } else {
+                Cow::Borrowed(context)
+            };
+
+            Ok(vec![expand_node_internal(value, &ctx, path, strict)?])
+        }
+    }
+}
+
+/// Parse a @value object
+fn parse_value_object(
+    map: &Map<String, JsonValue>,
+    entry: Option<&ContextEntry>,
+    context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<Vec<JsonValue>> {
+    let val = map.get("@value").or_else(|| map.get("value")).unwrap();
+
+    // Check for explicit @type
+    let explicit_type = match map
+        .get("@type")
+        .or_else(|| map.get("type"))
+        .and_then(|t| t.as_str())
+    {
+        Some(t) => Some(iri_dispatch(t, context, true, strict)?),
+        None => None,
+    };
+
+    let explicit_language = map
+        .get("@language")
+        .or_else(|| map.get("language"))
+        .and_then(|l| l.as_str());
+
+    // The object's own `@type` and `@language` exclude each other. Its own
+    // language overrides the datatype its term would give, and a datatype
+    // excludes the default language. A term's `@id` or `@vocab` coercion
+    // never applies here: JSON-LD 1.1 coerces only a string value to an IRI
+    // (Value Expansion), and a value object is a literal. Only an explicit
+    // `"@type": "@id"` on the object makes it a reference.
+    let type_iri = match explicit_type {
+        Some(_) if explicit_language.is_some() => return Err(JsonLdError::LanguageWithType),
+        Some(t) => Some(t),
+        None if explicit_language.is_some() => None,
+        None => entry.as_ref().and_then(|e| match &e.type_ {
+            Some(TypeValue::Iri(t)) => Some(t.clone()),
+            _ => None,
+        }),
+    };
+    // A value object typed `@id` gets its own message below, which names
+    // its fix: a string IRI.
+    if (val.is_array() || val.is_object())
+        && type_iri.as_deref() != Some("@id")
+        && !holds_structured_value(type_iri.as_deref(), val)
+    {
+        return Err(JsonLdError::InvalidValueObject {
+            at: path.to_json(),
+            reason: "a value object whose @value is an array or a map needs \"@type\": \
+                     \"@json\" (or \"@vector\" for an array)",
+        });
+    }
+    let lang = match type_iri {
+        Some(_) => None,
+        None => explicit_language
+            .map(std::string::ToString::to_string)
+            .or_else(|| context.language.clone()),
+    };
+
+    // Build result
+    let mut obj = Map::new();
+
+    if type_iri.as_deref() == Some("@id") {
+        let Some(iri) = val.as_str() else {
+            return Err(JsonLdError::InvalidValueObject {
+                at: path.to_json(),
+                reason: "a value object typed @id names an IRI, so its @value must be a string",
+            });
+        };
+        let iri_val = iri_dispatch(iri, context, false, strict)?;
+        obj.insert("@id".to_string(), json!(iri_val));
+    } else {
+        obj.insert("@value".to_string(), val.clone());
+
+        if let Some(t) = type_iri {
+            obj.insert("@type".to_string(), json!(t));
+        } else if let Some(l) = lang {
+            obj.insert("@language".to_string(), json!(l));
+        }
+    }
+
+    // `{"@value": …, "@annotation": {…}}`: the annotation describes a
+    // reifier of the triple this value completes, and expands as a node does.
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, context, &path.key(key), strict)?
+            {
+                JsonValue::Array(nodes) => nodes,
+                node => vec![node],
+            };
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
+        }
+    }
+
+    Ok(vec![JsonValue::Object(obj)])
+}
+
+/// Whether a value object typed `type_iri` may hold `val`, an array or a map:
+/// a JSON literal holds either, a vector only an array. Refused here, a map
+/// under a vector type fails every reader alike; a bulk import reaches no
+/// vector parser to refuse it.
+fn holds_structured_value(type_iri: Option<&str>, val: &JsonValue) -> bool {
+    match type_iri {
+        Some("@json" | fluree_vocab::rdf::JSON) => true,
+        Some("@vector" | fluree_vocab::fluree::EMBEDDING_VECTOR) => val.is_array(),
+        _ => false,
+    }
+}
+
+/// Parse @type values and return expanded types with potentially updated context
+fn parse_type<'c>(
+    node_map: &Map<String, JsonValue>,
+    context: &'c ParsedContext,
+    strict: bool,
+) -> Result<(Vec<String>, Cow<'c, ParsedContext>)> {
+    let type_key = &context.type_key;
+    let type_id = context.get(type_key).and_then(|e| e.id.clone());
+
+    let type_val = node_map
+        .get(type_key)
+        .or_else(|| type_id.as_ref().and_then(|id| node_map.get(id)));
+
+    if let Some(type_val) = type_val {
+        let types: Vec<String> = match type_val {
+            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
+            JsonValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        result.extend(type_iri(s, context, strict)?);
+                    }
+                }
+                result
+            }
+            _ => vec![],
+        };
+
+        // Check for type-dependent sub-contexts
+        let mut updated_context = Cow::Borrowed(context);
+        // Check original (unexpanded) types for sub-context
+        let original_types: Vec<&str> = match type_val {
+            JsonValue::String(s) => vec![s.as_str()],
+            JsonValue::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+            _ => vec![],
+        };
+
+        for orig_t in original_types {
+            if let Some(entry) = context.get(orig_t) {
+                if let Some(ref sub_ctx) = entry.context {
+                    apply_scoped_context(updated_context.to_mut(), sub_ctx);
+                }
+            }
+        }
+
+        Ok((types, updated_context))
+    } else {
+        Ok((vec![], Cow::Borrowed(context)))
+    }
+}
+
+/// Apply a scoped (property- or type-scoped) context's terms to the active
+/// context. A scoped context is parsed on its own, when its term is defined,
+/// so a term IRI it writes as a compact IRI over a prefix it does not define
+/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there. It
+/// is expanded here, against the active context the scoped context applies
+/// to, before the scoped terms take effect; left compact, it would expand a
+/// key to the compact string and store that as an IRI.
+fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
+    let resolve = |iri: &str| -> Option<String> {
+        let (prefix, suffix) = iri::parse_prefix(iri)?;
+        let prefix_iri = active.get(&prefix)?.id.as_deref()?;
+        (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+    };
+    let resolved: Vec<(String, ContextEntry)> = scoped
+        .terms
+        .iter()
+        .map(|(term, entry)| {
+            let mut entry = entry.clone();
+            if let Some(iri) = entry.id.as_deref().and_then(resolve) {
+                entry.id = Some(iri);
+            }
+            if let Some(iri) = entry.reverse.as_deref().and_then(resolve) {
+                entry.reverse = Some(iri);
+            }
+            if let Some(TypeValue::Iri(datatype)) = &entry.type_ {
+                if let Some(iri) = resolve(datatype) {
+                    entry.type_ = Some(TypeValue::Iri(iri));
+                }
+            }
+            (term.clone(), entry)
+        })
+        .collect();
+    active.terms.extend(resolved);
+    if scoped.vocab.is_some() {
+        active.vocab = scoped.vocab.clone();
+    }
+}
+
+/// Get context from node map
+fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
+    node_map.get("@context").or_else(|| node_map.get("context"))
+}
+
+/// Maximum expansion depth for nested JSON-LD values. Expansion recurses
+/// over the value tree through [`expand_node_internal`] and
+/// [`parse_node_value`], and while text inputs are already bounded by
+/// serde_json's default 128-level deserialization recursion limit, a
+/// programmatically built `JsonValue` bypasses that — without this guard,
+/// deep nesting would overflow the stack and abort the process (a Rust
+/// stack overflow is not catchable).
+///
+/// This bounds recursion frames, not user-visible nesting levels: `@list`/
+/// `@set` container chains add two frames per level and so are refused at
+/// ~64 levels rather than 128. See [`guard_depth`].
+pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
+
+/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The [`Path`] gains at least
+/// one step on each recursion edge (an array index or property key, directly
+/// or in the immediate caller), so its depth bounds the recursion. Both
+/// recursion entry points ([`expand_node_internal`] and [`parse_node_value`])
+/// call this, so the `@list`/`@set` self-recursion in `parse_node_value` —
+/// which never re-enters `expand_node_internal` — is bounded too.
+///
+/// The bound is on path steps (recursion frames), not user-visible nesting
+/// levels, and the two are not the same: a plain node chain adds one step per
+/// level, so it reaches `MAX_EXPAND_DEPTH` levels, but each `@list`/`@set`
+/// container level adds two (the property key, then the container marker), so
+/// container chains are refused at roughly half that — ~64 user-visible levels.
+/// A container-chain rejection near 64 is expected, not a bug.
+fn guard_depth(path: &Path<'_>) -> Result<()> {
+    if path.depth > MAX_EXPAND_DEPTH {
+        return Err(JsonLdError::NestingTooDeep);
+    }
+    Ok(())
+}
+
+/// Where expansion is in the document: the array indexes and property keys
+/// from the root. Each step borrows its parent, so descending costs no
+/// allocation; the steps are collected only to report an error.
+struct Path<'a> {
+    depth: usize,
+    last: Option<(&'a Path<'a>, Step<'a>)>,
+}
+
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Index(usize),
+    Key(&'a str),
+}
+
+impl<'a> Path<'a> {
+    const ROOT: Path<'static> = Path {
+        depth: 0,
+        last: None,
+    };
+
+    fn index(&'a self, i: usize) -> Path<'a> {
+        self.then(Step::Index(i))
+    }
+
+    fn key(&'a self, key: &'a str) -> Path<'a> {
+        self.then(Step::Key(key))
+    }
+
+    fn then(&'a self, step: Step<'a>) -> Path<'a> {
+        Path {
+            depth: self.depth + 1,
+            last: Some((self, step)),
+        }
+    }
+
+    /// The steps from the root, as JSON values (an index is a number, a key a
+    /// string).
+    fn to_vec(&self) -> Vec<JsonValue> {
+        let mut steps = Vec::with_capacity(self.depth);
+        let mut at = self;
+        while let Some((parent, step)) = at.last {
+            steps.push(match step {
+                Step::Index(i) => json!(i),
+                Step::Key(k) => json!(k),
+            });
+            at = parent;
+        }
+        steps.reverse();
+        steps
+    }
+
+    /// The steps from the root as a JSON array's text, for a message.
+    fn to_json(&self) -> String {
+        JsonValue::Array(self.to_vec()).to_string()
+    }
+}
+
+/// Internal node expansion
+fn expand_node_internal(
+    node_map: &JsonValue,
+    context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    guard_depth(path)?;
+    match node_map {
+        JsonValue::Array(arr) => {
+            let expanded: Result<Vec<JsonValue>> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, item)| expand_node_internal(item, context, &path.index(i), strict))
+                .collect();
+            Ok(JsonValue::Array(expanded?))
+        }
+
+        JsonValue::Object(map) => {
+            // Parse local context if present
+            let local_context = get_context(map);
+            let merged_context = if let Some(lc) = local_context {
+                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
+            } else {
+                Cow::Borrowed(context)
+            };
+
+            // Parse @type and get updated context
+            let (types, context_with_types) = parse_type(map, &merged_context, strict)?;
+
+            // Build result
+            let mut result = Map::new();
+
+            // Add @type if present
+            if !types.is_empty() {
+                result.insert("@type".to_string(), json!(types));
+            }
+
+            // Process other keys
+            let type_key = merged_context.type_key.clone();
+            let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
+            let keys = NodeKeys {
+                context: &context_with_types,
+                type_key: &type_key,
+                type_id: type_id.as_deref(),
+                strict,
+            };
+            expand_node_entries(map, &keys, path, false, &mut result)?;
+
+            Ok(JsonValue::Object(result))
+        }
+
+        _ => Ok(node_map.clone()),
+    }
+}
+
+/// What a node object's entries expand against.
+struct NodeKeys<'a> {
+    context: &'a ParsedContext,
+    /// The `@type` key and its alias, handled by [`parse_type`].
+    type_key: &'a str,
+    type_id: Option<&'a str>,
+    strict: bool,
+}
+
+/// Expand a node object's entries (every entry but `@context` and the type
+/// key) into `result`. `nested` is true for the entries of a `@nest` value,
+/// which belong to the enclosing node and so may not name another node or
+/// graph.
+fn expand_node_entries(
+    map: &Map<String, JsonValue>,
+    keys: &NodeKeys<'_>,
+    path: &Path<'_>,
+    nested: bool,
+    result: &mut Map<String, JsonValue>,
+) -> Result<()> {
+    let context = keys.context;
+    let strict = keys.strict;
+    for (k, v) in map {
+        // Skip context and type keys
+        if k == "@context" || k == "context" {
+            continue;
+        }
+        if k == keys.type_key || Some(k.as_str()) == keys.type_id {
+            continue;
+        }
+
+        let key_path = path.key(k);
+
+        let (expanded_key, entry) = details_dispatch(k, context, true, strict)?;
+        if entry.as_ref().is_some_and(|e| e.null_mapping) {
+            continue;
+        }
+
+        // Handle @graph: the keyword, an alias of it, or the legacy bare
+        // `graph` key when the context does not define `graph` as a property
+        // (a defined term is ordinary data).
+        if expanded_key == "@graph" || crate::graph_shape::is_graph_key(k, context) {
+            if nested {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "a nested value cannot carry `@graph`",
+                });
+            }
+            let graph_expanded = expand_node_internal(v, context, &key_path, strict)?;
+            result.insert("@graph".to_string(), graph_expanded);
+            continue;
+        }
+
+        // Handle @id
+        if expanded_key == "@id" || k == "@id" {
+            if nested {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "a nested value belongs to the enclosing node and cannot carry `@id`",
+                });
+            }
+            if let JsonValue::String(s) = v {
+                result.insert(
+                    "@id".to_string(),
+                    json!(iri_dispatch(s, context, false, strict)?),
+                );
+            }
+            continue;
+        }
+
+        // `@nest` (JSON-LD 1.1): the value's entries are this node's own
+        // entries, recursively.
+        if expanded_key == "@nest" {
+            expand_nest_value(v, keys, &key_path, result)?;
+            continue;
+        }
+
+        // `@reverse` (keyword): a map of properties whose values are the
+        // subjects of statements that point at this node.
+        if expanded_key == "@reverse" {
+            if !v.is_object() {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@reverse",
+                    reason: "the value must be a map of reverse properties",
+                });
+            }
+            if let JsonValue::Object(props) = expand_node_internal(v, context, &key_path, strict)? {
+                for (property, values) in props {
+                    if property.starts_with('@') {
+                        return Err(JsonLdError::InvalidKeywordValue {
+                            keyword: "@reverse",
+                            reason: "the value may hold only properties",
+                        });
+                    }
+                    let values = match values {
+                        JsonValue::Array(values) => values,
+                        other => vec![other],
+                    };
+                    push_reverse(result, property, values);
+                }
+            }
+            continue;
+        }
+
+        // Expand value
+        let expanded_values = parse_node_value(v, entry.as_ref(), context, &key_path, strict)?;
+
+        // A key whose values expand to nothing is dropped — EXCEPT
+        // `@list`: `{"@list": []}` is a value, the empty list, which
+        // denotes the IRI rdf:nil. Dropping the key here turned
+        // `[{"@list": []}]` into `[{}]` — a spurious blank node
+        // downstream instead of the rdf:nil triple (issue #1694
+        // twin). This branch is how an array-position `{"@list": …}`
+        // item expands (it routes through `expand_node_internal`
+        // rather than `parse_node_value`'s `@list` arm).
+        if !expanded_values.is_empty() || expanded_key == "@list" {
+            // A term defined with `@reverse` is a reverse property: its values
+            // are the subjects, as with the `@reverse` keyword. (It used to be
+            // written forward, inverting the statement.)
+            if entry.as_ref().is_some_and(|e| e.reverse.is_some()) {
+                push_reverse(result, expanded_key, expanded_values);
+                continue;
+            }
+
+            // Append to existing or create new
+            if let Some(existing) = result.get_mut(&expanded_key) {
+                if let JsonValue::Array(arr) = existing {
+                    arr.extend(expanded_values);
+                }
+            } else {
+                result.insert(expanded_key, JsonValue::Array(expanded_values));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge a `@nest` value (a map, or an array of maps) into the enclosing
+/// node: its properties and types are the node's own.
+fn expand_nest_value(
+    value: &JsonValue,
+    keys: &NodeKeys<'_>,
+    path: &Path<'_>,
+    result: &mut Map<String, JsonValue>,
+) -> Result<()> {
+    guard_depth(path)?;
+    let items: Vec<&JsonValue> = match value {
+        JsonValue::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    for item in items {
+        let nested = match item {
+            JsonValue::Object(nested)
+                if !["@value", "@list", "@set"]
+                    .iter()
+                    .any(|k| nested.contains_key(*k)) =>
+            {
+                nested
+            }
+            _ => {
+                return Err(JsonLdError::InvalidKeywordValue {
+                    keyword: "@nest",
+                    reason: "the value must be a map (or maps) of properties",
+                })
+            }
+        };
+        let (types, _) = parse_type(nested, keys.context, keys.strict)?;
+        if !types.is_empty() {
+            let slot = result
+                .entry("@type".to_string())
+                .or_insert_with(|| JsonValue::Array(Vec::new()));
+            if let JsonValue::Array(existing) = slot {
+                existing.extend(types.into_iter().map(JsonValue::String));
+            }
+        }
+        expand_node_entries(nested, keys, path, true, result)?;
+    }
+    Ok(())
+}
+
+/// Add `values` under `property` in the node's `@reverse` map.
+fn push_reverse(result: &mut Map<String, JsonValue>, property: String, values: Vec<JsonValue>) {
+    let reverse = result
+        .entry("@reverse".to_string())
+        .or_insert_with(|| JsonValue::Object(Map::new()));
+    if let JsonValue::Object(reverse) = reverse {
+        match reverse.get_mut(&property) {
+            Some(JsonValue::Array(existing)) => existing.extend(values),
+            _ => {
+                reverse.insert(property, JsonValue::Array(values));
+            }
+        }
+    }
+}
+
+/// Shared implementation for node expansion with configurable strictness.
+pub(crate) fn node_impl(
+    node_map: &JsonValue,
+    context: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    match node_map {
+        JsonValue::Array(arr) => {
+            let expanded: Result<Vec<JsonValue>> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, item)| expand_node_internal(item, context, &Path::ROOT.index(i), strict))
+                .collect();
+            Ok(JsonValue::Array(expanded?))
+        }
+
+        JsonValue::Object(map) => {
+            // Envelope form: a top-level `@graph` holding node objects, with no
+            // `@id`, is a default-graph wrapper. Expand only the `@graph`
+            // contents. Extra top-level keys (txn-meta properties) are handled
+            // separately by the transact parser's extract_txn_meta(), so we
+            // must not feed the whole envelope into expand_node_internal — that
+            // would treat the envelope as a single node and silently drop
+            // @graph.
+            //
+            // The value decides (`graph_shape::is_envelope_graph`, shared with
+            // every other reader of `@graph`): with an `@id` the content is a
+            // JSON-LD named graph, and a graph *selector* marks a node, not a
+            // wrapper. Both expand as a node, which keeps the `@id`, the
+            // properties and the `@graph` entry.
+            //
+            // A legacy bare `graph` key on an object with no `@id` is an
+            // envelope too. The transaction paths strip it before expansion
+            // (it is a reserved routing key there).
+            if let Some(key) = crate::graph_shape::envelope_graph_key(map)? {
+                return expand_envelope(map, key, &map[key], context, strict);
+            }
+
+            expand_node_internal(node_map, context, &Path::ROOT, strict)
+        }
+
+        _ => Ok(node_map.clone()),
+    }
+}
+
+/// Expand the contents of an envelope's `@graph` under the envelope's own
+/// `@context`.
+fn expand_envelope(
+    map: &Map<String, JsonValue>,
+    graph_key: &str,
+    graph: &JsonValue,
+    context: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    let merged_context = match get_context(map) {
+        Some(lc) => ParsedContext::parse(Some(context), lc)?,
+        None => context.clone(),
+    };
+    expand_node_internal(graph, &merged_context, &Path::ROOT.key(graph_key), strict)
+}
+
+/// Expand a JSON-LD node (document).
+///
+/// Permissive: unresolved compact-looking IRIs pass through silently.
+pub fn node(node_map: &JsonValue, context: &ParsedContext) -> Result<JsonValue> {
+    node_impl(node_map, context, false)
+}
+
+/// Expand a JSON-LD node (document) with strict compact-IRI checking.
+///
+/// Rejects unresolved compact-looking IRIs (e.g. `ex:Person` when `ex` is
+/// not defined in `@context`) at every IRI position. Use this at Fluree's
+/// JSON-LD parsing boundaries (queries and transactions).
+pub fn node_checked(node_map: &JsonValue, context: &ParsedContext) -> Result<JsonValue> {
+    node_impl(node_map, context, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_expand_iri_exact_match() {
+        let ctx = ParsedContext::parse(
+            None,
+            &json!({
+                "schema": "http://schema.org/",
+                "REPLACE": "http://schema.org/Person"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(iri("schema:name", &ctx, true), "http://schema.org/name");
+        assert_eq!(iri("REPLACE", &ctx, true), "http://schema.org/Person");
+    }
+
+    #[test]
+    fn test_expand_iri_vocab() {
+        let ctx = ParsedContext::parse(None, &json!("https://schema.org")).unwrap();
+
+        assert_eq!(iri("name", &ctx, true), "https://schema.org/name");
+        // Full IRIs should pass through
+        assert_eq!(
+            iri("http://example.org/ns#Book", &ctx, true),
+            "http://example.org/ns#Book"
+        );
+    }
+
+    #[test]
+    fn test_expand_iri_no_match() {
+        let ctx = ParsedContext::parse(None, &json!({"schema": "http://schema.org/"})).unwrap();
+
+        assert_eq!(iri("not:matching", &ctx, true), "not:matching");
+    }
+
+    #[test]
+    fn test_expand_reverse_iri() {
+        let ctx = ParsedContext::parse(
+            None,
+            &json!({
+                "schema": "http://schema.org/",
+                "parent": {"@reverse": "schema:child"}
+            }),
+        )
+        .unwrap();
+
+        let (expanded, entry) = details("parent", &ctx, true);
+        assert_eq!(expanded, "http://schema.org/child");
+        assert_eq!(
+            entry.unwrap().reverse,
+            Some("http://schema.org/child".to_string())
+        );
+    }
+
+    #[test]
+    fn test_expand_node_basic() {
+        let doc = json!({
+            "@context": {
+                "ical": "http://www.w3.org/2002/12/cal/ical#",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "ical:dtstart": {"@type": "xsd:dateTime"}
+            },
+            "ical:summary": "Lady Gaga Concert",
+            "ical:location": "New Orleans Arena, New Orleans, Louisiana, USA",
+            "ical:dtstart": "2011-04-09T20:00:00Z"
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        assert!(obj.contains_key("http://www.w3.org/2002/12/cal/ical#summary"));
+        assert!(obj.contains_key("http://www.w3.org/2002/12/cal/ical#dtstart"));
+
+        let dtstart = &obj["http://www.w3.org/2002/12/cal/ical#dtstart"][0];
+        assert_eq!(dtstart["@value"], "2011-04-09T20:00:00Z");
+        assert_eq!(
+            dtstart["@type"],
+            "http://www.w3.org/2001/XMLSchema#dateTime"
+        );
+    }
+
+    #[test]
+    fn test_expand_node_with_id_and_type() {
+        let doc = json!({
+            "@context": "https://schema.org",
+            "@id": "https://www.wikidata.org/wiki/Q836821",
+            "@type": "Movie",
+            "name": "Hitchhiker's Guide to the Galaxy"
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        assert_eq!(obj["@id"], "https://www.wikidata.org/wiki/Q836821");
+        // Without external context mapping, https://schema.org stays as https
+        assert_eq!(obj["@type"], json!(["https://schema.org/Movie"]));
+        assert!(obj.contains_key("https://schema.org/name"));
+    }
+
+    /// An empty `@list` survives expansion in every spelling. The
+    /// array-position item routes through `expand_node_internal`, whose
+    /// drop-empty-keys rule used to strip the `@list` key — `[{"@list": []}]`
+    /// expanded to `[{}]`, which downstream stored a spurious blank node
+    /// instead of the `rdf:nil` the empty list denotes (issue #1694 twin).
+    #[test]
+    fn test_expand_empty_list_keeps_list_key() {
+        for doc in [
+            json!({"@id": "http://example.org/s", "http://example.org/p": {"@list": []}}),
+            json!({"@id": "http://example.org/s", "http://example.org/p": [{"@list": []}]}),
+        ] {
+            let result = node(&doc, &ParsedContext::new()).unwrap();
+            let obj = result.as_object().unwrap();
+            assert_eq!(
+                obj["http://example.org/p"],
+                json!([{"@list": []}]),
+                "empty @list must expand to itself, not vanish: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_list() {
+        let doc = json!({
+            "@context": {
+                "nick": {"@id": "http://xmlns.com/foaf/0.1/nick", "@container": "@list"}
+            },
+            "@id": "http://example.org/people#joebob",
+            "nick": ["joe", "bob", "jaybee"]
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        let nicks = &obj["http://xmlns.com/foaf/0.1/nick"][0];
+        assert!(nicks.get("@list").is_some());
+        let list = nicks["@list"].as_array().unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn test_expand_set_flattens() {
+        let doc = json!({
+            "@context": {"foaf": "http://xmlns.com/foaf/0.1/"},
+            "@id": "http://example.org/people#joebob",
+            "foaf:nick": {"@set": ["joe", "bob", "jaybee"]}
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        let nicks = obj["http://xmlns.com/foaf/0.1/nick"].as_array().unwrap();
+        assert_eq!(nicks.len(), 3);
+        // @set should be flattened (no @set wrapper)
+        assert!(nicks[0].get("@value").is_some());
+    }
+
+    #[test]
+    fn test_expand_base_and_vocab() {
+        let doc = json!({
+            "@context": {
+                "@base": "https://base.com/base/iri",
+                "@vocab": "https://vocab.com/vocab/iri/",
+                "iriProperty": {"@type": "@id"}
+            },
+            "@id": "#joebob",
+            "@type": "Joey",
+            "name": "Joe Bob",
+            "iriProperty": "#a-relative-id"
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        assert_eq!(obj["@id"], "https://base.com/base/iri#joebob");
+        assert_eq!(obj["@type"], json!(["https://vocab.com/vocab/iri/Joey"]));
+    }
+
+    #[test]
+    fn test_false_value_survives() {
+        let doc = json!({
+            "@id": "foo",
+            "bar": {"@value": false}
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        assert_eq!(obj["bar"][0]["@value"], false);
+    }
+
+    /// A term's `@id` or `@vocab` coercion turns a string into an IRI, but a
+    /// value object stays a literal, with only its own `@type` or
+    /// `@language` (JSON-LD 1.1 API, Expansion Algorithm step 4.3 and Value
+    /// Expansion). An explicit `"@type": "@id"` still makes a reference.
+    #[test]
+    fn value_object_under_id_or_vocab_term_stays_a_literal() {
+        let xsd_string = "http://www.w3.org/2001/XMLSchema#string";
+        for coercion in ["@id", "@vocab"] {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#",
+                    "unit": {"@id": "ex:unit", "@type": coercion}
+                },
+                "@id": "ex:price",
+                "unit": [
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": "xsd:string"},
+                    {"@value": 5},
+                    {"@value": "ex:TWD", "@type": "@id"}
+                ]
+            });
+            let expanded = crate::expand(&doc).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([
+                    {"@value": "TWD"},
+                    {"@value": "TWD", "@language": "en"},
+                    {"@value": "TWD", "@type": xsd_string},
+                    {"@value": 5},
+                    {"@id": "http://example.org/TWD"}
+                ]),
+                "{coercion}: {expanded}"
+            );
+
+            // A single value object, not in an array, the shape an
+            // extraction service's answer writes.
+            let single = json!({
+                "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": coercion}},
+                "@id": "ex:price",
+                "unit": {"@value": "TWD"}
+            });
+            let expanded = crate::expand(&single).unwrap();
+            assert_eq!(
+                expanded["http://example.org/unit"],
+                json!([{"@value": "TWD"}]),
+                "{coercion}: {expanded}"
+            );
+        }
+
+        // An explicit `@id` type names an IRI, which only a string can.
+        for value in [json!(5), json!(true), JsonValue::Null] {
+            let doc = json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:price",
+                "ex:unit": {"@value": value, "@type": "@id"}
+            });
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("@value must be a string"), "{value}: {err}");
+        }
+
+        // The string beside it is still coerced.
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "unit": {"@id": "ex:unit", "@type": "@id"}},
+            "@id": "ex:price",
+            "unit": "ex:TWD"
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/unit"],
+            json!([{"@id": "http://example.org/TWD"}]),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn test_expand_vector_short_form_array_to_single_value_object() {
+        // Context coerces "ex:embedding" to @vector. A bare JSON array must
+        // expand to ONE value-object whose @value is the whole array, with
+        // @type normalized to the full f:embeddingVector IRI.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ex:embedding": {"@type": "@vector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.1, 0.2, 0.3, 0.4]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1, "vector array must expand as one value");
+        assert_eq!(
+            values[0]["@type"], "https://ns.flur.ee/db#embeddingVector",
+            "@type must be normalized to the full IRI"
+        );
+        assert_eq!(values[0]["@value"], json!([0.1, 0.2, 0.3, 0.4]));
+    }
+
+    #[test]
+    fn test_expand_vector_full_iri_form_array_to_single_value_object() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ex:embedding": {"@type": "https://ns.flur.ee/db#embeddingVector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.5, 0.6]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.5, 0.6]));
+        assert_eq!(values[0]["@type"], "https://ns.flur.ee/db#embeddingVector");
+    }
+
+    #[test]
+    fn test_expand_vector_prefixed_iri_form_array_to_single_value_object() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "f": "https://ns.flur.ee/db#",
+                "ex:embedding": {"@type": "f:embeddingVector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.7]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.7]));
+        assert_eq!(values[0]["@type"], "https://ns.flur.ee/db#embeddingVector");
+    }
+
+    #[test]
+    fn test_expand_non_vector_array_still_produces_n_values() {
+        // Sanity: a normal datatype on an array still expands to N value objects.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "ex:age": {"@type": "xsd:integer"}
+            },
+            "@id": "ex:doc1",
+            "ex:age": [10, 20, 30]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/age"].as_array().unwrap();
+        assert_eq!(
+            values.len(),
+            3,
+            "non-vector arrays must expand element-wise"
+        );
+    }
+
+    #[test]
+    fn test_expand_vector_explicit_value_wrapper_unchanged() {
+        // The explicit {"@value": [...], "@type": "@vector"} form must continue
+        // to round-trip through expansion as a single value object.
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:doc1",
+            "ex:embedding": {"@value": [0.1, 0.2], "@type": "@vector"}
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.1, 0.2]));
+    }
+
+    #[test]
+    fn test_variables_not_expanded() {
+        let doc = json!({
+            "@context": {"@base": "https:example.com/", "@vocab": "ns/"},
+            "foo": {"@id": "?s", "?p": "?o"},
+            "bar": {"@id": "me", "name": "Dan"}
+        });
+
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+
+        let foo = &obj["https:example.com/ns/foo"][0];
+        assert_eq!(foo["@id"], "?s");
+    }
+
+    // =========================================================================
+    // Expansion depth ceiling
+    // =========================================================================
+
+    /// A node nested `depth` levels via a single property chain.
+    fn nested_nodes(depth: usize) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({"http://example.org/child": value});
+        }
+        value
+    }
+
+    /// A `@list` (or `@set`) chain nested `depth` levels — each level is a
+    /// single-key container object, which recurses through `parse_node_value`
+    /// WITHOUT re-entering `expand_node_internal`.
+    fn nested_containers(depth: usize, key: &str) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({"http://example.org/p": {key: value}});
+        }
+        value
+    }
+
+    /// A `@list`/`@set` nested DIRECTLY inside another, with NO property key
+    /// between levels: a single outer property key, then `depth` bare container
+    /// wrappers. Unlike [`nested_containers`], nothing re-enters
+    /// `expand_node_internal` between levels, so the chain self-recurses purely
+    /// within `parse_node_value` and only that function's own guard can stop it.
+    fn direct_container_chain(depth: usize, key: &str) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({key: value});
+        }
+        json!({"http://example.org/p": value})
+    }
+
+    /// Realistic nesting well below the ceiling expands unchanged.
+    #[test]
+    fn nesting_below_the_ceiling_expands() {
+        crate::expand(&nested_nodes(100)).expect("below-ceiling nesting must expand");
+    }
+
+    /// A node chain expands up to the ceiling and is refused one level past
+    /// it: the bound is exact.
+    #[test]
+    fn nesting_ceiling_is_exact() {
+        crate::expand(&nested_nodes(MAX_EXPAND_DEPTH)).expect("nesting at the ceiling expands");
+        let err = crate::expand(&nested_nodes(MAX_EXPAND_DEPTH + 1)).expect_err("past it");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// A scoped context's term IRIs written as compact IRIs over a prefix the
+    /// outer context defines expand against that context, at every level of
+    /// a chain of scoped contexts, in both expansion modes; they used to stay
+    /// compact (`"ex:b"` as a key).
+    #[test]
+    fn scoped_context_terms_expand_against_the_active_context() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {
+                    "b": {"@id": "ex:b", "@context": {
+                        "c": {"@id": "ex:c", "@context": {"@vocab": "http://deep/"}}
+                    }}
+                }}
+            },
+            "@id": "ex:root",
+            "a": {"b": {"c": {"z": 1, "@type": "T"}}}
+        });
+        let expected = json!({
+            "@id": "http://example.org/root",
+            "http://example.org/a": [{
+                "http://example.org/b": [{
+                    "http://example.org/c": [{"@type": ["http://deep/T"], "http://deep/z": [{"@value": 1}]}]
+                }]
+            }]
+        });
+        for (mode, expanded) in [
+            ("permissive", crate::expand(&doc)),
+            ("strict", crate::expand_checked(&doc)),
+        ] {
+            let expanded = expanded.unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert_eq!(expanded, expected, "{mode}");
+        }
+
+        // A scoped datatype over the outer prefix expands too.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "a": {"@id": "ex:a", "@context": {"n": {"@id": "ex:n", "@type": "ex:Num"}}}
+            },
+            "@id": "ex:root",
+            "a": {"n": "5"}
+        });
+        let expanded = crate::expand_checked(&doc).unwrap();
+        assert_eq!(
+            expanded["http://example.org/a"][0]["http://example.org/n"][0]["@type"],
+            json!("http://example.org/Num"),
+            "{expanded}"
+        );
+    }
+
+    /// An array inside an array is refused with the path to it from the
+    /// document root: array indexes and the keys as written.
+    #[test]
+    fn nested_sequence_reports_its_path() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a"}, {"@id": "ex:b", "ex:p": ["x", ["y"]]}]
+        });
+        match crate::expand(&doc).expect_err("a nested array is refused") {
+            JsonLdError::NestedSequence { idx } => {
+                assert_eq!(
+                    idx,
+                    vec![json!("@graph"), json!(1), json!("ex:p"), json!(1)]
+                );
+            }
+            other => panic!("expected NestedSequence, got: {other}"),
+        }
+    }
+
+    /// A programmatically built value bypasses serde_json's deserialization
+    /// recursion limit, so expansion itself must refuse deep nesting with a
+    /// clean error instead of overflowing the stack. (Depth is kept moderate
+    /// only because dropping the test fixture itself recurses per level —
+    /// serde_json's `Value` has no iterative Drop; expansion's guard stops
+    /// at the ceiling regardless.)
+    #[test]
+    fn deeply_nested_programmatic_value_errors_cleanly() {
+        let err = crate::expand(&nested_nodes(2_000)).expect_err("expected depth error");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// `@list` / `@set` chains recurse through `parse_node_value` without
+    /// re-entering `expand_node_internal`, so its own depth guard must refuse
+    /// them rather than let the stack overflow.
+    #[test]
+    fn deeply_nested_containers_error_cleanly() {
+        for key in ["@list", "@set"] {
+            let err = crate::expand(&nested_containers(2_000, key)).expect_err("expected error");
+            assert!(
+                matches!(err, JsonLdError::NestingTooDeep),
+                "expected NestingTooDeep for {key}, got: {err}"
+            );
+        }
+    }
+
+    /// A `@list`/`@set` nested directly inside itself with no property key
+    /// between levels recurses purely within `parse_node_value`, never
+    /// re-entering `expand_node_internal`. Only the `parse_node_value` guard
+    /// stops it — the property-keyed `nested_containers` chain is caught one
+    /// level up in `expand_node_internal`, so without this case that guard is
+    /// uncovered and a refactor could delete it while every other depth test
+    /// stays green.
+    #[test]
+    fn deeply_nested_direct_containers_error_cleanly() {
+        for key in ["@list", "@set"] {
+            let err =
+                crate::expand(&direct_container_chain(2_000, key)).expect_err("expected error");
+            assert!(
+                matches!(err, JsonLdError::NestingTooDeep),
+                "expected NestingTooDeep for direct {key} chain, got: {err}"
+            );
+        }
+    }
+
+    /// Text input is already bounded by serde_json's default deserialization
+    /// recursion limit — the shield the expansion guard backs up. Pin it so a
+    /// dependency change that drops the default is caught.
+    #[test]
+    fn deeply_nested_text_is_rejected_at_deserialization() {
+        let text = format!("{}1{}", "{\"a\":".repeat(200), "}".repeat(200));
+        let err = serde_json::from_str::<JsonValue>(&text).expect_err("expected depth error");
+        assert!(
+            err.to_string().contains("recursion limit"),
+            "expected serde_json recursion-limit error, got: {err}"
+        );
+    }
+
+    /// A context that defines `graph` as a property gets a property: the
+    /// legacy bare `graph` spelling of `@graph` applies only when the context
+    /// leaves the word undefined. It used to hijack the key at every level,
+    /// dropping the triple and routing the node into a graph named by the
+    /// value.
+    #[test]
+    fn graph_term_in_context_is_a_property_not_a_graph_key() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "graph": "ex:graphProp"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "blue"}
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        let child = &expanded["http://example.org/child"][0];
+        assert!(child.get("@graph").is_none(), "{expanded}");
+        assert_eq!(child["http://example.org/graphProp"][0]["@value"], "blue");
+
+        // Undefined, the bare word still means `@graph`.
+        let legacy = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:child": {"@id": "ex:c", "graph": "ex:g", "ex:p": 1}
+        });
+        let expanded = crate::expand(&legacy).unwrap();
+        assert_eq!(expanded["http://example.org/child"][0]["@graph"], "ex:g");
+    }
+
+    /// `@nest` (JSON-LD 1.1): the nested value's properties and types are
+    /// the enclosing node's own, recursively.
+    #[test]
+    fn nest_merges_into_the_enclosing_node() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "labels": "@nest"},
+            "@id": "ex:s",
+            "ex:a": 1,
+            "@nest": {
+                "@type": "ex:T",
+                "ex:a": 2,
+                "ex:b": 3,
+                "@nest": {"ex:c": 4}
+            },
+            "labels": [{"ex:d": 5}]
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(expanded["@id"], "http://example.org/s");
+        assert_eq!(expanded["@type"], json!(["http://example.org/T"]));
+        let values = |p: &str| -> Vec<JsonValue> {
+            expanded[format!("http://example.org/{p}")]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["@value"].clone())
+                .collect()
+        };
+        assert_eq!(values("a"), [json!(1), json!(2)]);
+        assert_eq!(values("b"), [json!(3)]);
+        assert_eq!(values("c"), [json!(4)]);
+        assert_eq!(values("d"), [json!(5)]);
+        assert!(expanded.get("@nest").is_none(), "{expanded}");
+
+        for bad in [
+            json!({"@id": "ex:s", "@nest": {"@id": "ex:other", "ex:a": 1}}),
+            json!({"@id": "ex:s", "@nest": "text"}),
+            json!({"@id": "ex:s", "@nest": {"@value": 1}}),
+        ] {
+            let err = crate::expand(&bad).unwrap_err();
+            assert!(
+                matches!(err, JsonLdError::InvalidKeywordValue { .. }),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// A reverse property, spelled with the `@reverse` keyword or through a
+    /// context term defined with `@reverse`, expands into the node's
+    /// `@reverse` map. The term form used to expand as a forward property,
+    /// inverting the statement.
+    #[test]
+    fn reverse_properties_expand_into_the_reverse_map() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "parent": {"@reverse": "ex:child", "@type": "@id"}
+            },
+            "@id": "ex:kid",
+            "parent": "ex:mom",
+            "@reverse": {"ex:child": {"@id": "ex:dad"}}
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert!(
+            expanded.get("http://example.org/child").is_none(),
+            "{expanded}"
+        );
+        let mut subjects: Vec<&str> = expanded["@reverse"]["http://example.org/child"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["@id"].as_str().unwrap())
+            .collect();
+        subjects.sort_unstable();
+        assert_eq!(
+            subjects,
+            ["http://example.org/dad", "http://example.org/mom"]
+        );
+
+        let err = crate::expand(&json!({"@id": "ex:s", "@reverse": "x"})).unwrap_err();
+        assert!(
+            matches!(err, JsonLdError::InvalidKeywordValue { .. }),
+            "{err}"
+        );
+    }
+
+    /// A top-level `@graph` is an envelope only when it holds node objects
+    /// and the object has no `@id`. A graph selector marks a node.
+    #[test]
+    fn top_level_graph_selector_is_a_node_not_an_envelope() {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": "ex:g",
+            "ex:p": 1
+        });
+        let expanded = crate::expand(&doc).unwrap();
+        assert_eq!(expanded["@graph"], "ex:g", "{expanded}");
+        assert_eq!(expanded["http://example.org/p"][0]["@value"], 1);
+
+        let envelope = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:a", "ex:p": 1}, {"@id": "ex:b", "ex:p": 2}]
+        });
+        let expanded = crate::expand(&envelope).unwrap();
+        assert_eq!(expanded.as_array().map(Vec::len), Some(2), "{expanded}");
+
+        let err = crate::expand(&json!({"@graph": 3})).unwrap_err();
+        assert!(
+            matches!(err, JsonLdError::InvalidGraphValue { .. }),
+            "{err}"
+        );
+    }
+
+    const EX: &str = "http://example.org/";
+    const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+    /// The expanded values of `ex:p` in `doc`.
+    fn values_of_p(doc: JsonValue) -> JsonValue {
+        let expanded = crate::expand(&doc).unwrap();
+        expanded[format!("{EX}p")].clone()
+    }
+
+    /// A `@vocab`-typed term's string is a term, a compact IRI, or relative
+    /// to `@vocab`; with no `@vocab`, relative to `@base`.
+    #[test]
+    fn vocab_typed_term_expands_strings_as_iris() {
+        let ctx = json!({
+            "ex": EX,
+            "@vocab": "http://vocab.org/",
+            "K": "http://terms.org/K",
+            "p": {"@id": "ex:p", "@type": "@vocab"}
+        });
+        let values = values_of_p(json!({"@context": ctx, "p": ["K", "ex:L", "M"]}));
+        assert_eq!(
+            values,
+            json!([
+                {"@id": "http://terms.org/K"},
+                {"@id": "http://example.org/L"},
+                {"@id": "http://vocab.org/M"}
+            ])
+        );
+
+        let based = json!({"@base": "http://base.org/", "p": {"@id": EX.to_owned() + "p", "@type": "@vocab"}});
+        let values = values_of_p(json!({"@context": based, "p": "N"}));
+        assert_eq!(values, json!([{"@id": "http://base.org/N"}]));
+    }
+
+    /// A datatype, from the term or the value object, excludes the default
+    /// language; a value object naming both is still refused.
+    #[test]
+    fn datatype_excludes_the_default_language() {
+        let ctx = json!({
+            "@language": "en",
+            "p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}
+        });
+        assert_eq!(
+            values_of_p(json!({"@context": ctx, "p": "5"})),
+            json!([{"@value": "5", "@type": XSD_INTEGER}])
+        );
+        assert_eq!(
+            values_of_p(
+                json!({"@context": {"@language": "en"}, (EX.to_owned() + "p"): {"@value": "6", "@type": XSD_INTEGER}})
+            ),
+            json!([{"@value": "6", "@type": XSD_INTEGER}])
+        );
+        let both = json!({(EX.to_owned() + "p"): {"@value": "7", "@type": XSD_INTEGER, "@language": "en"}});
+        assert!(matches!(
+            crate::expand(&both),
+            Err(JsonLdError::LanguageWithType)
+        ));
+    }
+
+    /// A value object's own language overrides the datatype its term gives.
+    #[test]
+    fn value_object_language_overrides_the_term_datatype() {
+        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}});
+        assert_eq!(
+            values_of_p(json!({"@context": ctx, "p": {"@value": "cinq", "@language": "fr"}})),
+            json!([{"@value": "cinq", "@language": "fr"}])
+        );
+    }
+
+    #[test]
+    fn term_language_null_clears_the_default() {
+        let ctx = json!({
+            "@language": "en",
+            "p": {"@id": EX.to_owned() + "p", "@language": null},
+            "q": EX.to_owned() + "q"
+        });
+        let expanded =
+            crate::expand(&json!({"@context": ctx, "p": "plain", "q": "tagged"})).unwrap();
+        assert_eq!(expanded[format!("{EX}p")], json!([{"@value": "plain"}]));
+        assert_eq!(
+            expanded[format!("{EX}q")],
+            json!([{"@value": "tagged", "@language": "en"}])
+        );
+    }
+
+    /// A term defined as `null` maps to no IRI: its property is dropped, not
+    /// expanded against `@vocab`, and the definition reads back as `null`.
+    #[test]
+    fn null_term_drops_its_property() {
+        let ctx = json!({"@vocab": EX, "gone": null, "also": {"@id": null}});
+        let expanded = crate::expand(&json!({
+            "@context": ctx,
+            "gone": "x",
+            "also": "y",
+            "p": "kept"
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({format!("{EX}p"): [{"@value": "kept"}]}),
+            "{expanded}"
+        );
+
+        let parsed = ParsedContext::parse(None, &ctx).unwrap();
+        assert!(parsed.get("gone").is_some_and(|e| e.null_mapping));
+        assert_eq!(parsed.to_json()["gone"], JsonValue::Null);
+    }
+
+    /// A `null` term names no IRI as a value either: a `@vocab` term's value
+    /// and a `@type` naming it are dropped, not kept as the bare key.
+    #[test]
+    fn null_term_names_no_value_iri() {
+        let ctx = json!({
+            "@vocab": EX,
+            "gone": null,
+            "p": {"@type": "@vocab"}
+        });
+        let expanded = crate::expand(&json!({
+            "@context": ctx,
+            "@id": "http://example.org/s",
+            "@type": ["gone", "Kept"],
+            "p": ["gone", "kept"]
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({
+                "@id": "http://example.org/s",
+                "@type": [format!("{EX}Kept")],
+                format!("{EX}p"): [{"@id": format!("{EX}kept")}]
+            }),
+            "{expanded}"
+        );
+    }
+
+    /// An `@index` map's keys index its values and carry no data; a
+    /// property-valued index, whose keys would be data, is refused.
+    #[test]
+    fn index_container_keys_only_index_the_values() {
+        let ctx = json!({
+            "ex": EX,
+            "p": {"@id": "ex:p", "@container": ["@index", "@set"]}
+        });
+        let values = values_of_p(json!({
+            "@context": ctx,
+            "p": {
+                "first": {"@id": "ex:a", "ex:q": "in a"},
+                "second": ["text", {"@value": 3}]
+            }
+        }));
+        assert_eq!(
+            values,
+            json!([
+                {"@id": "http://example.org/a", "http://example.org/q": [{"@value": "in a"}]},
+                {"@value": "text"},
+                {"@value": 3}
+            ])
+        );
+
+        // Refused where a map uses it, not for a context that only carries it.
+        let by_property = json!({
+            "ex": EX,
+            "p": {"@id": "ex:p", "@container": "@index", "@index": "ex:q"}
+        });
+        assert!(crate::expand(&json!({"@context": by_property, "p": {"k": "v"}})).is_err());
+        let unused = crate::expand(&json!({"@context": by_property, "ex:r": "v"})).unwrap();
+        assert_eq!(unused, json!({format!("{EX}r"): [{"@value": "v"}]}));
+        let parsed = ParsedContext::parse(None, &by_property).unwrap();
+        assert_eq!(parsed.to_json()["p"]["@index"], json!("ex:q"));
+    }
+
+    /// A `@json`-typed term makes the whole value one JSON literal, whatever
+    /// its shape; an array is not split into values.
+    #[test]
+    fn json_typed_term_keeps_the_whole_value() {
+        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": "@json"}});
+        for value in [json!(5), json!(true), json!([1, {"a": [2]}])] {
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": value})),
+                json!([{"@value": value, "@type": "@json"}])
+            );
+        }
+        // A string goes in serialized, as the explicit form writes a document.
+        for (value, document) in [("text", r#""text""#), ("5", r#""5""#), ("{}", r#""{}""#)] {
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": value})),
+                json!([{"@value": document, "@type": "@json"}])
+            );
+        }
+    }
+
+    /// An array or map `@value` needs a `@json` or `@vector` type, its own or
+    /// its term's: without one it has no literal to stand for.
+    #[test]
+    fn structured_value_object_needs_a_json_or_vector_type() {
+        let p = EX.to_owned() + "p";
+        for (term, value) in [
+            (json!(p), json!({"@value": [0.5]})),
+            (json!(p), json!({"@value": {"a": 1}})),
+            (json!(p), json!({"@value": [0.5], "@type": XSD_INTEGER})),
+            (
+                json!({"@id": p, "@type": XSD_INTEGER}),
+                json!({"@value": [0.5]}),
+            ),
+            // A vector holds an array only.
+            (json!(p), json!({"@value": {"a": 1}, "@type": "@vector"})),
+            (
+                json!(p),
+                json!({"@value": {"a": 1}, "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+            ),
+            (
+                json!({"@id": p, "@type": "@vector"}),
+                json!({"@value": {"a": 1}}),
+            ),
+        ] {
+            let ctx = json!({"p": term});
+            let err = crate::expand(&json!({"@context": ctx, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(r#""@type": "@json""#), "{ctx} {value}: {err}");
+        }
+
+        let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        // Typed `@id`, an array or a map is told the IRI must be a string.
+        for value in [json!(["ex:a"]), json!({"@id": "ex:a"})] {
+            let doc = json!({"@context": {"p": p}, "p": {"@value": value, "@type": "@id"}});
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
+        }
+
+        let vector = json!({"p": {"@id": p, "@type": "@vector"}});
+        assert_eq!(
+            values_of_p(json!({"@context": vector, "p": {"@value": [0.5]}}))[0]["@value"],
+            json!([0.5])
+        );
+    }
+
+    /// A value object the expander refuses is named by where it is: the keys
+    /// and indexes from the root, so a refusal in one node of many, as in a
+    /// bulk import's chunk, points at that node.
+    #[test]
+    fn a_refused_value_object_names_where_it_is() {
+        let refused = |doc: JsonValue| match crate::expand(&doc) {
+            Err(JsonLdError::InvalidValueObject { at, .. }) => at,
+            other => panic!("{doc}: {other:?}"),
+        };
+        let structured = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:a", "ex:p": 1},
+                {"@id": "ex:b", "ex:p": {"@value": [1, 2]}}
+            ]
+        });
+        assert_eq!(refused(structured), r#"["@graph",1,"ex:p"]"#);
+        let typed_id = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:q": ["ex:o", {"@value": 3, "@type": "@id"}]
+        });
+        assert_eq!(refused(typed_id), r#"["ex:q",1]"#);
+    }
+}

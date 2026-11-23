@@ -1,0 +1,5031 @@
+//! JSON-LD Query Parser
+//!
+//! Parses JSON-based JSON-LD queries into the query execution engine's IR.
+//!
+//! # Architecture
+//!
+//! The parser operates in two phases:
+//!
+//! 1. **Parse phase** (`parse_query_ast`): Pure, sync transformation from JSON to
+//!    an unresolved AST with expanded IRIs but no database-specific encoding.
+//!    This phase uses `json-ld-rust` for context parsing and IRI expansion.
+//!
+//! 2. **Lower phase** (`lower_query`): Converts the AST to the execution IR,
+//!    encoding IRIs to Sids via the `IriEncoder` trait. This keeps the parser
+//!    WASM-compatible.
+//!
+//! See [`parse_query_ast`] for the pure parsing phase (no DB required),
+//! and `lower_query` for the lowering phase (requires `IriEncoder`).
+
+pub mod ast;
+pub mod encode;
+pub mod error;
+pub mod filter_common;
+pub mod filter_data;
+pub mod filter_sexpr;
+pub mod graph_name;
+pub mod lower;
+pub mod node_map;
+pub mod options;
+pub mod path_expr;
+pub mod policy;
+pub mod sexpr_tokenize;
+pub mod values;
+pub mod where_clause;
+
+pub use ast::{
+    encode_datatype_constraint, LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec,
+    UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
+    UnresolvedFilterValue, UnresolvedForwardItem, UnresolvedHydrationSpec,
+    UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPattern, UnresolvedQuery,
+    UnresolvedRoot, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
+    UnresolvedTriplePattern, UnresolvedValue,
+};
+pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
+pub use error::{ParseError, Result};
+pub use graph_name::{classify_written_graph_name, GraphNameEnv, WrittenGraphName};
+pub(crate) use lower::{lower_query, SelectMode};
+pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
+pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
+pub use where_clause::parse_where_with_counters;
+
+use crate::ir::{Expression, Query};
+use crate::var_registry::VarRegistry;
+use ast::{UnresolvedColumn, UnresolvedPathExpr, UnresolvedProjection};
+use fluree_graph_json_ld::{parse_context, ParsedContext};
+use serde_json::Value as JsonValue;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// Map from context term name to its parsed `@path` expression.
+///
+/// Extracted from the raw query `@context` JSON during parse phase.
+/// Used by node-map parsing to recognise property-path aliases.
+pub type PathAliasMap = HashMap<String, UnresolvedPathExpr>;
+
+// Re-export is_variable from node_map for use within this module
+use node_map::is_variable;
+
+/// [`parse_query_ast_in_dataset`] with no dataset names beyond the body's.
+#[cfg(test)]
+pub(crate) fn parse_query_ast(
+    json: &JsonValue,
+    strict_override: Option<bool>,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    parse_query_ast_in_dataset(json, strict_override, &HashSet::new())
+}
+
+/// Parse a JSON-LD query into an unresolved AST and determine the select mode.
+///
+/// This is phase 1 of parsing: pure, sync transformation from JSON to AST.
+/// No database access is required - IRI expansion uses the provided context.
+///
+/// # Arguments
+///
+/// * `json` - The JSON query value
+///
+/// # Returns
+///
+/// A tuple of `(UnresolvedQuery, SelectMode)` where the mode is derived from
+/// the query's select/selectOne/construct/ask key.
+///
+/// A `["graph", …]` name in `dataset_names` (a dataset built outside the
+/// body) is kept as written, as one the body's own `fromNamed` spells is.
+pub(crate) fn parse_query_ast_in_dataset(
+    json: &JsonValue,
+    strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    // M1b: read-side firewall on user-authored `f:reifies*` IRIs.
+    // The IR-level expansion in `where_plan.rs::expand_edge_annotation_patterns`
+    // is the *only* legitimate way f:reifies* predicates enter the
+    // pattern stream — direct user mention of these IRIs in a query
+    // would expose system facts as ordinary RDF. We reject before
+    // even building the AST so the error message points at the
+    // user's input verbatim.
+    reject_user_authored_reifies_in_query(json)?;
+
+    // Use shared counters so nested subqueries can generate unique implicit vars
+    // across the full query tree (prevents collisions like ?__s0 between parent/subquery).
+    let mut subject_counter: u32 = 0;
+    let mut nested_counter: u32 = 0;
+    parse_query_ast_internal(
+        json,
+        &mut subject_counter,
+        &mut nested_counter,
+        strict_override,
+        None,
+        dataset_names,
+    )
+}
+
+/// Reject user-authored `f:reifies*` IRIs anywhere in the query
+/// document. Resolves compact-IRI forms through the document's
+/// `@context` (and any nested per-node `@context`s) before checking,
+/// matching the write-side firewall in
+/// `fluree-db-transact::parse::edge_annotations`.
+fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
+    let top_ctx = json
+        .as_object()
+        .and_then(|m| m.get("@context").or_else(|| m.get("context")))
+        .map(|v| fluree_graph_json_ld::parse_context(&normalize_context_value(v)))
+        .transpose()
+        .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
+        .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
+    scan_query_for_reifies_iris(json, &top_ctx)
+}
+
+/// The query side's check for reserved predicates over one clause (an
+/// update's `where` or `values`), resolved against `context`, which holds the
+/// document's own `@context`: the check a query's clauses get.
+pub fn reject_reserved_iris_in_clause(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    scan_query_for_reifies_iris(value, context)
+}
+
+fn scan_query_for_reifies_iris(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    use fluree_vocab::reifies_iris;
+    match value {
+        JsonValue::Object(map) => {
+            // Honor per-node `@context` overrides for compact-IRI
+            // resolution.
+            let merged: Option<fluree_graph_json_ld::ParsedContext> =
+                if let Some(local) = map.get("@context").or_else(|| map.get("context")) {
+                    Some(
+                        fluree_graph_json_ld::parse_context_with_base(
+                            context,
+                            &normalize_context_value(local),
+                        )
+                        .map_err(|e| {
+                            ParseError::InvalidWhere(format!(
+                                "failed to parse nested @context during firewall scan: {e}"
+                            ))
+                        })?,
+                    )
+                } else {
+                    None
+                };
+            let effective = merged.as_ref().unwrap_or(context);
+
+            for (k, v) in map {
+                if k == "@context" || k == "context" {
+                    continue;
+                }
+                let expanded_key = if k.starts_with('@') {
+                    k.clone()
+                } else {
+                    fluree_graph_json_ld::expand_iri(k, effective)
+                };
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                         use @annotation or @reifies in queries instead"
+                    )));
+                }
+                scan_query_for_reifies_iris(v, effective)?;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                scan_query_for_reifies_iris(item, context)?;
+            }
+        }
+        JsonValue::String(s) => {
+            // Reject `f:reifies*` IRIs appearing as a VALUE — `values`
+            // data, an `@id` reference, or a tuple-form predicate
+            // string — not just as an object KEY. Without this a user
+            // can bind a predicate variable to `f:reifiesSubject` via
+            // `values` and leak the internal bundle through a
+            // `?s ?p ?o` scan (the key-only check sees only the bare
+            // variable `?p`). A legitimate query value never resolves
+            // to one of the seven reserved IRIs, so this cannot reject
+            // real input.
+            let expanded = fluree_graph_json_ld::expand_iri(s, context);
+            if reifies_iris::ALL.iter().any(|iri| *iri == expanded) {
+                return Err(ParseError::InvalidWhere(format!(
+                    "value '{s}' resolves to a system-controlled predicate '{expanded}'; \
+                     use @annotation or @reifies in queries instead"
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Parse a query object. A subquery passes the context of the `where` it is
+/// part of as `parent`: it then resolves graph names as that `where` does
+/// (an update's ledger, `fromNamed` aliases and `"default"` by name), inside
+/// the same enclosing graphs, and a read of the default graph by name in it
+/// is recorded on `parent`.
+pub(crate) fn parse_query_ast_internal(
+    json: &JsonValue,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+    strict_override: Option<bool>,
+    parent: Option<&JsonLdParseCtx>,
+    dataset_names: &HashSet<String>,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| ParseError::InvalidWhere("Query must be an object".to_string()))?;
+
+    // Parse context (accept both "@context" and "context")
+    let context_val = obj
+        .get("@context")
+        .or_else(|| obj.get("context"))
+        .unwrap_or(&JsonValue::Null);
+
+    let context = parse_context(&normalize_context_value(context_val))?;
+
+    // Resolve parse policy BEFORE extracting path aliases so that any
+    // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
+    let parse_policy = policy::resolve_parse_policy(strict_override, obj);
+    let path_aliases = extract_path_aliases(context_val, &context, parse_policy)?;
+    // A node-level `@graph` in `where` can name a `fromNamed` alias, which
+    // must stay the alias rather than expand as an IRI.
+    let mut graph_names = GraphNameEnv {
+        ledger_id: None,
+        aliases: query_from_named_aliases(obj),
+        default_by_name: false,
+    };
+    // A `["graph", …]` name the dataset spells is kept as written: the
+    // body's own `fromNamed`, the dataset the query runs against, and an
+    // enclosing query's names.
+    let mut names = body_dataset_names(obj);
+    names.extend(dataset_names.iter().cloned());
+    if let Some(parent) = parent {
+        let own = std::mem::replace(&mut graph_names, parent.graph_names.clone()).aliases;
+        for (alias, iri) in own {
+            graph_names.aliases.entry(alias).or_insert(iri);
+        }
+        names.extend(parent.dataset_names.iter().cloned());
+    }
+    let ctx = JsonLdParseCtx::new(context.clone(), path_aliases, parse_policy)
+        .with_graph_names(graph_names)
+        .with_dataset_names(names);
+    if let Some(parent) = parent {
+        ctx.enclosing_graphs.store(
+            parent
+                .enclosing_graphs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let parsed = parse_query_body(
+        obj,
+        context_val,
+        &context,
+        &ctx,
+        subject_counter,
+        nested_counter,
+    );
+    if let Some(parent) = parent {
+        if ctx.reads_ledger_default() {
+            parent.note_reads_ledger_default();
+        }
+    }
+    parsed
+}
+
+/// The query object `obj` after its `@context`: select, `values`, `where`
+/// and options, parsed with `ctx`.
+fn parse_query_body(
+    obj: &serde_json::Map<String, JsonValue>,
+    context_val: &JsonValue,
+    context: &ParsedContext,
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    let mut query = UnresolvedQuery::new(context.clone());
+
+    // Store original context JSON for CONSTRUCT output (only if not null)
+    if !context_val.is_null() {
+        query.orig_context = Some(context_val.clone());
+    }
+
+    // Check for CONSTRUCT query first
+    if let Some(construct_val) = obj.get("construct") {
+        return parse_construct_query(
+            obj,
+            construct_val,
+            ctx,
+            query,
+            subject_counter,
+            nested_counter,
+        );
+    }
+
+    // Check for ASK query — boolean existence check, no select clause.
+    // The value of `ask` IS the where clause (array or object), e.g.:
+    //   { "ask": [{ "@id": "?person", "ex:name": "Alice" }] }
+    //   { "ask": { "@id": "?person", "ex:name": "Alice" } }
+    if let Some(ask_val) = obj.get("ask") {
+        if !ask_val.is_array() && !ask_val.is_object() {
+            return Err(ParseError::InvalidWhere(
+                "\"ask\" must be an array or object of where-clause patterns".to_string(),
+            ));
+        }
+        let object_var_parsing = options::parse_object_var_parsing(obj);
+        where_clause::parse_where_with_counters(
+            ask_val,
+            ctx,
+            &mut query,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        )?;
+        // `groupBy` / `having` group the level, which changes the answer: `ask`
+        // is then true when some group passes `having` (a `having` that rejects
+        // every group is false), as in SPARQL ASK.
+        let (having, having_aggregates) =
+            options::parse_having_with_aggregates(obj, filter_data::parse_filter_expr)?;
+        query.options.group_by = options::parse_group_by(obj)?;
+        query.options.having = having;
+        query.options.aggregates = having_aggregates;
+        parse_top_level_values(obj, ctx, &mut query)?;
+        where_clause::resolve_atoms_outside_where(&mut query, ctx)?;
+        // `ask` is true when a solution remains after `offset` and `limit`
+        // (`limit: 0` is false); one is enough, so the limit is at most 1.
+        query.options.offset = options::parse_offset(obj)?;
+        query.options.limit = Some(options::parse_limit(obj)?.map_or(1, |limit| limit.min(1)));
+        // ASK returns before `parse_options` runs, so opts that the
+        // executor cares about have to be parsed inline. Currently
+        // just `includeSystemFacts`; extend here as more land.
+        query.options.include_system_facts = options::parse_include_system_facts(obj);
+        query.options.union_default_graph = options::parse_union_default_graph(obj)?;
+        return Ok((query, SelectMode::Ask));
+    }
+
+    // Determine select mode based on which key is present.
+    //
+    // Compatibility notes:
+    // - Support both camelCase and kebab-case variants:
+    //   - `selectOne` / `select-one`
+    //   - `selectDistinct` / `select-distinct`
+    let mut implied_distinct = false;
+    let (select, select_mode) =
+        if let Some(select_one) = obj.get("selectOne").or_else(|| obj.get("select-one")) {
+            (select_one, SelectMode::One)
+        } else if let Some(select_distinct) = obj
+            .get("selectDistinct")
+            .or_else(|| obj.get("select-distinct"))
+        {
+            implied_distinct = true;
+            (select_distinct, SelectMode::Many)
+        } else if let Some(select) = obj.get("select") {
+            (select, SelectMode::Many)
+        } else {
+            return Err(ParseError::MissingField(
+                "select, selectOne, select-one, selectDistinct, select-distinct, construct, or ask",
+            ));
+        };
+
+    // Wildcard `select: "*"` lives entirely in the projection; otherwise
+    // dispatch on JSON shape.
+    if select.as_str() == Some("*") {
+        query.select = UnresolvedProjection::Wildcard;
+    } else {
+        parse_select(select, ctx, &mut query)?;
+    }
+
+    // Parse depth parameter and apply to every hydration column.
+    if query.has_hydration() {
+        let depth = options::parse_depth(obj)?;
+        for column in query.select.columns_mut() {
+            if let UnresolvedColumn::Hydration(spec) = column {
+                spec.depth = depth;
+            }
+        }
+    }
+
+    parse_top_level_values(obj, ctx, &mut query)?;
+
+    // Parse where clause.
+    //
+    // Hydration queries like {"select": {"ex:dan": ["*"]}} are allowed.
+    // without an explicit WHERE clause (root may be an IRI constant).
+    let object_var_parsing = options::parse_object_var_parsing(obj);
+    if let Some(where_clause) = obj.get("where") {
+        where_clause::parse_where_with_counters(
+            where_clause,
+            ctx,
+            &mut query,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        )?;
+    } else if query.has_hydration() {
+        // Allowed: hydration-only query with no WHERE.
+        // Execution will produce an empty solution set, and hydration formatting will use the root
+        // (constant root emits one row; variable root yields no rows).
+    } else if !query
+        .patterns
+        .iter()
+        .any(|p| matches!(p, UnresolvedPattern::Values { .. }))
+    {
+        return Err(ParseError::MissingField("where"));
+    }
+
+    // Parse query options (limit, offset, orderBy, groupBy, having, etc.)
+    // Preserve aggregates collected from S-expression syntax in parse_select
+    let aggregates_from_select = std::mem::take(&mut query.options.aggregates);
+    let mut opts = options::parse_options(obj, filter_data::parse_filter_expr)?;
+    // Merge aggregates from HAVING parsing with aggregates collected from select clause.
+    // (HAVING may introduce synthetic aggregates like (count ?x) used only for filtering.)
+    opts.aggregates.extend(aggregates_from_select);
+    query.options = opts;
+    // SELECT computations and HAVING parse without the `@context`; give them
+    // the same compact-IRI resolution the WHERE clause gets.
+    where_clause::resolve_atoms_outside_where(&mut query, ctx)?;
+
+    // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
+    if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        query.options.order_by = query
+            .options
+            .group_by
+            .iter()
+            .filter_map(|v| {
+                let s = v.as_ref();
+                if !s.starts_with('?') {
+                    return None;
+                }
+                if !seen_names.insert(s) {
+                    return None;
+                }
+                Some(crate::parse::ast::UnresolvedSortSpec::asc(s))
+            })
+            .collect();
+    }
+    // selectOne is semantically "first solution" — enforce LIMIT 1 at the query
+    // level so execution can stop after one row, rather than materializing the
+    // full sequence and discarding the rest at format time. Overrides any
+    // user-provided limit because selectOne intent is unambiguous.
+    if select_mode == SelectMode::One {
+        query.options.limit = Some(1);
+    }
+
+    if implied_distinct {
+        query.options.distinct = true;
+        // select-distinct without explicit order defaults to sorting
+        // by the selected variables (ascending) for deterministic paging.
+        if query.options.order_by.is_empty() {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            query.options.order_by = query
+                .select
+                .columns()
+                .iter()
+                .filter_map(UnresolvedColumn::var_name)
+                .filter(|s| s.starts_with('?'))
+                .filter(|s| seen.insert(*s))
+                .map(crate::parse::ast::UnresolvedSortSpec::asc)
+                .collect();
+        }
+    }
+
+    Ok((query, select_mode))
+}
+
+pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
+    if let JsonValue::Object(map) = context_val {
+        if let Some(base) = map.get("@base") {
+            if !map.contains_key("@vocab") {
+                let mut out = map.clone();
+                out.insert("@vocab".to_string(), base.clone());
+                return JsonValue::Object(out);
+            }
+        }
+    }
+    context_val.clone()
+}
+
+/// Extract `@path` term definitions from the raw context JSON.
+///
+/// Scans the context for term definitions that contain `"@path"` and parses
+/// each into an [`UnresolvedPathExpr`]. The `@path` value may be a SPARQL-
+/// syntax string or an S-expression JSON array.
+///
+/// Handles all context shapes: null, string (vocab-only), object, and
+/// array-of-contexts. For arrays, later definitions override earlier ones
+/// (matching JSON-LD's "last context wins" semantics).
+///
+/// # Validation
+///
+/// - `@path` and `@reverse` on the same term → error (mutually exclusive).
+/// - `@path` value must be a string or array → error otherwise.
+pub(crate) fn extract_path_aliases(
+    context_val: &JsonValue,
+    parsed_context: &ParsedContext,
+    policy: JsonLdParsePolicy,
+) -> Result<PathAliasMap> {
+    let mut aliases = PathAliasMap::new();
+    // Build a temporary JsonLdParseCtx for path alias extraction. Aliases are
+    // extracted before the real ctx is built, but we use the resolved policy
+    // so @path expressions honor `opts.strictCompactIri`.
+    let tmp_ctx = JsonLdParseCtx::new(parsed_context.clone(), PathAliasMap::new(), policy);
+    extract_path_aliases_into(context_val, &tmp_ctx, &mut aliases)?;
+    Ok(aliases)
+}
+
+/// The names a query's `fromNamed` (or legacy `from-named`) gives its named
+/// graphs, which `where` graph patterns may use: the object form's keys, and
+/// the array form's strings, `alias`es and `@id`s. Each maps to the graph IRI
+/// when the entry gives one, else to the name itself.
+fn query_from_named_aliases(obj: &serde_json::Map<String, JsonValue>) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let graph_of = |entry: &JsonValue| {
+        entry
+            .get("@graph")
+            .or_else(|| entry.get("graph"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+    };
+    let mut add = |name: &str, iri: Option<String>| {
+        aliases.insert(name.to_string(), iri.unwrap_or_else(|| name.to_string()));
+    };
+    match obj.get("fromNamed").or_else(|| obj.get("from-named")) {
+        Some(JsonValue::Object(entries)) => {
+            for (alias, entry) in entries {
+                add(alias, graph_of(entry));
+            }
+        }
+        Some(JsonValue::String(name)) => add(name, None),
+        Some(JsonValue::Array(items)) => {
+            for item in items {
+                match item {
+                    JsonValue::String(name) => add(name, None),
+                    JsonValue::Object(entry) => {
+                        for key in ["alias", "@id"] {
+                            if let Some(name) = entry.get(key).and_then(JsonValue::as_str) {
+                                add(name, graph_of(item));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    aliases
+}
+
+/// Recursive helper that accumulates path aliases from a context value.
+fn extract_path_aliases_into(
+    context_val: &JsonValue,
+    ctx: &JsonLdParseCtx,
+    aliases: &mut PathAliasMap,
+) -> Result<()> {
+    match context_val {
+        JsonValue::Null | JsonValue::String(_) => {
+            // Null context or string vocab — no term definitions to inspect.
+            Ok(())
+        }
+        JsonValue::Object(map) => {
+            for (key, val) in map {
+                // Skip JSON-LD keywords
+                if key.starts_with('@') {
+                    continue;
+                }
+                // Only inspect object-valued term definitions
+                if let JsonValue::Object(term_def) = val {
+                    if let Some(path_val) = term_def.get("@path") {
+                        // Validate: @path and @reverse are mutually exclusive
+                        if term_def.contains_key("@reverse") {
+                            return Err(ParseError::InvalidContext(format!(
+                                "term '{key}': @path and @reverse are mutually exclusive",
+                            )));
+                        }
+
+                        let path_expr = match path_val {
+                            JsonValue::String(s) => path_expr::parse_path_string(s, ctx)?,
+                            JsonValue::Array(arr) => path_expr::parse_path_array(arr, ctx)?,
+                            _ => {
+                                return Err(ParseError::InvalidContext(format!(
+                                    "term '{}': @path must be a string or array, got {}",
+                                    key,
+                                    json_type_name(path_val),
+                                )));
+                            }
+                        };
+
+                        // Last definition wins (matching JSON-LD override semantics)
+                        aliases.insert(key.clone(), path_expr);
+                    }
+                }
+            }
+            Ok(())
+        }
+        JsonValue::Array(arr) => {
+            // Array of contexts — process in order, last wins
+            for item in arr {
+                extract_path_aliases_into(item, ctx, aliases)?;
+            }
+            Ok(())
+        }
+        _ => {
+            // Unexpected type (number, bool) — ignore, let json-ld parser handle errors
+            Ok(())
+        }
+    }
+}
+
+/// Return a human-readable JSON type name for error messages.
+fn json_type_name(val: &JsonValue) -> &'static str {
+    match val {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+/// Parse a CONSTRUCT query
+///
+/// CONSTRUCT queries transform matched data into JSON-LD graph format.
+/// Two forms are supported:
+/// - Explicit template: `{"construct": {"@id": "?s", ...}, "where": {...}}`
+/// - Shorthand: `{"construct": true, "where": {...}}` (uses WHERE as template)
+fn parse_construct_query(
+    obj: &serde_json::Map<String, JsonValue>,
+    construct_val: &JsonValue,
+    ctx: &JsonLdParseCtx,
+    mut query: UnresolvedQuery,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<(UnresolvedQuery, SelectMode)> {
+    // Require WHERE clause
+    let where_clause = obj.get("where").ok_or(ParseError::MissingField("where"))?;
+
+    // Parse WHERE clause first (needed for both explicit and shorthand templates)
+    let object_var_parsing = options::parse_object_var_parsing(obj);
+    where_clause::parse_where_with_counters(
+        where_clause,
+        ctx,
+        &mut query,
+        subject_counter,
+        nested_counter,
+        object_var_parsing,
+    )?;
+
+    // Parse template into patterns
+    let template_patterns = match construct_val {
+        JsonValue::Bool(true) => {
+            // Shorthand: use the WHERE clause's triples (and their edge
+            // annotations, and the graph blocks holding them) as the template
+            query
+                .patterns
+                .iter()
+                .cloned()
+                .filter_map(construct_template_pattern)
+                .collect()
+        }
+        JsonValue::Bool(false) => {
+            return Err(ParseError::InvalidConstruct(
+                "construct: false is not valid; use select for non-CONSTRUCT queries".to_string(),
+            ));
+        }
+        JsonValue::Object(_) | JsonValue::Array(_) => {
+            // Explicit template: parse separately
+            parse_construct_template(construct_val, ctx)?
+        }
+        _ => {
+            return Err(ParseError::InvalidConstruct(
+                "construct must be true or a template object/array".to_string(),
+            ))
+        }
+    };
+
+    query.construct_template = Some(ast::UnresolvedConstructTemplate::new(template_patterns));
+
+    parse_top_level_values(obj, ctx, &mut query)?;
+
+    // Parse query options (limit, offset, orderBy, etc.)
+    // Note: groupBy with CONSTRUCT will error at format time (Binding::Grouped unsupported)
+    query.options = options::parse_options(obj, filter_data::parse_filter_expr)?;
+
+    Ok((query, SelectMode::Construct))
+}
+
+/// Parse a query's top-level `values` (optional), the initial solution seed
+/// (mirrors `:values`), for every query form: `select`, `ask` and `construct`.
+fn parse_top_level_values(
+    obj: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+) -> Result<()> {
+    if let Some(values_val) = obj.get("values") {
+        if !values_val.is_null() {
+            let values_pat = values::parse_values_clause(values_val, ctx)?;
+            // Place VALUES first so it seeds the pipeline before WHERE patterns.
+            query.patterns.insert(0, values_pat);
+        }
+    }
+    Ok(())
+}
+
+/// Every string in the query's `fromNamed` (or legacy `from-named`), at the
+/// top level or under `opts`: aliases, ledger and graph source names, and
+/// graph selectors. A `graph` clause naming one of them as written means
+/// it, even where it reads as a compact IRI.
+fn body_dataset_names(obj: &serde_json::Map<String, JsonValue>) -> HashSet<String> {
+    fn collect(value: &JsonValue, names: &mut std::collections::HashSet<String>) {
+        match value {
+            JsonValue::String(s) => {
+                names.insert(s.clone());
+            }
+            JsonValue::Array(items) => items.iter().for_each(|v| collect(v, names)),
+            JsonValue::Object(map) => {
+                for (key, v) in map {
+                    names.insert(key.clone());
+                    collect(v, names);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    let opts = obj.get("opts").and_then(JsonValue::as_object);
+    for scope in std::iter::once(obj).chain(opts) {
+        for key in ["fromNamed", "from-named"] {
+            if let Some(value) = scope.get(key) {
+                collect(value, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Parse a CONSTRUCT template (explicit form)
+///
+/// Parses the template node-map(s) into unresolved triple patterns, edge
+/// annotations (`@annotation` on an object) and named-graph blocks
+/// (`["graph", "<iri or ?var>", node-map, ...]`, the `where` clause's form).
+/// Other patterns (filters, optionals) are ignored.
+fn parse_construct_template(
+    template: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut subject_counter = 0u32;
+    let mut nested_counter = 0u32;
+    match template {
+        JsonValue::Object(_) => parse_construct_items(
+            std::slice::from_ref(template),
+            ctx,
+            &mut subject_counter,
+            &mut nested_counter,
+        ),
+        JsonValue::Array(items) => {
+            parse_construct_items(items, ctx, &mut subject_counter, &mut nested_counter)
+        }
+        _ => Err(ParseError::InvalidConstruct(
+            "construct template must be an object or array".to_string(),
+        )),
+    }
+}
+
+/// A pattern a CONSTRUCT template node produces, kept when it is template
+/// output: a triple or an edge annotation, and a graph block (a node's own
+/// `@graph` is GRAPH sugar, as in a `where`) holding them. Other patterns a
+/// node map can produce are not output.
+fn construct_template_pattern(pattern: UnresolvedPattern) -> Option<UnresolvedPattern> {
+    match pattern {
+        UnresolvedPattern::Triple(_) | UnresolvedPattern::EdgeAnnotation { .. } => Some(pattern),
+        UnresolvedPattern::Graph { name, patterns } => Some(UnresolvedPattern::Graph {
+            name,
+            patterns: patterns
+                .into_iter()
+                .filter_map(construct_template_pattern)
+                .collect(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_construct_items(
+    items: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut patterns = Vec::new();
+    for item in items {
+        match item {
+            JsonValue::Object(map) => {
+                let mut temp_query = UnresolvedQuery::new(ctx.context.clone());
+                node_map::parse_node_map(
+                    map,
+                    ctx,
+                    &mut temp_query,
+                    subject_counter,
+                    nested_counter,
+                    true,
+                )?;
+                patterns.extend(
+                    temp_query
+                        .patterns
+                        .into_iter()
+                        .filter_map(construct_template_pattern),
+                );
+            }
+            JsonValue::Array(arr) if arr.first().and_then(JsonValue::as_str) == Some("graph") => {
+                let name = arr.get(1).and_then(JsonValue::as_str).ok_or_else(|| {
+                    ParseError::InvalidConstruct(
+                        "a construct graph block is [\"graph\", <graph IRI or ?var>, node-map, ...]"
+                            .to_string(),
+                    )
+                })?;
+                let name = if name.starts_with('?') {
+                    name.to_string()
+                } else {
+                    ctx.expand_id(name)?.0
+                };
+                let inner = parse_construct_items(&arr[2..], ctx, subject_counter, nested_counter)?;
+                patterns.push(UnresolvedPattern::graph(name.as_str(), inner));
+            }
+            _ => {
+                return Err(ParseError::InvalidConstruct(
+                    "construct items must be node-map objects or [\"graph\", ...] blocks"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(patterns)
+}
+
+/// Parse the select clause
+///
+/// Supports five forms:
+/// 1. Single string: `"?x"` - single variable selection (unwrap)
+/// 2. Simple array: `["?x", "?y"]` - flat variable selection
+/// 3. Mixed array: `["?age", {"?person": ["*"]}, {"?org": ["*"]}]` - any
+///    combination of variable and hydration columns, in any order; each
+///    object is an independent hydration with its own root, level, and
+///    depth.
+/// 4. Single object: `{"?person": ["*"]}` - one hydration column (rendered
+///    as a bare object per row rather than a single-element array).
+/// 5. S-expression aggregates: `["?name", "(count ?favNums as ?cnt)"]`
+fn parse_select(
+    select: &JsonValue,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+) -> Result<()> {
+    match select {
+        // Case 2, 3, 5: Array form — tuple-shaped rows of any arity.
+        // (`["?x"]` → `[[v]]`, `["?x", "?y"]` → `[[v1, v2]]`, etc.)
+        JsonValue::Array(arr) => {
+            let mut columns = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    JsonValue::String(s) => {
+                        columns.push(parse_select_string(s, &mut query.options.aggregates)?);
+                    }
+                    JsonValue::Object(map) => {
+                        let spec = parse_hydration_object(map, ctx)?;
+                        columns.push(UnresolvedColumn::Hydration(spec));
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidSelect(
+                            "select items must be strings or objects".to_string(),
+                        ));
+                    }
+                }
+            }
+            query.select = UnresolvedProjection::Tuple(columns);
+        }
+
+        // Case 4: Single object form: {"?person": ["*"]} — one hydration
+        // column wrapped as a Tuple (SPARQL has no scalar object form).
+        JsonValue::Object(map) => {
+            let spec = parse_hydration_object(map, ctx)?;
+            query.select = UnresolvedProjection::Tuple(vec![UnresolvedColumn::Hydration(spec)]);
+        }
+
+        // Case 1: Single string form: "?x" — bare variable, scalar shape.
+        JsonValue::String(s) => {
+            let column = parse_select_string(s, &mut query.options.aggregates)?;
+            query.select = UnresolvedProjection::Scalar(column);
+        }
+
+        _ => {
+            return Err(ParseError::InvalidSelect(
+                "select must be a string, array, or object".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true if the given (lowercased) function name is one of the
+/// SELECT-clause aggregate functions recognized by `parse_aggregate_fn_and_input`.
+///
+/// Used to dispatch S-expressions in the select clause between the aggregate
+/// path and the scalar-expression path.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "count"
+            | "count-distinct"
+            | "countdistinct"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "median"
+            | "variance"
+            | "stddev"
+            | "sample"
+            | "group-concat"
+            | "groupconcat"
+            | "collect"
+            | "collect-distinct"
+            | "collectdistinct"
+    )
+}
+
+/// Parse a string item from the select clause into a column.
+///
+/// Handles three cases:
+/// - Variable: `"?name"`
+/// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"` —
+///   the spec is appended to `aggregates` and the output var becomes the
+///   returned column.
+/// - S-expression scalar with alias: `"(as (coalesce ?a ?b) ?title)"` — the
+///   inner expression is captured as an `UnresolvedColumn::Computation` so lowering
+///   can desugar it to a `Pattern::Bind` with the alias as the projected var.
+///
+/// Wildcard (`"*"`) is rejected here; it must be the entire `select` value
+/// and is handled at the top-level dispatch in `parse_query_inner`.
+fn parse_select_string(
+    s: &str,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<UnresolvedColumn> {
+    let trimmed = s.trim();
+
+    if trimmed == "*" {
+        return Err(ParseError::InvalidSelect(
+            "wildcard '*' must be the only select item".to_string(),
+        ));
+    }
+
+    if !trimmed.starts_with('(') {
+        // Must be a variable - use validate_var_name for consistent error handling
+        validate_var_name(trimmed)?;
+        return Ok(UnresolvedColumn::Var(Arc::from(trimmed)));
+    }
+
+    // S-expression form. Tokenize once to peek at the head and decide
+    // between aggregate (existing behavior) and scalar expression (new).
+    if !trimmed.ends_with(')') {
+        return Err(ParseError::InvalidSelect(format!(
+            "S-expression must be wrapped in parentheses: {s}"
+        )));
+    }
+    let tokens = sexpr_tokenize::tokenize_sexpr(trimmed)?;
+    if tokens.len() != 1 {
+        return Err(ParseError::InvalidSelect(format!(
+            "expected single S-expression, got {} tokens",
+            tokens.len()
+        )));
+    }
+    let list = tokens[0].as_list()?;
+    if list.is_empty() {
+        return Err(ParseError::InvalidSelect(
+            "empty S-expression in select".to_string(),
+        ));
+    }
+    let head = list[0].expect_atom("function name")?.to_lowercase();
+
+    // (as <inner> ?alias) — could wrap an aggregate or a scalar expression.
+    if head == "as" {
+        if list.len() != 3 {
+            return Err(ParseError::InvalidSelect(format!(
+                "(as ...) requires exactly 2 arguments: (as <expr> ?alias), got {} elements",
+                list.len() - 1
+            )));
+        }
+        let inner = list[1].expect_list("first argument to 'as'")?;
+        if inner.is_empty() {
+            return Err(ParseError::InvalidSelect(
+                "empty inner expression in 'as'".to_string(),
+            ));
+        }
+        let inner_head = inner[0].expect_atom("function name")?.to_lowercase();
+        let alias = list[2].expect_atom("alias in 'as'")?;
+        if !is_variable(alias) {
+            return Err(ParseError::InvalidSelect(format!(
+                "alias must be a variable (start with '?'), got: {alias}"
+            )));
+        }
+
+        if is_aggregate_name(&inner_head) {
+            // Existing aggregate-with-alias path.
+            let (function, input_var) = parse_aggregate_fn_and_input(&inner_head, &inner[1..])?;
+            let agg_spec = ast::UnresolvedAggregateSpec {
+                function,
+                input_var: Arc::from(input_var),
+                output_var: Arc::from(alias),
+            };
+            let column = UnresolvedColumn::Var(Arc::from(alias));
+            aggregates.push(agg_spec);
+            return Ok(column);
+        }
+
+        // Scalar expression with explicit alias — desugars to a BIND.
+        //
+        // Compound expressions can contain aggregate calls (e.g.
+        // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
+        // `aggregates` with a synthetic output var and the call is rewritten
+        // to reference that var; the surrounding expression then lowers as a
+        // post-aggregation bind (`lower::lower_select_computations`).
+        let mut inner_tok = list[1].clone();
+        hoist_inline_aggregates(&mut inner_tok, aggregates)?;
+        let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
+        return Ok(UnresolvedColumn::Computation {
+            expr,
+            alias: Arc::from(alias),
+        });
+    }
+
+    // Direct aggregate: (count ?x) or (groupconcat ?x ", ").
+    if is_aggregate_name(&head) {
+        let agg_spec = parse_direct_aggregate(&head, &list[1..])?;
+        let column = UnresolvedColumn::Var(Arc::from(agg_spec.output_var.as_ref()));
+        aggregates.push(agg_spec);
+        return Ok(column);
+    }
+
+    // Scalar expression without an alias — disallowed: there is no
+    // unambiguous way to name the projected column.
+    Err(ParseError::InvalidSelect(format!(
+        "scalar expression '{head}' in select requires an alias: use (as ({head} ...) ?alias)"
+    )))
+}
+
+// SexprToken and tokenization moved to sexpr_tokenize module.
+// Dispatch between aggregate and scalar-expression S-expressions in select
+// is handled inline by `parse_select_string`.
+
+/// Parse a direct aggregate like `(count ?x)` or `(groupconcat ?x ", ")`
+fn parse_direct_aggregate(
+    fn_name: &str,
+    args: &[sexpr_tokenize::SexprToken],
+) -> Result<ast::UnresolvedAggregateSpec> {
+    let (function, input_var) = parse_aggregate_fn_and_input(fn_name, args)?;
+
+    // Auto-generate output var: (count ?x) -> ?count, (sum ?age) -> ?sum
+    let output_var = format!("?{}", fn_name.replace('-', "_"));
+
+    Ok(ast::UnresolvedAggregateSpec {
+        function,
+        input_var: Arc::from(input_var),
+        output_var: Arc::from(output_var),
+    })
+}
+
+/// Parse aggregate function and input variable from args
+///
+/// Returns (function, input_var)
+fn parse_aggregate_fn_and_input(
+    fn_name: &str,
+    args: &[sexpr_tokenize::SexprToken],
+) -> Result<(ast::UnresolvedAggregateFn, String)> {
+    if args.is_empty() {
+        return Err(ParseError::InvalidSelect(format!(
+            "aggregate '{fn_name}' requires at least one argument"
+        )));
+    }
+
+    // First arg is the input variable (or "*" for count)
+    let input = args[0].expect_atom("aggregate input")?;
+
+    // Validate input is a variable or "*"
+    if input != "*" && !is_variable(input) {
+        return Err(ParseError::InvalidSelect(format!(
+            "aggregate input must be a variable or '*', got: {input}"
+        )));
+    }
+
+    // Parse function + validate arity.
+    //
+    // IMPORTANT: don't silently ignore extra args (user feedback).
+    //
+    // Most aggregates take exactly 1 argument; special cases handled separately.
+    let function = match fn_name {
+        // group-concat accepts an optional separator: (groupconcat ?x ", ")
+        "group-concat" | "groupconcat" => {
+            if args.len() > 2 {
+                return Err(ParseError::InvalidSelect(format!(
+                    "aggregate '{fn_name}' accepts at most 2 arguments, got {} (expected: (groupconcat ?x) or (groupconcat ?x \", \"))",
+                    args.len(),
+                )));
+            }
+            let separator = if args.len() > 1 {
+                // Accept both quoted and unquoted forms — both express a
+                // string literal here.
+                args[1].as_str()?.to_string()
+            } else {
+                " ".to_string() // default separator
+            };
+            ast::UnresolvedAggregateFn::GroupConcat { separator }
+        }
+        // All other aggregates require exactly 1 argument.
+        _ => {
+            let variant = match fn_name {
+                "count" => ast::UnresolvedAggregateFn::Count,
+                "count-distinct" | "countdistinct" => ast::UnresolvedAggregateFn::CountDistinct,
+                "sum" => ast::UnresolvedAggregateFn::Sum,
+                "avg" => ast::UnresolvedAggregateFn::Avg,
+                "min" => ast::UnresolvedAggregateFn::Min,
+                "max" => ast::UnresolvedAggregateFn::Max,
+                "median" => ast::UnresolvedAggregateFn::Median,
+                "variance" => ast::UnresolvedAggregateFn::Variance,
+                "stddev" => ast::UnresolvedAggregateFn::Stddev,
+                "sample" => ast::UnresolvedAggregateFn::Sample,
+                "collect" => ast::UnresolvedAggregateFn::Collect,
+                "collect-distinct" | "collectdistinct" => {
+                    ast::UnresolvedAggregateFn::CollectDistinct
+                }
+                other => return Err(ParseError::UnknownAggregate(other.to_string())),
+            };
+            if args.len() != 1 {
+                return Err(ParseError::InvalidSelect(format!(
+                    "aggregate '{fn_name}' requires exactly 1 argument, got {} (expected: ({fn_name} ?x))",
+                    args.len(),
+                )));
+            }
+            variant
+        }
+    };
+
+    // Validate COUNT(*) is only used with count
+    if input == "*" && !matches!(function, ast::UnresolvedAggregateFn::Count) {
+        return Err(ParseError::InvalidSelect(format!(
+            "'*' can only be used with count, not {fn_name}"
+        )));
+    }
+
+    Ok((function, input.to_string()))
+}
+
+/// Walk a SELECT-clause S-expression token tree, hoisting any nested
+/// aggregate call out into `aggregates` and rewriting the call to an atom
+/// that references the synthetic output variable.
+///
+/// Used by `parse_select_string` so a compound expression like
+/// `(- (max ?u) (min ?u))` becomes `(- ?__inline_agg_0 ?__inline_agg_1)`
+/// with two `UnresolvedAggregateSpec`s pushed onto `aggregates`. Lowering
+/// then routes the surrounding expression to `post_binds` because the
+/// synthetic vars appear in the aggregate-output set.
+///
+/// Identical aggregates (same function + same input) dedupe to one output
+/// var via the `seen` map keyed by `"fn|input"`.
+fn hoist_inline_aggregates(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<()> {
+    hoist_inline_aggregates_inner(tok, aggregates, &mut HashMap::new())
+}
+
+fn hoist_inline_aggregates_inner(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+    seen: &mut HashMap<String, Arc<str>>,
+) -> Result<()> {
+    use sexpr_tokenize::SexprToken;
+
+    let SexprToken::List(items) = tok else {
+        return Ok(());
+    };
+
+    // If this list is itself an aggregate call, hoist it whole.
+    if let Some(SexprToken::Atom(name)) = items.first() {
+        let head = name.to_lowercase();
+        if is_aggregate_name(&head) {
+            let (function, input_var) = parse_aggregate_fn_and_input(&head, &items[1..])?;
+            let output_var = seen
+                .entry(format!("{head}|{input_var}"))
+                .or_insert_with(|| {
+                    let name: Arc<str> = Arc::from(format!("?__inline_agg_{}", aggregates.len()));
+                    aggregates.push(ast::UnresolvedAggregateSpec {
+                        function,
+                        input_var: Arc::from(input_var),
+                        output_var: name.clone(),
+                    });
+                    name
+                })
+                .clone();
+            *tok = SexprToken::Atom(output_var.to_string());
+            return Ok(());
+        }
+    }
+
+    // Otherwise recurse into children. A nested aggregate inside an arithmetic
+    // or function call gets rewritten in place.
+    for child in items {
+        hoist_inline_aggregates_inner(child, aggregates, seen)?;
+    }
+    Ok(())
+}
+
+/// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`.
+///
+/// Multiple hydration objects in one select clause are permitted; each
+/// becomes its own `Column::Hydration` and the formatter dispatches per
+/// column.
+fn parse_hydration_object(
+    map: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+) -> Result<UnresolvedHydrationSpec> {
+    // Must have exactly one key
+    if map.len() != 1 {
+        return Err(ParseError::InvalidSelect(
+            "graph-select object must have exactly one root key".to_string(),
+        ));
+    }
+
+    let (root_str, specs_val) = map.iter().next().unwrap();
+
+    // Root can be variable OR IRI constant
+    let root = if is_variable(root_str) {
+        UnresolvedRoot::Var(Arc::from(root_str.as_str()))
+    } else {
+        // IRI constant root - expand via @context
+        let (expanded, _) = ctx.expand_vocab(root_str)?;
+        UnresolvedRoot::Iri(expanded)
+    };
+
+    // Parse selection specs array
+    let specs_arr = specs_val.as_array().ok_or_else(|| {
+        ParseError::InvalidSelect("graph-select value must be an array".to_string())
+    })?;
+
+    let level = parse_selection_level(specs_arr, ctx)?;
+
+    Ok(UnresolvedHydrationSpec {
+        root,
+        level,
+        depth: 0, // Will be set later from query-level "depth" parameter
+    })
+}
+
+/// Build an optional boxed nested select spec, returning `None` when empty.
+fn make_nested_spec(level: UnresolvedNestedSelectSpec) -> Option<Box<UnresolvedNestedSelectSpec>> {
+    if level.is_empty() {
+        None
+    } else {
+        Some(Box::new(level))
+    }
+}
+
+/// If `key` uses the inline `@reverse:...` form, return the target predicate IRI
+/// (vocab-expanded). Returns `Ok(None)` for any other key so callers can fall
+/// through to the regular context-lookup path.
+///
+/// Supports `@reverse:@type` / `@reverse:type` (and the context's configured
+/// type key) as shorthand for the reverse of rdf:type, matching node_map.rs.
+fn parse_inline_reverse_key(key: &str, ctx: &JsonLdParseCtx) -> Result<Option<String>> {
+    let Some(rest) = key.strip_prefix("@reverse:") else {
+        return Ok(None);
+    };
+    if rest == "@type" || rest == "type" || rest == ctx.context.type_key.as_str() {
+        return Ok(Some(node_map::RDF_TYPE.to_string()));
+    }
+    let (expanded, _) = ctx.expand_vocab(rest)?;
+    Ok(Some(expanded))
+}
+
+/// Parse a selection-level array (the value of a hydration `{key: [...]}`)
+/// into either a `Wildcard` or `Explicit` level.
+/// A nested selection's parts: the selection array (absent for a literal-valued
+/// property, which has nothing to expand) and its per-value modifiers.
+type ModifiedSelection<'a> = (
+    Option<&'a [JsonValue]>,
+    Option<Box<ast::UnresolvedNestedModifiers>>,
+);
+
+/// The object form of a nested selection: `select` plus per-value modifiers.
+///
+/// Returns the selection array alongside the modifiers, so the caller parses the
+/// level exactly as it would the bare array form.
+fn parse_modified_selection<'a>(
+    value: &'a JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<ModifiedSelection<'a>> {
+    let map = value.as_object().expect("caller matched an object");
+
+    for key in map.keys() {
+        if !matches!(key.as_str(), "select" | "orderBy" | "limit" | "offset") {
+            return Err(ParseError::InvalidSelect(format!(
+                "unknown key `{key}` in a nested selection; expected `select`, `orderBy`, \
+                 `limit` or `offset`"
+            )));
+        }
+    }
+
+    // `select` is optional: a literal-valued property has nothing to expand, so
+    // `{"ex:tag": {"limit": 3}}` is meaningful on its own.
+    let select = match map.get("select") {
+        None | Some(JsonValue::Null) => None,
+        Some(v) => Some(v.as_array().ok_or_else(|| {
+            ParseError::InvalidSelect("`select` in a nested selection must be an array".to_string())
+        })?),
+    };
+
+    let mut modifiers = ast::UnresolvedNestedModifiers::default();
+    if let Some(order) = map.get("orderBy") {
+        modifiers.order = parse_nested_order(order, ctx)?;
+    }
+    modifiers.limit = parse_nested_count(map.get("limit"), "limit")?;
+    modifiers.offset = parse_nested_count(map.get("offset"), "offset")?;
+
+    if modifiers.is_noop() && select.is_none() {
+        return Err(ParseError::InvalidSelect(
+            "a nested selection object needs at least one of `select`, `orderBy`, `limit` \
+             or `offset`"
+                .to_string(),
+        ));
+    }
+
+    Ok((
+        select.map(Vec::as_slice),
+        (!modifiers.is_noop()).then(|| Box::new(modifiers)),
+    ))
+}
+
+/// `orderBy` for a nested selection: a predicate name, `["desc", name]`, or
+/// `"@value"` to order by the values themselves.
+fn parse_nested_order(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<Vec<ast::UnresolvedNestedOrderKey>> {
+    let items = match value {
+        JsonValue::Array(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let (descending, key) = match &item {
+            JsonValue::Array(pair) if pair.len() == 2 => {
+                let dir = pair[0].as_str().ok_or_else(|| {
+                    ParseError::InvalidSelect(
+                        "nested orderBy direction must be \"asc\" or \"desc\"".to_string(),
+                    )
+                })?;
+                match dir {
+                    "desc" => (true, pair[1].clone()),
+                    "asc" => (false, pair[1].clone()),
+                    other => {
+                        return Err(ParseError::InvalidSelect(format!(
+                        "unknown nested orderBy direction `{other}`; expected \"asc\" or \"desc\""
+                    )))
+                    }
+                }
+            }
+            other => (false, other.clone()),
+        };
+        let name = key.as_str().ok_or_else(|| {
+            ParseError::InvalidSelect("nested orderBy key must be a string".to_string())
+        })?;
+        // `@value` / `@id` order by the value itself: the literal for a
+        // literal-valued property, and the subject IRI for an expanded node.
+        // Neither has a predicate to read.
+        let predicate = if name == "@value" || name == "@id" {
+            None
+        } else {
+            Some(ctx.expand_vocab(name)?.0)
+        };
+        out.push(ast::UnresolvedNestedOrderKey {
+            predicate,
+            descending,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_nested_count(value: Option<&JsonValue>, key: &str) -> Result<Option<usize>> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+            ParseError::InvalidSelect(format!(
+                "`{key}` in a nested selection must be a non-negative integer"
+            ))
+        }),
+    }
+}
+
+fn parse_selection_level(
+    arr: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+) -> Result<UnresolvedNestedSelectSpec> {
+    let mut wildcard = false;
+    let mut forward: Vec<UnresolvedForwardItem> = Vec::new();
+    let mut refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>> =
+        std::collections::HashMap::new();
+    let mut reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>> =
+        std::collections::HashMap::new();
+
+    for item in arr {
+        match item {
+            // Wildcard: "*"
+            JsonValue::String(s) if s == "*" => {
+                wildcard = true;
+            }
+            // Explicit @id selection
+            JsonValue::String(s) if s == "@id" || s == "id" || s == ctx.context.id_key.as_str() => {
+                forward.push(UnresolvedForwardItem::Id);
+            }
+            // Explicit @type selection on a node is an alias for the rdf:type
+            // predicate, so `["@id", "@type"]` behaves identically to
+            // `["@id", "rdf:type"]` and the `*` wildcard (both surface types).
+            // On a literal value, the hydration formatter re-interprets an
+            // rdf:type forward item as "emit the literal's datatype".
+            JsonValue::String(s)
+                if s == "@type" || s == "type" || s == ctx.context.type_key.as_str() =>
+            {
+                forward.push(UnresolvedForwardItem::Property {
+                    predicate: node_map::RDF_TYPE.to_string(),
+                    sub_spec: None,
+                    modifiers: None,
+                });
+            }
+            // Property name: "ex:name" or inline "@reverse:ex:friend"
+            JsonValue::String(s) => {
+                if let Some(rev_iri) = parse_inline_reverse_key(s, ctx)? {
+                    reverse.insert(rev_iri, None);
+                } else {
+                    let (expanded, entry) = ctx.expand_vocab(s)?;
+                    if let Some(rev_iri) = entry.and_then(|e| e.reverse) {
+                        reverse.insert(rev_iri, None);
+                    } else {
+                        forward.push(UnresolvedForwardItem::Property {
+                            predicate: expanded,
+                            sub_spec: None,
+                            modifiers: None,
+                        });
+                    }
+                }
+            }
+            // Nested selection: {"ex:friend": ["*"]} or inline {"@reverse:ex:friend": ["*"]}
+            JsonValue::Object(map) => {
+                if map.len() != 1 {
+                    return Err(ParseError::InvalidSelect(
+                        "nested selection must have exactly one key".to_string(),
+                    ));
+                }
+
+                let (pred_str, sub_specs_val) = map.iter().next().unwrap();
+
+                // Two forms. The array form is the selection alone; the object
+                // form adds per-value ordering and paging around it:
+                //   {"ex:friend": ["@id", "ex:name"]}
+                //   {"ex:friend": {"select": ["@id"], "orderBy": ["ex:name"], "limit": 5}}
+                let (sub_arr, modifiers) = match sub_specs_val {
+                    JsonValue::Array(items) => (Some(items.as_slice()), None),
+                    JsonValue::Object(_) => parse_modified_selection(sub_specs_val, ctx)?,
+                    _ => {
+                        return Err(ParseError::InvalidSelect(
+                            "nested selection value must be an array, or an object of \
+                             `select`/`orderBy`/`limit`/`offset`"
+                                .to_string(),
+                        ))
+                    }
+                };
+
+                // No `select` means the values themselves, unexpanded — the same
+                // as the bare `"ex:tag"` string form, with modifiers attached.
+                let nested = match sub_arr {
+                    Some(arr) => make_nested_spec(parse_selection_level(arr, ctx)?),
+                    None => None,
+                };
+
+                if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
+                    if modifiers.is_some() {
+                        return Err(ParseError::InvalidSelect(format!(
+                            "`{pred_str}` is a reverse selection, which does not accept \
+                             `orderBy`/`limit`/`offset` yet"
+                        )));
+                    }
+                    reverse.insert(rev_iri, nested);
+                } else if pred_str == "@type"
+                    || pred_str == "type"
+                    || pred_str == ctx.context.type_key.as_str()
+                {
+                    // Nested `{"@type": [...]}` selects rdf:type, same as the
+                    // bare `"@type"` string form. Type values always render as
+                    // compact IRI strings, so any sub-spec is inert here.
+                    forward.push(UnresolvedForwardItem::Property {
+                        predicate: node_map::RDF_TYPE.to_string(),
+                        sub_spec: nested,
+                        modifiers,
+                    });
+                } else {
+                    let (expanded, entry) = ctx.expand_vocab(pred_str)?;
+                    let context_reverse = entry.as_ref().and_then(|e| e.reverse.as_ref());
+                    if let Some(rev_iri) = context_reverse {
+                        reverse.insert(rev_iri.clone(), nested);
+                    } else if let Some(boxed) = nested {
+                        // Wildcard refinements only matter when the parent is
+                        // a wildcard; otherwise it's a regular Property entry.
+                        // Decide based on `wildcard` after the loop completes.
+                        forward.push(UnresolvedForwardItem::Property {
+                            predicate: expanded,
+                            sub_spec: Some(boxed),
+                            modifiers,
+                        });
+                    } else {
+                        forward.push(UnresolvedForwardItem::Property {
+                            predicate: expanded,
+                            sub_spec: None,
+                            modifiers,
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError::InvalidSelect(
+                    "selection spec must be string or object".to_string(),
+                ));
+            }
+        }
+    }
+
+    if wildcard {
+        // For a wildcard level, fold any explicit Property entries back into
+        // `refinements` (they refine the wildcard's per-property recursion).
+        // Plain `Id` entries are redundant under wildcard and are dropped.
+        for item in forward {
+            if let UnresolvedForwardItem::Property {
+                predicate,
+                sub_spec: Some(boxed),
+                ..
+            } = item
+            {
+                refinements.insert(predicate, boxed);
+            }
+        }
+        Ok(UnresolvedNestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        })
+    } else {
+        Ok(UnresolvedNestedSelectSpec::Explicit { forward, reverse })
+    }
+}
+
+// parse_depth moved to options module
+// WHERE clause parsing functions moved to where_clause module
+// parse_values_clause and parse_values_cell moved to values module
+
+/// Parse filter value - can be a string expression "(> ?age 45)" or data expression ["expr", [...]]
+fn parse_filter_value(value: &JsonValue) -> Result<UnresolvedExpression> {
+    match value {
+        // String expression like "(> ?age 45)" - parse as S-expression
+        JsonValue::String(s) => filter_sexpr::parse_s_expression(s),
+        // Array: could be ["expr", [...]] or direct data expression
+        JsonValue::Array(arr) => {
+            if arr.is_empty() {
+                return Err(ParseError::InvalidFilter(
+                    "empty filter expression".to_string(),
+                ));
+            }
+            // Check if it's ["expr", [...]] format
+            if let Some(first) = arr[0].as_str() {
+                if first.to_lowercase() == "expr" {
+                    if arr.len() != 2 {
+                        return Err(ParseError::InvalidFilter(
+                            "expr format requires exactly one expression".to_string(),
+                        ));
+                    }
+                    return filter_data::parse_filter_expr(&arr[1]);
+                }
+            }
+            // Otherwise parse as direct data expression
+            filter_data::parse_filter_array(arr)
+        }
+        _ => Err(ParseError::InvalidFilter(
+            "filter expression must be a string or array".to_string(),
+        )),
+    }
+}
+
+// Parse an S-expression string like "(> ?age 45)" into a filter expression
+//
+// # Supported syntax
+// - Atoms: `?var`, numbers, `true`/`false`, quoted strings `"text"`
+// - Expressions: `(op arg1 arg2 ...)`
+// - Nested: `(and (> ?x 10) (< ?y 100))`
+// Limitations of S-expression filter parsing:
+// - Quoted strings cannot contain whitespace, parentheses, or escape sequences
+//   (e.g., `"Smith Jr"` with a space will not parse correctly)
+// - For complex string comparisons, use the data expression format instead:
+//   `["filter", ["=", "?name", "Smith Jr"]]`
+// Filter parsing functions moved to filter_sexpr and filter_data modules
+// Query modifier parsing - moved to options module
+
+/// Validate that a string looks like a variable (starts with ?)
+fn validate_var_name(name: &str) -> Result<()> {
+    if !name.starts_with('?') {
+        return Err(ParseError::InvalidVariable(name.to_string()));
+    }
+    Ok(())
+}
+
+// Query option parsing functions moved to options module
+
+/// Parse and lower a JSON query in one step
+///
+/// Convenience function combining `parse_query_ast` and `lower_query`.
+///
+/// # Arguments
+///
+/// * `json` - The JSON query value
+/// * `encoder` - IRI encoder for converting IRIs to Sids
+/// * `vars` - Variable registry
+///
+/// # Returns
+///
+/// A fully resolved `Query` ready for execution.
+pub fn parse_query<E: IriEncoder>(
+    json: &JsonValue,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    strict_override: Option<bool>,
+) -> Result<Query> {
+    parse_query_in_dataset(json, encoder, vars, strict_override, &HashSet::new())
+}
+
+/// [`parse_query`] for a query run against a dataset built outside its body
+/// (a Rust `DataSetDb`, or a graph source a `from` registers): a
+/// `["graph", …]` name in `dataset_names` is kept as written rather than
+/// expanded as a compact IRI.
+pub fn parse_query_in_dataset<E: IriEncoder>(
+    json: &JsonValue,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    strict_override: Option<bool>,
+    dataset_names: &HashSet<String>,
+) -> Result<Query> {
+    let (ast, select_mode) = parse_query_ast_in_dataset(json, strict_override, dataset_names)?;
+    let mut query = lower_query(ast, encoder, vars, select_mode)?;
+    // The JSON-LD query surface projects a variable its grouping does not
+    // produce as a per-group list (documented in `docs/query/jsonld-query.md`).
+    // Only the top-level output may: a subquery's projection cannot carry it.
+    query
+        .output
+        .set_ungrouped_projection(crate::ir::UngroupedProjection::PerGroupList);
+    if let crate::ir::QueryOutput::Construct(template) = &mut query.output {
+        template.mark_list_entries(&query.patterns, vars);
+    }
+    Ok(query)
+}
+
+/// Parse a filter expression value and lower it to a Expression.
+///
+/// This reuses the same expression language as FILTER/BIND in queries.
+pub fn parse_filter_expression(value: &JsonValue, vars: &mut VarRegistry) -> Result<Expression> {
+    let unresolved = parse_filter_value(value)?;
+    lower::lower_filter_expr(&unresolved, vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::ast::UnresolvedPattern;
+    use crate::parse::node_map::RDF_TYPE;
+    use serde_json::json;
+
+    /// Helper to extract the triple pattern from an UnresolvedPattern
+    fn triple(p: &UnresolvedPattern) -> &UnresolvedTriplePattern {
+        p.as_triple().expect("Expected UnresolvedPattern::Triple")
+    }
+
+    /// A node-level `@graph` in a query's `where` can name a `fromNamed`
+    /// alias, which stays the alias even where `@base` or a prefix could
+    /// expand it; any other compact name expands.
+    #[test]
+    fn node_level_graph_in_query_keeps_from_named_aliases() {
+        let graph_name = |query: JsonValue| {
+            let (ast, _) = parse_query_ast(&query, None).unwrap();
+            match &ast.patterns[..] {
+                [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+                other => panic!("expected one GRAPH pattern, got {other:?}"),
+            }
+        };
+        let context = json!({"ex": "http://example.org/", "@base": "http://base.example/"});
+        for (from_named, alias) in [
+            (
+                json!({"products": {"@id": "mydb:main", "@graph": "http://example.org/p"}}),
+                "products",
+            ),
+            (json!(["mydb:main"]), "mydb:main"),
+            (json!([{"@id": "mydb:main", "alias": "p2"}]), "p2"),
+        ] {
+            assert_eq!(
+                graph_name(json!({
+                    "@context": context,
+                    "fromNamed": from_named,
+                    "select": ["?s"],
+                    "where": {"@id": "?s", "@graph": alias, "ex:p": "?o"}
+                })),
+                alias
+            );
+        }
+        assert_eq!(
+            graph_name(json!({
+                "@context": context,
+                "select": ["?s"],
+                "where": {"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}
+            })),
+            "http://example.org/g"
+        );
+    }
+
+    #[test]
+    fn test_parse_minimal_query() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": { "@type": "ex:Person", "ex:name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.patterns.len(), 2); // @type + name
+    }
+
+    #[test]
+    fn test_parse_order_by_legacy_forms() {
+        // Legacy surface supports:
+        // - orderBy: "?x" (defaults asc)
+        // - orderBy: ["?x", "(desc ?y)", ["asc","?z"]] (mixed forms)
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": { "ex:name": "?x" },
+            "orderBy": ["?x", "(desc ?y)", ["ASC", "?z"]]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.options.order_by.len(), 3);
+        assert_eq!(ast.options.order_by[0].var.as_ref(), "?x");
+        assert_eq!(
+            ast.options.order_by[0].direction,
+            ast::UnresolvedSortDirection::Asc
+        );
+        assert_eq!(ast.options.order_by[1].var.as_ref(), "?y");
+        assert_eq!(
+            ast.options.order_by[1].direction,
+            ast::UnresolvedSortDirection::Desc
+        );
+        assert_eq!(ast.options.order_by[2].var.as_ref(), "?z");
+        assert_eq!(
+            ast.options.order_by[2].direction,
+            ast::UnresolvedSortDirection::Asc
+        );
+    }
+
+    #[test]
+    fn test_parse_order_by_single_scalar_string() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": { "ex:name": "?x" },
+            "orderBy": "?x"
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.options.order_by.len(), 1);
+        assert_eq!(ast.options.order_by[0].var.as_ref(), "?x");
+        assert_eq!(
+            ast.options.order_by[0].direction,
+            ast::UnresolvedSortDirection::Asc
+        );
+    }
+
+    #[test]
+    fn test_implicit_subject() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": { "ex:name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have generated ?__s0 as subject (unique per node-map, reserved prefix)
+        assert_eq!(ast.patterns.len(), 1);
+        let pattern = triple(&ast.patterns[0]);
+        assert!(matches!(&pattern.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__s0"));
+    }
+
+    #[test]
+    fn test_explicit_subject_variable() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?name"],
+            "where": { "@id": "?person", "ex:name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(matches!(&pattern.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+    }
+
+    #[test]
+    fn test_explicit_subject_iri() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": { "@id": "ex:alice", "ex:name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/alice")
+        );
+    }
+
+    #[test]
+    fn test_literal_values() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": {
+                "@id": "?s",
+                "ex:age": 42,
+                "ex:name": "Alice",
+                "ex:active": true
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 3);
+
+        // Find the age pattern
+        let age_pattern = ast.patterns.iter().find(|p| {
+            p.as_triple().is_some_and(
+                |tp| matches!(&tp.p, UnresolvedTerm::Iri(iri) if iri.as_ref().ends_with("age")),
+            )
+        });
+        assert!(age_pattern.is_some());
+        assert!(matches!(
+            &triple(age_pattern.unwrap()).o,
+            UnresolvedTerm::Literal(LiteralValue::Long(42))
+        ));
+    }
+
+    #[test]
+    fn test_accepts_both_context_keys() {
+        // @context
+        let json1 = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": { "ex:name": "?name" }
+        });
+        assert!(parse_query_ast(&json1, None).is_ok());
+
+        // context (without @)
+        let json2 = json!({
+            "context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": { "ex:name": "?name" }
+        });
+        assert!(parse_query_ast(&json2, None).is_ok());
+    }
+
+    #[test]
+    fn test_missing_select() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "where": { "ex:name": "?name" }
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingField(
+                "select, selectOne, select-one, selectDistinct, select-distinct, construct, or ask"
+            )
+        ));
+    }
+
+    #[test]
+    fn test_missing_where() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingField("where")
+        ));
+    }
+
+    #[test]
+    fn test_values_without_where_is_allowed() {
+        let json = json!({
+            "@context": { "xsd": "http://www.w3.org/2001/XMLSchema#" },
+            "select": ["?x"],
+            "values": ["?x", [1, 2, 3]]
+        });
+
+        let (ast, _mode) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        assert!(matches!(ast.patterns[0], UnresolvedPattern::Values { .. }));
+    }
+
+    #[test]
+    fn test_values_in_where_keyword() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#" },
+            "select": ["?x"],
+            "where": [
+                ["values", ["?x", [1, 2]]],
+                { "@id": "?s", "ex:age": "?x" }
+            ]
+        });
+
+        let (ast, _mode) = parse_query_ast(&json, None).unwrap();
+        assert!(ast
+            .patterns
+            .iter()
+            .any(|p| matches!(p, UnresolvedPattern::Values { .. })));
+    }
+
+    #[test]
+    fn test_values_typed_vector_cell_parses() {
+        let json = json!({
+            "@context": { "fluree": "https://ns.flur.ee/db#" },
+            "select": ["?v"],
+            "values": ["?v", [
+                { "@value": [0.7, 0.6], "@type": "fluree:embeddingVector" }
+            ]]
+        });
+
+        let (ast, _mode) = parse_query_ast(&json, None).unwrap();
+        let UnresolvedPattern::Values { vars, rows } = &ast.patterns[0] else {
+            panic!("expected Values pattern");
+        };
+        assert_eq!(vars.len(), 1);
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            UnresolvedValue::Literal {
+                value: LiteralValue::Vector(v),
+                dtc,
+            } => {
+                assert_eq!(v.as_slice(), &[0.7, 0.6]);
+                assert!(dtc
+                    .as_ref()
+                    .is_some_and(|d| d.datatype_iri() == "https://ns.flur.ee/db#embeddingVector"));
+            }
+            other => panic!("unexpected cell: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_variable() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["name"],  // Missing ?
+            "where": { "ex:name": "?name" }
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidVariable(_)
+        ));
+    }
+
+    #[test]
+    fn test_type_hydration() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "@type": "ex:Person" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let type_pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &type_pattern.p,
+            UnresolvedTerm::Iri(iri) if iri.as_ref() == RDF_TYPE
+        ));
+        assert!(matches!(
+            &type_pattern.o,
+            UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/Person"
+        ));
+    }
+
+    #[test]
+    fn test_multiple_types() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "@type": ["ex:Person", "ex:Agent"] }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have two type patterns
+        let type_patterns: Vec<_> = ast
+            .patterns
+            .iter()
+            .filter(|p| {
+                p.as_triple().is_some_and(
+                    |tp| matches!(&tp.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == RDF_TYPE),
+                )
+            })
+            .collect();
+        assert_eq!(type_patterns.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_and_lower() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name"],
+            "where": { "@id": "?s", "ex:name": "?name" }
+        });
+
+        let mut encoder = encode::MemoryEncoder::new();
+        encoder.add_namespace("http://example.org/", 100);
+
+        let mut vars = VarRegistry::new();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
+        assert_eq!(query.patterns.len(), 1);
+
+        // query.patterns now contains Pattern, not TriplePattern
+        if let crate::ir::Pattern::Triple(tp) = &query.patterns[0] {
+            // The registered prefix encodes at lowering, as SPARQL does.
+            assert_eq!(
+                tp.p.as_sid().map(|s| (s.namespace_code, &*s.name)),
+                Some((100, "name"))
+            );
+        } else {
+            panic!("Expected Pattern::Triple");
+        }
+    }
+
+    #[test]
+    fn test_property_datatype_from_context() {
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "age": { "@id": "ex:age", "@type": "xsd:integer" }
+            },
+            "select": ["?s", "?age"],
+            "where": { "@id": "?s", "age": "?age" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(pattern.dtc.is_some());
+        assert_eq!(
+            pattern
+                .dtc
+                .as_ref()
+                .map(fluree_vocab::UnresolvedDatatypeConstraint::datatype_iri),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+    }
+
+    #[test]
+    fn test_where_array_format() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?age"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                { "@id": "?s", "ex:age": "?age" }
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have patterns from both node-maps
+        assert_eq!(ast.patterns.len(), 2);
+    }
+
+    #[test]
+    fn test_vocab_hydration() {
+        let json = json!({
+            "@context": {
+                "@vocab": "http://schema.org/"
+            },
+            "select": ["?name"],
+            "where": { "name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://schema.org/name")
+        );
+    }
+
+    #[test]
+    fn test_floating_point_values() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "ex:score": 3.13 }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        if let UnresolvedTerm::Literal(LiteralValue::Double(d)) = &pattern.o {
+            assert!((d - 3.13).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected double literal");
+        }
+    }
+
+    #[test]
+    fn test_multiple_node_maps_unique_subjects() {
+        // Each node-map without @id should get a unique implicit subject
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name", "?age"],
+            "where": [
+                { "ex:name": "?name" },
+                { "ex:age": "?age" }
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+
+        // First node-map gets ?__s0
+        let p0 = triple(&ast.patterns[0]);
+        assert!(matches!(&p0.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__s0"));
+
+        // Second node-map gets ?__s1
+        let p1 = triple(&ast.patterns[1]);
+        assert!(matches!(&p1.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__s1"));
+    }
+
+    #[test]
+    fn test_mixed_explicit_implicit_subjects() {
+        // Node-maps with explicit @id should not affect the counter
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?name", "?age"],
+            "where": [
+                { "ex:name": "?name" },
+                { "@id": "?person", "ex:age": "?age" },
+                { "ex:email": "?email" }
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 3);
+
+        // First: implicit ?__s0
+        assert!(
+            matches!(&triple(&ast.patterns[0]).s, UnresolvedTerm::Var(v) if v.as_ref() == "?__s0")
+        );
+        // Second: explicit ?person
+        assert!(
+            matches!(&triple(&ast.patterns[1]).s, UnresolvedTerm::Var(v) if v.as_ref() == "?person")
+        );
+        // Third: implicit ?__s1
+        assert!(
+            matches!(&triple(&ast.patterns[2]).s, UnresolvedTerm::Var(v) if v.as_ref() == "?__s1")
+        );
+    }
+
+    #[test]
+    fn test_type_array_non_string_error() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "@type": ["ex:Person", 42] }
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidWhere(msg) if msg.contains("@type array items must be strings"))
+        );
+    }
+
+    #[test]
+    fn test_nested_context_error() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name"],
+            "where": {
+                "@context": { "foo": "http://foo.org/" },
+                "ex:name": "?name"
+            }
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidWhere(msg) if msg.contains("nested @context")));
+    }
+
+    #[test]
+    fn test_variable_predicate() {
+        // Variable predicates should be parsed as Var terms, not IRIs
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?p", "?o"],
+            "where": { "@id": "?s", "?p": "?o" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 1);
+        let pattern = triple(&ast.patterns[0]);
+
+        // Subject should be a variable
+        assert!(matches!(&pattern.s, UnresolvedTerm::Var(v) if v.as_ref() == "?s"));
+
+        // Predicate should be a variable (not an IRI)
+        assert!(matches!(&pattern.p, UnresolvedTerm::Var(v) if v.as_ref() == "?p"));
+
+        // Object should be a variable
+        assert!(matches!(&pattern.o, UnresolvedTerm::Var(v) if v.as_ref() == "?o"));
+    }
+
+    #[test]
+    fn test_variable_predicate_multiple_patterns() {
+        // Variable predicates work with multiple patterns
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?p", "?o", "?name"],
+            "where": {
+                "@id": "?s",
+                "?p": "?o",
+                "ex:name": "?name"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+
+        // Find the pattern with variable predicate
+        let var_pred_pattern = ast
+            .patterns
+            .iter()
+            .find(|p| {
+                p.as_triple()
+                    .is_some_and(|tp| matches!(&tp.p, UnresolvedTerm::Var(_)))
+            })
+            .expect("Should have a pattern with variable predicate");
+        assert!(
+            matches!(&triple(var_pred_pattern).p, UnresolvedTerm::Var(v) if v.as_ref() == "?p")
+        );
+
+        // Find the pattern with IRI predicate
+        let iri_pred_pattern = ast
+            .patterns
+            .iter()
+            .find(|p| {
+                p.as_triple()
+                    .is_some_and(|tp| matches!(&tp.p, UnresolvedTerm::Iri(_)))
+            })
+            .expect("Should have a pattern with IRI predicate");
+        assert!(
+            matches!(&triple(iri_pred_pattern).p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/name")
+        );
+    }
+
+    #[test]
+    fn test_nested_node_map_basic() {
+        // Nested node-maps should generate connecting triples
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?friendName"],
+            "where": {
+                "@id": "?person",
+                "ex:friend": {
+                    "ex:name": "?friendName"
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 2 patterns:
+        // 1. ?person ex:friend ?__n0  (connecting triple)
+        // 2. ?__n0 ex:name ?friendName  (nested property)
+        assert_eq!(ast.patterns.len(), 2);
+
+        // First pattern: connecting triple
+        let p0 = triple(&ast.patterns[0]);
+        assert!(matches!(&p0.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+        assert!(
+            matches!(&p0.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/friend")
+        );
+        assert!(matches!(&p0.o, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+
+        // Second pattern: nested property
+        let p1 = triple(&ast.patterns[1]);
+        assert!(matches!(&p1.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+        assert!(
+            matches!(&p1.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/name")
+        );
+        assert!(matches!(&p1.o, UnresolvedTerm::Var(v) if v.as_ref() == "?friendName"));
+    }
+
+    #[test]
+    fn test_nested_node_map_with_explicit_id() {
+        // Nested node-maps with explicit @id should override the generated subject
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?friend", "?friendName"],
+            "where": {
+                "@id": "?person",
+                "ex:friend": {
+                    "@id": "?friend",
+                    "ex:name": "?friendName"
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 2 patterns:
+        // 1. ?person ex:friend ?friend  (connecting triple uses explicit @id)
+        // 2. ?friend ex:name ?friendName
+        assert_eq!(ast.patterns.len(), 2);
+
+        // First pattern: connecting triple uses explicit @id
+        let p0 = triple(&ast.patterns[0]);
+        assert!(matches!(&p0.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+        assert!(matches!(&p0.o, UnresolvedTerm::Var(v) if v.as_ref() == "?friend"));
+
+        // Second pattern: nested property uses explicit @id
+        let p1 = triple(&ast.patterns[1]);
+        assert!(matches!(&p1.s, UnresolvedTerm::Var(v) if v.as_ref() == "?friend"));
+        assert!(matches!(&p1.o, UnresolvedTerm::Var(v) if v.as_ref() == "?friendName"));
+    }
+
+    #[test]
+    fn test_nested_node_map_deeply_nested() {
+        // Deeply nested node-maps should work recursively
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?city"],
+            "where": {
+                "@id": "?person",
+                "ex:address": {
+                    "ex:city": {
+                        "ex:name": "?city"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 3 patterns:
+        // 1. ?person ex:address ?__n0
+        // 2. ?__n0 ex:city ?__n1
+        // 3. ?__n1 ex:name ?city
+        assert_eq!(ast.patterns.len(), 3);
+
+        // First: person -> address -> nested0
+        let p0 = triple(&ast.patterns[0]);
+        assert!(matches!(&p0.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+        assert!(
+            matches!(&p0.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/address")
+        );
+        assert!(matches!(&p0.o, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+
+        // Second: nested0 -> city -> nested1
+        let p1 = triple(&ast.patterns[1]);
+        assert!(matches!(&p1.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+        assert!(
+            matches!(&p1.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/city")
+        );
+        assert!(matches!(&p1.o, UnresolvedTerm::Var(v) if v.as_ref() == "?__n1"));
+
+        // Third: nested1 -> name -> city
+        let p2 = triple(&ast.patterns[2]);
+        assert!(matches!(&p2.s, UnresolvedTerm::Var(v) if v.as_ref() == "?__n1"));
+        assert!(
+            matches!(&p2.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/name")
+        );
+        assert!(matches!(&p2.o, UnresolvedTerm::Var(v) if v.as_ref() == "?city"));
+    }
+
+    #[test]
+    fn test_nested_node_map_multiple_properties() {
+        // Nested node-maps with multiple properties
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?friendName", "?friendAge"],
+            "where": {
+                "@id": "?person",
+                "ex:friend": {
+                    "ex:name": "?friendName",
+                    "ex:age": "?friendAge"
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 3 patterns:
+        // 1. ?person ex:friend ?__n0
+        // 2. ?__n0 ex:name ?friendName
+        // 3. ?__n0 ex:age ?friendAge
+        assert_eq!(ast.patterns.len(), 3);
+
+        // First: connecting triple
+        let p0 = triple(&ast.patterns[0]);
+        assert!(matches!(&p0.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+        assert!(matches!(&p0.o, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+
+        // The nested properties both use ?__n0 as subject
+        let nested_patterns: Vec<_> = ast.patterns[1..].iter().collect();
+        for p in &nested_patterns {
+            assert!(matches!(&triple(p).s, UnresolvedTerm::Var(v) if v.as_ref() == "?__n0"));
+        }
+    }
+
+    // ==========================================
+    // Tests ported from legacy tests
+    // ==========================================
+
+    #[test]
+    fn test_reference_type_in_context() {
+        // When a property is typed as @id, string values should be treated as IRIs
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "friend": { "@id": "ex:friend", "@type": "@id" }
+            },
+            "select": ["?s", "?friend"],
+            "where": { "@id": "?s", "friend": "?friend" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        // The predicate should be expanded
+        assert!(
+            matches!(&pattern.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/friend")
+        );
+    }
+
+    #[test]
+    fn test_reference_value_hydration() {
+        // String values for @id-typed properties should expand to IRIs
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "friend": { "@id": "ex:friend", "@type": "@id" }
+            },
+            "select": ["?s"],
+            "where": { "@id": "?s", "friend": "ex:alice" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        // The object should be an IRI, not a string literal
+        assert!(
+            matches!(&pattern.o, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/alice")
+        );
+    }
+
+    /// A `@vocab`-typed term's value is an IRI, as a transaction writes it.
+    #[test]
+    fn vocab_typed_term_value_is_an_iri() {
+        let json = json!({
+            "@context": {
+                "@vocab": "http://example.org/",
+                "status": {"@type": "@vocab"}
+            },
+            "select": ["?s"],
+            "where": { "@id": "?s", "status": "Active" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.o, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/Active"),
+            "{:?}",
+            pattern.o
+        );
+    }
+
+    /// A `@json`-typed term's value is one canonical JSON literal, a string
+    /// serialized, as a transaction writes it; a variable stays a variable.
+    #[test]
+    fn json_typed_term_value_is_a_json_literal() {
+        let object_of = |value: JsonValue| {
+            let json = json!({
+                "@context": {"ex": "http://example.org/", "p": {"@id": "ex:p", "@type": "@json"}},
+                "select": ["?s"],
+                "where": { "@id": "?s", "p": value }
+            });
+            let (ast, _) = parse_query_ast(&json, None).unwrap();
+            let pattern = triple(&ast.patterns[0]).clone();
+            (pattern.o, pattern.dtc)
+        };
+        let json_dt = Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+            fluree_vocab::rdf::JSON,
+        )));
+
+        for (value, document) in [
+            (json!(5), "5"),
+            (json!("hello"), r#""hello""#),
+            (json!({"b": 1, "a": [true]}), r#"{"a":[true],"b":1}"#),
+            (json!([1, "x"]), r#"[1,"x"]"#),
+        ] {
+            let (o, dtc) = object_of(value.clone());
+            assert!(
+                matches!(&o, UnresolvedTerm::Literal(LiteralValue::String(s)) if s.as_ref() == document),
+                "{value}: {o:?}"
+            );
+            assert_eq!(dtc, json_dt, "{value}");
+        }
+
+        let (o, dtc) = object_of(json!("?v"));
+        assert!(matches!(o, UnresolvedTerm::Var(_)), "{o:?}");
+        assert_eq!(dtc, None);
+    }
+
+    /// A map in `where` is a node pattern under an `@index` term too: the
+    /// term's values can be nodes, and a pattern has to reach into them.
+    #[test]
+    fn index_term_map_in_where_is_a_node_pattern() {
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "m": {"@id": "ex:m", "@container": "@index"}
+            },
+            "select": ["?o"],
+            "where": { "@id": "?s", "m": {"@id": "?o", "ex:q": "x"} }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+        let link = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&link.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/m")
+        );
+        assert!(matches!(&link.o, UnresolvedTerm::Var(v) if v.as_ref() == "?o"));
+        let nested = triple(&ast.patterns[1]);
+        assert!(matches!(&nested.s, UnresolvedTerm::Var(v) if v.as_ref() == "?o"));
+    }
+
+    /// A term defined as `null` names no property, so a pattern on it is
+    /// refused rather than matching nothing.
+    #[test]
+    fn null_term_in_where_is_refused() {
+        let json = json!({
+            "@context": {"@vocab": "http://example.org/", "gone": null},
+            "select": ["?s"],
+            "where": { "@id": "?s", "gone": "?v" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err().to_string();
+        assert!(err.contains("'gone' is defined as null"), "{err}");
+    }
+
+    #[test]
+    fn test_no_context_full_iris() {
+        // Queries can use full IRIs without any context
+        let json = json!({
+            "select": ["?name"],
+            "where": {
+                "@id": "http://example.org/alice",
+                "http://example.org/name": "?name"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(
+            matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/alice")
+        );
+        assert!(
+            matches!(&pattern.p, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/name")
+        );
+    }
+
+    #[test]
+    fn test_type_as_variable() {
+        // @type can bind to a variable to query for types
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?type"],
+            "where": { "@id": "?s", "@type": "?type" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let type_pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &type_pattern.p,
+            UnresolvedTerm::Iri(iri) if iri.as_ref() == RDF_TYPE
+        ));
+        assert!(matches!(
+            &type_pattern.o,
+            UnresolvedTerm::Var(v) if v.as_ref() == "?type"
+        ));
+    }
+
+    #[test]
+    fn test_type_key_without_at() {
+        // "type" should work the same as "@type"
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "type": "ex:Person" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let type_pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &type_pattern.p,
+            UnresolvedTerm::Iri(iri) if iri.as_ref() == RDF_TYPE
+        ));
+    }
+
+    #[test]
+    fn test_context_array() {
+        // Context can be an array of context objects
+        let json = json!({
+            "@context": [
+                { "ex": "http://example.org/" },
+                { "schema": "http://schema.org/" }
+            ],
+            "select": ["?name", "?age"],
+            "where": {
+                "@id": "?s",
+                "ex:name": "?name",
+                "schema:age": "?age"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+
+        // Find the name pattern
+        let name_pattern = ast.patterns.iter().find(|p| {
+            p.as_triple().is_some_and(|tp| matches!(&tp.p, UnresolvedTerm::Iri(iri) if iri.as_ref().contains("example.org")))
+        });
+        assert!(name_pattern.is_some());
+
+        // Find the age pattern
+        let age_pattern = ast.patterns.iter().find(|p| {
+            p.as_triple().is_some_and(|tp| matches!(&tp.p, UnresolvedTerm::Iri(iri) if iri.as_ref().contains("schema.org")))
+        });
+        assert!(age_pattern.is_some());
+    }
+
+    #[test]
+    fn test_multiple_properties_same_node_map() {
+        // A single node-map can have multiple properties
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?age", "?email"],
+            "where": {
+                "@id": "?s",
+                "@type": "ex:Person",
+                "ex:name": "?name",
+                "ex:age": "?age",
+                "ex:email": "?email"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 4 patterns: type + name + age + email
+        assert_eq!(ast.patterns.len(), 4);
+
+        // All patterns should share the same subject variable
+        for pattern in &ast.patterns {
+            assert!(matches!(&triple(pattern).s, UnresolvedTerm::Var(v) if v.as_ref() == "?s"));
+        }
+    }
+
+    #[test]
+    fn test_joined_node_maps_same_subject() {
+        // When multiple node-maps share the same @id variable, they join
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?age"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                { "@id": "?s", "ex:age": "?age" }
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.patterns.len(), 2);
+
+        // Both patterns should share the same subject variable
+        assert!(
+            matches!(&triple(&ast.patterns[0]).s, UnresolvedTerm::Var(v) if v.as_ref() == "?s")
+        );
+        assert!(
+            matches!(&triple(&ast.patterns[1]).s, UnresolvedTerm::Var(v) if v.as_ref() == "?s")
+        );
+    }
+
+    #[test]
+    fn test_literal_string_value() {
+        // String values that aren't variables should be treated as literals
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "ex:name": "Alice" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &pattern.o,
+            UnresolvedTerm::Literal(LiteralValue::String(s)) if s.as_ref() == "Alice"
+        ));
+    }
+
+    #[test]
+    fn test_negative_integer() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "ex:balance": -100 }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &pattern.o,
+            UnresolvedTerm::Literal(LiteralValue::Long(-100))
+        ));
+    }
+
+    #[test]
+    fn test_negative_float() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "ex:temperature": -273.15 }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        if let UnresolvedTerm::Literal(LiteralValue::Double(d)) = &pattern.o {
+            assert!((d - (-273.15)).abs() < f64::EPSILON);
+        } else {
+            panic!("Expected double literal");
+        }
+    }
+
+    #[test]
+    fn test_boolean_false() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": { "@id": "?s", "ex:active": false }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &pattern.o,
+            UnresolvedTerm::Literal(LiteralValue::Boolean(false))
+        ));
+    }
+
+    #[test]
+    fn test_empty_select_error() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [],
+            "where": { "ex:name": "?name" }
+        });
+
+        // Empty select should parse (though semantically questionable)
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(ast.select.columns().is_empty());
+    }
+
+    #[test]
+    fn test_empty_where_object() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": {}
+        });
+
+        // Empty where object produces no patterns (just implicit subject)
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(ast.patterns.is_empty());
+    }
+
+    #[test]
+    fn test_custom_type_key_in_context() {
+        // Context can define a custom type key via "kind": "@type"
+        // This allows using "kind" as an alias for @type in the data
+        let json = json!({
+            "@context": {
+                "kind": "@type",
+                "ex": "http://example.org/"
+            },
+            "select": ["?s"],
+            "where": { "@id": "?s", "kind": "ex:Person" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let type_pattern = triple(&ast.patterns[0]);
+        assert!(matches!(
+            &type_pattern.p,
+            UnresolvedTerm::Iri(iri) if iri.as_ref() == RDF_TYPE
+        ));
+    }
+
+    #[test]
+    fn test_multiple_select_same_variable() {
+        // Duplicate variables in select should be preserved
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name", "?name"],
+            "where": { "ex:name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.select.columns().len(), 2);
+    }
+
+    #[test]
+    fn test_where_array_empty() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": []
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(ast.patterns.is_empty());
+    }
+
+    #[test]
+    fn test_base_iri_expansion_fragment() {
+        // @base provides the base IRI for relative references
+        // Fragment identifiers like "#alice" resolve against @base
+        let json = json!({
+            "@context": {
+                "@base": "http://example.org/resource",
+                "name": "http://example.org/name"
+            },
+            "select": ["?name"],
+            "where": { "@id": "#alice", "name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        // Subject "#alice" should expand using @base
+        assert!(
+            matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/resource#alice")
+        );
+    }
+
+    #[test]
+    fn test_base_iri_expansion_relative_path() {
+        // Relative paths resolve against @base
+        let json = json!({
+            "@context": {
+                "@base": "http://example.org/",
+                "name": "http://example.org/name"
+            },
+            "select": ["?name"],
+            "where": { "@id": "people/alice", "name": "?name" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let pattern = triple(&ast.patterns[0]);
+        // Subject "people/alice" should expand using @base
+        assert!(
+            matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/people/alice")
+        );
+    }
+
+    // ==================== FILTER SYNTAX TESTS ====================
+
+    /// Helper to find the first filter pattern in the AST
+    fn find_filter(patterns: &[UnresolvedPattern]) -> Option<&UnresolvedExpression> {
+        patterns.iter().find_map(|p| {
+            if let UnresolvedPattern::Filter(expr) = p {
+                Some(expr)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Helper to count triple patterns
+    fn count_triples(patterns: &[UnresolvedPattern]) -> usize {
+        patterns.iter().filter(|p| p.is_triple()).count()
+    }
+
+    /// Helper to count filter patterns
+    fn count_filters(patterns: &[UnresolvedPattern]) -> usize {
+        patterns
+            .iter()
+            .filter(|p| matches!(p, UnresolvedPattern::Filter(_)))
+            .count()
+    }
+
+    #[test]
+    fn test_filter_simple_comparison() {
+        // Using array syntax: ["filter", [">", "?age", 18]]
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?age"],
+            "where": [
+                { "@id": "?s", "ex:age": "?age" },
+                ["filter", [">", "?age", 18]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 2 patterns: 1 triple + 1 filter
+        assert_eq!(ast.patterns.len(), 2);
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_filters(&ast.patterns), 1);
+
+        // Find the filter
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), ">");
+                assert!(matches!(&args[0], UnresolvedExpression::Var(v) if v.as_ref() == "?age"));
+                assert!(matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Long(18))
+                ));
+            }
+            _ => panic!("Expected Call expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_s_expression_string() {
+        // Using S-expression string syntax: ["filter", "(> ?age 18)"]
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?age"],
+            "where": [
+                { "@id": "?s", "ex:age": "?age" },
+                ["filter", "(> ?age 18)"]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_filters(&ast.patterns), 1);
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), ">");
+                assert!(matches!(&args[0], UnresolvedExpression::Var(v) if v.as_ref() == "?age"));
+                assert!(matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Long(18))
+                ));
+            }
+            _ => panic!("Expected Call expression"),
+        }
+    }
+
+    #[test]
+    fn filter_compact_iri_operand_resolves_through_context() {
+        // `(= ?p ex:knows)`: the prefix is defined, so the operand is the IRI
+        // http://example.org/knows — compared by term identity, like SPARQL —
+        // not the string "ex:knows" (which an IRI-bound ?p could never equal).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?o"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p ex:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Iri(i))
+                        if i.as_ref() == "http://example.org/knows"
+                ),
+                "expected an expanded IRI operand, got {:?}",
+                args[1]
+            ),
+            _ => panic!("Expected Call expression"),
+        }
+
+        // An undefined prefix is not expanded: the atom stays the plain
+        // string it always was (a Curie that lowers as a string), so
+        // `(= ?slot 12:30)`-style values are unaffected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p zz:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Curie(c))
+                        if c.as_ref() == "zz:knows"
+                ),
+                "expected an unexpanded Curie operand, got {:?}",
+                args[1]
+            ),
+            _ => panic!("Expected Call expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_and_expression() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?age"],
+            "where": [
+                { "@id": "?s", "ex:age": "?age" },
+                ["filter", ["and", [">=", "?age", 18], ["<", "?age", 65]]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 2 patterns: 1 triple + 1 filter
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_filters(&ast.patterns), 1);
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::And(exprs) => {
+                assert_eq!(exprs.len(), 2);
+                // First condition: ?age >= 18
+                match &exprs[0] {
+                    UnresolvedExpression::Call { func, .. } => {
+                        assert_eq!(func.as_ref(), ">=");
+                    }
+                    _ => panic!("Expected Call"),
+                }
+                // Second condition: ?age < 65
+                match &exprs[1] {
+                    UnresolvedExpression::Call { func, .. } => {
+                        assert_eq!(func.as_ref(), "<");
+                    }
+                    _ => panic!("Expected Call"),
+                }
+            }
+            _ => panic!("Expected And expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_and_s_expression() {
+        // Test AND with S-expression syntax
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?age"],
+            "where": [
+                { "@id": "?s", "ex:age": "?age" },
+                ["filter", "(and (>= ?age 18) (< ?age 65))"]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::And(exprs) => {
+                assert_eq!(exprs.len(), 2);
+            }
+            _ => panic!("Expected And expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_or_expression() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?status"],
+            "where": [
+                { "@id": "?s", "ex:status": "?status" },
+                ["filter", ["or", ["=", "?status", "active"], ["=", "?status", "pending"]]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Or(exprs) => {
+                assert_eq!(exprs.len(), 2);
+            }
+            _ => panic!("Expected Or expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_not_expression() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?active"],
+            "where": [
+                { "@id": "?s", "ex:active": "?active" },
+                ["filter", ["not", ["=", "?active", false]]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Not(inner) => {
+                assert!(matches!(inner.as_ref(), UnresolvedExpression::Call { .. }));
+            }
+            _ => panic!("Expected Not expression"),
+        }
+    }
+
+    #[test]
+    fn test_filter_arithmetic_expression() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x", "?y"],
+            "where": [
+                { "@id": "?s", "ex:x": "?x", "ex:y": "?y" },
+                ["filter", [">", ["+", "?x", "?y"], 100]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // 2 triple patterns (ex:x and ex:y) + 1 filter (@id just sets subject, doesn't create pattern)
+        assert_eq!(count_triples(&ast.patterns), 2);
+        assert_eq!(count_filters(&ast.patterns), 1);
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), ">");
+                match &args[0] {
+                    UnresolvedExpression::Call {
+                        func: inner_func, ..
+                    } => {
+                        assert_eq!(inner_func.as_ref(), "+");
+                    }
+                    _ => panic!("Expected Call expression on left"),
+                }
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_filter_function_call() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["filter", ["contains", "?name", "Smith"]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), "contains");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], UnresolvedExpression::Var(v) if v.as_ref() == "?name"));
+                assert!(
+                    matches!(&args[1], UnresolvedExpression::Const(UnresolvedFilterValue::String(s)) if s.as_ref() == "Smith")
+                );
+            }
+            _ => panic!("Expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_filter_unary_negation() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?val"],
+            "where": [
+                { "@id": "?s", "ex:val": "?val" },
+                ["filter", [">", ["-", "?val"], -10]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { func, args } => {
+                assert_eq!(func.as_ref(), ">");
+                // First arg should be negate(?val)
+                match &args[0] {
+                    UnresolvedExpression::Call {
+                        func: inner_func, ..
+                    } => {
+                        assert_eq!(inner_func.as_ref(), "negate");
+                    }
+                    _ => panic!("Expected Call with negate"),
+                }
+                // Second arg should be -10
+                assert!(matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Long(-10))
+                ));
+            }
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_filter_all_comparison_operators() {
+        // Test all comparison operators using array syntax
+        let operators = vec![
+            ("=", "="),
+            ("!=", "!="),
+            ("<>", "!="),
+            ("<", "<"),
+            ("<=", "<="),
+            (">", ">"),
+            (">=", ">="),
+        ];
+
+        for (op_str, expected_func) in operators {
+            let json = json!({
+                "@context": { "ex": "http://example.org/" },
+                "select": ["?x"],
+                "where": [
+                    { "ex:val": "?x" },
+                    ["filter", [op_str, "?x", 0]]
+                ]
+            });
+
+            let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+            let filter = find_filter(&ast.patterns).expect("Should have a filter");
+            match filter {
+                UnresolvedExpression::Call { func, .. } => {
+                    assert_eq!(
+                        func.as_ref(),
+                        expected_func,
+                        "Operator {op_str} did not match"
+                    );
+                }
+                _ => panic!("Expected Call for operator {op_str}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_expr_format() {
+        // Test the ["filter", ["expr", [...]]] format
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?age"],
+            "where": [
+                { "ex:age": "?age" },
+                ["filter", ["expr", [">", "?age", 21]]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_filters(&ast.patterns), 1);
+    }
+
+    #[test]
+    fn test_filter_double_values() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?price"],
+            "where": [
+                { "ex:price": "?price" },
+                ["filter", ["<", "?price", 99.99]]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => match &args[1] {
+                UnresolvedExpression::Const(UnresolvedFilterValue::Double(d)) => {
+                    assert!((d - 99.99).abs() < f64::EPSILON);
+                }
+                _ => panic!("Expected Double constant"),
+            },
+            _ => panic!("Expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_filter_error_empty_array() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": [
+                { "ex:val": "?x" },
+                ["filter", []]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidFilter(_)));
+    }
+
+    #[test]
+    fn test_filter_single_arg_comparison_parses() {
+        // Single-arg comparison is valid with variadic ops (vacuously true)
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": [
+                { "ex:val": "?x" },
+                ["filter", [">", "?x"]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_filter_error_zero_args() {
+        // Zero-arg comparison should still fail
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": [
+                { "ex:val": "?x" },
+                ["filter", [">"]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidFilter(_)));
+    }
+
+    #[test]
+    fn test_filter_error_non_string_operator() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": [
+                { "ex:val": "?x" },
+                ["filter", [123, "?x", 1]]  // Operator should be string
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidFilter(_)));
+    }
+
+    // ==================== OPTIONAL SYNTAX TESTS ====================
+
+    /// Helper to find optional patterns
+    fn find_optional(patterns: &[UnresolvedPattern]) -> Option<&Vec<UnresolvedPattern>> {
+        patterns.iter().find_map(|p| {
+            if let UnresolvedPattern::Optional(inner) = p {
+                Some(inner)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Helper to count optional patterns
+    fn count_optionals(patterns: &[UnresolvedPattern]) -> usize {
+        patterns
+            .iter()
+            .filter(|p| matches!(p, UnresolvedPattern::Optional(_)))
+            .count()
+    }
+
+    #[test]
+    fn test_optional_basic() {
+        // ["optional", {...}] syntax
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?email"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", { "@id": "?s", "ex:email": "?email" }]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Should have 2 patterns: 1 triple + 1 optional
+        assert_eq!(ast.patterns.len(), 2);
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_optionals(&ast.patterns), 1);
+
+        // Check optional content
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        assert_eq!(optional.len(), 1);
+        assert!(optional[0].is_triple());
+    }
+
+    #[test]
+    fn test_optional_multiple_patterns() {
+        // SPARQL semantics: ["optional", {a}, {b}] is one conjunctive OPTIONAL,
+        // equivalent to OPTIONAL { a . b }.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?email", "?phone"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    { "@id": "?s", "ex:email": "?email" },
+                    { "@id": "?s", "ex:phone": "?phone" }
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_optionals(&ast.patterns), 1);
+
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        assert_eq!(optional.len(), 2);
+        assert!(optional
+            .iter()
+            .all(super::ast::UnresolvedPattern::is_triple));
+    }
+
+    #[test]
+    fn test_optional_with_filter() {
+        // Optional can contain filters too
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?age"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    { "@id": "?s", "ex:age": "?age" },
+                    ["filter", "(> ?age 18)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        // Optional should contain 1 triple + 1 filter
+        assert_eq!(optional.len(), 2);
+
+        // Count types inside optional
+        let optional_triples = optional.iter().filter(|p| p.is_triple()).count();
+        let optional_filters = optional
+            .iter()
+            .filter(|p| matches!(p, UnresolvedPattern::Filter(_)))
+            .count();
+        assert_eq!(optional_triples, 1);
+        assert_eq!(optional_filters, 1);
+    }
+
+    #[test]
+    fn test_optional_with_nested_object() {
+        // Optional with nested node-map
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?friendName"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", {
+                    "@id": "?s",
+                    "ex:friend": { "ex:name": "?friendName" }
+                }]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        // Optional should contain 2 triples (connecting + nested property)
+        assert_eq!(optional.len(), 2);
+    }
+
+    #[test]
+    fn test_multiple_optionals() {
+        // Multiple optional clauses
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?email", "?phone"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", { "@id": "?s", "ex:email": "?email" }],
+                ["optional", { "@id": "?s", "ex:phone": "?phone" }]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_optionals(&ast.patterns), 2);
+    }
+
+    #[test]
+    fn test_filter_and_optional_together() {
+        // Both filter and optional in same where clause
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?name", "?age", "?email"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name", "ex:age": "?age" },
+                ["filter", "(> ?age 21)"],
+                ["optional", { "@id": "?s", "ex:email": "?email" }]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(count_triples(&ast.patterns), 2); // name + age
+        assert_eq!(count_filters(&ast.patterns), 1);
+        assert_eq!(count_optionals(&ast.patterns), 1);
+    }
+
+    #[test]
+    fn test_optional_error_no_patterns() {
+        // Optional requires at least one pattern
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s" },
+                ["optional"]  // No patterns
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optional_values_then_filter() {
+        // VALUES is a binding-producing pattern, so a following FILTER inside the
+        // same OPTIONAL block has an anchor and must be accepted.
+        // SPARQL: OPTIONAL { VALUES (?x) { (1) (2) (3) } FILTER(?x > 0) }
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    ["values", ["?x", [1, 2, 3]]],
+                    ["filter", "(> ?x 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        assert_eq!(optional.len(), 2);
+        assert!(matches!(optional[0], UnresolvedPattern::Values { .. }));
+        assert!(matches!(optional[1], UnresolvedPattern::Filter(_)));
+    }
+
+    #[test]
+    fn test_optional_bind_anchor_for_filter() {
+        // BIND inside OPTIONAL produces a binding for ?doubled, anchoring the
+        // following FILTER. The leading node-map provides the BIND anchor.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x", "?doubled"],
+            "where": [
+                ["optional",
+                    { "@id": "?s", "ex:x": "?x" },
+                    ["bind", "?doubled", ["*", "?x", 2]],
+                    ["filter", "(> ?doubled 0)"]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let optional = find_optional(&ast.patterns).expect("Should have optional");
+        // 1 triple from node-map + 1 bind + 1 filter
+        assert_eq!(optional.len(), 3);
+    }
+
+    #[test]
+    fn test_optional_filter_first_rejected() {
+        // FILTER as the very first item in an OPTIONAL has nothing to constrain
+        // and must be rejected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["filter", "(> ?name 0)"]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_optional_bind_first_rejected() {
+        // BIND as the very first item in an OPTIONAL has nothing to bind from
+        // and must be rejected (matches the pre-existing contract).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional", ["bind", "?x", ["+", 1, 1]]]
+            ]
+        });
+
+        let result = parse_query_ast(&json, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nested_optional_structure_preserved() {
+        // Nested OPTIONAL should create nested Optional(...) wrapper, not flatten
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?email", "?phone"],
+            "where": [
+                { "@id": "?s", "ex:name": "?name" },
+                ["optional",
+                    { "@id": "?s", "ex:email": "?email" },
+                    ["optional", { "@id": "?s", "ex:phone": "?phone" }]
+                ]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Top level: 1 triple + 1 optional
+        assert_eq!(count_triples(&ast.patterns), 1);
+        assert_eq!(count_optionals(&ast.patterns), 1);
+
+        // Get the outer optional
+        let outer_optional = find_optional(&ast.patterns).expect("Should have outer optional");
+
+        // Outer optional should contain: 1 triple (email) + 1 nested optional (phone)
+        let outer_triples = outer_optional.iter().filter(|p| p.is_triple()).count();
+        let outer_optionals = outer_optional
+            .iter()
+            .filter(|p| matches!(p, UnresolvedPattern::Optional(_)))
+            .count();
+        assert_eq!(
+            outer_triples, 1,
+            "Outer optional should have 1 triple pattern"
+        );
+        assert_eq!(
+            outer_optionals, 1,
+            "Outer optional should have 1 nested optional (not flattened)"
+        );
+
+        // Get the nested optional
+        let nested_optional = outer_optional
+            .iter()
+            .find_map(|p| {
+                if let UnresolvedPattern::Optional(inner) = p {
+                    Some(inner)
+                } else {
+                    None
+                }
+            })
+            .expect("Should have nested optional");
+
+        // Nested optional should contain 1 triple (phone)
+        assert_eq!(nested_optional.len(), 1);
+        assert!(nested_optional[0].is_triple());
+    }
+
+    #[test]
+    fn test_s_expression_complex() {
+        // Test more complex S-expressions
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?x", "?y"],
+            "where": [
+                { "@id": "?s", "ex:x": "?x", "ex:y": "?y" },
+                ["filter", "(and (> ?x 10) (< ?y 100) (>= (+ ?x ?y) 50))"]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        let filter = find_filter(&ast.patterns).expect("Should have filter");
+        match filter {
+            UnresolvedExpression::And(exprs) => {
+                assert_eq!(exprs.len(), 3, "Should have 3 conditions in AND");
+            }
+            _ => panic!("Expected And expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_count_with_alias() {
+        // Test parsing aggregate S-expression with alias: (as (count ?favNums) ?count)
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name", "(as (count ?favNums) ?count)"],
+            "where": { "ex:name": "?name", "ex:favNums": "?favNums" },
+            "groupBy": ["?name"]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // Check select has both vars
+        assert_eq!(ast.select.columns().len(), 2);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.select.columns()[1].var_name().unwrap(), "?count");
+
+        // Check aggregate was parsed
+        assert_eq!(ast.options.aggregates.len(), 1);
+        let agg = &ast.options.aggregates[0];
+        assert_eq!(agg.function, ast::UnresolvedAggregateFn::Count);
+        assert_eq!(agg.input_var.as_ref(), "?favNums");
+        assert_eq!(agg.output_var.as_ref(), "?count");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_count_star() {
+        // Test parsing COUNT(*) S-expression: (as (count *) ?total)
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?name", "(as (count *) ?total)"],
+            "where": { "ex:name": "?name" },
+            "groupBy": ["?name"]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.options.aggregates.len(), 1);
+        let agg = &ast.options.aggregates[0];
+        assert_eq!(agg.function, ast::UnresolvedAggregateFn::Count);
+        assert_eq!(agg.input_var.as_ref(), "*");
+        assert_eq!(agg.output_var.as_ref(), "?total");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_auto_output() {
+        // Test auto-generated output var: (sum ?age) -> ?sum
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["(sum ?age)"],
+            "where": { "ex:age": "?age" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?sum");
+
+        assert_eq!(ast.options.aggregates.len(), 1);
+        let agg = &ast.options.aggregates[0];
+        assert_eq!(agg.function, ast::UnresolvedAggregateFn::Sum);
+        assert_eq!(agg.input_var.as_ref(), "?age");
+        assert_eq!(agg.output_var.as_ref(), "?sum");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_groupconcat_with_separator() {
+        // Test groupconcat with separator: (as (groupconcat ?x ", ") ?result)
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "(as (groupconcat ?favNums \", \") ?nums)"],
+            "where": { "@id": "?s", "ex:favNums": "?favNums" },
+            "groupBy": ["?s"]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        assert_eq!(ast.options.aggregates.len(), 1);
+        let agg = &ast.options.aggregates[0];
+        match &agg.function {
+            ast::UnresolvedAggregateFn::GroupConcat { separator } => {
+                assert_eq!(separator, ", ");
+            }
+            _ => panic!("Expected GroupConcat"),
+        }
+        assert_eq!(agg.input_var.as_ref(), "?favNums");
+        assert_eq!(agg.output_var.as_ref(), "?nums");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_rejects_extra_args() {
+        // Extra args should not be silently ignored (helps users/LLMs self-correct).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["(count ?x ?y)"],
+            "where": { "ex:x": "?x", "ex:y": "?y" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires exactly 1 argument"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("expected:"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_groupconcat_rejects_too_many_args() {
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["(groupconcat ?x \", \" \"extra\")"],
+            "where": { "ex:x": "?x" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accepts at most 2 arguments"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("expected:"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_aggregate_sexpr_rejects_unclosed_string_literal() {
+        // Missing closing quote around separator should produce a useful error.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["(as (groupconcat ?x \", ) ?out)"],
+            "where": { "ex:x": "?x" },
+            "groupBy": ["?x"]
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unclosed string literal"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("missing closing"), "unexpected error: {msg}");
+    }
+
+    // ==========================================
+    // SELECT-clause scalar expression tests
+    // ==========================================
+
+    #[test]
+    fn test_select_scalar_expr_with_alias_parses_to_expr_column() {
+        // (as (coalesce ?titleFr ?titleEn) ?title) should produce an Expr column.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(as (coalesce ?titleFr ?titleEn) ?title)"],
+            "where": [
+                {"@id": "?scheme", "@type": "ex:Scheme"},
+                ["optional", {"@id": "?scheme", "ex:titleFr": "?titleFr"}],
+                ["optional", {"@id": "?scheme", "ex:titleEn": "?titleEn"}]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let cols = ast.select.columns();
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0], UnresolvedColumn::Var(n) if n.as_ref() == "?scheme"));
+        match &cols[1] {
+            UnresolvedColumn::Computation { expr, alias } => {
+                assert_eq!(alias.as_ref(), "?title");
+                match expr {
+                    UnresolvedExpression::Call { func, args } => {
+                        assert_eq!(func.as_ref(), "coalesce");
+                        assert_eq!(args.len(), 2);
+                    }
+                    other => panic!("expected Call, got {other:?}"),
+                }
+            }
+            other => panic!("expected Expr column, got {other:?}"),
+        }
+        // No aggregates should have been collected.
+        assert!(ast.options.aggregates.is_empty());
+    }
+
+    #[test]
+    fn test_select_scalar_expr_lowers_to_bind() {
+        // The scalar select expression should desugar to a Pattern::Bind in
+        // the IR, with the projection referring to the alias var.
+        use crate::ir::Pattern;
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(as (coalesce ?titleFr ?titleEn) ?title)"],
+            "where": [
+                {"@id": "?scheme", "ex:titleFr": "?titleFr"},
+                {"@id": "?scheme", "ex:titleEn": "?titleEn"}
+            ]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        // Exactly one Bind pattern, binding the alias to a Coalesce call.
+        let bind_count = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { .. }))
+            .count();
+        assert_eq!(
+            bind_count, 1,
+            "expected exactly one BIND pattern from select expression"
+        );
+
+        let title_var = vars.get("?title").expect("alias var registered");
+        let bind = query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Bind { var, expr } if *var == title_var => Some(expr),
+                _ => None,
+            })
+            .expect("BIND for ?title");
+        // Expression should be a Coalesce function call.
+        match bind {
+            crate::ir::Expression::Call { func, args } => {
+                assert!(matches!(func, crate::ir::Function::Coalesce));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Call(Coalesce), got {other:?}"),
+        }
+        // No grouping phase (no aggregates here, so no post-bind channel).
+        assert!(query.grouping.is_none());
+    }
+
+    #[test]
+    fn test_select_scalar_expr_post_aggregate_bind() {
+        // (as (+ ?cnt 1) ?adjusted) where ?cnt is an aggregate output should
+        // land in the grouping's post-aggregation binds, not in patterns.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?name",
+                "(as (count ?favNums) ?cnt)",
+                "(as (+ ?cnt 1) ?adjusted)"
+            ],
+            "where": { "ex:name": "?name", "ex:favNums": "?favNums" },
+            "groupBy": ["?name"]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
+        // One aggregate, one post-aggregation BIND.
+        assert_eq!(agg.aggregates.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 1);
+        let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
+        assert_eq!(binds[0].0, adjusted_var);
+    }
+
+    #[test]
+    fn test_select_scalar_expr_without_alias_errors() {
+        // A bare scalar S-expression in select must require an alias.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(coalesce ?a ?b)"],
+            "where": { "@id": "?scheme", "ex:a": "?a", "ex:b": "?b" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("requires an alias"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_select_scalar_expr_with_if_function() {
+        // IF is a builtin scalar conditional; should also work via (as ... ?alias).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?p", "(as (if (> ?age 18) \"adult\" \"minor\") ?label)"],
+            "where": { "@id": "?p", "ex:age": "?age" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.select.columns()[1] {
+            UnresolvedColumn::Computation { alias, expr } => {
+                assert_eq!(alias.as_ref(), "?label");
+                assert!(
+                    matches!(expr, UnresolvedExpression::Call { func, .. } if func.as_ref() == "if")
+                );
+            }
+            other => panic!("expected Expr column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_scalar_expr_quoted_keyword_stays_string() {
+        // Regression: a quoted "false" / "42" / "?nope" in a select expression
+        // must remain a string literal — not be re-parsed as a boolean,
+        // number, or variable. Regression for the SexprToken atom/string
+        // collapse that earlier versions had.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?p",
+                "(as (coalesce ?flag \"false\") ?fallback_bool)",
+                "(as (coalesce ?n \"42\") ?fallback_num)",
+                "(as (coalesce ?v \"?notavar\") ?fallback_varlike)"
+            ],
+            "where": { "@id": "?p", "ex:flag": "?flag", "ex:n": "?n", "ex:v": "?v" }
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // For each Expr column, the second arg of coalesce must be a string Const.
+        for (idx, expected) in [(1, "false"), (2, "42"), (3, "?notavar")] {
+            let col = &ast.select.columns()[idx];
+            let UnresolvedColumn::Computation { expr, .. } = col else {
+                panic!("col {idx}: expected Expr, got {col:?}");
+            };
+            let UnresolvedExpression::Call { func, args } = expr else {
+                panic!("col {idx}: expected Call, got {expr:?}");
+            };
+            assert_eq!(func.as_ref(), "coalesce");
+            match &args[1] {
+                UnresolvedExpression::Const(crate::parse::ast::UnresolvedFilterValue::String(
+                    s,
+                )) => {
+                    assert_eq!(s.as_ref(), expected, "col {idx} second arg");
+                }
+                other => panic!("col {idx} second arg: expected string Const, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_scalar_expr_xsd_cast_recognized() {
+        // Parity with SPARQL: xsd:integer / xsd:boolean / etc. cast
+        // constructors must lower to the dedicated `Function::Xsd*` variant
+        // rather than fall through to `Function::Custom`.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?p",
+                "(as (xsd:integer ?n) ?asInt)",
+                "(as (xsd:string ?n) ?asStr)"
+            ],
+            "where": { "@id": "?p", "ex:n": "?n" }
+        });
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        let int_var = vars.get("?asInt").expect("?asInt registered");
+        let str_var = vars.get("?asStr").expect("?asStr registered");
+
+        let mut found_int = false;
+        let mut found_str = false;
+        for p in &query.patterns {
+            if let crate::ir::Pattern::Bind {
+                var,
+                expr: crate::ir::Expression::Call { func, .. },
+            } = p
+            {
+                if *var == int_var {
+                    assert!(matches!(func, crate::ir::Function::XsdInteger));
+                    found_int = true;
+                }
+                if *var == str_var {
+                    assert!(matches!(func, crate::ir::Function::XsdString));
+                    found_str = true;
+                }
+            }
+        }
+        assert!(
+            found_int,
+            "xsd:integer cast did not lower to Function::XsdInteger"
+        );
+        assert!(
+            found_str,
+            "xsd:string cast did not lower to Function::XsdString"
+        );
+    }
+
+    #[test]
+    fn test_select_scalar_expr_chained_post_binds() {
+        // Regression: an Expr that references a previous Expr alias which
+        // itself landed in post_binds must also land in post_binds. Otherwise
+        // the chained expression evaluates against an unbound variable.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?name",
+                "(as (count ?favNums) ?cnt)",
+                "(as (+ ?cnt 1) ?adjusted)",
+                "(as (+ ?adjusted 1) ?again)"
+            ],
+            "where": { "ex:name": "?name", "ex:favNums": "?favNums" },
+            "groupBy": ["?name"]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        // One aggregate, two post-aggregation BINDs (in select order).
+        let grouping = query.grouping.as_ref().expect("grouping phase present");
+        let agg = grouping.aggregation().expect("aggregation phase present");
+        assert_eq!(agg.aggregates.len(), 1);
+        let binds = grouping.bind_list();
+        assert_eq!(binds.len(), 2);
+
+        let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
+        let again_var = vars.get("?again").expect("?again registered");
+        assert_eq!(binds[0].0, adjusted_var);
+        assert_eq!(binds[1].0, again_var);
+
+        // No leaked Pattern::Bind for these — they must NOT have been
+        // pre-aggregation.
+        let bind_count = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, crate::ir::Pattern::Bind { .. }))
+            .count();
+        assert_eq!(
+            bind_count, 0,
+            "chained post-bind expression must not leak into pre-aggregation patterns"
+        );
+    }
+
+    // ==========================================
+    // Vector Search Pattern Tests
+    // ==========================================
+
+    #[test]
+    fn test_parse_vector_search_constant_vector() {
+        // Vector search with constant vector using f: prefix
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc", "?score"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": [0.1, 0.2, 0.3],
+                "f:distanceMetric": "cosine",
+                "f:searchLimit": 10,
+                "f:searchResult": {
+                    "f:resultId": "?doc",
+                    "f:resultScore": "?score"
+                }
+            }]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::VectorSearch(vsp) => {
+                assert_eq!(vsp.graph_source_id.as_ref(), "embeddings:main");
+                assert_eq!(vsp.metric.as_ref(), "cosine");
+                assert_eq!(vsp.limit, Some(10));
+                assert_eq!(vsp.id_var.as_ref(), "?doc");
+                assert_eq!(vsp.score_var.as_deref(), Some("?score"));
+
+                match &vsp.target {
+                    ast::UnresolvedVectorSearchTarget::Const(vec) => {
+                        assert_eq!(vec.len(), 3);
+                        assert!((vec[0] - 0.1).abs() < 0.001);
+                        assert!((vec[1] - 0.2).abs() < 0.001);
+                        assert!((vec[2] - 0.3).abs() < 0.001);
+                    }
+                    _ => panic!("Expected constant vector target"),
+                }
+            }
+            _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vector_search_variable_vector() {
+        // Vector search with variable vector
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": "?queryVec",
+                "f:distanceMetric": "dot",
+                "f:searchResult": "?doc"
+            }]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::VectorSearch(vsp) => {
+                assert_eq!(vsp.graph_source_id.as_ref(), "embeddings:main");
+                assert_eq!(vsp.metric.as_ref(), "dot");
+                assert_eq!(vsp.id_var.as_ref(), "?doc");
+                assert!(vsp.score_var.is_none());
+
+                match &vsp.target {
+                    ast::UnresolvedVectorSearchTarget::Var(v) => {
+                        assert_eq!(v.as_ref(), "?queryVec");
+                    }
+                    _ => panic!("Expected variable vector target"),
+                }
+            }
+            _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vector_search_with_sync_and_timeout() {
+        // Vector search with sync and timeout options
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": [0.5, 0.5],
+                "f:distanceMetric": "euclidean",
+                "f:searchResult": "?doc",
+                "f:syncBeforeQuery": true,
+                "f:timeoutMs": 5000
+            }]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::VectorSearch(vsp) => {
+                assert_eq!(vsp.metric.as_ref(), "euclidean");
+                assert!(vsp.sync);
+                assert_eq!(vsp.timeout, Some(5000));
+            }
+            _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vector_search_with_full_iris() {
+        // Vector search using full IRIs (no prefix needed)
+        let json = json!({
+            "select": ["?doc"],
+            "where": [{
+                "https://ns.flur.ee/db#graphSource": "embeddings:main",
+                "https://ns.flur.ee/db#queryVector": [0.1, 0.2],
+                "https://ns.flur.ee/db#distanceMetric": "cosine",
+                "https://ns.flur.ee/db#searchResult": "?doc"
+            }]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::VectorSearch(vsp) => {
+                assert_eq!(vsp.graph_source_id.as_ref(), "embeddings:main");
+            }
+            _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vector_search_missing_vector() {
+        // Missing f:queryVector should fail
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:distanceMetric": "cosine",
+                "f:searchResult": "?doc"
+            }]
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queryVector") && msg.contains("required"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_vector_search_missing_result() {
+        // Missing f:searchResult should fail
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": [0.1, 0.2],
+                "f:distanceMetric": "cosine"
+            }]
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("searchResult") && msg.contains("required"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_vector_search_invalid_vector_value() {
+        // Non-array, non-variable f:queryVector should fail
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": "not a variable or array",
+                "f:distanceMetric": "cosine",
+                "f:searchResult": "?doc"
+            }]
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queryVector") && msg.contains("variable or array"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_vector_search_default_metric() {
+        // Default metric should be "cosine" if not specified
+        let json = json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "select": ["?doc"],
+            "where": [{
+                "f:graphSource": "embeddings:main",
+                "f:queryVector": [0.1, 0.2],
+                "f:searchResult": "?doc"
+            }]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::VectorSearch(vsp) => {
+                // Default metric is "cosine"
+                assert_eq!(vsp.metric.as_ref(), "cosine");
+            }
+            _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    // ---- multi-hydration parsing ----
+
+    #[test]
+    fn test_parse_two_hydration_columns() {
+        // Two var-rooted hydrations in one select clause.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*", {"ex:member": ["*"]}]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+
+        let spec0 = columns[0]
+            .as_hydration()
+            .expect("first column should be a hydration");
+        assert!(matches!(&spec0.root, UnresolvedRoot::Var(v) if v.as_ref() == "?person"));
+
+        let spec1 = columns[1]
+            .as_hydration()
+            .expect("second column should be a hydration");
+        assert!(matches!(&spec1.root, UnresolvedRoot::Var(v) if v.as_ref() == "?org"));
+    }
+
+    #[test]
+    fn test_parse_mixed_var_and_constant_root_hydrations() {
+        // One var-rooted hydration plus one IRI-constant-rooted hydration.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"ex:alice": ["ex:name"]}
+            ],
+            "where": { "@id": "?person", "ex:active": true }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            &columns[0].as_hydration().unwrap().root,
+            UnresolvedRoot::Var(_)
+        ));
+        assert!(matches!(
+            &columns[1].as_hydration().unwrap().root,
+            UnresolvedRoot::Iri(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_mixes_hydration_with_var_columns() {
+        // Hydration columns interleaved with plain variable columns.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?age",
+                {"?person": ["*"]},
+                "?title",
+                {"?org": ["*"]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:age": "?age",
+                "ex:title": "?title",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].var_name().unwrap(), "?age");
+        assert!(columns[1].as_hydration().is_some());
+        assert_eq!(columns[2].var_name().unwrap(), "?title");
+        assert!(columns[3].as_hydration().is_some());
+    }
+
+    #[test]
+    fn test_depth_option_applies_to_every_hydration_column() {
+        // The query-level `depth` option must reach every hydration spec.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*"]}
+            ],
+            "depth": 2,
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        for column in columns {
+            let spec = column
+                .as_hydration()
+                .expect("every column should be a hydration");
+            assert_eq!(spec.depth, 2);
+        }
+    }
+
+    // ---- Edge annotations (M0 parser surface) ----
+
+    #[test]
+    fn test_parse_edge_annotation_inline() {
+        // Canonical inline form: @annotation block on the object node-map.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1, "expected one EdgeAnnotation pattern");
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                // Base edge: ?person ex:worksFor ?org
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "subject should be ?person"
+                );
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor"),
+                    "predicate should be ex:worksFor"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "object should be ?org"
+                );
+                assert_eq!(body.len(), 1, "body should have one triple for ex:role");
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_alias_normalizes_to_annotation() {
+        // `@edge` is an alias for `@annotation` and should produce the same IR.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@edge": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            &ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_annotation_target_via_reifies() {
+        // Annotation-rooted form: @reifies names the base triple, the
+        // surrounding map describes the annotation.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?since"],
+            "where": {
+                "ex:role": "Engineer",
+                "ex:since": "?since",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                // Anonymous annotation → synthetic var.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref().starts_with("?__ann")),
+                    "anonymous annotation should mint a synthetic var"
+                );
+                // Base edge: ?person ex:worksFor ?org
+                assert!(matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
+                );
+                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                // Body: 2 facts about the annotation (ex:role, ex:since).
+                assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_annotation_target_named_subject() {
+        // Explicit @id on the annotation surrounding map names the
+        // annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann"],
+            "where": {
+                "@id": "?ann",
+                "ex:role": "Engineer",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_explicit_id() {
+        // Explicit @id on the @annotation block should be carried through
+        // as the annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "@id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_both_annotation_and_edge() {
+        // Cannot use both keys on the same object node.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" },
+                    "@edge":       { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@annotation") && msg.contains("@edge"),
+            "error should name both keywords: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_extra_property_alongside_annotation() {
+        // Object node may carry only @id + @annotation/@edge. A free-form
+        // predicate alongside `@annotation` is the deferred shape.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "ex:other": "?other",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ex:other") || msg.contains("extra property"),
+            "error should name the offending property: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_multi_triple_reifies() {
+        // Multi-triple reifiers are deferred to v2: @reifies must lower
+        // to exactly one triple.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "ex:role": "?role",
+                "@reifies": {
+                    "@id": "?s",
+                    "ex:worksFor": { "@id": "?o" },
+                    "ex:since": "?since"
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one") || msg.contains("multi-triple") || msg.contains("deferred"),
+            "error should explain the multi-triple reifier deferral: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_full_reifies_iri() {
+        // The read-side firewall mirrors the write side: user-authored
+        // `f:reifies*` IRIs (full or compact) are system-controlled and
+        // cannot be queried directly.
+        let json = json!({
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "https://ns.flur.ee/db#reifiesSubject": "?s"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesSubject"),
+            "expected system-controlled rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_compact_reifies_iri() {
+        // Compact form via `@context` is also blocked.
+        let json = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "f:reifiesPredicate": "?p"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesPredicate"),
+            "expected system-controlled rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_lowers_literal_value_object_with_annotation_to_edge_annotation() {
+        // RDF 1.2: literal-valued objects may carry `@annotation`. The
+        // parser routes through `parse_literal_edge_annotation` and
+        // emits a `Pattern::EdgeAnnotation` with the base edge's
+        // `dtc` set so the scan matches the literal by exact datatype.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "xsd:date",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                assert!(
+                    edge.dtc.is_some(),
+                    "literal base edge must carry a dtc; got {:?}",
+                    edge.dtc
+                );
+                assert_eq!(body.len(), 1, "one annotation body entry");
+            }
+            other => panic!("expected UnresolvedPattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_stray_property_on_annotated_literal_value_object() {
+        // Mirror of the ref-object path's "extra property alongside
+        // @annotation is deferred" rejection. Without this, the stray
+        // `ex:other` would be silently dropped by parse_value_object.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": {
+                "@id": "?s",
+                "ex:name": {
+                    "@value": "Alice",
+                    "ex:other": "?x",
+                    "@annotation": { "ex:source": "hr" }
+                }
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extra property 'ex:other'") && msg.contains("literal value object"),
+            "expected literal stray-key deferral, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_metadata_bindings_combined_with_literal_annotation() {
+        // `@type: "?dt"` and `@annotation` in the same value object is
+        // an unsupported combination — the BIND for ?dt would need to
+        // sit inside the EdgeAnnotation's base-edge slot, which has
+        // no shape for it. Reject explicitly so the user splits the
+        // metadata binding into a separate triple.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since", "?dt"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "?dt",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata-binding extensions"),
+            "expected metadata-binding deferral, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_lowers_literal_value_object_with_edge_alias_to_edge_annotation() {
+        // Same path via the `@edge` alias keyword.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?val"],
+            "where": {
+                "@id": "?s",
+                "ex:label": {
+                    "@value": "?val",
+                    "@edge": { "ex:lang": "en" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_honors_id_alias() {
+        // `"id": "@id"` in @context should make `"id"` a valid alias
+        // for `@id` everywhere — including inside annotation node-maps.
+        let json = json!({
+            "@context": { "ex": "http://example.org/", "id": "@id" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "id": "?person",
+                "ex:worksFor": {
+                    "id": "?org",
+                    "@annotation": {
+                        "id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                // Aliased @id on the surrounding subject + nested object
+                // both resolve to user-named variables (not synthetic).
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "aliased @id on the surrounding subject should resolve to ?person"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "aliased @id on the nested object should resolve to ?org"
+                );
+                // Aliased @id on the annotation block resolves to ?ann.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"),
+                    "aliased @id on the annotation block should resolve to ?ann"
+                );
+                // The aliased @id on the annotation block must NOT be
+                // re-emitted as a body triple ("id" → ?ann).
+                assert_eq!(
+                    body.len(),
+                    1,
+                    "aliased @id on annotation must be skipped, not re-emitted as a body triple"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_nested_annotation_in_body() {
+        // Annotation-of-annotation is deferred. The body of an
+        // `@annotation` block cannot itself carry `@annotation`.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "ex:role": {
+                            "@id": "?role",
+                            "@annotation": { "ex:nested": "?n" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        // Any of these substrings is acceptable as long as something
+        // identifies this as the annotation-of-annotation case.
+        assert!(
+            msg.contains("annotation") && msg.contains("deferred"),
+            "error should explain the annotation-of-annotation deferral: {msg}"
+        );
+    }
+}

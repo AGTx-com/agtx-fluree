@@ -1,0 +1,5071 @@
+//! Shared primitives for fast-path query operators.
+//!
+//! All fast-path operators (fused scan + aggregate) share common building blocks:
+//! predicate resolution, leaf range scanning, subject collection, and operator plumbing.
+//! This module consolidates them to avoid ~1,100 lines of duplication across 9 files.
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::{QueryError, Result};
+use crate::index_scope::{overlay_carries_novelty, IndexScope};
+use crate::ir::triple::Ref;
+use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::policy::PredicateCoverage;
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use fluree_db_binary_index::format::branch::LeafEntry;
+use fluree_db_binary_index::format::column_block::ColumnId;
+use fluree_db_binary_index::format::run_record::RunSortOrder;
+use fluree_db_binary_index::format::run_record_v2::{
+    cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+};
+use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
+use fluree_db_binary_index::{
+    BinaryCursor, BinaryFilter, BinaryIndexStore, BranchManifest, ColumnBatch, ColumnProjection,
+    ColumnSet,
+};
+use fluree_db_core::o_type::OType;
+use fluree_db_core::subject_id::SubjectId;
+use fluree_db_core::{FlakeValue, GraphId, Sid};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// 0. Declining on a failure
+// ---------------------------------------------------------------------------
+
+/// A fast path's answer, or `None` to decline to the general pipeline when
+/// it failed on its own terms. An error the general pipeline would meet too
+/// is raised instead: one that ends the query (a cancellation, an exhausted
+/// memory budget or fuel) and a residency miss, which the host answers by
+/// fetching what was recorded and retrying.
+pub(crate) fn answer_or_decline<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(answer) => Ok(Some(answer)),
+        Err(e) if e.ends_the_query() || matches!(e, QueryError::NeedFetch(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0a. Cold-path cancellation checkpoint
+// ---------------------------------------------------------------------------
+
+/// Bail with `QueryError::Cancelled` if cancellation was signalled.
+///
+/// Call ONLY from cold paths — leaflet refill, leaf open, partition start.
+/// Never call from per-group/per-row merge loops: any added instruction
+/// stream there (even a strided counter+branch) measurably perturbs codegen
+/// of the fused-COUNT loops (+5-15% end-to-end, wikidata-scale benchmarks).
+/// Leaflet granularity is thousands of rows, so cancellation still lands
+/// within ~1ms of work.
+#[inline]
+pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation) -> Result<()> {
+    if cfg!(feature = "cancel-checks-off") {
+        return Ok(());
+    }
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
+}
+
+/// Charge `tracker` one index touch for a leaflet a fast path reads, the unit
+/// `BinaryCursor` charges per leaflet it returns, cache hit or not.
+///
+/// Same placement rule as [`bail_if_cancelled`]: once per leaflet, never per
+/// row. On an untracked query `consume_fuel` returns before touching the
+/// atomic.
+///
+/// Only the enabled check is inlined: the charge itself is out of line, so a
+/// refill inlined into a per-row loop keeps that loop's code as it was.
+#[inline]
+pub(crate) fn charge_leaflet(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    if tracker.is_enabled() {
+        charge_leaflet_tracked(tracker)
+    } else {
+        Ok(())
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn charge_leaflet_tracked(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    tracker
+        .consume_fuel(fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL)
+        .map_err(QueryError::FuelLimitExceeded)
+}
+
+/// Decode `projection`'s columns of leaflet `idx` straight from `handle`,
+/// bypassing the leaflet cache, and charge `tracker` for the read.
+#[inline]
+pub(crate) fn load_leaflet_columns_charged(
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
+    handle
+        .load_columns(idx, projection, order)
+        .map_err(|e| QueryError::from_io("load columns", e))
+}
+
+// ---------------------------------------------------------------------------
+// 0. Shared string-ID range helpers
+// ---------------------------------------------------------------------------
+
+/// Sort a list of dictionary string IDs and verify they form a single contiguous range.
+///
+/// Returns `[(start, end)]` on success. Errors if the IDs are not contiguous.
+///
+/// Used by both `fast_string_prefix_count_all` and `BinaryScanOperator::build_prefix_id_ranges`.
+pub fn contiguous_id_range(ids: &[u32]) -> Result<Vec<(u32, u32)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    let start = sorted[0];
+    let end = *sorted.last().unwrap_or(&start);
+    let span_len = u64::from(end) - u64::from(start) + 1;
+    if span_len != sorted.len() as u64 {
+        return Err(QueryError::execution(
+            "prefix string ids are not contiguous; refusing range pushdown",
+        ));
+    }
+    Ok(vec![(start, end)])
+}
+
+// ---------------------------------------------------------------------------
+// 1. Predicate resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a predicate `Ref` to its `Sid`, returning an error for variables.
+pub fn normalize_pred_sid(store: &BinaryIndexStore, pred: &Ref) -> Result<Sid> {
+    Ok(match pred {
+        Ref::Sid(s) => s.clone(),
+        Ref::Iri(i) => store.encode_iri(i),
+        Ref::Var(_) => {
+            return Err(QueryError::Internal(
+                "fast-path requires bound predicates".to_string(),
+            ))
+        }
+    })
+}
+
+/// Like [`normalize_pred_sid`] but returns `None` for variables instead of an error.
+pub fn try_normalize_pred_sid(store: &BinaryIndexStore, pred: &Ref) -> Option<Sid> {
+    match pred {
+        Ref::Sid(s) => Some(s.clone()),
+        Ref::Iri(i) => Some(store.encode_iri(i)),
+        Ref::Var(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Column projection helpers
+// ---------------------------------------------------------------------------
+
+/// Projection that loads only the SId column (internal, not output).
+#[inline]
+pub fn projection_sid_only() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s
+        },
+    }
+}
+
+/// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
+/// when the store has one: an entry that covers them serves them projected;
+/// one that falls short decodes only the missing columns into it. Charges
+/// `tracker` for the read either way.
+pub(crate) fn load_leaflet_projection(
+    store: &BinaryIndexStore,
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
+    let batch = match store.leaflet_cache() {
+        Some(cache) => load_columns_cached_via_handle(
+            handle,
+            cache,
+            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                leaf_id: handle.leaf_id(),
+                leaflet_idx: idx
+                    .try_into()
+                    .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                order,
+                decode_set: projection.effective(),
+            },
+        ),
+        None => handle.load_columns(idx, projection, order),
+    };
+    batch.map_err(|e| QueryError::from_io("load columns", e))
+}
+
+/// Projection that loads only the OKey column (internal, not output).
+#[inline]
+pub fn projection_okey_only() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OKey);
+            s
+        },
+    }
+}
+
+/// Projection that loads SId + OKey columns (internal, not output).
+#[inline]
+pub fn projection_sid_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OKey);
+            s
+        },
+    }
+}
+
+/// Projection that loads SId + OKey + OI columns (internal, not output).
+///
+/// `OI` (the value/list index) is part of the V3 fact identity
+/// `(s_id, p_id, o_type, o_key, o_i)`, so paths that dedup or retract by fact
+/// identity (e.g. the overlay-merge tail scan) must carry it.
+#[inline]
+pub fn projection_sid_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
+            s
+        },
+    }
+}
+
+/// Projection that loads SId + OType + OKey columns (internal, not output).
+#[inline]
+pub fn projection_sid_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+    }
+}
+
+/// [`projection_sid_otype_okey`] plus `OI` — the full per-subject fact
+/// identity an overlay-merging probe needs to reconcile retracts.
+pub fn projection_sid_otype_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
+            s
+        },
+    }
+}
+
+/// Projection that loads OType + OKey columns (internal, not output).
+#[inline]
+pub fn projection_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+    }
+}
+
+/// Projection that loads only the OType column (internal, not output).
+#[inline]
+pub fn projection_otype_only() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OType);
+            s
+        },
+    }
+}
+
+/// Projection for `BinaryCursor` that outputs SId + OType + OKey columns.
+///
+/// Unlike `projection_sid_otype_okey` (which uses `internal` for raw leaf access),
+/// this places columns in `output` as required by `BinaryCursor`.
+#[inline]
+pub fn cursor_projection_sid_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+        internal: ColumnSet::EMPTY,
+    }
+}
+
+/// Projection for `BinaryCursor` that outputs only the SId column.
+#[inline]
+pub fn cursor_projection_sid_only() -> ColumnProjection {
+    ColumnProjection {
+        output: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s
+        },
+        internal: ColumnSet::EMPTY,
+    }
+}
+
+/// Projection for `BinaryCursor` that outputs OType + OKey columns.
+///
+/// Object-only counterpart of [`cursor_projection_sid_otype_okey`] for paths
+/// that fold over object values without needing the subject (e.g. POST-ordered
+/// scalar aggregates). Columns are in `output` as required by `BinaryCursor`.
+#[inline]
+pub fn cursor_projection_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+        internal: ColumnSet::EMPTY,
+    }
+}
+
+/// True when an object `o_type` is **order-preserving in `o_key`**: the raw
+/// `u64` `o_key` byte order equals the value's semantic order, so a scan of a
+/// single such `o_type` yields rows in value order.
+///
+/// This is the gate for the reverse-POST `ORDER BY DESC(?o) LIMIT k` fast path
+/// (see [`crate::fast_post_order_limit`]). It admits the embedded numeric,
+/// temporal, and boolean types whose encodings are documented order-preserving
+/// in `fluree_db_core::value_id`, and EXCLUDES:
+/// - dict-backed strings/IRIs (`LEX_ID`/`IRI_REF`, tag `10`): ids are assigned
+///   by insertion order, not lexicographic value order;
+/// - lang strings (tag `11`);
+/// - `XSD_DURATION`: although it sits inside the `is_temporal()` range, generic
+///   `xsd:duration` has no total order and is stored as a string-dict id of its
+///   canonical lexical (see `fluree-db-indexer/.../resolver.rs`, "General
+///   xsd:duration has no total order — store as canonical string"), so its
+///   `o_key` is insertion-ordered like any other dict-backed type. The inline
+///   `xsd:yearMonthDuration`/`xsd:dayTimeDuration` subtypes are separate
+///   `o_type`s outside this range and are unaffected;
+/// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
+/// - overflow big numerics / JSON / vector arena handles (equality-only).
+///
+/// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
+/// `o_type`s under one predicate is rejected by the operator at runtime.
+#[inline]
+pub const fn is_post_desc_orderable(o_type: u16) -> bool {
+    let ot = OType::from_u16(o_type);
+    // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
+    // (is_numeric: 0x0003..=0x0012), and the order-preserving temporal types
+    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D, minus XSD_DURATION
+    // which is dict-backed). Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F),
+    // and every dict-backed/lang/arena type.
+    o_type == OType::XSD_BOOLEAN.as_u16()
+        || ot.is_numeric()
+        || (ot.is_temporal() && o_type != OType::XSD_DURATION.as_u16())
+}
+
+// ---------------------------------------------------------------------------
+// 3. Leaf range scanning
+// ---------------------------------------------------------------------------
+
+/// Construct min/max `RunRecordV2` keys spanning all rows for a predicate.
+#[inline]
+pub(crate) fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
+    let min_key = RunRecordV2 {
+        s_id: SubjectId(0),
+        o_key: 0,
+        p_id,
+        t: 0,
+        o_i: 0,
+        o_type: 0,
+        g_id,
+    };
+    let max_key = RunRecordV2 {
+        s_id: SubjectId(u64::MAX),
+        o_key: u64::MAX,
+        p_id,
+        t: u32::MAX,
+        o_i: u32::MAX,
+        o_type: u16::MAX,
+        g_id,
+    };
+    (min_key, max_key)
+}
+
+/// Find leaf entries for a predicate in a given sort order.
+///
+/// Returns an empty slice if the branch does not exist.
+pub fn leaf_entries_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    p_id: u32,
+) -> &[LeafEntry] {
+    let Some(branch) = store.branch_for_order(g_id, order) else {
+        return &[];
+    };
+    let cmp = cmp_v2_for_order(order);
+    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
+    let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+    &branch.leaves[leaf_range]
+}
+
+/// Ascending candidate subject boundaries for partitioning a predicate's scan.
+///
+/// When the predicate has at least `k` leaves, returns each leaf's first subject
+/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
+/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
+/// returns each matching leaflet's first subject, giving finer boundaries for a
+/// predicate that fits in one/few leaves but many leaflets. The returned values
+/// are non-decreasing (leaves and leaflets are subject-sorted).
+pub(crate) fn driver_subject_boundaries(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    k: usize,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    if leaves.len() >= k {
+        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
+    }
+    let mut bounds: Vec<u64> = Vec::new();
+    for leaf in leaves {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+            bounds.push(first.s_id.as_u64());
+        }
+    }
+    Ok(bounds)
+}
+
+/// Whether `p_id`'s stored rows make `(s_id, o_type, o_key)` unreliable as a
+/// join key **across two different predicates** (#1652 case 3). True when any
+/// POST leaflet shows either hazard:
+///
+/// - an arena-backed object (`NUM_BIG_OVERFLOW`, `VECTOR`): its `o_key` is a
+///   handle into a **per-predicate** arena (see
+///   [`OType::o_key_is_globally_identifying`]), so equal values under two
+///   predicates carry unrelated handles and never compare equal, and equal
+///   handles under two predicates name unrelated values;
+/// - a list row (`HAS_O_I`): the generic pipeline's list-element bindings join
+///   neither like plain values nor purely by value, so a key that drops `o_i`
+///   diverges from it on multiplicity.
+///
+/// Per-predicate consumers need neither check — their key fixes the `p_id`
+/// that scopes a NumBig handle, and within one predicate `o_i` only splits a
+/// group it fully contains. They check
+/// `BinaryIndexStore::objects_keyed_by_value` instead: a vector arena does not
+/// deduplicate, so it may hold a value twice, and a legacy decimal arena keeps
+/// a handle per scale variant.
+///
+/// Metadata-first: `HAS_O_I` is a leaflet flag, and a homogeneous leaflet's
+/// o_type is answered by `o_type_const` — no payload touched. A mixed leaflet
+/// is bounded by the o_type of its first/last keys (exact bounds — POST orders
+/// `o_type` immediately after `p_id`); only when that range straddles a
+/// non-identifying o_type is the leaflet's o_type column decoded for an exact
+/// membership check, because the range alone over-declines (inline numerics
+/// sort below `NUM_BIG_OVERFLOW` and langstrings above it, so a plain
+/// int+string+langstring leaflet straddles it without containing one).
+///
+/// Covers the base index only — novelty NumBig values get query-scoped
+/// ephemeral handles that ARE value-deduped across predicates
+/// (`DictOverlay::assign_numbig_handle`), a novelty value reuses a base arena
+/// handle only when the predicate's base arena is non-empty (already reported
+/// here), and novelty *list* rows need a row-level check in the overlay lane.
+///
+/// `replay_to` is the read's `t` when it is below the index's. The flags and
+/// the type constant describe a leaflet's live rows; history newer than the
+/// read can hold list rows or arena handles, so a leaflet the read replays is
+/// unsafe.
+pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    replay_to: Option<i64>,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<bool> {
+    use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
+    for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+        let dir = handle.dir();
+        for (idx, entry) in dir.entries.iter().enumerate() {
+            let replays = entry.replays_history(replay_to);
+            if (entry.row_count == 0 && !replays) || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if replays || entry.flags & HAS_O_I != 0 {
+                return Ok(true);
+            }
+            match entry.o_type_const {
+                Some(ot) => {
+                    if !OType::from_u16(ot).o_key_is_globally_identifying() {
+                        return Ok(true);
+                    }
+                }
+                None => {
+                    let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
+                    let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
+                    if !OType::range_holds_non_globally_identifying(
+                        OType::from_u16(lo),
+                        OType::from_u16(hi),
+                    ) {
+                        continue;
+                    }
+                    // Range straddles a non-identifying o_type: decode this
+                    // leaflet's o_type column and check exact membership.
+                    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                        &*handle,
+                        idx,
+                        &projection_otype_only(),
+                        RunSortOrder::Post,
+                        tracker,
+                    )?;
+                    for i in 0..batch.row_count {
+                        if !OType::from_u16(batch.o_type.get(i)).o_key_is_globally_identifying() {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Minimum total predicate rows before a parallel leaf-chunk scan is worth its
+/// thread-spawn overhead; below this the reducer runs serially on the whole slice.
+const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
+/// Cap on leaf-chunk worker count regardless of core count.
+const PARALLEL_LEAF_SCAN_MAX_CHUNKS: usize = 16;
+/// Minimum leaf count before a parallel directory-only walk is worth rayon
+/// dispatch. Dir-only opens cost a prefix read + decode (tens of µs warm, no
+/// column payload), so the break-even is leaf count, not row count.
+const DEFAULT_PARALLEL_DIR_WALK_MIN_LEAVES: usize = 128;
+
+/// Parallel gate for directory-only walks, overridable via
+/// `FLUREE_PARALLEL_DIR_WALK_MIN_LEAVES` (set huge to force serial — A/B kill
+/// switch; set small to engage chunking on test-sized ledgers).
+pub(crate) fn parallel_dir_walk_min_leaves() -> usize {
+    std::env::var("FLUREE_PARALLEL_DIR_WALK_MIN_LEAVES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PARALLEL_DIR_WALK_MIN_LEAVES)
+}
+
+/// Run `f` over `items` on the shared global rayon thread pool, preserving order and
+/// the current tracing span, returning each item's result.
+///
+/// This is the multi-tenant-safe replacement for a per-call `std::thread::scope`.
+/// A `scope` spawns fresh OS threads on every invocation, so under concurrent query
+/// load N queries each running a partitioned count/scan spawn up to N×K worker
+/// threads — thrashing a multi-tenant server's scheduler and memory. The global
+/// rayon pool is sized once (≈ logical cores) and shared across every query, so the
+/// total worker-thread count stays bounded no matter how many queries run at once
+/// (matching the pool `fluree-db-novelty` already uses). Like `thread::scope` — and
+/// unlike `thread::spawn` / `spawn_blocking` — rayon's parallel iterator is fully
+/// structured: it blocks until every task finishes, so `f` may borrow non-`'static`
+/// data (the store, the reducer) exactly as the old scoped threads did. A panic in a
+/// worker is converted to an error for that item instead of unwinding the query.
+pub(crate) fn parallel_map_pooled<T, R, F>(items: Vec<T>, f: F) -> Vec<Result<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> Result<R> + Sync + Send,
+{
+    use rayon::prelude::*;
+    let span = tracing::Span::current();
+    items
+        .into_par_iter()
+        .map(|item| {
+            let _guard = span.enter();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))) {
+                Ok(result) => result,
+                Err(_) => Err(QueryError::execution("parallel worker panicked")),
+            }
+        })
+        .collect()
+}
+
+/// Partition `leaves` into up to `PARALLEL_LEAF_SCAN_MAX_CHUNKS` contiguous
+/// chunks (~one per core), run `map(chunk)` per chunk on the shared global
+/// rayon pool (via [`parallel_map_pooled`]), and fold the partials **in chunk
+/// order** with `combine`.
+///
+/// This is the generic ordered chunk reducer: any aggregate that can be
+/// computed independently on a contiguous leaf segment and merged with an
+/// associative `combine` fits — plain sums (`combine = +`, no boundary state)
+/// as well as boundary-stitched partials like distinct-lead counts, where the
+/// partial carries its segment's first/last lead key and `combine` dedups the
+/// seam. `combine` need not be commutative: chunks are contiguous and
+/// [`parallel_map_pooled`] preserves order, so partials are always folded
+/// left-to-right in leaf order.
+///
+/// `map` returns `Ok(None)` to signal the whole computation must defer to the
+/// general pipeline (an unsupported shape, e.g. a non-numeric leaflet); any
+/// `None` short-circuits the result to `Ok(None)`.
+///
+/// `parallel` is the caller's cost gate (rows for payload scans, leaf count
+/// for directory-only walks). When it is false — or there aren't enough
+/// leaves/cores for ≥2 chunks — `map` runs once on the whole slice, identical
+/// to a serial walk. BASE index only: the caller must reach here via
+/// [`fast_path_store`] (HEAD, no overlay), so the base leaflets already
+/// reflect current state.
+pub fn parallel_leaf_chunk_reduce<P, F, C>(
+    leaves: &[LeafEntry],
+    parallel: bool,
+    map: F,
+    combine: C,
+) -> Result<Option<P>>
+where
+    P: Send,
+    F: Fn(&[LeafEntry]) -> Result<Option<P>> + Sync + Send,
+    C: Fn(P, P) -> P,
+{
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let k = ncpu.min(PARALLEL_LEAF_SCAN_MAX_CHUNKS).min(leaves.len());
+    if !parallel || ncpu < 2 || k < 2 {
+        // Not worth parallelizing: run the map serially over the whole slice.
+        return map(leaves);
+    }
+
+    // Contiguous, near-equal leaf chunks (`chunks()` yields ceil(len/per) slices).
+    let per = leaves.len().div_ceil(k);
+    let chunks: Vec<&[LeafEntry]> = leaves.chunks(per).collect();
+    tracing::debug!(
+        chunks = chunks.len(),
+        leaves = leaves.len(),
+        "fast-path: parallel leaf-chunk reduce"
+    );
+
+    let partials: Vec<Result<Option<P>>> = parallel_map_pooled(chunks, map);
+
+    let mut acc: Option<P> = None;
+    for partial in partials {
+        match partial? {
+            Some(p) => {
+                acc = Some(match acc {
+                    Some(prev) => combine(prev, p),
+                    None => p,
+                });
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(acc)
+}
+
+/// Row-count specialization of [`parallel_leaf_chunk_reduce`]: partials are
+/// plain `u64` row counts summed with saturating add.
+///
+/// Every row lives in exactly one leaflet of one leaf, so counting rows per
+/// chunk and summing is exact for ANY index order — unlike the per-subject
+/// [`crate::count_plan_exec::parallel_partition_count`] (which must partition
+/// on subject boundaries because a subject's rows span leaves), this counts
+/// independent rows and so can split purely on leaf index.
+pub fn parallel_leaf_chunk_count<F>(
+    leaves: &[LeafEntry],
+    total_rows: u64,
+    reducer: F,
+) -> Result<Option<u64>>
+where
+    F: Fn(&[LeafEntry]) -> Result<Option<u64>> + Sync + Send,
+{
+    parallel_leaf_chunk_reduce(
+        leaves,
+        total_rows >= PARALLEL_LEAF_SCAN_MIN_ROWS,
+        reducer,
+        u64::saturating_add,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 4. Subject collection
+// ---------------------------------------------------------------------------
+
+/// Collect distinct subject IDs from PSOT for a predicate as a sorted `Vec<u64>`.
+///
+/// PSOT guarantees subjects are emitted in sorted order within a fixed predicate,
+/// so deduplication is a simple consecutive check.
+pub fn collect_subjects_for_predicate_sorted(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    let projection = projection_sid_only();
+
+    let mut out: Vec<u64> = Vec::new();
+    let mut prev: Option<u64> = None;
+
+    for leaf_entry in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+        let dir = handle.dir();
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
+            for row in 0..batch.row_count {
+                let sid = batch.s_id.get(row);
+                if prev != Some(sid) {
+                    out.push(sid);
+                    prev = Some(sid);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Collect distinct subject IDs from PSOT for a predicate as an `FxHashSet<u64>`.
+///
+/// Preferred when the caller needs O(1) membership tests rather than merge-join.
+pub fn collect_subjects_for_predicate_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<FxHashSet<u64>> {
+    let mut out: FxHashSet<u64> = FxHashSet::default();
+    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out, tracker)?;
+    Ok(out)
+}
+
+/// Add the distinct subject IDs of a predicate in one graph (PSOT) to `out`.
+///
+/// For a set over several graphs: each graph's subjects go into one set, with
+/// no per-graph set to build and merge.
+pub fn extend_subjects_for_predicate_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    out: &mut FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<()> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    let projection = projection_sid_only();
+
+    let mut prev: Option<u64> = None;
+
+    for leaf_entry in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+        let dir = handle.dir();
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
+            for row in 0..batch.row_count {
+                let sid = batch.s_id.get(row);
+                if prev != Some(sid) {
+                    out.insert(sid);
+                    prev = Some(sid);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 5. Sorted set operations
+// ---------------------------------------------------------------------------
+
+/// Two-pointer intersection of two sorted, deduplicated `u64` slices.
+pub fn intersect_sorted(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (av, bv) = (a[i], b[j]);
+        match av.cmp(&bv) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(av);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// N-way intersection of sorted `u64` lists. Sorts by length and folds pairwise.
+pub fn intersect_many_sorted(mut lists: Vec<Vec<u64>>) -> Vec<u64> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
+    lists.sort_by_key(std::vec::Vec::len);
+    let mut acc = lists.remove(0);
+    for next in lists {
+        if acc.is_empty() {
+            break;
+        }
+        acc = intersect_sorted(&acc, &next);
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
+// 6. Merge-count
+// ---------------------------------------------------------------------------
+
+/// Count total rows for a predicate from the PSOT branch manifest.
+///
+/// This is the fastest possible implementation of:
+/// `SELECT (COUNT(*) AS ?c) WHERE { ?s <p> ?o }`
+/// (and also `COUNT(?s)` / `COUNT(?o)` for the same single-triple pattern),
+/// because every solution binding has all vars bound.
+///
+/// A leaf whose `first_key` and `last_key` both belong to `p_id` is *interior* to
+/// the predicate: PSOT order (p_id, s_id, …) means every row in it is `p_id`, so
+/// `LeafEntry.row_count` (the manifest's latest-state row count, which equals the
+/// sum of that leaf's leaflet `row_count`s) IS the predicate's contribution — no
+/// leaf open. Only the at-most-two *boundary* leaves (where the predicate range
+/// starts or ends mid-leaf, mixing predicates) need a directory walk. For a large
+/// predicate (e.g. `rdf:type`, thousands of leaves) this turns thousands of leaf
+/// opens into ~two.
+pub fn count_rows_for_predicate_psot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<u64> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    let mut total: u64 = 0;
+
+    for leaf_entry in leaves {
+        // Interior leaf: entirely this predicate → use the manifest count, no open.
+        if leaf_entry.first_key.p_id == p_id && leaf_entry.last_key.p_id == p_id {
+            total += leaf_entry.row_count;
+            continue;
+        }
+        // Boundary leaf: may mix predicates → read its directory (no payload)
+        // and sum the matching leaflets.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 {
+                continue;
+            }
+            if entry.p_const != Some(p_id) {
+                continue;
+            }
+            total += entry.row_count as u64;
+        }
+    }
+
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// 7. Streaming PSOT subject-count iterator
+// ---------------------------------------------------------------------------
+
+/// Streaming iterator over PSOT leaflets for a predicate that yields
+/// `(subject_id, row_count)` groups in sorted subject order.
+pub struct PsotSubjectCountIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaf_entries: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+    /// Accumulated subject for a group that may span leaflet boundaries.
+    cur_s: Option<u64>,
+    cur_count: u64,
+    /// Half-open subject range `[lo, hi)` this iterator emits. Subjects below
+    /// `lo` are skipped; the first subject `>= hi` ends the stream. Used to
+    /// partition one predicate's subjects across parallel workers.
+    lo: u64,
+    hi: u64,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
+}
+
+impl<'a> PsotSubjectCountIter<'a> {
+    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Self> {
+        Self::new_bounded(store, g_id, p_id, 0, u64::MAX)
+    }
+
+    /// Iterate only the subjects in `[lo, hi)`. Leaves entirely below `lo` are
+    /// skipped via a binary search on the predicate's leaf slice (so a partition
+    /// only opens its own leaves), and iteration ends at the first subject `>= hi`.
+    pub fn new_bounded(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Self> {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        // Leaf leapfrog to `lo`: skip leaves whose last subject (for THIS predicate)
+        // is below `lo`. Guarded by `last_key.p_id == p_id` because a boundary
+        // leaf's `last_key` can belong to a higher predicate (see PsotSubjectSeek).
+        let leaf_pos =
+            leaves.partition_point(|e| e.last_key.p_id == p_id && e.last_key.s_id.as_u64() < lo);
+        Ok(Self {
+            store,
+            p_id,
+            leaf_entries: leaves,
+            leaf_pos,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            cur_s: None,
+            cur_count: 0,
+            lo,
+            hi,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
+        })
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
+        self
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
+        let projection = projection_sid_only();
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    /// Return the next `(subject_id, count)` group.
+    ///
+    /// Groups span leaflet boundaries — a subject that straddles two leaflets
+    /// will NOT be split across two calls (the group accumulates until the
+    /// subject changes).
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            // Load a batch if needed. If there are no more batches, flush any accumulated group.
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                if let Some(s) = self.cur_s.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((s, n)));
+                }
+                return Ok(None);
+            }
+
+            let batch = self.batch.as_ref().unwrap();
+
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+
+            let sid = batch.s_id.get(self.row);
+
+            // Below the partition's range: skip whole sub-`lo` subjects. Only
+            // possible before the first in-range subject (rows are subject-sorted),
+            // so `cur_s` is None here.
+            if sid < self.lo {
+                self.row += 1;
+                continue;
+            }
+            // At/above the partition's end: no more in-range subjects (sorted), so
+            // flush any accumulated group and end the stream. The `>= hi` row is
+            // left unconsumed (it belongs to the next partition).
+            if sid >= self.hi {
+                if let Some(s) = self.cur_s.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((s, n)));
+                }
+                return Ok(None);
+            }
+
+            match self.cur_s {
+                None => {
+                    self.cur_s = Some(sid);
+                    self.cur_count = 0;
+                }
+                Some(cur) if cur != sid => {
+                    // New subject starts; emit previous group without consuming this row.
+                    let out_s = self.cur_s.take().expect("checked: cur_s is Some");
+                    let out_n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((out_s, out_n)));
+                }
+                Some(_) => {}
+            }
+
+            // Accumulate current subject (may span batches).
+            self.cur_count += 1;
+            self.row += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7a-seek. Forward-only per-subject PSOT seek (asymmetric-join probe)
+// ---------------------------------------------------------------------------
+
+/// Forward-only monotonic per-subject seek over a predicate's PSOT leaves.
+///
+/// Given **strictly non-decreasing** target subjects, returns the row count for
+/// each (any object datatype) — the probe side of an asymmetric subject join
+/// (drive from the small predicate, seek into the large one). Cost is driven
+/// sub-linear in the probe predicate two ways:
+/// - **leaf leapfrog**: a binary search over the predicate's leaf slice skips
+///   whole leaves — and their blob reads — that cannot contain the target;
+/// - **leaflet skip**: leaflets whose `last_key` subject is below the target are
+///   skipped without decoding their columns.
+///
+/// Subjects whose rows span leaflet/leaf boundaries are handled. Because the
+/// cursor only ever advances, the total work across an ascending target sequence
+/// is one monotonic pass.
+///
+/// PRECONDITION: targets must be non-decreasing across calls (the cursor never
+/// rewinds). BASE index only — callers MUST gate to HEAD (no overlay,
+/// `to_t == max_t`); novelty / time-travel are not merged here.
+pub struct PsotSubjectSeek<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaves: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+    projection: ColumnProjection,
+    /// Checked once per leaflet refill (cold path), never per probe.
+    cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
+}
+
+impl<'a> PsotSubjectSeek<'a> {
+    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        Self::with_projection(store, g_id, p_id, projection_sid_only())
+    }
+
+    /// Identity-yielding variant for [`Self::rows_for_subject_identity`]:
+    /// decodes `OI` alongside SId/OType/OKey so overlay-merging callers can
+    /// reconcile retracts on the full fact identity. Same `None` semantics as
+    /// [`Self::new_with_objects`].
+    pub fn new_with_identity(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> Option<Self> {
+        store.branch_for_order(g_id, RunSortOrder::Psot)?;
+        Some(Self::with_projection(
+            store,
+            g_id,
+            p_id,
+            projection_sid_otype_okey_oi(),
+        ))
+    }
+
+    fn with_projection(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        projection: ColumnProjection,
+    ) -> Self {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        Self {
+            store,
+            p_id,
+            leaves,
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            projection,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
+        }
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
+        self
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
+    fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
+        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        bail_if_cancelled(&self.cancellation)?;
+        loop {
+            if self.handle.is_none() {
+                // Leaf leapfrog: skip leaves that provably cannot contain target_s.
+                //
+                // A leaf is skippable only when its `last_key` belongs to THIS
+                // predicate AND its subject is below the target. At the predicate's
+                // upper boundary a leaf's `last_key` may belong to a higher predicate
+                // (our rows are a prefix of that leaf); such a leaf must NOT be
+                // skipped by its foreign subject. `leaf_entries_for_predicate`
+                // guarantees `last_key.p_id >= self.p_id`, so the skip predicate is
+                // a monotone leading run and `partition_point` is valid.
+                let skip = self.leaves[self.leaf_pos..].partition_point(|e| {
+                    e.last_key.p_id == self.p_id && e.last_key.s_id.as_u64() < target_s
+                });
+                self.leaf_pos += skip;
+                if self.leaf_pos >= self.leaves.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaves[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                // Leaflet skip: cannot contain target_s if its last subject is below it.
+                let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
+                if last.s_id.as_u64() < target_s {
+                    continue;
+                }
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    &self.projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+            self.handle = None;
+        }
+    }
+
+    /// Row count for `target_s` (any object datatype), or `None` if the subject is
+    /// absent. Targets MUST be non-decreasing across calls.
+    pub fn count_for_subject(&mut self, target_s: u64) -> Result<Option<u64>> {
+        self.visit_subject(target_s, |_, _| {})
+    }
+
+    /// Visit each of `target_s`'s rows as `(o_type, o_key, o_i)`, returning
+    /// the row count, or `None` if the subject is absent. Requires
+    /// construction via [`Self::new_with_identity`]. Targets MUST be
+    /// non-decreasing across calls.
+    pub fn rows_for_subject_identity(
+        &mut self,
+        target_s: u64,
+        mut on_row: impl FnMut(u16, u64, u32),
+    ) -> Result<Option<u64>> {
+        self.visit_subject(target_s, |batch, row| {
+            on_row(
+                batch.o_type.get(row),
+                batch.o_key.get(row),
+                batch.o_i.get_or(row, u32::MAX),
+            );
+        })
+    }
+
+    /// Shared seek state machine: advance to `target_s`, invoke `on_row` for
+    /// each of its rows, and return the row count (`None` = subject absent).
+    fn visit_subject(
+        &mut self,
+        target_s: u64,
+        mut on_row: impl FnMut(&ColumnBatch, usize),
+    ) -> Result<Option<u64>> {
+        let mut found = false;
+        let mut count: u64 = 0;
+        loop {
+            if self.batch.is_none() && self.load_next_batch(target_s)?.is_none() {
+                return Ok(found.then_some(count));
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            if !found {
+                // Advance to the first row with s_id >= target_s. Within a leaflet
+                // s_id is sorted, so binary-search the unconsumed suffix instead of
+                // skipping row-by-row — cheap when the target is far in, e.g. when a
+                // sparse driver seeks past a high-multiplicity subject's run.
+                let (mut lo, mut hi) = (self.row, batch.row_count);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if batch.s_id.get(mid) < target_s {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                self.row = lo;
+                if self.row >= batch.row_count {
+                    self.batch = None;
+                    continue;
+                }
+                if batch.s_id.get(self.row) > target_s {
+                    // Cursor is now parked at the first subject above target_s, ready
+                    // for the next (larger) target. Subject is absent.
+                    return Ok(None);
+                }
+                found = true;
+            } else if batch.s_id.get(self.row) > target_s {
+                return Ok(Some(count));
+            }
+            // At target_s: visit its rows (the group may span batches).
+            while self.row < batch.row_count && batch.s_id.get(self.row) == target_s {
+                on_row(batch, self.row);
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| QueryError::execution("COUNT(*) overflow in subject seek"))?;
+                self.row += 1;
+            }
+            if self.row < batch.row_count {
+                return Ok(Some(count));
+            }
+            // Subject group may continue into the next leaflet/leaf.
+            self.batch = None;
+        }
+    }
+
+    /// Whether `target_s` has any row. Targets MUST be non-decreasing across calls.
+    pub fn subject_present(&mut self, target_s: u64) -> Result<bool> {
+        Ok(self.count_for_subject(target_s)?.is_some())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7b. Streaming POST object-group-count iterator
+// ---------------------------------------------------------------------------
+
+/// Streaming iterator over POST leaflets for a predicate that yields
+/// `(object_key, row_count)` groups in POST order, restricted to IRI_REF objects.
+///
+/// Non-IRI rows contribute nothing: mixed-type leaflets skip them row-wise and
+/// homogeneous non-IRI leaflets are skipped whole (POST sorts `o_type` before
+/// `o_key`, so the IRI rows form one contiguous run either way).
+///
+/// Groups span leaflet/leaf boundaries — an `o_key` whose rows straddle two
+/// leaflets is emitted ONCE with its full count (`cur_key`/`cur_count` carry,
+/// mirroring [`PsotSubjectCountIter`]). Callers rely on strictly increasing
+/// group keys: `execute_chain`'s forward-only PSOT seek treats a repeated key
+/// as "absent" and would silently drop the second fragment's rows (#1652).
+pub struct PostObjectGroupCountIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaf_entries: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+    mixed: bool,
+    /// Accumulated object key for a group that may span leaflet boundaries.
+    cur_key: Option<u64>,
+    cur_count: u64,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
+}
+
+impl<'a> PostObjectGroupCountIter<'a> {
+    pub fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Result<Option<Self>> {
+        Ok(Some(Self {
+            store,
+            p_id,
+            leaf_entries: leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id),
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            mixed: false,
+            cur_key: None,
+            cur_count: 0,
+            tracker: tracker.clone(),
+        }))
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        let proj_okey = projection_okey_only();
+        let proj_otype_okey = projection_otype_okey();
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                let mixed = entry.o_type_const.is_none();
+                if !mixed && entry.o_type_const != Some(OType::IRI_REF.as_u16()) {
+                    // Homogeneous non-IRI leaflet: no IRI rows in it, skip it.
+                    // (Terminating here instead — the pre-#1652 behavior — cut
+                    // off every IRI group sorting after the leaflet's o_type.)
+                    continue;
+                }
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed { &proj_otype_okey } else { &proj_okey },
+                    RunSortOrder::Post,
+                    &self.tracker,
+                )?;
+                self.row = 0;
+                self.batch = Some(batch);
+                self.mixed = mixed;
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    /// Return the next `(object_key, count)` group.
+    ///
+    /// Only counts IRI_REF objects (mixed-type leaflets filter to IRI rows;
+    /// homogeneous non-IRI leaflets are skipped in `load_next_batch`). Groups
+    /// accumulate across leaflet/leaf boundaries — each distinct `o_key` is
+    /// emitted exactly once, with its complete count.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            // Load a batch if needed. If there are no more, flush any group
+            // carried across the last boundary.
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                if let Some(k) = self.cur_key.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((k, n)));
+                }
+                return Ok(None);
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            if self.mixed && batch.o_type.get(self.row) != OType::IRI_REF.as_u16() {
+                self.row += 1;
+                continue;
+            }
+
+            let key = batch.o_key.get(self.row);
+            match self.cur_key {
+                None => {
+                    self.cur_key = Some(key);
+                    self.cur_count = 0;
+                }
+                Some(cur) if cur != key => {
+                    // New group starts; emit the previous one without
+                    // consuming this row.
+                    self.cur_key = Some(key);
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((cur, n)));
+                }
+                Some(_) => {}
+            }
+
+            // Accumulate the current group's run within this batch.
+            while self.row < batch.row_count
+                && (!self.mixed || batch.o_type.get(self.row) == OType::IRI_REF.as_u16())
+                && batch.o_key.get(self.row) == key
+            {
+                self.cur_count += 1;
+                self.row += 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7c. PSOT subject-weighted-sum iterator (for OPTIONAL chain patterns)
+// ---------------------------------------------------------------------------
+
+/// Streaming iterator over PSOT leaflets for a predicate that yields
+/// `(subject_id, weighted_sum)` groups, where the weight of each object is
+/// looked up in a `FxHashMap<u64, u64>`.
+///
+/// Used by OPTIONAL chain patterns:
+/// - **Head** (`default_weight = 0`): `Σ_{c in p2(b)} n3(c)` where missing c → 0
+/// - **Tail** (`default_weight = 1`): `Σ_{c in p2(b)} max(1, n3(c))` where missing c → 1
+///
+/// Requires IRI_REF objects (o_key is a subject ID). Mixed-type leaflets are
+/// handled by treating non-IRI rows as weight 0.
+pub struct PsotSubjectWeightedSumIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    weights: &'a FxHashMap<u64, u64>,
+    default_weight: u64,
+    /// Optional allowlist of subject IDs to emit groups for.
+    /// When present, the iterator will **skip entire subject groups** that are
+    /// not in this sorted list, and will stop early once the list is exhausted.
+    allowed_subjects: Option<&'a [u64]>,
+    allowed_pos: usize,
+    leaf_entries: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+    cur_b: Option<u64>,
+    cur_sum: u64,
+    mixed: bool,
+    /// True when the current batch is a pure non-IRI_REF leaflet —
+    /// every row gets `default_weight` without looking up `o_key` in `weights`.
+    all_default: bool,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
+}
+
+impl<'a> PsotSubjectWeightedSumIter<'a> {
+    /// Create a new iterator. `default_weight` is used for objects not in `weights`.
+    pub fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        weights: &'a FxHashMap<u64, u64>,
+        default_weight: u64,
+    ) -> Result<Option<Self>> {
+        Ok(Some(Self {
+            store,
+            p_id,
+            weights,
+            default_weight,
+            allowed_subjects: None,
+            allowed_pos: 0,
+            leaf_entries: leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id),
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            cur_b: None,
+            cur_sum: 0,
+            mixed: false,
+            all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
+        }))
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
+        self
+    }
+
+    /// Create a new iterator that only emits groups for subjects in `allowed_subjects`.
+    ///
+    /// `allowed_subjects` must be sorted ascending and must not contain duplicates.
+    // Kept for: filtered-subject weighted-sum fast path (e.g., COUNT with WHERE filter).
+    // Use when: fast-path COUNT(*) adds subject-filtering support.
+    #[expect(dead_code)]
+    pub fn new_filtered_subjects(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        weights: &'a FxHashMap<u64, u64>,
+        default_weight: u64,
+        allowed_subjects: &'a [u64],
+    ) -> Result<Option<Self>> {
+        Ok(Some(Self {
+            store,
+            p_id,
+            weights,
+            default_weight,
+            allowed_subjects: Some(allowed_subjects),
+            allowed_pos: 0,
+            leaf_entries: leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id),
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            cur_b: None,
+            cur_sum: 0,
+            mixed: false,
+            all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
+        }))
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
+        let proj_sid_okey = projection_sid_okey();
+        let proj_sid_otype_okey = projection_sid_otype_okey();
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                let mixed = entry.o_type_const.is_none();
+                let iri_only = entry.o_type_const == Some(OType::IRI_REF.as_u16());
+                let non_iri_only = !mixed && !iri_only;
+
+                if non_iri_only && self.default_weight == 0 {
+                    // Every row would get weight 0 — skip without terminating.
+                    continue;
+                }
+
+                let batch = load_leaflet_projection(
+                    self.store,
+                    handle.as_ref(),
+                    idx,
+                    if mixed {
+                        &proj_sid_otype_okey
+                    } else {
+                        &proj_sid_okey
+                    },
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
+                self.row = 0;
+                self.batch = Some(batch);
+                self.mixed = mixed;
+                self.all_default = non_iri_only;
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    /// Return the next `(subject_id, weighted_sum)` group with non-zero sum,
+    /// or `None` when exhausted.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        if self.allowed_subjects.is_none() {
+            return self.next_group_unfiltered();
+        }
+        self.next_group_filtered()
+    }
+
+    fn next_group_unfiltered(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                if let Some(b) = self.cur_b.take() {
+                    let n = std::mem::take(&mut self.cur_sum);
+                    // We are flushing the final allowed subject group at exhaustion.
+                    // Advancing keeps `allowed_pos` consistent even though we will
+                    // immediately return `None` on the next call.
+                    self.allowed_pos += 1;
+                    return Ok(Some((b, n)));
+                }
+                return Ok(None);
+            }
+
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+
+            let b = batch.s_id.get(self.row);
+
+            let w = if self.all_default {
+                // Pure non-IRI_REF leaflet — o_key can't be a subject ID.
+                self.default_weight
+            } else if self.mixed && batch.o_type.get(self.row) != OType::IRI_REF.as_u16() {
+                // Non-IRI_REF row in mixed leaflet — o_key can't be a subject ID.
+                self.default_weight
+            } else {
+                let c = batch.o_key.get(self.row);
+                self.weights.get(&c).copied().unwrap_or(self.default_weight)
+            };
+
+            match self.cur_b {
+                None => {
+                    self.cur_b = Some(b);
+                    self.cur_sum = 0;
+                }
+                Some(cur) if cur != b => {
+                    let out_b = self.cur_b.replace(b).expect("checked: cur_b is Some");
+                    let out_n = std::mem::replace(&mut self.cur_sum, w);
+                    self.row += 1;
+                    return Ok(Some((out_b, out_n)));
+                }
+                Some(_) => {}
+            }
+
+            self.cur_sum += w;
+            self.row += 1;
+        }
+    }
+
+    fn next_group_filtered(&mut self) -> Result<Option<(u64, u64)>> {
+        let allowed = self
+            .allowed_subjects
+            .expect("checked: allowed_subjects is Some");
+        loop {
+            if self.allowed_pos >= allowed.len() {
+                // All requested subjects were processed — stop early.
+                if let Some(b) = self.cur_b.take() {
+                    let n = std::mem::take(&mut self.cur_sum);
+                    return Ok(Some((b, n)));
+                }
+                return Ok(None);
+            }
+
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                if let Some(b) = self.cur_b.take() {
+                    let n = std::mem::take(&mut self.cur_sum);
+                    return Ok(Some((b, n)));
+                }
+                return Ok(None);
+            }
+
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+
+            let b = batch.s_id.get(self.row);
+
+            // If we are mid-group, do not skip.
+            if self.cur_b.is_none() {
+                while self.allowed_pos < allowed.len() && allowed[self.allowed_pos] < b {
+                    self.allowed_pos += 1;
+                }
+                if self.allowed_pos >= allowed.len() {
+                    return Ok(None);
+                }
+                let target = allowed[self.allowed_pos];
+                if b < target {
+                    // Skip this entire subject group quickly.
+                    let skip_b = b;
+                    while self.row < batch.row_count && batch.s_id.get(self.row) == skip_b {
+                        self.row += 1;
+                    }
+                    continue;
+                }
+                // b == target → allow group, but don't advance allowed_pos until the group ends.
+            }
+
+            // If we reached a new subject, emit the previous group (if any) before consuming this row.
+            if let Some(cur) = self.cur_b {
+                if cur != b {
+                    let out_b = self.cur_b.take().expect("checked: cur_b is Some");
+                    let out_n = std::mem::take(&mut self.cur_sum);
+                    // Completed one allowed subject group.
+                    self.allowed_pos += 1;
+                    return Ok(Some((out_b, out_n)));
+                }
+            } else {
+                self.cur_b = Some(b);
+                self.cur_sum = 0;
+            }
+
+            let w = if self.all_default
+                || (self.mixed && batch.o_type.get(self.row) != OType::IRI_REF.as_u16())
+            {
+                self.default_weight
+            } else {
+                let c = batch.o_key.get(self.row);
+                self.weights.get(&c).copied().unwrap_or(self.default_weight)
+            };
+
+            self.cur_sum += w;
+            self.row += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7d. PSOT object-filtered group-count iterator (unified Include/Exclude)
+// ---------------------------------------------------------------------------
+
+/// Whether to count objects that ARE in the set or are NOT in the set.
+#[derive(Clone, Copy)]
+pub enum ObjectFilterMode {
+    /// Count objects whose `o_key` IS in the set (EXISTS / join semantics).
+    InSet,
+    /// Count objects whose `o_key` is NOT in the set (MINUS / anti-join semantics).
+    NotInSet,
+}
+
+/// Streaming iterator over PSOT leaflets for a predicate that yields
+/// `(subject_id, filtered_count)` groups — counting objects that either appear
+/// in or do not appear in a reference set, depending on [`ObjectFilterMode`].
+///
+/// Requires `o_type_const == IRI_REF` so that `o_key` is a subject ID.
+/// Returns `Ok(None)` from the constructor or `next_group` if a non-IRI_REF
+/// leaflet is encountered.
+pub struct PsotObjectFilterCountIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    reference_set: &'a FxHashSet<u64>,
+    mode: ObjectFilterMode,
+    leaf_entries: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+    /// True when the current batch is a pure non-IRI_REF leaflet in `NotInSet` mode —
+    /// all rows count without checking the reference set.
+    all_count: bool,
+    /// True when the current batch is a mixed leaflet (o_type_const is None) —
+    /// each row must be checked for IRI_REF type before set membership lookup.
+    mixed: bool,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
+}
+
+impl<'a> PsotObjectFilterCountIter<'a> {
+    pub fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        reference_set: &'a FxHashSet<u64>,
+        mode: ObjectFilterMode,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Result<Option<Self>> {
+        Ok(Some(Self {
+            store,
+            p_id,
+            reference_set,
+            mode,
+            leaf_entries: leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id),
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            all_count: false,
+            mixed: false,
+            tracker: tracker.clone(),
+        }))
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        let proj_sid_okey = projection_sid_okey();
+        let proj_sid_otype_okey = projection_sid_otype_okey();
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+
+                let iri_only = entry.o_type_const == Some(OType::IRI_REF.as_u16());
+                let mixed = entry.o_type_const.is_none();
+                let non_iri_only = !iri_only && !mixed;
+
+                if non_iri_only {
+                    // Non-IRI_REF objects can never be in the reference set (which
+                    // contains subject IDs). InSet → no rows match, skip leaflet.
+                    // NotInSet → all rows match, count every row per subject.
+                    if matches!(self.mode, ObjectFilterMode::InSet) {
+                        continue;
+                    }
+                    // NotInSet: load s_id + o_key, mark all_count so next_group
+                    // counts every row without checking the reference set.
+                    let batch = load_leaflet_columns_charged(
+                        handle.as_ref(),
+                        idx,
+                        &proj_sid_okey,
+                        RunSortOrder::Psot,
+                        &self.tracker,
+                    )?;
+                    self.row = 0;
+                    self.batch = Some(batch);
+                    self.all_count = true;
+                    self.mixed = false;
+                    return Ok(Some(()));
+                }
+
+                let projection = if mixed {
+                    &proj_sid_otype_okey
+                } else {
+                    &proj_sid_okey
+                };
+                let batch = load_leaflet_columns_charged(
+                    handle.as_ref(),
+                    idx,
+                    projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
+                self.row = 0;
+                self.batch = Some(batch);
+                self.all_count = false;
+                self.mixed = mixed;
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    /// Return the next `(subject_id, count)` group with non-zero count.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                return Ok(None);
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            let b_id = batch.s_id.get(self.row);
+            let mut count: u64 = 0;
+            while self.row < batch.row_count && batch.s_id.get(self.row) == b_id {
+                let counts = if self.all_count {
+                    // Pure non-IRI_REF leaflet + NotInSet: all rows count.
+                    true
+                } else if self.mixed {
+                    // Mixed leaflet: check o_type per row.
+                    let is_iri = batch.o_type.get(self.row) == OType::IRI_REF.as_u16();
+                    if is_iri {
+                        let c_id = batch.o_key.get(self.row);
+                        let in_set = self.reference_set.contains(&c_id);
+                        match self.mode {
+                            ObjectFilterMode::InSet => in_set,
+                            ObjectFilterMode::NotInSet => !in_set,
+                        }
+                    } else {
+                        // Non-IRI_REF: can't be in the IRI reference set.
+                        matches!(self.mode, ObjectFilterMode::NotInSet)
+                    }
+                } else {
+                    // Pure IRI_REF leaflet: check set membership.
+                    let c_id = batch.o_key.get(self.row);
+                    let in_set = self.reference_set.contains(&c_id);
+                    match self.mode {
+                        ObjectFilterMode::InSet => in_set,
+                        ObjectFilterMode::NotInSet => !in_set,
+                    }
+                };
+                if counts {
+                    count += 1;
+                }
+                self.row += 1;
+            }
+            if count > 0 {
+                return Ok(Some((b_id, count)));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7e. Object-in-set subject collection and POST filtered counting
+// ---------------------------------------------------------------------------
+
+/// Collect subjects from PSOT(p_id) where any object `o_key` is in `object_set`.
+///
+/// Returns a sorted `Vec<u64>` of qualifying subject IDs, or `None` if any
+/// leaflet has a non-IRI_REF `o_type_const`.
+pub fn collect_subjects_with_object_in_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    object_set: &FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<Vec<u64>>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    let projection = projection_sid_okey();
+    let mut out: Vec<u64> = Vec::new();
+
+    for leaf_entry in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+
+        let dir = handle.dir();
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const != Some(OType::IRI_REF.as_u16()) {
+                return Ok(None);
+            }
+
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
+
+            let mut i = 0usize;
+            while i < batch.row_count {
+                let b_id = batch.s_id.get(i);
+                let mut ok = false;
+                while i < batch.row_count && batch.s_id.get(i) == b_id {
+                    let c_id = batch.o_key.get(i);
+                    if object_set.contains(&c_id) {
+                        ok = true;
+                    }
+                    i += 1;
+                }
+                if ok {
+                    out.push(b_id);
+                }
+            }
+        }
+    }
+
+    Ok(Some(out))
+}
+
+/// Sum row counts from POST(p_id) for object groups whose `o_key` is in
+/// `allowed_objects_sorted` (must be pre-sorted ascending).
+///
+/// Uses a merge-scan between sorted POST groups and the sorted allowed list.
+/// Returns `None` if any leaflet has non-IRI_REF `o_type_const`.
+pub fn sum_post_object_counts_filtered(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    allowed_objects_sorted: &[u64],
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    let projection = projection_okey_only();
+
+    let mut allowed_idx: usize = 0;
+    let mut total: u64 = 0;
+
+    for leaf_entry in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+        let dir = handle.dir();
+
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const != Some(OType::IRI_REF.as_u16()) {
+                return Ok(None);
+            }
+
+            let batch: ColumnBatch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
+
+            let mut i = 0usize;
+            while i < batch.row_count {
+                let b_id = batch.o_key.get(i);
+                let mut count: u64 = 0;
+                while i < batch.row_count && batch.o_key.get(i) == b_id {
+                    count += 1;
+                    i += 1;
+                }
+
+                while allowed_idx < allowed_objects_sorted.len()
+                    && allowed_objects_sorted[allowed_idx] < b_id
+                {
+                    allowed_idx += 1;
+                }
+                if allowed_idx < allowed_objects_sorted.len()
+                    && allowed_objects_sorted[allowed_idx] == b_id
+                {
+                    total = total.saturating_add(count);
+                }
+            }
+        }
+    }
+
+    Ok(Some(total))
+}
+
+// ---------------------------------------------------------------------------
+// 8. BinaryCursor construction
+// ---------------------------------------------------------------------------
+
+/// Construct a `BinaryCursor` over an explicit key range + filter in `order`,
+/// without overlay merging or `to_t` filtering.
+///
+/// Lowest-level shared cursor constructor: looks up the branch for `order` and,
+/// on success, builds the cursor. Callers are responsible for `set_to_t` (and
+/// any overlay wiring) afterwards. Returns `None` when the branch for `order`
+/// does not exist for `g_id`.
+///
+/// Used directly by object-/subject-range-bounded fast paths
+/// (`fast_string_prefix_count_all`, `fast_star_const_order_topk`) and as the
+/// base of [`build_overlay_cursor_for_predicate`].
+pub fn build_range_cursor(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    min_key: &RunRecordV2,
+    max_key: &RunRecordV2,
+    filter: BinaryFilter,
+    projection: ColumnProjection,
+) -> Option<BinaryCursor> {
+    let branch = Arc::clone(store.branch_for_order(g_id, order)?);
+    Some(BinaryCursor::new(
+        Arc::clone(store),
+        order,
+        branch,
+        min_key,
+        max_key,
+        filter,
+        projection,
+    ))
+}
+
+/// Boundary flakes bracketing every flake with predicate `pred` in a
+/// predicate-leading index order (Psot/Post both compare `p` first).
+///
+/// `first` (exclusive) sorts strictly before any real flake with `p == pred`
+/// (all non-predicate fields at their minimum; no real flake has
+/// `t == i64::MIN`). `rhs` (inclusive) sorts at-or-after any such flake and
+/// before any flake of a higher predicate. The bounds are a superset
+/// optimization for `for_each_overlay_flake` — callers must still filter the
+/// callback by predicate.
+///
+/// `pub(crate)` only so `binary_scan`'s
+/// `every_bound_builder_pins_the_sentinel_guard` can quantify over it; the
+/// sole production caller is [`collect_resolved_overlay_ops`] below.
+pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
+    use fluree_db_core::flake::FlakeMeta;
+    use fluree_db_core::Flake;
+    let first = Flake::new(
+        Sid::min(),
+        pred.clone(),
+        FlakeValue::min(),
+        Sid::min(),
+        i64::MIN,
+        false,
+        None,
+    );
+    let rhs = Flake::new(
+        Sid::max(),
+        pred.clone(),
+        FlakeValue::max(),
+        Sid::max(),
+        i64::MAX,
+        true,
+        Some(FlakeMeta::max()),
+    );
+    (first, rhs)
+}
+
+/// Upper bound on the overlay flakes of `pred_sid` in `g_id` (the extent
+/// [`collect_resolved_overlay_ops`] walks for PSOT), when the overlay can
+/// count without walking.
+pub(crate) fn predicate_overlay_extent(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    predicate_overlay_extent_in(ctx, g_id, RunSortOrder::Psot, pred_sid)
+}
+
+/// [`predicate_overlay_extent`] in a predicate-leading `order`; `None` for
+/// any other order.
+fn predicate_overlay_extent_in(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    if !matches!(order, RunSortOrder::Psot | RunSortOrder::Post) {
+        return None;
+    }
+    let (first, rhs) = predicate_walk_bounds(pred_sid);
+    ctx.overlay().overlay_range_flake_count(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(order),
+        Some(&first),
+        Some(&rhs),
+        false,
+    )
+}
+
+/// Collect the novelty-overlay ops for a single predicate, translated into the
+/// binary-index `OverlayOp` representation and sorted/resolved for `order`.
+///
+/// Returns `Ok(Some(ops))` on success (`ops` may be empty), or `Ok(None)` when
+/// any flake fails to translate — in which case the caller must disable the
+/// fast path for correctness. Only meaningful when [`overlay_has_novelty`]
+/// reports pending flakes.
+///
+/// For predicate-leading orders (Psot/Post) the overlay walk is range-bounded
+/// to the predicate via [`predicate_walk_bounds`], so its cost is
+/// O(log novelty + matching flakes) instead of a full-novelty walk. Other
+/// orders keep the full walk; the callback-side predicate filter is the
+/// correctness backstop in all cases.
+pub fn collect_resolved_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+    use std::collections::HashMap;
+    let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
+        Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
+    });
+    let mut ephemeral_preds = HashMap::new();
+    let mut next_ep = store.predicate_count();
+    let mut ops = Vec::new();
+    let mut translate_failed = false;
+    let mut translate_fail_count: u32 = 0;
+
+    let pred_bounds = matches!(order, RunSortOrder::Psot | RunSortOrder::Post)
+        .then(|| predicate_walk_bounds(pred_sid));
+    let (first, rhs, leftmost) = match &pred_bounds {
+        Some((first, rhs)) => (Some(first), Some(rhs), false),
+        None => (None, None, true),
+    };
+
+    ctx.overlay().for_each_overlay_flake(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(order),
+        first,
+        rhs,
+        leftmost,
+        ctx.to_t,
+        &mut |flake| {
+            if flake.p != *pred_sid {
+                return;
+            }
+            match crate::binary_scan::translate_one_flake_v3_pub(
+                flake,
+                store,
+                Some(&dn),
+                ctx.runtime_small_dicts,
+                &mut ephemeral_preds,
+                &mut next_ep,
+                g_id,
+            ) {
+                Ok(op) => ops.push(op),
+                Err(e) => {
+                    translate_failed = true;
+                    translate_fail_count = translate_fail_count.saturating_add(1);
+                    if translate_fail_count == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            s = %flake.s,
+                            p = %flake.p,
+                            t = flake.t,
+                            op = flake.op,
+                            "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
+                        );
+                    }
+                }
+            }
+        },
+    );
+
+    if translate_failed {
+        tracing::debug!(
+            failures = translate_fail_count,
+            "fast-path cursor: falling back due to overlay translation failures"
+        );
+        return Ok(None);
+    }
+
+    if !ops.is_empty() {
+        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+        fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+    }
+    Ok(Some(ops))
+}
+
+/// Shared, immutable translated overlay ops for one `(graph, order, predicate)`.
+pub type SharedOverlayOps = Arc<[fluree_db_binary_index::read::types::OverlayOp]>;
+
+/// Identity of every input that determines a translated overlay-ops vector.
+///
+/// Address fields are stable for the lifetime of the borrows/Arcs the
+/// `ExecutionContext` holds, which covers the whole execution. `epoch` is
+/// included so a (hypothetical) in-place overlay mutation mid-query also
+/// invalidates rather than serving stale ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OverlayOpsBinding {
+    overlay_addr: usize,
+    overlay_epoch: u64,
+    to_t: i64,
+    dict_novelty_addr: usize,
+    small_dicts_addr: usize,
+    store_addr: usize,
+}
+
+impl OverlayOpsBinding {
+    fn of(ctx: &ExecutionContext<'_>, store: &Arc<BinaryIndexStore>) -> Self {
+        Self {
+            overlay_addr: ctx.overlay.map_or(0, |o| {
+                o as *const dyn fluree_db_core::OverlayProvider as *const () as usize
+            }),
+            overlay_epoch: ctx.overlay().epoch(),
+            to_t: ctx.to_t,
+            dict_novelty_addr: ctx
+                .dict_novelty
+                .as_ref()
+                .map_or(0, |d| Arc::as_ptr(d) as usize),
+            small_dicts_addr: ctx
+                .runtime_small_dicts
+                .map_or(0, |d| d as *const _ as usize),
+            store_addr: Arc::as_ptr(store) as usize,
+        }
+    }
+}
+
+struct BoundOpsMap {
+    binding: OverlayOpsBinding,
+    /// `None` value = translation failed for that predicate (memoized so a
+    /// declined fast path doesn't re-walk the overlay on every retry).
+    map: std::sync::Mutex<FxHashMap<(GraphId, RunSortOrder, Sid), Option<SharedOverlayOps>>>,
+}
+
+/// Per-execution memo of translated + resolved overlay ops, keyed by
+/// `(graph, order, predicate)`.
+///
+/// Lazily binds on first access to the fingerprint of the inputs that
+/// determine the result ([`OverlayOpsBinding`]); every access re-validates, so
+/// an `ExecutionContext` derivation that shares the cache while changing
+/// `overlay`/`to_t`/dictionaries can never read stale ops — it merely computes
+/// uncached (and trips a `debug_assert` so the lifecycle bug is caught in CI).
+/// Derivations that change none of the bound inputs (e.g. graph switches —
+/// `GraphId` is in the key) share safely.
+///
+/// Note: translated ops may carry *ephemeral* `p_id`s (predicates absent from
+/// the base index get ids allocated from `store.predicate_count()` per
+/// collect). Cached vecs from different predicates can therefore carry
+/// colliding ephemeral ids — safe because consumers only compare identity
+/// within a single predicate's vec.
+#[derive(Default)]
+pub struct OverlayOpsCache {
+    inner: std::sync::OnceLock<BoundOpsMap>,
+}
+
+impl OverlayOpsCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Cached front-end to [`collect_resolved_overlay_ops`].
+///
+/// Same contract (`Ok(None)` = translation failed → caller must decline the
+/// fast path), but the walk + translation + sort runs at most once per
+/// `(graph, order, predicate)` per execution; repeat lookups are an `Arc`
+/// clone. Misses compute *outside* the map lock so concurrent workers on
+/// different predicates never serialize behind one another's overlay walk.
+pub fn cached_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    debug_assert!(
+        !matches!(order, RunSortOrder::Opst),
+        "OPST keys hold the object lane's ops (`cached_object_probe_ops`)"
+    );
+    cached_ops_entry(ctx, store, g_id, order, pred_sid, || {
+        Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        )
+    })
+}
+
+/// Whether the bound-object lane can probe objects of `o_type`: refs and
+/// string terms, whose `(o_type, o_key)` is their whole identity. Other
+/// literals match across datatypes and are left to the per-row scan.
+pub(crate) fn object_probe_covers(o_type: u16) -> bool {
+    use fluree_db_core::o_type::DecodeKind;
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::IriRef | DecodeKind::StringDict
+    )
+}
+
+/// The predicate's ops on the objects the bound-object lane probes
+/// ([`object_probe_covers`]), sorted by `(o_type, o_key, s_id, o_i)`, the order
+/// it reconciles in. Derived from the PSOT ops once and cached beside them
+/// under the OPST key: no scan reads OPST ops, while the POST key holds a POST
+/// scan's own.
+pub(crate) fn cached_object_probe_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let g_id = ctx.binary_g_id;
+    cached_ops_entry(ctx, store, g_id, RunSortOrder::Opst, pred_sid, || {
+        let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? else {
+            return Ok(None);
+        };
+        let mut subset: Vec<_> = ops
+            .iter()
+            .filter(|o| object_probe_covers(o.o_type))
+            .copied()
+            .collect();
+        subset.sort_unstable_by_key(|o| (o.o_type, o.o_key, o.s_id, o.o_i));
+        Ok(Some(subset.into()))
+    })
+}
+
+/// Whether the ops for `(g_id, order, pred_sid)` are already translated,
+/// in this execution or, under reasoning, on the materialization.
+pub(crate) fn overlay_ops_cached(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> bool {
+    let in_execution = ctx.overlay_ops_cache.inner.get().is_some_and(|bound| {
+        bound.binding == OverlayOpsBinding::of(ctx, store)
+            && bound
+                .map
+                .lock()
+                .expect("overlay ops cache poisoned")
+                .contains_key(&(g_id, order, pred_sid.clone()))
+    });
+    in_execution || crate::reasoning_ops::cached(ctx, store, g_id, order, pred_sid)
+}
+
+fn cached_ops_entry(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+    compute: impl FnOnce() -> Result<Option<SharedOverlayOps>>,
+) -> Result<Option<SharedOverlayOps>> {
+    let binding = OverlayOpsBinding::of(ctx, store);
+    let bound = ctx.overlay_ops_cache.inner.get_or_init(|| BoundOpsMap {
+        binding,
+        map: std::sync::Mutex::new(FxHashMap::default()),
+    });
+    if bound.binding != binding {
+        debug_assert!(
+            false,
+            "overlay-ops cache shared across an ExecutionContext derivation that \
+             changed its binding (overlay/to_t/dict_novelty/runtime_small_dicts/store); \
+             the deriving constructor must start a fresh cache"
+        );
+        tracing::debug!("overlay-ops cache binding mismatch; computing uncached");
+        return compute();
+    }
+    let key = (g_id, order, pred_sid.clone());
+    if let Some(entry) = bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .get(&key)
+    {
+        return Ok(entry.clone());
+    }
+    // A concurrent miss on the same key duplicates the walk (acceptable —
+    // last write wins with an identical value) but never holds the lock
+    // across the walk.
+    let computed = crate::reasoning_ops::get_or_translate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        || predicate_overlay_extent_in(ctx, g_id, order, pred_sid),
+        compute,
+    )?;
+    bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .insert(key, computed.clone());
+    Ok(computed)
+}
+
+/// Fate of a base row checked against a predicate's overlay ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowFate {
+    /// Emit the base row (no op for it, or a re-assert of the same fact).
+    Keep,
+    /// A novelty retract matched the row's identity — suppress it.
+    Drop,
+}
+
+/// Per-flush reconciler merging resolved overlay ops into a batched
+/// leaflet-probe scan (the "strategy (b)" merge for probe lanes that
+/// read base leaflets directly instead of going through `BinaryCursor`).
+///
+/// Mirrors `merge_overlay_into_batch`'s case analysis for set-of-matches
+/// consumers: base row with no identity-matching op → emit; identity-matching
+/// retract → suppress; identity-matching assert (re-asserted fact) → emit the
+/// base row once; unconsumed asserts are injected per probed subject after the
+/// base scan ([`Self::drain_asserts_for_subject`]); unconsumed retracts are
+/// no-ops (their base row is absent). Equivalence with the cursor merge holds
+/// because `resolve_overlay_ops` guarantees at most one op per fact key and
+/// probe consumers are emission-order-insensitive.
+///
+/// Identity is the full `(p_id, o_type, o_key, o_i)` within a subject, so one
+/// reconciler serves both the single-predicate PSOT probes (p constant) and
+/// the multi-predicate SPOT star probes (ops merged across the star's
+/// predicates): both sort by `(s_id, p_id, o_type, o_key, o_i)`.
+///
+/// **Scope: one instance per flush** (one probe call, or one predicate's
+/// chunk sequence over disjoint probed subjects). Probed keys legitimately recur across
+/// flushes (each flush carries different left rows), so consumed-state must
+/// not outlive a flush — a longer-lived instance would silently drop injected
+/// asserts from every flush after the first.
+pub struct ProbeOps {
+    ops: SharedOverlayOps,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ProbeOps {
+    /// `ops` must be resolved and sorted by `(s_id, p_id, o_type, o_key,
+    /// o_i)`: a single predicate's [`cached_overlay_ops`] for
+    /// `RunSortOrder::Psot`, or a multi-predicate merge re-sorted for
+    /// `RunSortOrder::Spot`. Returns `None` when empty — callers then run
+    /// their unmodified scan.
+    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
+        if ops.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            ops.windows(2).all(|w| {
+                (w[0].s_id, w[0].p_id, w[0].o_type, w[0].o_key, w[0].o_i)
+                    < (w[1].s_id, w[1].p_id, w[1].o_type, w[1].o_key, w[1].o_i)
+            }),
+            "ProbeOps requires subject-major sorted, resolved ops"
+        );
+        let consumed = vec![false; ops.len()];
+        Some(Self {
+            ops,
+            consumed,
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// Index range of ops for `s_id` (ops are subject-sorted within the
+    /// predicate). Empty for subjects with no novelty — the common case, which
+    /// makes the per-row fate check free for them.
+    pub fn subject_window(&self, s_id: u64) -> std::ops::Range<usize> {
+        let start = self.ops.partition_point(|o| o.s_id < s_id);
+        let end = start + self.ops[start..].partition_point(|o| o.s_id == s_id);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s subject against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::subject_window`] for the row's subject.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.ops[window.clone()];
+        let probe = (p_id, o_type, o_key, o_i);
+        let pos = win.partition_point(|o| (o.p_id, o.o_type, o.o_key, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.p_id, op.o_type, op.o_key, op.o_i) == probe {
+                self.consumed[window.start + pos] = true;
+                if op.op {
+                    // Re-asserted fact: the base row stands in for it.
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for `s_id` to `f` — the
+    /// `emit_overlay_only` analogue: novelty-only facts of probed subjects
+    /// become new matches. Call once per probed subject after the base scan;
+    /// retracts without a base row are dropped silently, matching the cursor.
+    pub fn drain_asserts_for_subject(
+        &mut self,
+        s_id: u64,
+        mut f: impl FnMut(&fluree_db_binary_index::read::types::OverlayOp) -> Result<()>,
+    ) -> Result<()> {
+        let window = self.subject_window(s_id);
+        for i in window {
+            if !self.consumed[i] && self.ops[i].op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(&self.ops[i])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-flush reconciler for one object type of the bound-object probe lane.
+///
+/// The lane scans one predicate's rows for a set of objects, each an exact
+/// `(o_type, o_key)`, so it reconciles against [`cached_object_probe_ops`]:
+/// the predicate's resolved ops on such objects in `(o_type, o_key, s_id, o_i)`
+/// order, object-major windows shared across flushes and (for eager callers)
+/// queries. A probe walks one type at a time and an op of another type cannot
+/// touch its rows, so the reconciler holds that type's run of the ops alone.
+/// Same case analysis and per-flush scope as [`ProbeOps`].
+pub struct ObjectProbeOps {
+    ops: SharedOverlayOps,
+    /// Where the probed type's ops start in `ops`; `consumed` has one flag
+    /// for each of them.
+    start: usize,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ObjectProbeOps {
+    /// `ops` must come from [`cached_object_probe_ops`]. Returns `None` when
+    /// none is on an object of `o_type`: no op can affect the probe, so
+    /// callers run their unmodified scan.
+    pub fn for_type(ops: &SharedOverlayOps, o_type: u16) -> Option<Self> {
+        debug_assert!(
+            ops.windows(2).all(|w| {
+                (w[0].o_type, w[0].o_key, w[0].s_id, w[0].o_i)
+                    < (w[1].o_type, w[1].o_key, w[1].s_id, w[1].o_i)
+            }),
+            "ObjectProbeOps requires object-major sorted, resolved ops"
+        );
+        let start = ops.partition_point(|o| o.o_type < o_type);
+        let len = ops[start..].partition_point(|o| o.o_type == o_type);
+        if len == 0 {
+            return None;
+        }
+        Some(Self {
+            ops: Arc::clone(ops),
+            start,
+            consumed: vec![false; len],
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// The probed type's ops, in `(o_key, s_id, o_i)` order.
+    fn typed(&self) -> &[fluree_db_binary_index::read::types::OverlayOp] {
+        &self.ops[self.start..self.start + self.consumed.len()]
+    }
+
+    /// Index range, within the probed type's ops, of those for the object
+    /// `o_key`. Empty for objects with no novelty — the common case, which
+    /// keeps the per-row fate check free for them.
+    pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
+        let typed = self.typed();
+        let start = typed.partition_point(|o| o.o_key < o_key);
+        let end = start + typed[start..].partition_point(|o| o.o_key == o_key);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s object against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::object_window`] for the row's object.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        s_id: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.typed()[window.clone()];
+        let probe = (s_id, o_i);
+        let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.s_id, op.o_i) == probe {
+                let assert = op.op;
+                self.consumed[window.start + pos] = true;
+                if assert {
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for the object `o_key` to `f` (as
+    /// the asserting subject id) — novelty-only facts of probed objects
+    /// become new matches. Call once per probed object after the base scan.
+    pub fn drain_asserts_for_object(
+        &mut self,
+        o_key: u64,
+        mut f: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        for i in self.object_window(o_key) {
+            let op = self.ops[self.start + i];
+            if !self.consumed[i] && op.op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(op.s_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How a batched leaflet-probe lane should handle the active overlay.
+///
+/// Centralizes the decline analysis every probe lane needs (the bug class
+/// the old `overlay_free_single_graph()` bails guarded against): translation
+/// failure, a predicate that exists only in novelty (no base `p_id` to scan),
+/// and a graph whose branch is absent while novelty exists would all silently
+/// drop or duplicate rows if the probe ran against base leaflets.
+pub enum ProbeLanePlan {
+    /// No novelty on the active graph (or none survives `to_t`) — run the
+    /// unmodified probe.
+    Clean,
+    /// Merge these non-empty resolved ops during the probe (construct one
+    /// [`ProbeOps`] per flush from them).
+    Merge(SharedOverlayOps),
+    /// Unmergeable — the caller must take its overlay-correct fallback.
+    Decline,
+}
+
+/// Routing-stamp site for the binary scan's cursor lane under a policy.
+pub(crate) const POLICY_PREDICATE_SCAN_SITE: &str = "policy_predicate_scan";
+/// Routing-stamp site for the batched leaflet probe lanes under a policy.
+pub(crate) const POLICY_PREDICATE_PROBE_SITE: &str = "policy_predicate_probe";
+
+/// Whether a reader that emits raw index rows of ONE statically known
+/// predicate, without per-leaf policy filtering, may run under the view
+/// policy. Unstamped: for decisions that only shape a plan (whether to dedup
+/// ahead of a lane, say) and must not show up as a routing outcome. Readers
+/// use [`policy_lane_for_predicate`], which stamps.
+///
+/// Unpoliced contexts return `Allow` from the first check, so the ordinary
+/// query path pays nothing new. Under a non-root policy the predicate is
+/// classified against the view set ([`cursor_fast_path_for_predicate`]).
+/// `Empty` and `Decline` both mean the caller must not read raw rows;
+/// callers that have no empty result to emit treat `Empty` as `Decline`.
+///
+/// The view set is keyed in the namespace space of the snapshot it was built
+/// against, and a pattern SID is encoded against `original_snapshot`. When a
+/// per-graph context has swapped in a different snapshot the code may not
+/// name the same IRI, so classification is refused rather than risk clearing
+/// the wrong predicate.
+pub(crate) fn classify_predicate_under_policy(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    if std::ptr::eq(ctx.original_snapshot, ctx.active_snapshot) {
+        cursor_fast_path_for_predicate(ctx, pred_sid)
+    } else {
+        PredicateFastPath::Decline
+    }
+}
+
+/// [`classify_predicate_under_policy`] over a set the reader touches as a
+/// whole: every predicate must clear. An empty set declines rather than
+/// clearing vacuously; any `Decline` wins over any `Empty`, and `Empty` over
+/// `Allow`. Readers whose members are independent (a union of per-predicate
+/// counts, say) classify each member on its own instead.
+pub(crate) fn classify_predicates_under_policy(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    if pred_sids.is_empty() {
+        return PredicateFastPath::Decline;
+    }
+    let mut verdict = PredicateFastPath::Allow;
+    for pred_sid in pred_sids {
+        match classify_predicate_under_policy(ctx, pred_sid) {
+            PredicateFastPath::Decline => return PredicateFastPath::Decline,
+            PredicateFastPath::Empty => verdict = PredicateFastPath::Empty,
+            PredicateFastPath::Allow => {}
+        }
+    }
+    verdict
+}
+
+fn stamp_policy_lane(site: &'static str, verdict: PredicateFastPath) {
+    crate::fast_path_outcome::stamp_fast_path(
+        site,
+        match verdict {
+            PredicateFastPath::Allow | PredicateFastPath::Empty => {
+                crate::fast_path_outcome::FastPathOutcome::Proceed
+            }
+            PredicateFastPath::Decline => crate::fast_path_outcome::FastPathOutcome::Fallback(
+                crate::fast_path_outcome::FastPathFallback::GateDeclined,
+            ),
+        },
+    );
+}
+
+/// Per-predicate policy gate for a raw-row reader of ONE predicate:
+/// [`classify_predicate_under_policy`] with the decision stamped on `site`
+/// so a routing test can pin it. Unpoliced contexts stamp nothing.
+pub(crate) fn policy_lane_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+    site: &'static str,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    let verdict = classify_predicate_under_policy(ctx, pred_sid);
+    stamp_policy_lane(site, verdict);
+    verdict
+}
+
+/// [`policy_lane_for_predicate`] for a reader that touches a set of
+/// predicates as a whole ([`classify_predicates_under_policy`]), stamped
+/// once for the set.
+pub(crate) fn policy_lane_for_predicates(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+    site: &'static str,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    let verdict = classify_predicates_under_policy(ctx, pred_sids);
+    stamp_policy_lane(site, verdict);
+    verdict
+}
+
+/// An eager (reasoning) caller with an overlay to merge.
+pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.eager_materialization && !ctx.overlay_free_single_graph()
+}
+
+/// What a probe lane emits, which decides whether an eager caller with an
+/// overlay may take it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneOutput {
+    /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
+    /// head rejects an encoded binding), so admission declines them.
+    Encoded,
+    /// Decoded bindings under eager materialization, as the per-row scan
+    /// emits, or no bindings at all.
+    DecodesForEager,
+}
+
+/// Admission shared by every probe lane and by the join's early routing
+/// decision: `Some(plan)` settles the lane without consulting the overlay,
+/// `None` means plan against it.
+///
+/// Order matters. The lanes read raw leaflets in `Clean` mode too and never
+/// run per-leaf policy filtering, and they emit current facts where a
+/// history range needs every event with its `t` and `op` — so both the
+/// history gate and the per-predicate policy gate sit BEFORE the
+/// overlay-free return, which would otherwise admit the lane on a clean
+/// graph.
+pub(crate) fn probe_lane_admission(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+    output: LaneOutput,
+) -> Option<ProbeLanePlan> {
+    if ctx.is_history_range() {
+        return Some(ProbeLanePlan::Decline);
+    }
+    // The lanes read one graph's index (`binary_g_id`'s).
+    if !ctx.reads_exactly_one_graph() {
+        return Some(ProbeLanePlan::Decline);
+    }
+    // Every predicate the lane reads must clear; an empty set has nothing to
+    // clear and declines under any non-root policy. `Allow` keeps the lane,
+    // anything else declines it (the lanes have no empty result to
+    // short-circuit to; the per-row fallback filters and finds nothing).
+    if !matches!(
+        policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
+        PredicateFastPath::Allow
+    ) {
+        return Some(ProbeLanePlan::Decline);
+    }
+    if ctx.overlay_free_single_graph() {
+        return Some(ProbeLanePlan::Clean);
+    }
+    // An eager caller's resolved ops carry the derived facts, so a lane that
+    // decodes what it emits can merge them.
+    if ctx.eager_materialization && output == LaneOutput::Encoded {
+        return Some(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Some(ProbeLanePlan::Decline);
+    }
+    None
+}
+
+/// An eager caller declines a predicate the index lacks before translating
+/// its ops, which could only decide between declining and an empty lane: a
+/// derived-only extent is translated in full for nothing, and the fallback is
+/// correct either way.
+fn eager_declines_unindexed(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    pred_sid: &Sid,
+) -> bool {
+    eager_with_overlay(ctx) && store.sid_to_p_id(pred_sid).is_none()
+}
+
+/// Plan a single-predicate PSOT subject probe under the active overlay.
+pub fn subject_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+    output: LaneOutput,
+) -> Result<ProbeLanePlan> {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
+        return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("subject probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("subject probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+        .is_none()
+    {
+        tracing::debug!("subject probe: PSOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    Ok(ProbeLanePlan::Merge(ops))
+}
+
+/// Plan a bound-object probe under the active overlay.
+///
+/// Gates on the predicate's PSOT ops and the POST branch the probe reads, and
+/// merges the ops on probeable objects ([`cached_object_probe_ops`]).
+pub fn object_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+    output: LaneOutput,
+) -> Result<ProbeLanePlan> {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
+        return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("object probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("object probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Post)
+        .is_none()
+    {
+        tracing::debug!("object probe: POST branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(object_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
+        return Ok(ProbeLanePlan::Decline);
+    };
+    Ok(ProbeLanePlan::Merge(object_ops))
+}
+
+/// Plan a multi-predicate SPOT star probe under the active overlay.
+///
+/// Fetches each predicate's resolved ops, declines if any predicate is
+/// unmergeable, and merges the non-empty vecs into one SPOT-sorted vec
+/// (identities stay unique across predicates because `p_id` is part of the
+/// fact key, so the merge stays resolved).
+pub fn star_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sids: &[&Sid],
+    output: LaneOutput,
+) -> Result<ProbeLanePlan> {
+    if let Some(plan) = probe_lane_admission(ctx, pred_sids, output) {
+        return Ok(plan);
+    }
+    if pred_sids
+        .iter()
+        .any(|pred_sid| eager_declines_unindexed(ctx, store, pred_sid))
+    {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
+    for pred_sid in pred_sids {
+        let Some(ops) =
+            cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+        else {
+            tracing::debug!("star probe: overlay flake translation failed; declining");
+            return Ok(ProbeLanePlan::Decline);
+        };
+        if ops.is_empty() {
+            continue;
+        }
+        if store.sid_to_p_id(pred_sid).is_none() {
+            tracing::debug!("star probe: predicate exists only in novelty; declining");
+            return Ok(ProbeLanePlan::Decline);
+        }
+        merged.extend_from_slice(&ops);
+    }
+    if merged.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Spot)
+        .is_none()
+    {
+        tracing::debug!("star probe: SPOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    fluree_db_binary_index::read::types::sort_overlay_ops(&mut merged, RunSortOrder::Spot);
+    Ok(ProbeLanePlan::Merge(merged.into()))
+}
+
+/// The `order` branch a batched probe reads for `g_id`, or `None` when the
+/// index holds no such branch.
+///
+/// A graph with no branch has nothing indexed, so a probe there finds
+/// nothing. That answer is complete only while no overlay merge is in play:
+/// the lane plans above decline a branchless graph whose novelty the probe
+/// would have to merge, and a probe that reached one with ops to merge would
+/// drop those rows. That case is refused, in release builds as well.
+pub(crate) fn branch_or_none(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    merging: bool,
+) -> Result<Option<&Arc<BranchManifest>>> {
+    match store.branch_for_order(g_id, order) {
+        Some(branch) => Ok(Some(branch)),
+        None if merging => Err(QueryError::Internal(format!(
+            "{order:?} probe has novelty to merge in graph {g_id}, which has no {order:?} branch"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// The `p_id` a batched probe reads `pred_sid` under, or `None` when the
+/// index holds no such predicate.
+///
+/// A predicate the index doesn't hold has nothing indexed, so a probe finds
+/// nothing for it. As with [`branch_or_none`], that answer is complete only
+/// while none of the predicate's novelty is in play: the lane plans decline
+/// a novelty-only predicate whose ops the probe would merge, and a probe that
+/// reached one would drop those rows. `merges_ops` says whether the probe's
+/// merge holds ops of `pred_sid`, and is asked only when the index lacks it;
+/// when it does, the lookup refuses, in release builds as well.
+pub(crate) fn p_id_or_none(
+    store: &BinaryIndexStore,
+    pred_sid: &Sid,
+    merges_ops: impl FnOnce() -> Result<bool>,
+) -> Result<Option<u32>> {
+    match store.sid_to_p_id(pred_sid) {
+        Some(p_id) => Ok(Some(p_id)),
+        None if merges_ops()? => Err(QueryError::Internal(format!(
+            "probe has novelty to merge for {pred_sid}, a predicate the index doesn't hold"
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Whether the active graph's novelty holds ops of `pred_sid`, for a probe
+/// that merges several predicates' ops ([`p_id_or_none`]). A translation
+/// failure counts as holding some, since its lane plan declines on one.
+pub(crate) fn overlay_holds_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<bool> {
+    Ok(
+        cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+            .is_none_or(|ops| !ops.is_empty()),
+    )
+}
+
+/// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
+/// overlay and honoring `to_t`.
+///
+/// `order` must be a *predicate-bounded* order — [`RunSortOrder::Psot`] or
+/// [`RunSortOrder::Post`] — because both place `p_id` first in their key, so
+/// [`predicate_range_keys`] bounds the scan to one predicate. `Opst` is
+/// object-keyed (its `p_id` is not a primary key component) and is intentionally
+/// unsupported here; object-ordered cursors must be range-bounded by object
+/// instead (see `fast_string_prefix_count_all::count_prefix_rows_opst`).
+///
+/// Unlike the raw leaf-entry scans, this folds uncommitted overlay flakes into
+/// the cursor, so it stays correct when `ctx.overlay` carries novelty or when
+/// `ctx.to_t < max_t` — operators using it should gate on
+/// [`allow_cursor_fast_path`], not [`fast_path_store`]. Returns `None` if the
+/// branch for `order` is absent, or if an overlay flake fails to translate (fast
+/// path disabled for correctness).
+pub fn build_overlay_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    debug_assert!(
+        matches!(order, RunSortOrder::Psot | RunSortOrder::Post),
+        "build_overlay_cursor_for_predicate requires a p_id-primary order \
+         (Psot or Post); got {order:?}"
+    );
+
+    // When an overlay merge can run, `merge_overlay_into_batch` needs the full
+    // V3 identity (s_id, p_id, o_type, o_key, o_i) on every base row. Narrow
+    // count projections (SId-only, OType+OKey) omit some, which would read as
+    // `AbsentDefault` and corrupt the identity compare. Force the identity
+    // columns into `internal` so they're loaded for the merge but dropped before
+    // the returned batch — the output shape the count operators see is
+    // unchanged. (Production masks this via the cache's `all()` load; a
+    // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
+    let overlay_active = overlay_has_novelty(ctx);
+    let projection = overlay_cursor_projection(projection, overlay_active);
+
+    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..Default::default()
+    };
+    let Some(cursor) =
+        build_range_cursor(store, g_id, order, &min_key, &max_key, filter, projection)
+    else {
+        return Ok(None);
+    };
+    // Every leaflet it reads is charged to the query, as the scan's are.
+    let mut cursor = cursor.with_tracker(ctx.tracker.clone());
+    cursor.set_to_t(ctx.to_t);
+
+    // Fold the novelty overlay in. Skip the walk entirely when there is no
+    // novelty: the persisted index alone is then exact. Ops come
+    // from the per-execution cache, so N cursors over the same predicate
+    // (flushes, partitions, cyclic edges) share one walk + translation.
+    if overlay_active {
+        match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+            Some(ops) => {
+                if !ops.is_empty() {
+                    cursor.set_overlay_ops(ops);
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+
+    Ok(Some(cursor))
+}
+
+/// Build a per-predicate PSOT overlay cursor (subject-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+#[inline]
+pub fn build_psot_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Psot,
+        pred_sid,
+        p_id,
+        projection,
+    )
+}
+
+/// Build a per-predicate POST overlay cursor (object-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+///
+/// POST groups rows by `(o_type, o_key)` within the predicate, so adjacent rows
+/// share an object — the natural shape for object-folding aggregates and
+/// distinct-object counts that must stay overlay-correct.
+#[inline]
+pub fn build_post_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Post,
+        pred_sid,
+        p_id,
+        projection,
+    )
+}
+
+/// Build an overlay-folding PSOT cursor bounded to the subject range `[lo, hi)`,
+/// using `sliced_ops` (the predicate's resolved overlay ops already restricted to
+/// `[lo, hi)`) rather than re-collecting them. This is the per-partition primitive
+/// for parallelizing an overlay count: the partition harness hands each worker a
+/// subject range, and each worker scans only its leaves and merges only its ops.
+///
+/// Takes `to_t` and the query's `tracker` as values (not `&ExecutionContext`)
+/// so the caller can hoist them out of the parallel region and keep the
+/// reducer `Sync`; the tracker is charged for every leaflet the cursor reads. The cursor's leaf
+/// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
+/// leaf shared with an adjacent partition still emits its out-of-range subjects — the
+/// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
+/// exactly one partition. Returns `None` if the PSOT branch is absent.
+#[allow(clippy::too_many_arguments)]
+pub fn build_overlay_cursor_for_subject_range(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    projection: ColumnProjection,
+    lo: u64,
+    hi: u64,
+    sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
+    to_t: i64,
+    tracker: &fluree_db_core::Tracker,
+) -> Option<BinaryCursor> {
+    let overlay_active = !sliced_ops.is_empty();
+    // Identity columns must be present for merge_overlay_into_batch (see
+    // build_overlay_cursor_for_predicate / set_overlay_ops).
+    let projection = overlay_cursor_projection(projection, overlay_active);
+
+    let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
+    min_key.s_id = SubjectId(lo);
+    // Upper bound: smallest key at subject `hi` (exclusive `hi` is enforced by the
+    // caller's per-row filter; this only narrows the scanned leaf range).
+    max_key.s_id = SubjectId(hi);
+    max_key.o_key = 0;
+    max_key.o_type = 0;
+    max_key.o_i = 0;
+    max_key.t = 0;
+
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..Default::default()
+    };
+    let mut cursor = build_range_cursor(
+        store,
+        g_id,
+        RunSortOrder::Psot,
+        &min_key,
+        &max_key,
+        filter,
+        projection,
+    )?
+    .with_tracker(tracker.clone());
+    cursor.set_to_t(to_t);
+    if overlay_active {
+        cursor.set_overlay_ops(sliced_ops.into());
+    }
+    Some(cursor)
+}
+
+/// Include the full fact identity internally whenever a cursor merges overlay rows.
+fn overlay_cursor_projection(
+    projection: ColumnProjection,
+    overlay_active: bool,
+) -> ColumnProjection {
+    if !overlay_active {
+        return projection;
+    }
+    let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+    ColumnProjection {
+        output: projection.output,
+        internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+    }
+}
+
+/// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
+/// `(p_id, s_id, …)` for a single predicate) to those with `s_id ∈ [lo, hi)`.
+/// Since the ops are sorted by `s_id`, this is two binary searches.
+pub fn slice_overlay_ops_by_subject(
+    ops: &[fluree_db_binary_index::read::types::OverlayOp],
+    lo: u64,
+    hi: u64,
+) -> Vec<fluree_db_binary_index::read::types::OverlayOp> {
+    let start = ops.partition_point(|o| o.s_id < lo);
+    let end = ops.partition_point(|o| o.s_id < hi);
+    ops[start..end].to_vec()
+}
+
+/// Streams `(s_id, edge_count)` groups from an overlay-merging PSOT cursor.
+///
+/// The cursor yields rows in PSOT order, so a running group-by on `s_id`
+/// produces the same `(subject, count)` pairs that the metadata
+/// [`PsotSubjectCountIter`] derives from leaflet headers — but over the
+/// novelty-merged row stream. Shared by `fast_union_star_count_all` and the
+/// `count_plan_exec` overlay lane.
+///
+/// Use `cursor_projection_sid_only()` (or any projection that includes `s_id`)
+/// when building the cursor.
+pub struct CursorSubjectCountStream {
+    cursor: BinaryCursor,
+    current: Option<ColumnBatch>,
+    row: usize,
+    cur_s: Option<u64>,
+    cur_count: u64,
+    /// Checked once per cursor-batch refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
+}
+
+impl CursorSubjectCountStream {
+    pub fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+            cur_s: None,
+            cur_count: 0,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
+        }
+    }
+
+    /// Attach a cancellation handle, checked once per cursor-batch refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Next `(subject_id, row_count)` group, or `None` when exhausted.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.current.is_none() {
+                bail_if_cancelled(&self.cancellation)?;
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    if let Some(s) = self.cur_s.take() {
+                        let n = std::mem::take(&mut self.cur_count);
+                        return Ok(Some((s, n)));
+                    }
+                    return Ok(None);
+                }
+            }
+
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let s = batch.s_id.get(self.row);
+            if self.cur_s.is_none() {
+                self.cur_s = Some(s);
+                self.cur_count = 0;
+            } else if self.cur_s != Some(s) {
+                let out_s = self.cur_s.replace(s).unwrap();
+                let out_n = std::mem::replace(&mut self.cur_count, 0);
+                // Don't advance row; reprocess it into the new group.
+                return Ok(Some((out_s, out_n)));
+            }
+            self.cur_count += 1;
+            self.row += 1;
+        }
+    }
+}
+
+/// An ascending `(key, count)` group stream, as merged by [`InnerMergeHeads`].
+pub(crate) trait GroupStream {
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>>;
+}
+
+impl GroupStream for PsotSubjectCountIter<'_> {
+    #[inline]
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        PsotSubjectCountIter::next_group(self)
+    }
+}
+
+impl GroupStream for CursorSubjectCountStream {
+    #[inline]
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        CursorSubjectCountStream::next_group(self)
+    }
+}
+
+/// The current group of every stream in an N-way inner (intersection) merge.
+///
+/// Heads are `u64` columns, not a `Vec<Option<(u64, u64)>>`: moving the option
+/// whole out of `next_group`'s `Result` compiles to a 16-byte store through an
+/// unaligned stack temporary, which straddles a cache line on some worker-thread
+/// stack alignments and cost ~50% on a 127M-row merge. The scalar stores here
+/// are 8-byte aligned and cannot.
+///
+/// Everything is `#[inline(always)]`: the merge is a few instructions per key
+/// between `next_group` calls, and an out-of-line step cost 8% on a star whose
+/// subjects mostly match.
+///
+/// ```ignore
+/// let Some(mut heads) = InnerMergeHeads::prime(&mut streams)? else { return Ok(0) };
+/// loop {
+///     if heads.aligned() {
+///         total += heads.count_product();      // every stream is on heads.key()
+///     }
+///     if !heads.advance(&mut streams)? { break; }
+/// }
+/// ```
+pub(crate) struct InnerMergeHeads {
+    keys: Vec<u64>,
+    counts: Vec<u64>,
+    /// Largest head key, as of the last [`aligned`](Self::aligned).
+    max_key: u64,
+    /// Whether every head was on `max_key`, as of the last `aligned`.
+    all_on_max: bool,
+}
+
+impl InnerMergeHeads {
+    /// Read each stream's first group. `None` when a stream is empty, which
+    /// makes the intersection empty.
+    pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Option<Self>> {
+        // With no streams `aligned` is never true and `advance` never ends.
+        assert!(
+            !streams.is_empty(),
+            "InnerMergeHeads needs at least one stream"
+        );
+        let mut heads = Self {
+            keys: vec![0; streams.len()],
+            counts: vec![0; streams.len()],
+            max_key: 0,
+            all_on_max: false,
+        };
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if !heads.advance_one(i, stream)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(heads))
+    }
+
+    /// Compare the heads: `true` when every stream is on the same key. Call
+    /// once per step, before [`advance`](Self::advance), which acts on the
+    /// comparison made here.
+    #[inline(always)]
+    pub(crate) fn aligned(&mut self) -> bool {
+        let mut min_key = u64::MAX;
+        let mut max_key = 0;
+        for &key in &self.keys {
+            min_key = min_key.min(key);
+            max_key = max_key.max(key);
+        }
+        self.max_key = max_key;
+        self.all_on_max = min_key == max_key;
+        self.all_on_max
+    }
+
+    /// The key every head is on. Meaningful only when the last
+    /// [`aligned`](Self::aligned) returned `true`.
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.max_key
+    }
+
+    /// Product of the heads' counts: the join's row count at [`key`](Self::key).
+    #[inline(always)]
+    pub(crate) fn count_product(&self) -> u128 {
+        self.counts.iter().map(|&n| n as u128).product()
+    }
+
+    /// Step the merge: past the shared key when the heads were aligned,
+    /// otherwise each lagging stream one group toward the largest key.
+    /// `false` when a stream runs out, which ends the intersection.
+    #[inline(always)]
+    pub(crate) fn advance<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if (self.all_on_max || self.keys[i] < self.max_key) && !self.advance_one(i, stream)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(always)]
+    fn advance_one<S: GroupStream>(&mut self, i: usize, stream: &mut S) -> Result<bool> {
+        match stream.next_group()? {
+            Some((key, count)) => {
+                self.keys[i] = key;
+                self.counts[i] = count;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+/// Count rows of `p_id` (scanned in `order`) for which `per_row(s_id, o_type, o_key)`
+/// returns `Some(true)`, reading through an overlay-folding cursor so the count
+/// includes novelty asserts, excludes retracts, and honors `to_t`.
+///
+/// This is the overlay/time-travel lane for the single-predicate filter-COUNT fast
+/// paths: the caller gates on [`allow_cursor_fast_path`] and uses this when there is
+/// novelty or `to_t < max_t`; the HEAD lane keeps its faster base-leaflet scan and
+/// metadata shortcuts. `per_row` returning `None` aborts and yields `Ok(None)`, so a
+/// row the predicate can't classify (e.g. a non-numeric object under a numeric
+/// compare) defers to the operator's fallback — matching the base path's bail. Also
+/// returns `Ok(None)` when the cursor can't be built (branch absent for `order`, or
+/// an overlay flake fails to translate).
+pub fn count_rows_via_overlay_cursor<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    mut per_row: P,
+) -> Result<Option<u64>>
+where
+    P: FnMut(u64, u16, u64) -> Option<bool>,
+{
+    let Some(mut cursor) = build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
+    {
+        for r in 0..batch.row_count {
+            match per_row(batch.s_id.get(r), batch.o_type.get(r), batch.o_key.get(r)) {
+                Some(true) => total = total.saturating_add(1),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Parallel overlay/time-travel COUNT of rows of `p_id` (PSOT) matching
+/// `per_row(s_id, o_type, o_key)`, folding novelty correctly.
+///
+/// Partitions the subject space with the shared [`crate::count_plan_exec::parallel_partition_count`]
+/// harness (so the base scan runs across the global rayon pool, like the HEAD path),
+/// and gives each partition a *bounded overlay cursor* — its leaf range plus the
+/// novelty ops sliced to its subject range — reusing `merge_overlay_into_batch`. A
+/// per-row `[lo, hi)` filter keeps boundary subjects (shared leaves) counted once.
+/// The overlay ops are collected once up front and only sliced per partition (cheap;
+/// novelty is small). Below the parallel threshold, falls back to the serial
+/// whole-predicate overlay cursor. Returns `Ok(None)` to defer (an overlay flake
+/// failed to translate).
+pub fn parallel_overlay_psot_filter_count<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    per_row: P,
+) -> Result<Option<u64>>
+where
+    P: Fn(u64, u16, u64) -> bool + Sync + Send,
+{
+    // Per-execution cached collect + resolve; sliced per partition below.
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let to_t = ctx.to_t;
+    let tracker = &ctx.tracker;
+    let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+
+    let ops_ref = &ops;
+    let per_row_ref = &per_row;
+    let parallel = crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        p_id,
+        total_rows,
+        &ctx.cancellation,
+        move |lo, hi| {
+            let sliced = slice_overlay_ops_by_subject(ops_ref, lo, hi);
+            let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+                store,
+                g_id,
+                p_id,
+                cursor_projection_sid_otype_okey(),
+                lo,
+                hi,
+                sliced,
+                to_t,
+                tracker,
+            ) else {
+                return Ok(0u128);
+            };
+            let mut total: u128 = 0;
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s < lo || s >= hi {
+                        continue; // boundary leaf shared with an adjacent partition
+                    }
+                    if per_row_ref(s, batch.o_type.get(r), batch.o_key.get(r)) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
+            Ok(total)
+        },
+    )?;
+
+    match parallel {
+        Some(n) => Ok(Some(n)),
+        // Below the parallel threshold: serial whole-predicate overlay cursor.
+        None => count_rows_via_overlay_cursor(
+            ctx,
+            store,
+            g_id,
+            RunSortOrder::Psot,
+            pred_sid,
+            p_id,
+            |s, ot, ok| Some(per_row(s, ot, ok)),
+        ),
+    }
+}
+
+/// Overlay COUNT(*) of a predicate via a **novelty-delta**, for the common
+/// live-write case (pending novelty, HEAD): `base_total − base(touched) + merged(touched)`.
+///
+/// At HEAD the predicate count is metadata-only (instant). Under novelty the cursor
+/// path would rescan the whole predicate to fold a few uncommitted rows. Instead:
+/// only the per-leaf subject ranges that novelty actually touches are rescanned
+/// (base via the bounded iterator, merged via the bounded overlay cursor — the
+/// proven `merge_overlay_into_batch`); every untouched leaf keeps its instant
+/// manifest count (`base_total − base(touched)`). So the work is proportional to the
+/// novelty's footprint, not the predicate size.
+///
+/// CALLER GATE: only valid for `to_t == max_t` (no time-travel replay) and
+/// pending novelty; the base manifest count is the current-state base count only then.
+/// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
+/// plain manifest count when there is no novelty for the predicate.
+///
+/// CALLER GATE: `p_id` must be a **persisted** predicate id. Both the touched-leaf
+/// partition and the bounded overlay cursor are range-bounded by it, so a predicate
+/// that exists only in the overlay (uncommitted novelty, or a datalog / OWL2-RL
+/// materialization) is unreachable here by construction — the leaf list is empty and
+/// this returns the base count, 0. Callers must therefore resolve `sid_to_p_id`
+/// **inside** this lane and defer on a miss; hoisting that lookup above the lane
+/// split and reading the miss as "count 0" is fluree/db#1863.
+pub fn count_predicate_overlay_delta(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let base_total = count_rows_for_predicate_psot(store, g_id, p_id)?;
+    if ops.is_empty() {
+        return Ok(Some(base_total));
+    }
+    let to_t = ctx.to_t;
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+
+    // Per-leaf subject ranges [lo, hi); the last extends to MAX so novelty subjects
+    // beyond the base's last leaf land in (and are scanned by) the final range.
+    let mut base_touched: u64 = 0;
+    let mut merged_touched: u64 = 0;
+    let mut op_idx = 0usize;
+    let n = leaves.len();
+    for i in 0..n {
+        // The first leaf's range starts at 0 (mirroring `parallel_partition_count`'s
+        // `bounds[0] == 0`) so novelty ops below the predicate's first indexed subject
+        // — a low-id subject newly gaining this predicate — fall into leaf 0's range
+        // and are merged in, rather than being skipped by the op-cursor advance below
+        // and silently undercounted.
+        let lo = if i == 0 {
+            0
+        } else {
+            leaves[i].first_key.s_id.as_u64()
+        };
+        let hi = if i + 1 < n {
+            leaves[i + 1].first_key.s_id.as_u64()
+        } else {
+            u64::MAX
+        };
+        // Ops with s_id in [lo, hi). Ops are sorted by s_id; advance the cursor.
+        while op_idx < ops.len() && ops[op_idx].s_id < lo {
+            op_idx += 1;
+        }
+        let start = op_idx;
+        let mut end = op_idx;
+        while end < ops.len() && ops[end].s_id < hi {
+            end += 1;
+        }
+        if end == start {
+            continue; // untouched leaf — its rows are covered by base_total
+        }
+        op_idx = end;
+
+        // Base count of this touched leaf: the manifest `row_count` for an interior
+        // leaf (no open); a boundary leaf (shared with an adjacent predicate) opens
+        // and sums its p_id leaflets. Only the merged pass below opens the leaf, so
+        // the worst case (novelty touching every leaf) is one full scan, not two.
+        let leaf = &leaves[i];
+        if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
+            base_touched = base_touched.saturating_add(leaf.row_count);
+        } else {
+            let dir = store
+                .open_leaf_dir(&leaf.leaf_cid)
+                .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+            for entry in &dir.entries {
+                if entry.row_count != 0 && entry.p_const == Some(p_id) {
+                    base_touched = base_touched.saturating_add(entry.row_count as u64);
+                }
+            }
+        }
+
+        // Merged count of this range (base + this range's novelty ops).
+        let sliced = ops[start..end].to_vec();
+        if let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            &ctx.tracker,
+        ) {
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s >= lo && s < hi {
+                        merged_touched = merged_touched.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // base_total − base(touched) = base(untouched); + merged(touched) = grand total.
+    let total = base_total
+        .saturating_sub(base_touched)
+        .saturating_add(merged_touched);
+    Ok(Some(total))
+}
+
+/// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).
+///
+/// Returns `Ok(None)` for `Ref::Var` or if the subject is not found in the store.
+pub fn subject_ref_to_s_id(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    store: &BinaryIndexStore,
+    r: &Ref,
+) -> Result<Option<u64>> {
+    match r {
+        Ref::Iri(iri) => Ok(store
+            .find_subject_id(iri)
+            .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?),
+        Ref::Sid(sid) => {
+            if let Some(s_id) = store
+                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::Internal(format!("find_subject_id_by_parts: {e}")))?
+            {
+                return Ok(Some(s_id));
+            }
+            if let Some(iri) = snapshot.decode_sid(sid).or_else(|| store.sid_to_iri(sid)) {
+                Ok(store
+                    .find_subject_id(&iri)
+                    .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?)
+            } else {
+                Ok(None)
+            }
+        }
+        Ref::Var(_) => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Graph reachability (transitive property paths)
+// ---------------------------------------------------------------------------
+
+/// BFS one-or-more reachability count from a single start node.
+///
+/// Returns the number of unique nodes reachable from `start` via one or more
+/// hops in the adjacency map. The start node itself is only counted if a cycle
+/// leads back to it.
+pub fn reach_count_plus(adj: &FxHashMap<u64, Vec<u64>>, start: u64) -> u64 {
+    let mut visited: FxHashSet<u64> = FxHashSet::default();
+    let mut q: VecDeque<u64> = VecDeque::new();
+    let mut count: u64 = 0;
+    let mut added_start_via_cycle = false;
+
+    visited.insert(start);
+    q.push_back(start);
+
+    while let Some(cur) = q.pop_front() {
+        if let Some(nexts) = adj.get(&cur) {
+            for &n in nexts {
+                if n == start && !added_start_via_cycle {
+                    count = count.saturating_add(1);
+                    added_start_via_cycle = true;
+                    continue;
+                }
+                if visited.insert(n) {
+                    count = count.saturating_add(1);
+                    q.push_back(n);
+                }
+            }
+        }
+    }
+
+    count
+}
+
+/// BFS one-or-more reachability count from multiple start nodes (union semantics).
+///
+/// Returns `|⋃ reach_plus(s_i)|` — the number of unique nodes reachable from
+/// *any* start node via one or more hops. Start nodes themselves are counted
+/// only if a cycle leads back to them.
+pub fn reach_count_plus_multi(adj: &FxHashMap<u64, Vec<u64>>, starts: &[u64]) -> u64 {
+    if starts.is_empty() {
+        return 0;
+    }
+    if starts.len() == 1 {
+        return reach_count_plus(adj, starts[0]);
+    }
+
+    let mut starts_set: FxHashSet<u64> = FxHashSet::default();
+    let mut counted_starts: FxHashSet<u64> = FxHashSet::default();
+    let mut visited: FxHashSet<u64> = FxHashSet::default();
+    let mut q: VecDeque<u64> = VecDeque::new();
+    let mut count: u64 = 0;
+
+    for &s in starts {
+        starts_set.insert(s);
+        visited.insert(s);
+        q.push_back(s);
+    }
+
+    while let Some(cur) = q.pop_front() {
+        if let Some(nexts) = adj.get(&cur) {
+            for &n in nexts {
+                if starts_set.contains(&n) {
+                    if counted_starts.insert(n) {
+                        count = count.saturating_add(1);
+                    }
+                    continue;
+                }
+                if visited.insert(n) {
+                    count = count.saturating_add(1);
+                    q.push_back(n);
+                }
+            }
+        }
+    }
+
+    count
+}
+
+/// Build an IRI-ref-only adjacency map from a PSOT cursor.
+///
+/// Scans all batches from `cursor`, collecting `(s_id -> [o_key])` edges
+/// where `o_type == IRI_REF`. Used by transitive property path operators.
+pub fn build_iri_adjacency_from_cursor(
+    cursor: &mut BinaryCursor,
+) -> Result<FxHashMap<u64, Vec<u64>>> {
+    let iri_ref = OType::IRI_REF.as_u16();
+    let mut adj: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
+    {
+        for i in 0..batch.row_count {
+            if batch.o_type.get(i) != iri_ref {
+                continue;
+            }
+            let s = batch.s_id.get(i);
+            let o = batch.o_key.get(i);
+            adj.entry(s).or_default().push(o);
+        }
+    }
+    Ok(adj)
+}
+
+// ---------------------------------------------------------------------------
+// 10. Operator plumbing
+// ---------------------------------------------------------------------------
+
+/// Tiny helper operator: yields exactly one precomputed batch, then exhausts.
+///
+/// Starts in `Open` state since the batch is pre-computed at construction time.
+struct PrecomputedSingleBatchOperator {
+    batch: Option<Batch>,
+    state: OperatorState,
+}
+
+impl PrecomputedSingleBatchOperator {
+    fn new(batch: Batch) -> Self {
+        Self {
+            batch: Some(batch),
+            state: OperatorState::Open,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for PrecomputedSingleBatchOperator {
+    fn schema(&self) -> &[VarId] {
+        self.batch
+            .as_ref()
+            .map(super::binding::Batch::schema)
+            .unwrap_or(&[])
+    }
+
+    async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if !self.state.can_next() {
+            return Ok(None);
+        }
+        let out = self.batch.take();
+        if out.is_none() {
+            self.state = OperatorState::Exhausted;
+        }
+        Ok(out)
+    }
+
+    fn close(&mut self) {
+        self.batch = None;
+        self.state = OperatorState::Closed;
+    }
+}
+
+/// Build a single-row batch containing an `xsd:integer` value.
+pub fn build_i64_singleton_batch(out_var: VarId, value: i64, label: &str) -> Result<Batch> {
+    let schema: Arc<[VarId]> = Arc::from(vec![out_var].into_boxed_slice());
+    let col = vec![Binding::lit(FlakeValue::Long(value), Sid::xsd_integer())];
+    Batch::new(schema, vec![col])
+        .map_err(|e| QueryError::execution(format!("fast-path {label} batch build: {e}")))
+}
+
+/// Build a single-row batch containing a count value (`xsd:integer`).
+pub fn build_count_batch(out_var: VarId, count: i64) -> Result<Batch> {
+    build_i64_singleton_batch(out_var, count, "count")
+}
+
+/// Convert a non-negative count to `i64`, erroring on overflow instead of silently capping.
+pub fn count_to_i64(count: u64, label: &'static str) -> Result<i64> {
+    i64::try_from(count).map_err(|_| QueryError::execution(format!("{label} exceeds i64")))
+}
+
+/// Build an empty batch (zero rows) with the given schema.
+pub fn empty_batch(schema: Arc<[VarId]>) -> Result<Batch> {
+    let cols: Vec<Vec<Binding>> = (0..schema.len()).map(|_| Vec::new()).collect();
+    Batch::new(schema, cols).map_err(Into::into)
+}
+
+/// Resolve a bound predicate `Ref` to its binary-index predicate ID (`u32`).
+///
+/// Uses `ExecutionContext` to decode `Sid` variants. Returns an error for `Ref::Var`.
+/// `None` when the index has never seen the predicate: a fast path reading the
+/// index at its own `t` with no novelty then has no rows for it.
+///
+/// That answer is complete only where the index answers alone, as
+/// [`fast_path_store`] requires. A caller on a gate that tolerates novelty, or
+/// reads at a `t` other than the index's, would answer no rows for a
+/// predicate whose rows are all in novelty, so a miss there is refused, in
+/// release builds as well.
+pub fn ref_to_p_id(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    r: &Ref,
+) -> Result<Option<u32>> {
+    let iri: Arc<str> = match r {
+        Ref::Sid(sid) => ctx
+            .decode_sid(sid)
+            .map(Arc::from)
+            .ok_or_else(|| QueryError::execution("failed to decode predicate SID".to_string()))?,
+        Ref::Iri(i) => Arc::clone(i),
+        Ref::Var(_) => {
+            return Err(QueryError::Internal(
+                "fast-path requires bound predicates".to_string(),
+            ))
+        }
+    };
+    match store.find_predicate_id(iri.as_ref()) {
+        Some(p_id) => Ok(Some(p_id)),
+        None if overlay_has_novelty(ctx) || ctx.to_t != store.max_t() => Err(QueryError::Internal(
+            format!("{iri} is not in the index, and the index does not answer alone here"),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Resolve a bound `Term` (IRI or Sid) to its internal subject ID (`u64`).
+///
+/// Uses `ExecutionContext` to decode `Sid` variants. Returns `Ok(None)` for
+/// non-IRI terms or if the subject is not found in the store.
+pub fn term_to_ref_s_id(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    t: &crate::ir::triple::Term,
+) -> Result<Option<u64>> {
+    let iri: Arc<str> = match t {
+        crate::ir::triple::Term::Sid(sid) => match ctx.decode_sid(sid) {
+            Some(i) => Arc::from(i),
+            None => return Ok(None),
+        },
+        crate::ir::triple::Term::Iri(i) => Arc::clone(i),
+        _ => return Ok(None),
+    };
+    let sid = store.encode_iri(iri.as_ref());
+    store
+        .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+        .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))
+}
+
+/// True when the overlay can still contribute flakes
+/// ([`overlay_carries_novelty`]).
+///
+/// `epoch()` is a monotonic mutation counter that never resets, so
+/// `epoch() == 0` means "never had novelty since this overlay was created" —
+/// it stays non-zero forever on a long-lived cached ledger even after an
+/// index swap drains every segment. Gating on it alone permanently disables
+/// the metadata fast paths on any server that has processed a write
+/// (measured: whole-graph aggregates stuck at ~190ms after the background
+/// indexer caught up, until restart). `is_effectively_empty()` exists for
+/// exactly this distinction; keep `epoch()` itself for cache keys only.
+#[inline]
+pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.overlay.is_some_and(overlay_carries_novelty)
+}
+
+/// The store a metadata fast path reads, when it may: the scope reads one
+/// graph ([`IndexScope::One`] from [`ExecutionContext::index_scope`]: a store,
+/// one graph, no `from_t`, root or no policy) whose index alone answers for it
+/// ([`IndexMember::index_is_current`]: no novelty, `to_t == max_t`). `None`
+/// otherwise.
+///
+/// A default graph of several graphs is not `One`: there `binary_g_id` names
+/// one member, which these lanes would read alone.
+///
+/// [`IndexMember::index_is_current`]: crate::index_scope::IndexMember::index_is_current
+#[inline]
+pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<BinaryIndexStore>> {
+    match ctx.index_scope()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
+    }
+}
+
+/// Like [`fast_path_store`] but with the view-policy clause **already
+/// discharged by the caller** ([`ExecutionContext::index_scope_policy_cleared`])
+/// — use only after [`cursor_fast_path_for_predicate`] returned
+/// [`PredicateFastPath::Allow`] for the operator's single scanned predicate.
+/// Same structural metadata-lane conditions otherwise: one graph, no `from_t`,
+/// overlay-free, store present, `to_t == max_t`.
+#[inline]
+pub fn fast_path_store_policy_cleared<'a>(
+    ctx: &'a ExecutionContext<'_>,
+) -> Option<&'a Arc<BinaryIndexStore>> {
+    match ctx.index_scope_policy_cleared()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
+    }
+}
+
+/// Cursor-flavored fast-path gate (strategy (b)).
+///
+/// Unlike [`fast_path_store`], this does **not** reject uncommitted overlay or
+/// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
+/// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
+/// in and honors `to_t`, so those cases stay correct. It still requires a scope
+/// of one graph read through a store ([`IndexScope::One`]: the cursor reads
+/// `binary_g_id`'s graph), no `from_t`, and root (or no) policy; History mode
+/// is filtered at the planner level too.
+#[inline]
+pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
+    matches!(ctx.index_scope(), Some(IndexScope::One(_)))
+}
+
+/// Verdict for a single-predicate cursor fast path under a view policy, returned
+/// by [`cursor_fast_path_for_predicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateFastPath {
+    /// Run the fast path as usual: no policy / root, or the scanned predicate is
+    /// provably uncovered by the view policy and the effective default is allow.
+    Allow,
+    /// The scanned predicate is uncovered and the effective default is deny:
+    /// every matching flake is hidden, so the operator should emit its empty
+    /// result (count 0 / aggregate identity / no rows) without scanning.
+    Empty,
+    /// A restriction may apply, or the query is otherwise fast-path-ineligible
+    /// (multi-ledger / historical): fall back to the filtered scan path.
+    Decline,
+}
+
+/// Per-predicate relaxation of [`allow_cursor_fast_path`]: under an active
+/// non-root view policy, a single-predicate cursor fast path can still run when
+/// its one statically-known scanned predicate `pred_sid` is provably uncovered
+/// by the policy, instead of bailing to the filtered scan for *any* non-root
+/// policy.
+///
+/// - [`PredicateFastPath::Allow`] — run the fast path (no policy / root, or
+///   uncovered + default-allow).
+/// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
+///   result for this predicate without scanning.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the scope
+///   reads more than one graph ([`ExecutionContext::reads_exactly_one_graph`])
+///   or is historical: take the filtered fallback.
+///
+/// Only valid for an operator that scans exactly one ground predicate; multi- or
+/// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
+/// (they would have to clear *every* touched predicate).
+#[inline]
+pub fn cursor_fast_path_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+) -> PredicateFastPath {
+    if !ctx.reads_exactly_one_graph() || ctx.is_history_range() {
+        return PredicateFastPath::Decline;
+    }
+    // No policy or root: nothing to filter, run the fast path unfiltered.
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    // allow_unfiltered() == false implies a Some(non-root) enforcer; the None arm
+    // is unreachable but kept total.
+    match ctx.policy_enforcer.as_ref() {
+        Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
+            PredicateCoverage::Covered => PredicateFastPath::Decline,
+            PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
+            PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,
+        },
+        None => PredicateFastPath::Allow,
+    }
+}
+
+/// Shared single-predicate fast-path gate: normalize `predicate` against
+/// `store` and decide whether the cursor fast path may run.
+///
+/// `Ok(true)` when the predicate is provably safe to fast-path under the
+/// current view policy (no policy / root, or uncovered + default-allow);
+/// `Ok(false)` to decline (covered, default-deny, multi-ledger, or historical
+/// — take the filtered fallback).
+///
+/// This is the decision every single-predicate fast path repeats; callers that
+/// also need a no-overlay, at-HEAD store should pair it with
+/// [`fast_path_store_policy_cleared`] (or just call
+/// [`fast_path_store_for_predicate`], which combines the two).
+#[inline]
+pub fn predicate_fast_path_allowed(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    predicate: &Ref,
+) -> Result<bool> {
+    let pred_sid = normalize_pred_sid(store, predicate)?;
+    Ok(matches!(
+        cursor_fast_path_for_predicate(ctx, &pred_sid),
+        PredicateFastPath::Allow
+    ))
+}
+
+/// Convenience preamble for fast paths that scan **persisted index rows only**:
+/// runs [`predicate_fast_path_allowed`] against the context's binary store, then
+/// returns the policy-cleared, at-HEAD store ([`fast_path_store_policy_cleared`])
+/// to scan — or `None` to decline.
+///
+/// Overlay-aware cursor fast paths (which tolerate novelty / `to_t < max_t`)
+/// must NOT use this; they call [`predicate_fast_path_allowed`] directly and
+/// keep their own store handling.
+#[inline]
+pub fn fast_path_store_for_predicate<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    predicate: &Ref,
+) -> Result<Option<&'a Arc<BinaryIndexStore>>> {
+    if let Some(store) = ctx.binary_store.as_ref() {
+        if !predicate_fast_path_allowed(ctx, store, predicate)? {
+            return Ok(None);
+        }
+    }
+    Ok(fast_path_store_policy_cleared(ctx))
+}
+
+// ---------------------------------------------------------------------------
+// 11. Generic fast-path operator
+// ---------------------------------------------------------------------------
+
+/// Generic fast-path operator that eliminates per-operator boilerplate.
+///
+/// Each fast-path file provides a constructor function that captures domain-specific
+/// data into a closure. `FastPathOperator` handles all lifecycle plumbing:
+/// state transitions, fallback delegation, and single-batch yielding.
+///
+/// The `compute` closure is called once during `open()`:
+/// - `Ok(Some(batch))` → fast path succeeded; that batch is yielded then exhausted
+/// - `Ok(None)` → fall through to the fallback operator tree
+/// - `Err(_)` → propagated as-is
+// Boxed closure that computes the fast-path result during `open()`.
+type FastPathCompute =
+    Box<dyn FnOnce(&ExecutionContext<'_>) -> Result<Option<Batch>> + Send + Sync>;
+
+pub struct FastPathOperator {
+    schema: FastPathSchema,
+    state: OperatorState,
+    fallback: Option<BoxedOperator>,
+    compute: Option<FastPathCompute>,
+    label: &'static str,
+}
+
+enum FastPathSchema {
+    Single(VarId),
+    Multi(Arc<[VarId]>),
+}
+
+impl FastPathOperator {
+    /// Create a fast-path operator with a single output variable.
+    pub fn new(
+        out_var: VarId,
+        compute: impl FnOnce(&ExecutionContext<'_>) -> Result<Option<Batch>> + Send + Sync + 'static,
+        fallback: Option<BoxedOperator>,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            schema: FastPathSchema::Single(out_var),
+            state: OperatorState::Created,
+            fallback,
+            compute: Some(Box::new(compute)),
+            label,
+        }
+    }
+
+    /// Create a fast-path operator with a multi-variable output schema.
+    pub fn with_schema(
+        schema: Arc<[VarId]>,
+        compute: impl FnOnce(&ExecutionContext<'_>) -> Result<Option<Batch>> + Send + Sync + 'static,
+        fallback: Option<BoxedOperator>,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            schema: FastPathSchema::Multi(schema),
+            state: OperatorState::Created,
+            fallback,
+            compute: Some(Box::new(compute)),
+            label,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for FastPathOperator {
+    fn op_name(&self) -> String {
+        format!("FastPath:{}", self.label)
+    }
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
+    fn schema(&self) -> &[VarId] {
+        match &self.schema {
+            FastPathSchema::Single(v) => std::slice::from_ref(v),
+            FastPathSchema::Multi(v) => v,
+        }
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        if !self.state.can_open() {
+            if self.state.is_closed() {
+                return Err(QueryError::OperatorClosed);
+            }
+            return Err(QueryError::OperatorAlreadyOpened);
+        }
+
+        if let Some(compute) = self.compute.take() {
+            if let Some(batch) = compute(ctx)? {
+                // Kept for existing span-capture consumers (it_minmax_fast_path_fired
+                // asserts on this message + `label`).
+                tracing::debug!(label = self.label, "fast path produced result");
+                // EXPLAIN seed (PR-1): structured runtime Proceed on the
+                // fluree::fastpath target.
+                crate::fast_path_outcome::stamp_fast_path(
+                    self.label,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+                self.state = OperatorState::Open;
+                self.fallback = Some(Box::new(PrecomputedSingleBatchOperator::new(batch)));
+                return Ok(());
+            }
+            tracing::debug!(label = self.label, "fast path declined; running fallback");
+            // EXPLAIN seed (PR-1): structured runtime Fallback(GateDeclined).
+            crate::fast_path_outcome::stamp_fast_path(
+                self.label,
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                ),
+            );
+        }
+
+        let Some(fallback) = &mut self.fallback else {
+            return Err(QueryError::Internal(format!(
+                "{} fast-path unavailable and no fallback provided",
+                self.label
+            )));
+        };
+        fallback.open(ctx).await?;
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if !self.state.can_next() {
+            if self.state == OperatorState::Created {
+                return Err(QueryError::OperatorNotOpened);
+            }
+            return Ok(None);
+        }
+
+        let Some(fallback) = &mut self.fallback else {
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        };
+        let b = fallback.next_batch(ctx).await?;
+        if b.is_none() {
+            self.state = OperatorState::Exhausted;
+        }
+        Ok(b)
+    }
+
+    fn close(&mut self) {
+        if let Some(fb) = &mut self.fallback {
+            fb.close();
+        }
+        self.state = OperatorState::Closed;
+    }
+}
+
+/// The current group of each branch in an N-way union (min) merge: every key
+/// in any stream, with the sum of its counts across the streams that carry it
+/// (bag semantics). An exhausted branch drops out; the merge ends when all have.
+///
+/// Scalar columns for the reason given on [`InnerMergeHeads`].
+pub(crate) struct UnionMergeHeads {
+    keys: Vec<u64>,
+    counts: Vec<u64>,
+    live: Vec<bool>,
+    key: u64,
+    count_sum: u64,
+}
+
+impl UnionMergeHeads {
+    /// Read each stream's first group.
+    pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Self> {
+        let mut heads = Self {
+            keys: vec![0; streams.len()],
+            counts: vec![0; streams.len()],
+            live: vec![true; streams.len()],
+            key: 0,
+            count_sum: 0,
+        };
+        for (i, stream) in streams.iter_mut().enumerate() {
+            heads.step(i, stream)?;
+        }
+        Ok(heads)
+    }
+
+    /// Take the smallest key across the live streams, consuming its group from
+    /// each stream on it. `false` when every stream is exhausted; otherwise
+    /// [`key`](Self::key) and [`count_sum`](Self::count_sum) describe it.
+    #[inline(always)]
+    pub(crate) fn next<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        let mut min_key = u64::MAX;
+        let mut any_live = false;
+        for (i, &key) in self.keys.iter().enumerate() {
+            if self.live[i] {
+                any_live = true;
+                min_key = min_key.min(key);
+            }
+        }
+        if !any_live {
+            return Ok(false);
+        }
+        let mut count_sum = 0u64;
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if self.live[i] && self.keys[i] == min_key {
+                count_sum = count_sum.saturating_add(self.counts[i]);
+                self.step(i, stream)?;
+            }
+        }
+        self.key = min_key;
+        self.count_sum = count_sum;
+        Ok(true)
+    }
+
+    /// The key taken by the last [`next`](Self::next).
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// Sum of that key's counts across the streams that carried it.
+    #[inline(always)]
+    pub(crate) fn count_sum(&self) -> u64 {
+        self.count_sum
+    }
+
+    #[inline(always)]
+    fn step<S: GroupStream>(&mut self, i: usize, stream: &mut S) -> Result<()> {
+        match stream.next_group()? {
+            Some((key, count)) => {
+                self.keys[i] = key;
+                self.counts[i] = count;
+            }
+            None => self.live[i] = false,
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::Flake;
+
+    /// A fast path declines on its own failures, and raises an error the
+    /// general pipeline would meet too: a cancellation, an exhausted budget
+    /// or fuel, a residency miss.
+    #[test]
+    fn a_fast_path_declines_only_on_its_own_failures() {
+        assert_eq!(answer_or_decline(Ok(3)).unwrap(), Some(3));
+        let declined = answer_or_decline::<u8>(Err(QueryError::Internal("not values".into())));
+        assert_eq!(declined.unwrap(), None);
+        let raised = [
+            QueryError::Cancelled {
+                reason: fluree_db_core::QueryCancellationReason::Cancelled,
+            },
+            QueryError::MemoryBudgetExceeded {
+                used_bytes: 2,
+                budget_bytes: 1,
+            },
+            QueryError::from_io(
+                "vector read",
+                fluree_db_core::storage::residency::NeedFetch::new(
+                    fluree_db_core::ContentId::new(
+                        fluree_db_core::ContentKind::IndexLeaf,
+                        b"missing leaf",
+                    ),
+                    fluree_db_core::storage::residency::FetchKind::IndexLeaf,
+                )
+                .into_io_error(),
+            ),
+        ];
+        for e in raised {
+            let shown = e.to_string();
+            assert!(answer_or_decline::<u8>(Err(e)).is_err(), "{shown}");
+        }
+    }
+
+    /// A `GroupStream` over a fixed ascending list.
+    struct VecGroups(VecDeque<(u64, u64)>);
+
+    impl VecGroups {
+        fn new(groups: &[(u64, u64)]) -> Self {
+            Self(groups.iter().copied().collect())
+        }
+    }
+
+    impl GroupStream for VecGroups {
+        fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+            Ok(self.0.pop_front())
+        }
+    }
+
+    /// `(key, Π count)` for every key present in all streams, via the helper.
+    fn inner_merge(streams: &[&[(u64, u64)]]) -> Vec<(u64, u128)> {
+        let mut streams: Vec<VecGroups> = streams.iter().map(|g| VecGroups::new(g)).collect();
+        let Some(mut heads) = InnerMergeHeads::prime(&mut streams).unwrap() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        loop {
+            if heads.aligned() {
+                out.push((heads.key(), heads.count_product()));
+            }
+            if !heads.advance(&mut streams).unwrap() {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn inner_merge_heads_intersects_and_multiplies_counts() {
+        // Counts differ per stream, so a sum, a single column, or a dropped
+        // stream cannot produce these products.
+        let a: &[(u64, u64)] = &[(1, 2), (3, 3), (4, 1), (7, 5), (9, 2)];
+        let b: &[(u64, u64)] = &[(2, 9), (3, 4), (7, 2), (8, 1), (9, 3), (12, 1)];
+        let c: &[(u64, u64)] = &[(3, 2), (5, 1), (7, 7), (9, 1)];
+
+        assert_eq!(inner_merge(&[a, b]), vec![(3, 12), (7, 10), (9, 6)]);
+        assert_eq!(inner_merge(&[a, b, c]), vec![(3, 24), (7, 70), (9, 6)]);
+        // One stream: every group is a match.
+        assert_eq!(inner_merge(&[c]), vec![(3, 2), (5, 1), (7, 7), (9, 1)]);
+        // A key at 0 and at u64::MAX are ordinary keys, not sentinels.
+        let lo_hi: &[(u64, u64)] = &[(0, 2), (u64::MAX, 3)];
+        assert_eq!(inner_merge(&[lo_hi, lo_hi]), vec![(0, 4), (u64::MAX, 9)]);
+    }
+
+    #[test]
+    fn union_merge_heads_sums_counts_per_key_until_all_streams_end() {
+        let a: &[(u64, u64)] = &[(1, 2), (3, 3), (9, 1)];
+        let b: &[(u64, u64)] = &[(3, 4), (4, 5), (u64::MAX, 6)];
+        let empty: &[(u64, u64)] = &[];
+        let mut streams = vec![VecGroups::new(a), VecGroups::new(empty), VecGroups::new(b)];
+        let mut heads = UnionMergeHeads::prime(&mut streams).unwrap();
+        let mut out = Vec::new();
+        while heads.next(&mut streams).unwrap() {
+            out.push((heads.key(), heads.count_sum()));
+        }
+        // 3 is in both branches (3 + 4); `a` ends at 9 while `b` runs on, and
+        // u64::MAX is a real key, not the exhaustion marker.
+        assert_eq!(out, vec![(1, 2), (3, 7), (4, 5), (9, 1), (u64::MAX, 6)]);
+        assert!(!heads.next(&mut streams).unwrap());
+
+        let mut none: Vec<VecGroups> = Vec::new();
+        let mut heads = UnionMergeHeads::prime(&mut none).unwrap();
+        assert!(!heads.next(&mut none).unwrap());
+    }
+
+    #[test]
+    fn inner_merge_heads_ends_when_any_stream_runs_out() {
+        let a: &[(u64, u64)] = &[(1, 1), (2, 1), (3, 1)];
+        let empty: &[(u64, u64)] = &[];
+        let disjoint: &[(u64, u64)] = &[(10, 1), (11, 1)];
+        let short: &[(u64, u64)] = &[(2, 4)];
+
+        assert!(inner_merge(&[a, empty]).is_empty());
+        assert!(inner_merge(&[empty, a]).is_empty());
+        assert!(inner_merge(&[a, disjoint]).is_empty());
+        // The match on the short stream's last group is still reported.
+        assert_eq!(inner_merge(&[a, short]), vec![(2, 4)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "InnerMergeHeads needs at least one stream")]
+    fn inner_merge_heads_rejects_zero_streams() {
+        inner_merge(&[]);
+    }
+
+    /// `cursor_fast_path_for_predicate` must: run unfiltered with no policy;
+    /// decline for a covered predicate under a non-root policy; keep the fast
+    /// path for an uncovered predicate when the default is allow; and short to
+    /// Empty for an uncovered predicate when the default is deny.
+    #[test]
+    fn cursor_fast_path_for_predicate_uses_coverage() {
+        use crate::policy::QueryPolicyEnforcer;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_policy::{PolicyContext, PolicySet, PolicyWrapper, PropertyPolicyEntry};
+        use std::collections::HashMap;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ssn = Sid::new(100, "ssn"); // covered by the view policy
+        let name = Sid::new(100, "name"); // uncovered
+
+        // No policy at all => always Allow.
+        let ctx_none = ExecutionContext::new(&snapshot, &vars);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_none, &ssn),
+            PredicateFastPath::Allow
+        );
+
+        // Build a non-root view policy that only covers `ssn` (a single
+        // by_property entry), parameterized by default_allow.
+        let make_ctx = |default_allow: bool| {
+            let mut view = PolicySet::default();
+            view.by_property
+                .entry(ssn.clone())
+                .or_default()
+                .push(PropertyPolicyEntry {
+                    idx: 0,
+                    class_check_needed: false,
+                });
+            let wrapper = PolicyWrapper::new(
+                view,
+                PolicySet::default(),
+                false, // root
+                default_allow,
+                HashMap::new(),
+            );
+            let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+                wrapper, None,
+            ))));
+            // SAFETY: snapshot/vars outlive the returned ctx within each assert.
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer)
+        };
+
+        // Covered predicate => decline regardless of default_allow.
+        let ctx_allow = make_ctx(true);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, &ssn),
+            PredicateFastPath::Decline
+        );
+        // Uncovered predicate + default-allow => keep the fast path.
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, &name),
+            PredicateFastPath::Allow
+        );
+        // Uncovered predicate + default-deny => short-circuit to Empty.
+        let ctx_deny = make_ctx(false);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_deny, &name),
+            PredicateFastPath::Empty
+        );
+    }
+
+    /// `predicate_walk_bounds` must bracket every possible flake of the
+    /// predicate in both predicate-leading orders: `first` strictly below all
+    /// of them (it is an exclusive bound), `rhs` at-or-above all of them
+    /// (inclusive), and both bounds strictly inside the neighboring
+    /// predicates' ranges so no foreign flake is required — only allowed — by
+    /// the range. Callback-side predicate filtering removes any extras.
+    #[test]
+    fn predicate_walk_bounds_bracket_predicate() {
+        let pred = Sid::new(5, "knows");
+        let (first, rhs) = predicate_walk_bounds(&pred);
+
+        let flake = |p: &Sid, s: u16, v: i64, t: i64| {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                p.clone(),
+                FlakeValue::Long(v),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        };
+        // Extremes a real flake of `pred` can plausibly take (plus a
+        // ref-valued minimum-class object).
+        let lowest = Flake::new(
+            Sid::new(0, "a"),
+            pred.clone(),
+            FlakeValue::Ref(Sid::new(0, "a")),
+            Sid::new(0, ""),
+            1,
+            false,
+            None,
+        );
+        let highest = flake(&pred, u16::MAX - 1, i64::MAX, i64::MAX);
+        let pred_below = flake(&Sid::new(5, "kno"), 9, 9, 9);
+        let pred_above = flake(&Sid::new(5, "knowsX"), 0, 0, 1);
+
+        for index in [IndexType::Psot, IndexType::Post] {
+            let cmp = index.comparator();
+            for real in [&lowest, &highest] {
+                assert_eq!(
+                    cmp(&first, real),
+                    std::cmp::Ordering::Less,
+                    "{index:?}: first must sort strictly below every {pred:?} flake"
+                );
+                assert_ne!(
+                    cmp(real, &rhs),
+                    std::cmp::Ordering::Greater,
+                    "{index:?}: rhs must sort at-or-above every {pred:?} flake"
+                );
+            }
+            assert_eq!(
+                cmp(&pred_below, &first),
+                std::cmp::Ordering::Less,
+                "{index:?}: lower predicates stay below first"
+            );
+            assert_eq!(
+                cmp(&rhs, &pred_above),
+                std::cmp::Ordering::Less,
+                "{index:?}: rhs stays below higher predicates"
+            );
+        }
+    }
+
+    /// A graph with no branch answers a probe with nothing only when no
+    /// overlay merge is in play; with ops to merge, that answer would drop
+    /// them, so the lookup refuses.
+    #[test]
+    fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
+        let store = BinaryIndexStore::empty(std::env::temp_dir());
+        for order in [RunSortOrder::Psot, RunSortOrder::Post, RunSortOrder::Spot] {
+            assert!(
+                matches!(branch_or_none(&store, 3, order, false), Ok(None)),
+                "{order:?}: no merge, no branch: nothing to read"
+            );
+            match branch_or_none(&store, 3, order, true) {
+                Err(QueryError::Internal(msg)) => {
+                    assert!(msg.contains(&format!("no {order:?} branch")), "{msg}");
+                }
+                Err(other) => panic!("{order:?}: wrong error: {other}"),
+                Ok(_) => panic!("{order:?}: a merge over a graph with no branch must refuse"),
+            }
+        }
+    }
+
+    /// A predicate the index doesn't hold answers a probe with nothing only
+    /// while none of its ops is merged; with one, that answer would drop it,
+    /// so the lookup refuses. The merge check isn't asked for a predicate the
+    /// index holds.
+    #[test]
+    fn p_id_or_none_refuses_a_merge_of_a_predicate_the_index_doesnt_hold() {
+        let store = BinaryIndexStore::empty(std::env::temp_dir());
+        let pred = Sid::new(100, "novelty-only");
+        assert!(
+            matches!(p_id_or_none(&store, &pred, || Ok(false)), Ok(None)),
+            "no ops of it merged: nothing to read"
+        );
+        match p_id_or_none(&store, &pred, || Ok(true)) {
+            Err(QueryError::Internal(msg)) => {
+                assert!(msg.contains("the index doesn't hold"), "{msg}");
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("a merge of a predicate the index doesn't hold must refuse"),
+        }
+        let refused = p_id_or_none(&store, &pred, || {
+            Err(QueryError::Internal("merge check failed".into()))
+        });
+        assert!(refused.is_err(), "a failed merge check fails the lookup");
+    }
+
+    /// Eager callers with an overlay are owed decoded bindings, so only a
+    /// lane that decodes them is admitted; on an overlay-free graph every
+    /// lane is `Clean`.
+    #[test]
+    fn probe_lane_admission_admits_eager_only_for_decoding_lanes() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let mut novelty = Novelty::new(0);
+        let flake = Flake {
+            g: None,
+            s: Sid::new(100, "s"),
+            p: pred.clone(),
+            o: FlakeValue::Ref(Sid::new(100, "o")),
+            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t: 1,
+            op: true,
+            m: None,
+        };
+        novelty
+            .apply_commit(vec![flake], 1, &Default::default())
+            .unwrap();
+        let admit =
+            |ctx: &ExecutionContext<'_>, output| probe_lane_admission(ctx, &[&pred], output);
+
+        let plain = ExecutionContext::with_overlay(&snapshot, &vars, &novelty);
+        assert!(admit(&plain, LaneOutput::Encoded).is_none());
+
+        let eager =
+            ExecutionContext::with_overlay(&snapshot, &vars, &novelty).with_eager_materialization();
+        assert!(matches!(
+            admit(&eager, LaneOutput::Encoded),
+            Some(ProbeLanePlan::Decline)
+        ));
+        assert!(admit(&eager, LaneOutput::DecodesForEager).is_none());
+
+        let clean = ExecutionContext::new(&snapshot, &vars).with_eager_materialization();
+        for output in [LaneOutput::Encoded, LaneOutput::DecodesForEager] {
+            assert!(matches!(admit(&clean, output), Some(ProbeLanePlan::Clean)));
+        }
+    }
+
+    /// Translated ops outlive an execution only on a reasoning
+    /// materialization, for the contexts reading its overlay, and only
+    /// within its reasoning memory budget.
+    #[test]
+    fn only_a_materialization_keeps_ops_across_queries() {
+        use crate::reasoning_ops::ReasoningOpsHandle;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+        use fluree_db_reasoner::DerivedFactsOverlay;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let novelty_with = |object: &str| {
+            let mut novelty = Novelty::new(0);
+            let flake = Flake {
+                g: None,
+                s: Sid::new(100, "s"),
+                p: pred.clone(),
+                o: FlakeValue::Ref(Sid::new(100, object)),
+                dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                t: 1,
+                op: true,
+                m: None,
+            };
+            novelty
+                .apply_commit(vec![flake], 1, &Default::default())
+                .unwrap();
+            novelty
+        };
+        let overlay = novelty_with("o");
+        let other_overlay = novelty_with("o2");
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        fn ctx<'a>(
+            snapshot: &'a LedgerSnapshot,
+            vars: &'a VarRegistry,
+            store: &Arc<BinaryIndexStore>,
+            overlay: &'a Novelty,
+            ops: Option<&ReasoningOpsHandle>,
+        ) -> ExecutionContext<'a> {
+            let ctx = ExecutionContext::with_time_and_overlay(snapshot, vars, 1, None, overlay)
+                .with_binary_store(Arc::clone(store), 0)
+                .with_eager_materialization()
+                .with_reasoning_active(true);
+            match ops {
+                Some(ops) => ctx.with_reasoning_ops(ops.clone()),
+                None => ctx,
+            }
+        }
+        let ctx = |overlay, ops| ctx(&snapshot, &vars, &store, overlay, ops);
+        let kept_by_a_later_query = |first: ExecutionContext<'_>, later: ExecutionContext<'_>| {
+            let ops = cached_overlay_ops(&first, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+            // An empty store can't translate the fact; a failed translation
+            // is kept like any other, and an empty one never is.
+            assert!(ops.is_none_or(|ops| !ops.is_empty()), "never empty");
+            overlay_ops_cached(&later, &store, 0, RunSortOrder::Psot, &pred)
+        };
+        let attach = |limit| {
+            ReasoningOpsHandle::attach(
+                &DerivedFactsOverlay::empty(),
+                limit,
+                fluree_db_core::OverlayProvider::content_version(&overlay),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            !kept_by_a_later_query(ctx(&overlay, None), ctx(&overlay, None)),
+            "a reasoning query without a materialization keeps nothing"
+        );
+        let ops = attach(usize::MAX);
+        assert!(
+            kept_by_a_later_query(ctx(&overlay, Some(&ops)), ctx(&overlay, Some(&ops))),
+            "queries reading one materialization share its translations"
+        );
+        let fresh = attach(usize::MAX);
+        assert!(
+            !kept_by_a_later_query(
+                ctx(&other_overlay, Some(&fresh)),
+                ctx(&other_overlay, Some(&fresh))
+            ),
+            "a context reading another overlay leaves the materialization alone"
+        );
+        let tight = attach(1);
+        let tight_ctx = ctx(&overlay, Some(&tight));
+        cached_overlay_ops(&tight_ctx, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+        assert!(
+            !overlay_ops_cached(
+                &ctx(&overlay, Some(&tight)),
+                &store,
+                0,
+                RunSortOrder::Psot,
+                &pred
+            ),
+            "a translation past the reasoning memory budget isn't kept"
+        );
+    }
+}

@@ -1,0 +1,288 @@
+# Cookbook: Branching and Merging
+
+Fluree lets you fork a ledger into independent branches, each with its own commit history. Experiment freely, then merge changes back when ready. Think of it like `git branch` for your data.
+
+## Quick start
+
+```bash
+# Create a branch from main
+fluree branch create experiment
+
+# Switch to the branch
+fluree use mydb:experiment
+
+# Make changes (only on the branch)
+fluree insert '...'
+fluree update '...'
+
+# See both branches
+fluree branch list
+
+# Merge back into main
+fluree branch merge experiment
+
+# Clean up
+fluree branch drop experiment
+```
+
+## Core concepts
+
+- **Branches are isolated** — Transactions on one branch are invisible to others
+- **Branches are cheap** — Creating a branch doesn't copy data; it creates a new commit pointer
+- **Merge takes two shapes** — If the target's head is on the source's line of commits, the merge fast-forwards and the source's commits become the target's line. Otherwise the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
+- **Merge runs in any direction.** A branch merges into the one it came from, into one created from it, or into a branch that shares an earlier commit. Use `--target` to name where the changes go
+- **Source branch survives merge** — After merging, the branch can continue receiving transactions
+
+## Patterns
+
+### Safe experimentation
+
+Try a risky change without affecting production:
+
+```bash
+fluree branch create try-new-schema
+
+fluree use mydb:try-new-schema
+
+# Restructure data
+fluree update 'PREFIX ex: <http://example.org/>
+DELETE { ?doc ex:category ?cat }
+INSERT { ?doc ex:tags ?cat }
+WHERE  { ?doc ex:category ?cat }'
+
+# Verify the change looks right
+fluree query 'SELECT ?doc ?tag WHERE { ?doc ex:tags ?tag }'
+
+# If it works, merge back
+fluree branch merge try-new-schema
+fluree branch drop try-new-schema
+
+# If it doesn't work, just drop the branch — main is untouched
+fluree branch drop try-new-schema
+```
+
+### Review before merge
+
+Use branches as a staging area for data changes:
+
+```bash
+# Data engineer creates a branch for the weekly import
+fluree branch create weekly-import
+
+fluree use mydb:weekly-import
+
+# Import new data
+fluree insert -f new-data.ttl
+
+# Verify: count new entities
+fluree query 'SELECT (COUNT(?s) AS ?count) WHERE { ?s a ex:NewRecord }'
+
+# Verify: no duplicates
+fluree query 'SELECT ?id (COUNT(?s) AS ?count) WHERE {
+  ?s ex:externalId ?id
+} GROUP BY ?id HAVING(?count > 1)'
+
+# Looks good — merge into main
+fluree branch merge weekly-import
+```
+
+### Multi-environment workflow
+
+Use branches to model dev/staging/prod environments within a single ledger:
+
+```bash
+# Create environment branches
+fluree branch create staging
+fluree branch create dev --from staging
+
+# Developers work on dev
+fluree use mydb:dev
+fluree insert '...'
+
+# Promote to staging via merge
+fluree branch merge dev --target staging
+
+# Promote to main (production) after testing
+fluree use mydb:staging
+# ... run validation queries ...
+fluree branch merge staging
+```
+
+### Feature branches
+
+Multiple people can work on different features simultaneously:
+
+```bash
+# Team member A: add product categories
+fluree branch create feature-categories
+
+# Team member B: update pricing
+fluree branch create feature-pricing
+
+# Each works independently on their branch
+# ...
+
+# Merge sequentially — first one is a fast-forward
+fluree branch merge feature-categories
+
+# Second one may need rebase if main advanced
+fluree branch rebase feature-pricing
+fluree branch merge feature-pricing
+```
+
+### Rebase to catch up with upstream
+
+When main has advanced since you branched:
+
+```bash
+# Main has new commits that your branch doesn't have
+fluree branch rebase my-branch
+```
+
+This replays your branch's commits on top of main's current HEAD. Conflict strategies:
+
+| Strategy | Behavior |
+|---|---|
+| `take-both` (default) | Keep both the source and branch changes |
+| `abort` | Stop if any conflicts — let you inspect |
+| `take-source` | Source (main) wins on conflict |
+| `take-branch` | Branch wins on conflict |
+| `skip` | Skip conflicting commits entirely |
+
+```bash
+# Rebase with abort on conflict for manual review
+fluree branch rebase my-branch --strategy abort
+
+# Rebase where main always wins
+fluree branch rebase my-branch --strategy take-source
+```
+
+### Fast-forward indexing and transaction ordering
+
+A fast-forward advances the target to the source's commit head while retaining the target's own index. It does not copy or adopt the source's index, because that index's reserved graph names belong to the source branch. Queries replay commits after the target's indexed point until indexing catches up; a target with no index replays from genesis. For a large merged range, run `fluree index mydb:main` to catch up explicitly.
+
+For embedded applications calling `Fluree::merge_branch` directly with a Raft nameservice, the fast-forward ref update goes through consensus but bypasses the per-branch work queue. It can overtake transactions already submitted to that queue. The CAS checks the target head observed during merge preparation; if another writer advances it first, the merge returns `BranchConflict` (409) and should be retried so it recomputes against the new head. Repeating an already-completed fast-forward succeeds without copying commits again.
+
+The server's Raft merge path uses `QueuedTransactor::merge`, which queues the merge alongside transactions and prepares it when the worker reaches it. That path preserves queue ordering and was not affected by the direct API's empty-queue publish failure.
+
+### A target that adopted another branch's index
+
+Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. The target's config still governs it, and a query or write names its system graphs as `config` and `txn-meta` or by the target's own IRIs, not by the source's labels; its next index build relabels both graphs with the target's own IRIs. `fluree reindex mydb:main` relabels them at once.
+
+### Compare branches
+
+Preview what a merge would do before doing it:
+
+```bash
+# Ahead/behind commits, conflicts, whether the merge would go through
+fluree branch diff my-branch --target main
+
+# With the values on each side of every conflict
+fluree branch diff my-branch --target main --conflict-details
+```
+
+The preview stages the merge's resolved change set on the target and validates it against the target's SHACL shapes and uniqueness constraints and re-checks its config groups, through the same code path the merge uses (a fast-forward only when the target's config enables SHACL or uniqueness, or the adopted commits carry config settings, as the merge does). `mergeable: yes` means neither the strategy nor the target's shapes will reject the merge; otherwise the `validation:` line carries the report the merge would fail with. Other conditions still apply at commit time, such as novelty backpressure on a ledger due for indexing. Pass `--no-validate` for a cheaper count-only preview.
+
+See what's different between two branches:
+
+```bash
+# Query branch for entities not in main. The SERVICE endpoint must be in the
+# query's dataset, so name both branches.
+fluree query --ledger mydb:my-branch 'SELECT ?s ?p ?o
+FROM <mydb:my-branch>
+FROM NAMED <mydb:main>
+WHERE {
+  ?s ?p ?o .
+  FILTER NOT EXISTS {
+    SERVICE <fluree:ledger:mydb:main> { ?s ?p ?o }
+  }
+}'
+```
+
+### Time travel across branches
+
+Each branch has its own transaction history. Query any branch at any point in time:
+
+```bash
+# Branch state after its 3rd transaction
+fluree query --ledger mydb:experiment --at 3 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
+```
+
+Each branch numbers its transactions on its own clock, starting from the point where it forked, so `--at 3` on `experiment` and `--at 3` on `main` are unrelated states. A merge lands on the target as a single commit at the target's next transaction number, carrying the whole resolved change from the source, or, for a fast-forward, the source's commits simply become the target's line with their `t` values already on the target's clock. Reads below that number return what the target held at the time: merging never rewrites a branch's earlier history, and a branch's state at any `--at` is the fold of its own line of commits, not of the branches merged into it.
+
+### Branch at a historical point
+
+By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier point on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
+
+```bash
+# Start a branch at transaction 5 on main
+fluree branch create rewind --at t:5
+
+# Or use a hex-digest prefix of the commit
+fluree branch create rewind --at 3dd028a7
+
+# Or start from the data as of a point in time
+fluree branch create q2-close --at time:2026-06-30T23:59:59Z
+```
+
+`--at` takes the same spellings as `fluree query --at`, and the branch starts at the commit a query at that point would read: `time:` (alias `iso:`) resolves against commit event time, `recorded:` against the wall-clock time commits were recorded, and `latest` is the HEAD. A time before the source's first commit is rejected.
+
+The commit must be reachable from the source branch's HEAD (branching from an unrelated branch's commit is rejected). The new branch starts with no index and replays from genesis on first query — acceptable for small/medium histories; if replay cost matters, transact a small no-op to force an index rebuild.
+
+Full CIDs are also accepted (`--at fluree:commit:sha256:...`).
+
+## Branch lifecycle
+
+```
+create ──→ transact ──→ rebase (if needed) ──→ merge ──→ drop
+              ↑                                  │
+              └──────── continue working ←───────┘
+```
+
+After merging, the branch is still alive. You can:
+- Continue transacting on it (for ongoing work)
+- Merge again later (only new commits since last merge are copied)
+- Drop it when done
+
+## HTTP API
+
+```bash
+# Create a branch
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "dev", "source": "main"}'
+
+# Branch at a historical commit
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "rewind", "at": "t:5"}'
+
+# Branch from the data as of a point in time
+curl -X POST http://localhost:8090/v1/fluree/branch \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "branch": "q2-close", "at": "time:2026-06-30T23:59:59Z"}'
+
+# Query a specific branch
+curl -X POST 'http://localhost:8090/v1/fluree/query?ledger=mydb:dev' \
+  -H "Content-Type: application/sparql-query" \
+  -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
+
+# Merge
+curl -X POST http://localhost:8090/v1/fluree/merge \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "source": "dev"}'
+```
+
+## Best practices
+
+1. **Name branches descriptively** — `weekly-import-2025-04`, `feature-product-tags`, not `test1`
+2. **Keep branches short-lived** — Long-lived branches diverge more, making rebase harder
+3. **Merge frequently** — Small, frequent merges are easier than large, infrequent ones
+4. **Test before merging** — Run validation queries on the branch before promoting
+5. **Drop after merging** — Clean up branches you're done with
+
+## Related documentation
+
+- [CLI: branch](../cli/branch.md) — Full command reference
+- [Ledgers and Nameservice](../concepts/ledgers-and-nameservice.md) — Branch architecture
+- [Time Travel](../concepts/time-travel.md) — Temporal queries on branches

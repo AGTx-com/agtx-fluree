@@ -1,0 +1,321 @@
+//! Operator trait and lifecycle types for query execution.
+//!
+//! Operators form a tree that produces batches of results through the
+//! `open/next_batch/close` lifecycle pattern.
+
+pub(crate) mod flush;
+pub mod inline;
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::error::Result;
+use crate::sort::SortSpec;
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use std::sync::Arc;
+
+/// One nonempty group returned by a grouped count drain.
+#[derive(Debug)]
+pub struct CountGroup {
+    /// Representative bindings in the requested group-variable order.
+    pub keys: Vec<Binding>,
+    /// Number of remaining output rows in this group.
+    pub count: u64,
+}
+
+/// What one row of a triple pattern's scan needs beside its bindings to name
+/// the fact it matched. Storage's fact identity is one fact per value
+/// and list position. The bindings carry neither the term a constant object
+/// matched (a constant can match terms of several datatypes: `1` matches
+/// `1` and `1.0e0`) nor the list position, so two facts can bind one row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowFact {
+    /// The matched object, when the pattern's object is a constant literal.
+    pub object: Option<Binding>,
+    /// The list position, when the fact is a list item.
+    pub list_index: Option<u32>,
+}
+
+/// Query execution operator
+///
+/// Operators follow a lifecycle pattern for resource control:
+/// 1. `open()` - Initialize state, allocate buffers
+/// 2. `next_batch()` - Pull batches until exhausted (returns None)
+/// 3. `close()` - Release resources
+///
+/// # Schema Contract
+///
+/// - `schema()` returns the output variables, fixed at construction
+/// - All batches from `next_batch()` have columns in schema order
+/// - Schema contains no duplicate VarIds
+///
+/// Call `open`, then loop on `next_batch` until `None`, then `close`.
+#[async_trait]
+pub trait Operator: Send + Sync {
+    /// Output schema - which variables this operator produces
+    ///
+    /// Fixed at construction time (does not change across batches).
+    /// Batch columns are in this order.
+    fn schema(&self) -> &[VarId];
+
+    /// Initialize operator state
+    ///
+    /// Called once before `next_batch()`. Allocates buffers, opens
+    /// child operators, etc.
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()>;
+
+    /// Pull next batch of results
+    ///
+    /// Returns `Ok(Some(batch))` with results, or `Ok(None)` when exhausted.
+    /// Batch columns are ordered according to `schema()`.
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>>;
+
+    /// Release resources
+    ///
+    /// Called when operator is no longer needed. Closes child operators,
+    /// releases buffers, etc.
+    fn close(&mut self);
+
+    /// Estimated cardinality (for planning/EXPLAIN)
+    ///
+    /// Returns estimated number of rows this operator will produce.
+    /// Used by the planner for cost estimation and by EXPLAIN for display.
+    fn estimated_rows(&self) -> Option<usize> {
+        None
+    }
+
+    /// True only for a source guaranteed to emit exactly one empty solution.
+    /// This is an algebraic identity, not an estimated row count. Operators with
+    /// zero columns may still emit zero or many rows and must keep the default.
+    fn is_identity_seed(&self) -> bool {
+        false
+    }
+
+    /// Schema variables bound in every row this operator emits, when it can see
+    /// its rows. A plan seeded by this operator holds a BIND or FILTER reading
+    /// any other schema variable until the triples that could still bind it
+    /// have run. `None` plans every schema variable as bound.
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        None
+    }
+
+    /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
+    /// The caller must prove that its consumer cannot observe input duplicates.
+    /// A successful extraction leaves the wrapper closed; discard it immediately.
+    /// Only DISTINCT implements this: do not forward through other operators,
+    /// since a LIMIT, projection or subquery can make deduplication significant.
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        None
+    }
+
+    /// Consume all remaining output rows to exhaustion and return the total count.
+    ///
+    /// # Contract
+    ///
+    /// - **Exhaustion**: Must consume the operator fully. After returning `Some(n)`,
+    ///   the operator is exhausted — `next_batch()` must return `None`.
+    /// - **Semantic fidelity**: The count must equal the number of rows the normal
+    ///   `next_batch()` loop would have produced. All operator semantics (filtering,
+    ///   Unbound/Poisoned handling, SPARQL substitution) must be preserved.
+    /// - **Fallback**: Return `Ok(None)` when count-only mode cannot guarantee the
+    ///   above — the caller falls back to the normal `next_batch()` drain loop.
+    ///
+    /// Operators that implement this avoid materializing output batches, reducing
+    /// allocation and cloning overhead when the downstream consumer only needs a count.
+    async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Count remaining rows by `group_vars`, using ordinary GROUP BY equality.
+    /// A successful drain exhausts this operator and returns each nonempty group
+    /// exactly once. Empty input returns an empty vector. Returning `None` must
+    /// leave the input untouched so the consumer can aggregate ordinary rows.
+    /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    ///
+    /// `bound_vars` are the variables a `COUNT(?v)` reads: such a count is a
+    /// row count only if every row binds `?v`, so a drain that cannot show
+    /// that for each of them returns `None`.
+    async fn drain_grouped_count(
+        &mut self,
+        _ctx: &ExecutionContext<'_>,
+        _group_vars: &[VarId],
+        _bound_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
+        Ok(None)
+    }
+
+    /// Advisory row budget pushed down from a top-of-tree `LIMIT`.
+    ///
+    /// Tells this operator that its parent needs at most `budget` rows, so an
+    /// eager operator MAY bound its work (e.g. flush a batched accumulator
+    /// early). It is **purely advisory**: a fully-drained operator must still
+    /// produce the identical multiset *and* order, so the hint can never change
+    /// query results.
+    ///
+    /// **Default = ABSORB** (no-op). An operator forwards a budget to its
+    /// children only by explicitly overriding this, and only when it is
+    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`,
+    /// and (switch-gated, F17) `Bind` (1:1, order-preserving) and `Union`
+    /// (to *each* branch — a single branch may supply all `budget` rows, so
+    /// the whole budget is forwarded, not split). Row-dropping / reordering /
+    /// materializing operators (`Filter`, `Sort`, `Distinct`, `GroupAggregate`,
+    /// hash-join build) absorb, so a budget never leaks past a boundary where
+    /// it would be unsound.
+    ///
+    /// Set **before** `open()`. Consult only at batch/leaflet boundaries —
+    /// never inside fused per-row/per-group loops (hot-loop purity).
+    fn set_row_budget(&mut self, _budget: usize) {}
+
+    /// Offer a source-side top-k directive: `ORDER BY <ordering> LIMIT k` (`k`
+    /// = LIMIT + OFFSET) sits directly above a row-preserving operator chain
+    /// down to a single source. `ordering` is the complete ORDER BY. Default
+    /// no-op. The R2RML scan reads the primary key alone and skips only the
+    /// files that cannot hold the top-k, which stays a superset under ties, so
+    /// the `Sort` above remains authoritative (for ASC it also requires a
+    /// non-nullable column, since SPARQL orders unbound first). A source that
+    /// answers *exactly* k rows (the SQL pushdown lane) must order on every
+    /// key or leave the LIMIT to the engine. Order-preserving pass-through
+    /// operators forward it to their child. Set **before** `open()`.
+    fn set_topk(&mut self, _ordering: &[SortSpec], _k: usize) {}
+
+    /// Tell a source that a `DISTINCT` over exactly `vars` sits directly above
+    /// it (through row-preserving operators only), so it may return each
+    /// distinct combination of those variables once and leave the others
+    /// unbound. Default no-op; the `DistinctOperator` above stays
+    /// authoritative, so honoring it never changes results. Set **before**
+    /// `open()`.
+    fn set_distinct(&mut self, _vars: &[VarId]) {}
+
+    /// Record the fact each returned row matched ([`RowFact`]), for a union
+    /// of graphs that deduplicates on fact identity. Returns whether this
+    /// operator records them; a triple pattern's scan does. Set **before**
+    /// `open()`.
+    fn record_row_facts(&mut self) -> bool {
+        false
+    }
+
+    /// The facts of the rows of the batch `next_batch` last returned, in row
+    /// order, once [`Self::record_row_facts`] armed recording.
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        None
+    }
+
+    // ------------------------------------------------------------------
+    // EXPLAIN introspection (never called on the hot path)
+    // ------------------------------------------------------------------
+    //
+    // `describe()` renders the *planned* physical plan from the built (but not
+    // opened) operator tree. Composite operators override `plan_children()` to
+    // expose their inputs so the tree connects; leaves can add `plan_details()`.
+    // Decisions finalized at `open()` (multi-graph hash→nested-loop downgrade,
+    // fast-path-vs-fallback, the actual index permutation) are NOT reflected
+    // here — that is `EXPLAIN ANALYZE` territory. See `docs`/the plan note.
+
+    /// Operator display name. Defaults to the bare Rust type name.
+    fn op_name(&self) -> String {
+        crate::plan_node::short_type_name(std::any::type_name_of_val(self)).to_string()
+    }
+
+    /// Operator-specific attributes for the plan node (join var, predicate,
+    /// chosen index hint, …). Default: none.
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    /// Child operators this node will consume, tagged with their edge kind.
+    /// Override on every operator that owns inputs, or the rendered plan tree
+    /// truncates at this node. Default: none (leaf).
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        Vec::new()
+    }
+
+    /// Render this operator (and, recursively, its children) as a [`PlanNode`].
+    /// Provided — operators customize via `op_name`/`plan_details`/`plan_children`.
+    fn describe(&self) -> crate::plan_node::PlanNode {
+        crate::plan_node::PlanNode {
+            op: self.op_name(),
+            est_rows: self.estimated_rows(),
+            details: self.plan_details(),
+            children: self
+                .plan_children()
+                .into_iter()
+                .map(|c| crate::plan_node::PlanEdge {
+                    rel: c.rel,
+                    node: c.op.describe(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Boxed operator for dynamic dispatch
+pub type BoxedOperator = Box<dyn Operator + Send + Sync>;
+
+/// Operator state for lifecycle tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorState {
+    /// Not yet opened
+    Created,
+    /// Opened and ready to produce batches
+    Open,
+    /// Exhausted (next_batch returned None)
+    Exhausted,
+    /// Closed
+    Closed,
+}
+
+impl OperatorState {
+    /// Check if operator can be opened
+    pub fn can_open(&self) -> bool {
+        matches!(self, OperatorState::Created)
+    }
+
+    /// Check if operator can produce batches
+    pub fn can_next(&self) -> bool {
+        matches!(self, OperatorState::Open)
+    }
+
+    /// Check if operator is closed
+    pub fn is_closed(&self) -> bool {
+        matches!(self, OperatorState::Closed)
+    }
+}
+
+// ============================================================================
+// Projection trimming helpers
+// ============================================================================
+//
+// These free functions implement the `with_out_schema` / `trim_output`
+// pattern used by operators that support projection pushdown.  Each operator
+// stores an `Option<Arc<[VarId]>>` computed at construction time and uses
+// these helpers to trim its output schema and batches.
+
+/// Intersect a full schema with downstream requirements, preserving order.
+///
+/// Returns `None` when `downstream` is `None` (no trimming requested).
+pub fn compute_trimmed_vars(
+    full_schema: &[VarId],
+    downstream: Option<&[VarId]>,
+) -> Option<Arc<[VarId]>> {
+    downstream.map(|dv| {
+        let trimmed: Vec<VarId> = full_schema
+            .iter()
+            .filter(|v| dv.contains(v))
+            .copied()
+            .collect();
+        Arc::from(trimmed.into_boxed_slice())
+    })
+}
+
+/// Return the trimmed schema if set, otherwise the full schema.
+pub fn effective_schema<'a>(trimmed: &'a Option<Arc<[VarId]>>, full: &'a [VarId]) -> &'a [VarId] {
+    trimmed.as_deref().unwrap_or(full)
+}
+
+/// Trim a batch to only the required variables, or pass through unchanged.
+pub fn trim_batch(out_schema: &Option<Arc<[VarId]>>, batch: Batch) -> Option<Batch> {
+    match out_schema {
+        Some(schema) => Some(batch.retain(Arc::clone(schema))),
+        None => Some(batch),
+    }
+}

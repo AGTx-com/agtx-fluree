@@ -1,0 +1,2699 @@
+//! Transaction endpoints: /fluree/update, /fluree/insert, /fluree/upsert
+//!
+//! Supports multiple content types:
+//! - `application/json`: JSON-LD transaction format (update/insert/upsert)
+//! - `application/sparql-update`: SPARQL UPDATE syntax (update only)
+//! - `text/turtle`: Turtle RDF format (insert/upsert only)
+//! - `application/trig`: TriG format with named graphs (insert/upsert only)
+//!
+//! # Ledger Selection Priority
+//!
+//! For non-path endpoints (/fluree/update, etc.), ledger is resolved in this order:
+//! 1. Path parameter (/:ledger/update, etc.)
+//! 2. Query parameter (?ledger=mydb:main)
+//! 3. Header (Fluree-Ledger: mydb:main)
+//! 4. Body field ("ledger" or "from")
+//!
+//! # Turtle vs TriG Semantics
+//!
+//! - **Turtle on `/insert`**: Uses fast direct flake path. Pure insert semantics.
+//! - **TriG on `/insert`**: Insert semantics; GRAPH blocks land in their named graphs.
+//! - **Turtle/TriG on `/upsert`**: Uses upsert path with GRAPH block extraction for named graphs.
+
+use crate::config::ServerRole;
+use crate::error::{Result, ServerError};
+use crate::extract::tracking_headers;
+use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::state::AppState;
+use crate::telemetry::{
+    create_request_span, extract_request_id, extract_trace_id, set_span_error_code,
+};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use fluree_db_api::{
+    with_index_request_correlation, ApiError, CommitOpts, Fluree, GovernanceOptions, GraphSel,
+    IndexRequestCorrelation, LedgerHandle, PolicyStats, TrackingOptions, TrackingTally, TxnOpts,
+    TxnType,
+};
+use fluree_db_consensus::{
+    GraphBody, IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt,
+    TransactionRequest,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tracing::Instrument;
+
+/// Query parameters for transaction endpoints
+#[derive(Debug, Deserialize, Default)]
+pub struct TransactQueryParams {
+    /// Target ledger (format: name:branch)
+    pub ledger: Option<String>,
+    /// Sync target graph IRI (`/sync` only); absent means the default graph.
+    pub graph: Option<String>,
+    /// Sync target is the default graph, said explicitly: a bare `default`
+    /// key (`/sync` only).
+    #[serde(skip)]
+    pub default_graph: bool,
+    /// Sync: compute and report the delta without committing (`/sync` only).
+    #[serde(rename = "dryRun", default)]
+    pub dry_run: bool,
+    /// Sync: allow an explicitly empty payload, which clears the graph
+    /// (`/sync` only).
+    #[serde(rename = "allowEmpty", default)]
+    pub allow_empty: bool,
+    /// SPARQL Protocol `using-graph-uri` / `using-named-graph-uri` (update only).
+    #[serde(skip)]
+    pub using: crate::routes::sparql_protocol::UsingParams,
+}
+
+/// Commit information in transaction response
+#[derive(Serialize)]
+pub struct CommitInfo {
+    /// Commit content identifier (CID)
+    pub hash: String,
+}
+
+/// Transaction response - expected server format
+#[derive(Serialize)]
+pub struct TransactResponse {
+    /// Ledger identifier
+    pub ledger_id: String,
+    /// Transaction time (t value)
+    pub t: i64,
+    /// Transaction ID (SHA-256 hash of transaction data)
+    #[serde(rename = "tx-id")]
+    pub tx_id: String,
+    /// Commit information
+    pub commit: CommitInfo,
+    /// Execution time when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Fuel consumed when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    /// Policy stats when policy tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+}
+
+fn transact_response(
+    ledger_id: String,
+    t: i64,
+    tx_id: String,
+    commit_hash: String,
+    tally: Option<&TrackingTally>,
+) -> TransactResponse {
+    TransactResponse {
+        ledger_id,
+        t,
+        tx_id,
+        commit: CommitInfo { hash: commit_hash },
+        time: tally.and_then(|t| t.time.clone()),
+        fuel: tally.and_then(|t| t.fuel),
+        policy: tally.and_then(|t| t.policy.clone()),
+    }
+}
+
+fn record_tracking_on_span(span: &tracing::Span, tally: &TrackingTally) {
+    if let Some(ref time) = tally.time {
+        span.record("tracker_time", time.as_str());
+    }
+    if let Some(fuel) = tally.fuel {
+        span.record("tracker_fuel", fuel);
+    }
+}
+
+/// Compute transaction ID from request body (SHA-256 hash)
+///
+/// This matches the legacy derive-tx-id behavior which hashes the JSON-LD normalized data.
+/// For simplicity we hash the raw JSON bytes - this is deterministic for the same input.
+fn compute_tx_id(body: &JsonValue) -> String {
+    let json_bytes = serde_json::to_vec(body).unwrap_or_default();
+    let hash = Sha256::digest(&json_bytes);
+    format!("fluree:tx:sha256:{}", hex::encode(hash))
+}
+
+/// Compute transaction ID from SPARQL UPDATE string
+fn compute_tx_id_sparql(sparql: &str) -> String {
+    let hash = Sha256::digest(sparql.as_bytes());
+    format!("fluree:tx:sha256:{}", hex::encode(hash))
+}
+
+/// Extract an [`IdempotencyKey`] from the `Idempotency-Key` request header.
+///
+/// Returns `Ok(None)` when the header is absent, empty, or non-UTF-8; the
+/// caller proceeds as if no idempotency key was supplied. Returns
+/// `Err(ServerError::BadRequest)` when the header is present and rejected
+/// by the type's validating constructor (currently: bytes over
+/// [`fluree_db_consensus::MAX_IDEMPOTENCY_KEY_LEN`]). Surfacing the rejection
+/// as a 400 — rather than silently dropping the key — prevents the client
+/// from believing a too-long key was accepted and stops the oversize value
+/// from ever reaching the cache.
+pub(crate) fn extract_idempotency_key(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<IdempotencyKey>, ServerError> {
+    let Some(raw) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+    let Ok(text) = raw.to_str() else {
+        return Ok(None);
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    IdempotencyKey::new(trimmed)
+        .map(Some)
+        .map_err(|e| ServerError::BadRequest(format!("invalid Idempotency-Key: {e}")))
+}
+
+/// Tracking options requested via headers, or `None` when none were requested.
+fn tracking_from_headers(headers: &FlureeHeaders) -> Option<TrackingOptions> {
+    headers
+        .has_tracking()
+        .then(|| headers.to_tracking_options())
+}
+
+/// Map a [`SubmissionError`] to the [`ServerError`] / HTTP status the rest
+/// of the server expects.
+///
+/// `Execution` carries the status from the underlying transaction pipeline
+/// (e.g. 422 for a validation failure, 404 for a missing ledger), so it is
+/// passed through rather than collapsed to a 500.
+pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
+    let status = match &err {
+        SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
+        SubmissionError::Overloaded => 503,
+        // Keep the typed identity through the flattening: 503 +
+        // `err:db/NoveltyAtMax` + Retry-After for drainable backpressure,
+        // 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+        // fit — a status-only passthrough degrades the `@type` to the
+        // internal-error catch-all (and 413 is ambiguous with the HTTP
+        // body-size limit).
+        SubmissionError::NoveltyBackpressure { message } => {
+            return ServerError::NoveltyBackpressure(message.clone());
+        }
+        SubmissionError::NoveltyDeltaTooLarge { message } => {
+            return ServerError::NoveltyDeltaTooLarge(message.clone());
+        }
+        SubmissionError::DatatypeLimitExceeded { message } => {
+            return ServerError::DatatypeLimitExceeded(message.clone());
+        }
+        SubmissionError::CommitNotFound { message } => {
+            return ServerError::Api(ApiError::CommitNotFound(message.clone()));
+        }
+        SubmissionError::ConfigUnavailable { message } => {
+            return ServerError::Api(ApiError::ConfigUnavailable(message.clone()));
+        }
+        SubmissionError::CommitContention { message } => {
+            return ServerError::CommitContention(message.clone());
+        }
+        SubmissionError::IndexNotLoaded { message } => {
+            return ServerError::IndexNotLoaded(message.clone());
+        }
+        SubmissionError::Execution { status, .. } => *status,
+    };
+    ServerError::Api(ApiError::http(status, err.to_string()))
+}
+
+/// Build a response from a consensus receipt, attaching the headers the
+/// receipt implies.
+///
+/// Echoes the `Idempotency-Key` when the submission carried one (signalling
+/// that the server tracked it for idempotent retry; absence signals it was
+/// ignored), and attaches the tracking headers when a tally is present.
+fn build_consensus_response(
+    response_json: Json<TransactResponse>,
+    receipt: &TransactionReceipt,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Some(key) = &receipt.idempotency_key {
+        if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+            headers.insert("Idempotency-Key", value);
+        }
+    }
+    if let Some(tally) = &receipt.tally {
+        headers.extend(tracking_headers(tally));
+    }
+    (headers, response_json).into_response()
+}
+
+/// The mutated body plus options extracted from it.
+///
+/// Returned by [`prepare_transaction_body`] and consumed downstream by both
+/// the consensus and direct-builder paths.
+struct PreparedTransaction {
+    body: JsonValue,
+    tracking: Option<TrackingOptions>,
+    governance: GovernanceOptions,
+}
+
+/// Phase 1 of [`execute_transaction`]: prepare the JSON-LD request body.
+///
+/// Injects header-derived options, applies bearer-identity / policy-class
+/// defaults to the body's opts (which the rest of the pipeline reads),
+/// then extracts the tracking and policy options from the finalized body.
+fn prepare_transaction_body(
+    mut body: JsonValue,
+    headers: &FlureeHeaders,
+) -> Result<PreparedTransaction> {
+    inject_headers_into_txn(&mut body, headers);
+
+    crate::routes::policy_auth::apply_authorization_to_opts(&mut body, headers)?;
+
+    let tracking = tracking_options_from_body(&body);
+    let mut governance =
+        GovernanceOptions::from_json(&body).map_err(|e| ServerError::bad_request(e.to_string()))?;
+    // The auth-layer-verified identity `f:overrideControl` gates on, bound by
+    // `bind_authorization`. Where a credential lets its holder select the
+    // policy identity, `identity` above carries the selected one while this
+    // stays the credential's own; `from_json` never reads it from the body.
+    governance.server_identity = headers.server_identity.clone();
+
+    Ok(PreparedTransaction {
+        body,
+        tracking,
+        governance,
+    })
+}
+
+/// Use the policy subject selected by verified authority for commit provenance,
+/// falling back to the authenticated author when no subject was selected.
+fn effective_did<'a>(
+    governance: &'a GovernanceOptions,
+    author: Option<&'a str>,
+) -> Option<&'a str> {
+    governance.identity.as_deref().or(author)
+}
+
+/// Stamp a caller-supplied event time (`opts.eventTime`, `# PRAGMA
+/// event-time`) on the commit, for backdated historical loads.
+///
+/// Validated for RFC 3339 shape at the boundary; monotonicity/future bounds
+/// are enforced by the commit build path against the ledger head. Recording
+/// the wall-clock receipt time alongside flips the ledger into dual-stamp mode
+/// so `@recorded:` (audit-axis) time travel stays exact.
+fn with_event_time(commit_opts: CommitOpts, event_time: &str, field: &str) -> Result<CommitOpts> {
+    if chrono::DateTime::parse_from_rfc3339(event_time).is_err() {
+        return Err(ServerError::bad_request(format!(
+            "{field} is not a valid RFC 3339 timestamp: {event_time}"
+        )));
+    }
+    Ok(commit_opts
+        .with_timestamp(event_time.to_string())
+        .with_received_at(chrono::Utc::now().to_rfc3339()))
+}
+
+/// Build the [`CommitOpts`] for the transaction.
+///
+/// Encodes the effective identity (so the commit records its author) and,
+/// for signed requests, spawns the raw-envelope upload in parallel so it
+/// overlaps with the rest of the pipeline.
+fn build_commit_opts(
+    did: Option<&str>,
+    credential: &MaybeCredential,
+    fluree: &Fluree,
+    handle: &LedgerHandle,
+) -> CommitOpts {
+    let mut commit_opts = match did {
+        Some(d) => CommitOpts::default().identity(d.to_string()),
+        None => CommitOpts::default(),
+    };
+    if let Some(raw_txn) = raw_txn_from_credential(credential) {
+        let content_store = fluree.content_store(handle.id());
+        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+    }
+    commit_opts
+}
+
+/// Submit a prepared transaction through the configured committer and
+/// shape the HTTP response.
+///
+/// All upstream preparation (header injection, identity wiring, opts
+/// assembly, `tx_id` derivation) happens in the caller. Request correlation
+/// is attached around the submission so background index work the
+/// transaction triggers stays attributable to the originating request.
+async fn transact_via_consensus(
+    state: &AppState,
+    ledger_id: &str,
+    request: TransactionRequest,
+    tx_id: String,
+    headers: &HeaderMap,
+) -> Result<Response> {
+    let receipt = submit_via_consensus(state, request, headers).await?;
+    let response_json = Json(transact_response(
+        ledger_id.to_string(),
+        receipt.commit.t,
+        tx_id,
+        receipt.commit.commit_id.to_string(),
+        receipt.tally.as_ref(),
+    ));
+    Ok(build_consensus_response(response_json, &receipt))
+}
+
+/// Submit a transaction through consensus and return the receipt, recording
+/// the tracking tally on the current span. Shared by the commit-receipt
+/// response path ([`transact_via_consensus`]) and the Cypher write-RETURN
+/// path, which shapes its own response body from the receipt.
+pub(crate) async fn submit_via_consensus(
+    state: &AppState,
+    request: TransactionRequest,
+    headers: &HeaderMap,
+) -> Result<fluree_db_consensus::TransactionReceipt> {
+    let correlation = IndexRequestCorrelation::new(
+        extract_request_id(headers, &state.telemetry_config),
+        extract_trace_id(headers),
+        Some(request.body.operation_tag()),
+    );
+
+    let submission =
+        with_index_request_correlation(correlation, state.committer.transact(request)).await;
+    let receipt = match submission {
+        Ok(receipt) => {
+            tracing::info!(
+                status = "success",
+                commit_t = receipt.commit.t,
+                commit_id = %receipt.commit.commit_id,
+                "transaction committed via consensus"
+            );
+            receipt
+        }
+        Err(err) => {
+            set_span_error_code(&tracing::Span::current(), "error:InvalidTransaction");
+            tracing::error!(error = %err, "transaction submission failed");
+            return Err(submission_error_to_server_error(err));
+        }
+    };
+
+    if let Some(tally) = &receipt.tally {
+        record_tracking_on_span(&tracing::Span::current(), tally);
+    }
+    Ok(receipt)
+}
+
+/// If the request was signed (credentialed), return the *original* signed envelope
+/// to store for provenance (JWS string or VC JSON).
+fn raw_txn_from_credential(credential: &MaybeCredential) -> Option<JsonValue> {
+    let extracted = credential.credential.as_ref()?;
+    let raw = extracted.raw_body.as_ref();
+
+    // Prefer JSON if it parses, otherwise store as string.
+    if let Ok(s) = std::str::from_utf8(raw) {
+        let trimmed = s.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(json) = serde_json::from_str::<JsonValue>(trimmed) {
+                return Some(json);
+            }
+        }
+        return Some(JsonValue::String(trimmed.to_string()));
+    }
+
+    // Fallback for non-UTF8: store base64 string for auditability.
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    Some(JsonValue::String(format!("base64:{b64}")))
+}
+
+/// Extract query params from request URI before consuming the request.
+///
+/// Parsed from the decoded pair list rather than `serde_urlencoded` into the
+/// struct: the SPARQL Protocol `using-*` keys repeat once per graph, and a
+/// repeated key made the struct parse fail — which, swallowed, dropped every
+/// parameter, `ledger` included. A malformed parameter is now a 400 instead of
+/// silently becoming "no parameters".
+fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
+    let pairs = crate::routes::sparql_protocol::decode_pairs(request.uri().query().unwrap_or(""))?;
+    let mut params = TransactQueryParams::default();
+    let flag = |key: &str, value: &str| match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ServerError::bad_request(format!(
+            "`{key}` must be true or false; got {other:?}"
+        ))),
+    };
+    let once = |slot: &mut Option<String>, key: &str, value: &str| {
+        if slot.replace(value.to_string()).is_some() {
+            return Err(ServerError::bad_request(format!(
+                "the `{key}` parameter may appear only once"
+            )));
+        }
+        Ok(())
+    };
+    for (key, value) in &pairs {
+        match key.as_str() {
+            "ledger" => once(&mut params.ledger, key, value)?,
+            "graph" => once(&mut params.graph, key, value)?,
+            "default" => params.default_graph = value.is_empty() || flag(key, value)?,
+            "dryRun" => params.dry_run = flag(key, value)?,
+            "allowEmpty" => params.allow_empty = flag(key, value)?,
+            "params" => return Err(update_bindings_unsupported()),
+            binding if binding.starts_with('$') => return Err(update_bindings_unsupported()),
+            _ => {}
+        }
+    }
+    params.using.extend_from_pairs(&pairs);
+    Ok(params)
+}
+
+/// `$name` parameters bind query variables on the query endpoints. An update
+/// reached with one (or with `params`) must fail: ignored, the binding would
+/// leave its variable unbound, and `DELETE WHERE { ?s ex:name $name }` would
+/// delete every name.
+fn update_bindings_unsupported() -> ServerError {
+    ServerError::bad_request(
+        "variable bindings (`$name` parameters) are accepted only by the SPARQL query \
+         endpoints; an update carries its values in the request text",
+    )
+}
+
+/// The one graph a sync or Graph Store request targets: `graph=<iri>` names
+/// a graph and a bare `default` key the default graph. Naming neither means
+/// the default graph unless `explicit` (the Graph Store Protocol requires one
+/// of the two).
+pub(crate) fn graph_target(
+    graph: Option<String>,
+    default_graph: bool,
+    explicit: bool,
+) -> Result<GraphSel> {
+    match (graph, default_graph) {
+        (Some(iri), false) => Ok(GraphSel::Graph(iri)),
+        (None, true) => Ok(GraphSel::Default),
+        (Some(_), true) => Err(ServerError::bad_request(
+            "pass either `graph=<iri>` or `default`, not both",
+        )),
+        (None, false) if !explicit => Ok(GraphSel::Default),
+        (None, false) => Err(ServerError::bad_request(
+            "the request must name its target graph: `graph=<iri>`, or `default` for the \
+             default graph",
+        )),
+    }
+}
+
+/// A write scoped to one graph (see [`fluree_db_api::GraphSel`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GraphWrite {
+    /// Make the graph's contents exactly the payload, committing only the
+    /// delta.
+    Sync,
+    /// Add the payload's triples to the graph.
+    Insert,
+}
+
+/// Check if the credential contains a W3C SPARQL Protocol form-encoded update
+/// (`Content-Type: application/x-www-form-urlencoded` with `update=<sparql>`).
+///
+/// If detected, rewrites the credential's body and flags so the rest of the
+/// pipeline treats it as `application/sparql-update`.  This is required for
+/// standard SPARQL benchmarking tools (e.g. BSBM test driver) that use the
+/// form-encoded transport defined in the SPARQL 1.1 Protocol spec §2.2.
+///
+/// The form may also carry `using-graph-uri` / `using-named-graph-uri`, which
+/// are added to `using`.
+fn maybe_rewrite_form_encoded_update(
+    credential: &mut MaybeCredential,
+    using: &mut crate::routes::sparql_protocol::UsingParams,
+) -> Result<()> {
+    // Only act when none of the typed content-type flags are already set
+    if credential.is_sparql_update
+        || credential.is_sparql
+        || credential.is_turtle
+        || credential.is_trig
+    {
+        return Ok(());
+    }
+
+    // Check Content-Type header for form-urlencoded
+    let is_form = credential
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("application/x-www-form-urlencoded"))
+        .unwrap_or(false);
+
+    if !is_form {
+        return Ok(());
+    }
+
+    // Try to parse the body as form data and extract the `update` field
+    let body_str = match std::str::from_utf8(&credential.body) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+
+    let parsed: Vec<(String, String)> = match serde_urlencoded::from_str(body_str) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    if let Some((_, sparql)) = parsed.iter().find(|(k, _)| k == "update") {
+        if parsed
+            .iter()
+            .any(|(k, _)| k == "params" || k.starts_with('$'))
+        {
+            return Err(update_bindings_unsupported());
+        }
+        using.extend_from_pairs(&crate::routes::sparql_protocol::decode_pairs(body_str)?);
+        credential.body = axum::body::Bytes::from(sparql.clone());
+        credential.is_sparql_update = true;
+    }
+    Ok(())
+}
+
+/// Inject header-based policy and tracking defaults into the transaction body.
+///
+/// Mirrors the query-side `inject_headers_into_query` pattern: header values act
+/// as defaults that do not override body-level opts. Policy headers apply even
+/// without tracking, including for anonymous requests.
+fn inject_headers_into_txn(body: &mut JsonValue, headers: &FlureeHeaders) {
+    if let Some(obj) = body.as_object_mut() {
+        let opts = obj
+            .entry("opts")
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+        if let Some(opts_obj) = opts.as_object_mut() {
+            headers.inject_into_opts(opts_obj);
+        }
+    }
+}
+
+/// Check if tracking options are present in transaction body (meta or max-fuel).
+fn has_tracking_opts(body: &JsonValue) -> bool {
+    let Some(opts) = body.get("opts") else {
+        return false;
+    };
+    if let Some(meta) = opts.get("meta") {
+        match meta {
+            JsonValue::Bool(true) => return true,
+            JsonValue::Object(obj) if !obj.is_empty() => return true,
+            _ => {}
+        }
+    }
+    opts.get("max-fuel").is_some()
+        || opts.get("max_fuel").is_some()
+        || opts.get("maxFuel").is_some()
+}
+
+/// Build `TrackingOptions` from the transaction body opts (after header injection).
+fn tracking_options_from_body(body: &JsonValue) -> Option<TrackingOptions> {
+    if !has_tracking_opts(body) {
+        return None;
+    }
+    let opts = body.get("opts");
+    let tracking = TrackingOptions::from_opts_value(opts);
+    if tracking.any_enabled() {
+        Some(tracking)
+    } else {
+        None
+    }
+}
+
+/// Helper to extract ledger ID from request
+///
+/// Priority: path > query param > header > body.ledger > body.from
+fn get_ledger_id(
+    path_ledger: Option<&str>,
+    query_params: &TransactQueryParams,
+    headers: &FlureeHeaders,
+    body: &JsonValue,
+) -> Result<String> {
+    // Priority: path > query param > header > body.ledger > body.from
+    if let Some(ledger) = path_ledger {
+        return Ok(ledger.to_string());
+    }
+
+    if let Some(ledger) = &query_params.ledger {
+        return Ok(ledger.clone());
+    }
+
+    if let Some(ledger) = &headers.ledger {
+        return Ok(ledger.clone());
+    }
+
+    if let Some(ledger) = body.get("ledger").and_then(|v| v.as_str()) {
+        return Ok(ledger.to_string());
+    }
+
+    if let Some(from) = body.get("from").and_then(|v| v.as_str()) {
+        return Ok(from.to_string());
+    }
+
+    Err(ServerError::MissingLedger)
+}
+
+// ============================================================================
+// Data API Auth Helpers
+// ============================================================================
+
+/// Resolve the effective author identity for transactions.
+///
+/// Precedence:
+/// 1) Signed request DID (credential)
+/// 2) Bearer token identity (fluree.identity ?? sub)
+pub(crate) fn effective_author(
+    credential: &MaybeCredential,
+    bearer: Option<&crate::extract::DataPrincipal>,
+) -> Option<String> {
+    credential
+        .did()
+        .map(std::string::ToString::to_string)
+        .or_else(|| bearer.and_then(|p| p.identity.clone()))
+}
+
+/// Enforce write authorization for a ledger according to `data_auth.mode`.
+///
+/// Records `error_code` on the current span when access is denied.
+pub(crate) fn enforce_write_access(
+    state: &AppState,
+    ledger: &str,
+    bearer: Option<&crate::extract::DataPrincipal>,
+    credential: &MaybeCredential,
+) -> Result<()> {
+    let data_auth = state.config.data_auth();
+
+    // In Required mode: accept either signed requests OR bearer tokens.
+    if data_auth.mode == crate::config::DataAuthMode::Required && !credential.is_signed() {
+        let Some(p) = bearer else {
+            set_span_error_code(&tracing::Span::current(), "error:Unauthorized");
+            return Err(ServerError::unauthorized(
+                "Authentication required (signed request or Bearer token)",
+            ));
+        };
+        if !p.can_write(&crate::error::scope_id(ledger)?) {
+            set_span_error_code(&tracing::Span::current(), "error:Forbidden");
+            // Avoid existence leak
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+        return Ok(());
+    }
+
+    // In Optional/None mode: if a bearer token is present, it still limits access.
+    if !credential.is_signed() {
+        if let Some(p) = bearer {
+            if !p.can_write(&crate::error::scope_id(ledger)?) {
+                set_span_error_code(&tracing::Span::current(), "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute an update transaction (WHERE/DELETE/INSERT)
+///
+/// POST /fluree/update
+///
+/// Executes a full transaction with insert, delete, and where clauses.
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn update(
+    State(state): State<Arc<AppState>>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    // Transaction mode: process locally
+    update_local(state, bearer, request).await.into_response()
+}
+
+/// Local implementation of update (transaction mode only)
+async fn update_local(
+    state: Arc<AppState>,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let mut query_params = extract_query_params(&request)?;
+    // Extract headers
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+
+    // Extract credential (consumes the request body)
+    let mut credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
+    maybe_rewrite_form_encoded_update(&mut credential, &mut query_params.using)?;
+    if !credential.is_sparql_update() {
+        query_params.using.reject_outside_sparql()?;
+    }
+
+    // Create request span with correlation context
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    // Detect input format before span creation so otel.name is set at open time
+    let input_format = if credential.is_sparql_update() {
+        "sparql-update"
+    } else if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "update",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        None, // ledger ID determined later
+        None, // tenant_id not yet supported
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a SPARQL UPDATE request
+        if credential.is_sparql_update() {
+            tracing::info!(
+                status = "start",
+                format = "sparql-update",
+                "SPARQL UPDATE request received"
+            );
+            return execute_sparql_update_request(
+                &state,
+                None,
+                &query_params,
+                &headers,
+                &credential,
+                &span,
+                bearer.as_ref(),
+            )
+            .await;
+        }
+
+        // Cypher needs an explicit ledger; the connection-scoped endpoint
+        // can't resolve one — direct callers at the ledger-scoped route.
+        if headers.is_cypher_query() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Cypher writes must target a ledger; use the /v1/fluree/update/<ledger> endpoint.",
+            ));
+        }
+
+        // Update does not accept Turtle/TriG. Use /insert or /upsert.
+        if credential.is_turtle_or_trig() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Turtle/TriG is not supported on the update endpoint. \
+                 Use /v1/fluree/insert for Turtle inserts, /v1/fluree/upsert for Turtle/TriG upserts, \
+                 or send JSON-LD/SPARQL UPDATE to /v1/fluree/update.",
+            ));
+        }
+
+        tracing::info!(status = "start", "transaction request received");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in transaction body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(None, &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "missing ledger ID");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Update,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Execute an update transaction with ledger in path
+///
+/// POST /:ledger/update
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn update_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    // Transaction mode: process locally
+    update_ledger_local(state, ledger, bearer, request)
+        .await
+        .into_response()
+}
+
+/// Execute a transaction with ledger as greedy tail segment.
+///
+/// POST /fluree/update/<ledger...>
+pub async fn update_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    update_ledger(State(state), Path(ledger), MaybeDataBearer(bearer), request).await
+}
+
+/// Local implementation of update_ledger
+async fn update_ledger_local(
+    state: Arc<AppState>,
+    ledger: String,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let mut query_params = extract_query_params(&request)?;
+
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    let mut credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
+    maybe_rewrite_form_encoded_update(&mut credential, &mut query_params.using)?;
+    if !credential.is_sparql_update() {
+        query_params.using.reject_outside_sparql()?;
+    }
+
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_sparql_update() {
+        "sparql-update"
+    } else if headers.is_cypher_query() {
+        "cypher"
+    } else if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "update",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        Some(&ledger),
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a SPARQL UPDATE request
+        if credential.is_sparql_update() {
+            tracing::info!(
+                status = "start",
+                format = "sparql-update",
+                "SPARQL UPDATE request received"
+            );
+            return execute_sparql_update_request(
+                &state,
+                Some(&ledger),
+                &query_params,
+                &headers,
+                &credential,
+                &span,
+                bearer.as_ref(),
+            )
+            .await;
+        }
+
+        // Cypher write (Content-Type: application/cypher) — ledger from path.
+        if headers.is_cypher_query() {
+            tracing::info!(status = "start", format = "cypher", "Cypher write request received");
+            let cypher = credential.body_string()?;
+            return execute_cypher_transact(
+                &state,
+                &ledger,
+                &cypher,
+                &headers,
+                bearer.as_ref(),
+                &credential,
+                &span,
+            )
+            .await;
+        }
+
+        // Update does not accept Turtle/TriG. Use /insert or /upsert.
+        if credential.is_turtle_or_trig() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Turtle/TriG is not supported on the update endpoint. \
+                 Use /v1/fluree/insert for Turtle inserts, /v1/fluree/upsert for Turtle/TriG upserts, \
+                 or send JSON-LD/SPARQL UPDATE to /v1/fluree/update.",
+            ));
+        }
+
+        tracing::info!(status = "start", "ledger transaction request received");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in transaction body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(Some(&ledger), &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "ledger ID mismatch");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Update,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Insert data
+///
+/// POST /fluree/insert
+///
+/// Convenience endpoint for insert-only transactions.
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn insert(
+    State(state): State<Arc<AppState>>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    insert_local(state, bearer, request).await.into_response()
+}
+
+/// Local implementation of insert
+async fn insert_local(
+    state: Arc<AppState>,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
+
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "insert",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        None,
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a Turtle or TriG request
+        if credential.is_turtle_or_trig() {
+            let format = if credential.is_trig() {
+                "trig"
+            } else {
+                "turtle"
+            };
+            tracing::info!(
+                status = "start",
+                format = format,
+                "insert transaction requested"
+            );
+
+            let turtle = match credential.body_string() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!(error = %e, "invalid UTF-8 in Turtle/TriG body");
+                    return Err(e);
+                }
+            };
+
+            // For Turtle/TriG, ledger must come from query param or header
+            let ledger_id = match query_params.ledger.as_ref().or(headers.ledger.as_ref()) {
+                Some(ledger) => {
+                    span.record("ledger_id", ledger.as_str());
+                    ledger.clone()
+                }
+                None => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!("missing ledger ID for Turtle/TriG insert");
+                    return Err(ServerError::MissingLedger);
+                }
+            };
+
+            enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            return execute_turtle_transaction(
+                &state,
+                &ledger_id,
+                TurtleOp::Insert,
+                &turtle,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
+
+        tracing::info!(status = "start", "insert transaction requested");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in insert request body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(None, &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "missing ledger ID");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Insert,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Upsert data
+///
+/// POST /fluree/upsert
+///
+/// Convenience endpoint for upsert transactions (insert or update).
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn upsert(
+    State(state): State<Arc<AppState>>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    upsert_local(state, bearer, request).await.into_response()
+}
+
+/// Local implementation of upsert
+async fn upsert_local(
+    state: Arc<AppState>,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
+
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "upsert",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        None,
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a Turtle or TriG request
+        if credential.is_turtle_or_trig() {
+            let format = if credential.is_trig() {
+                "trig"
+            } else {
+                "turtle"
+            };
+            tracing::info!(
+                status = "start",
+                format = format,
+                "upsert transaction requested"
+            );
+
+            let turtle = match credential.body_string() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!(error = %e, "invalid UTF-8 in Turtle/TriG body");
+                    return Err(e);
+                }
+            };
+
+            // For Turtle/TriG, ledger must come from query param or header
+            let ledger_id = match query_params.ledger.as_ref().or(headers.ledger.as_ref()) {
+                Some(ledger) => {
+                    span.record("ledger_id", ledger.as_str());
+                    ledger.clone()
+                }
+                None => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!("missing ledger ID for Turtle/TriG upsert");
+                    return Err(ServerError::MissingLedger);
+                }
+            };
+
+            enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            return execute_turtle_transaction(
+                &state,
+                &ledger_id,
+                TurtleOp::Upsert,
+                &turtle,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
+
+        tracing::info!(status = "start", "upsert transaction requested");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in upsert request body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(None, &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "missing ledger ID");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Upsert,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Synchronize a graph: make its contents exactly the payload (JSON-LD,
+/// Turtle, N-Triples or TriG), committing only the delta. Without `graph`,
+/// the default graph.
+///
+/// POST /sync?ledger=name:branch[&graph=<iri>][&dryRun=true][&allowEmpty=true]
+/// In peer mode, forwards the request to the transaction server.
+pub async fn sync(
+    State(state): State<Arc<AppState>>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    sync_local(state, bearer, None, request)
+        .await
+        .into_response()
+}
+
+/// Synchronize a named graph with ledger in path.
+///
+/// POST /:ledger/sync?graph=<iri>
+pub async fn sync_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    sync_local(state, bearer, Some(ledger), request)
+        .await
+        .into_response()
+}
+
+/// Local implementation of graph sync.
+async fn sync_local(
+    state: Arc<AppState>,
+    bearer: Option<crate::extract::DataPrincipal>,
+    path_ledger: Option<String>,
+    request: Request,
+) -> Result<Response> {
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+    let span = create_request_span(
+        "sync",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        None,
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", "graph sync requested");
+
+        let graph = match graph_target(
+            query_params.graph.clone(),
+            query_params.default_graph,
+            false,
+        ) {
+            Ok(graph) => graph,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(e);
+            }
+        };
+
+        if credential.is_turtle_or_trig() {
+            let text = credential.body_string()?;
+            // An RDF body carries no `ledger` / `from` key.
+            let ledger_id = match path_ledger {
+                Some(l) => l,
+                None => get_ledger_id(None, &query_params, &headers, &JsonValue::Null)?,
+            };
+            span.record("ledger_id", ledger_id.as_str());
+            enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            let op = TurtleOp::Graph {
+                graph: &graph,
+                write: GraphWrite::Sync,
+                allow_empty: query_params.allow_empty,
+            };
+            if query_params.dry_run {
+                // Turtle/TriG bodies carry no `opts`: policy comes from the
+                // headers alone, as it does for the committed run.
+                let governance = crate::routes::policy_auth::bound_governance(
+                    headers.identity.as_deref(),
+                    &headers,
+                )?;
+                let report = dry_run_sync(
+                    &state,
+                    &ledger_id,
+                    &graph,
+                    fluree_db_api::GraphPayload::Rdf(&text),
+                    query_params.allow_empty,
+                    TxnOpts::default(),
+                    &governance,
+                )
+                .await?;
+                return Ok(report);
+            }
+            return execute_turtle_transaction(
+                &state,
+                &ledger_id,
+                op,
+                &text,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
+
+        let body_json = credential.body_json()?;
+        let ledger_id = match path_ledger {
+            Some(l) => l,
+            None => get_ledger_id(None, &query_params, &headers, &body_json)?,
+        };
+        span.record("ledger_id", ledger_id.as_str());
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+
+        // Empty-payload gate: an explicitly empty payload clears the graph.
+        // Enforced here (not only in `sync_named_graph`) because the
+        // consensus submission below calls the builder directly.
+        let explicitly_empty =
+            fluree_db_api::GraphPayload::JsonLd(&body_json).is_explicitly_empty_jsonld();
+        if explicitly_empty && !query_params.allow_empty {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "sync payload is empty; this would clear the graph — pass allowEmpty=true to confirm",
+            ));
+        }
+
+        if query_params.dry_run {
+            // Dry run: stage + count locally, commit nothing. Safe outside
+            // consensus — it is a read of the delta, not a write. It stages
+            // under the SAME inputs the real run would (header-injected
+            // opts, governance-derived policy context built from the ledger
+            // state, inline shapes / unique properties), so a restricted
+            // writer sees policy-filtered counts and a run that would fail
+            // policy / SHACL / uniqueness fails here too.
+            let prepared = prepare_transaction_body(body_json, &headers)?;
+            let txn_opts = txn_opts_from_body(&prepared.body, &prepared.governance, &span)?;
+            return dry_run_sync(
+                &state,
+                &ledger_id,
+                &graph,
+                fluree_db_api::GraphPayload::JsonLd(&prepared.body),
+                query_params.allow_empty,
+                txn_opts,
+                &prepared.governance,
+            )
+            .await;
+        }
+
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Insert,
+            Some((&graph, GraphWrite::Sync)),
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Stage a sync against the ledger head and report the delta, committing
+/// nothing. Safe outside consensus: it is a read of the delta, not a write.
+/// Policy is built from the ledger state exactly as the committed run builds
+/// it, so a restricted writer sees policy-filtered counts and a run that
+/// would fail policy / SHACL / uniqueness fails here too.
+async fn dry_run_sync(
+    state: &AppState,
+    ledger_id: &str,
+    graph: &GraphSel,
+    payload: fluree_db_api::GraphPayload<'_>,
+    allow_empty: bool,
+    txn_opts: TxnOpts,
+    governance: &fluree_db_api::GovernanceOptions,
+) -> Result<Response> {
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::from)?;
+    let snap = handle.snapshot().await;
+    let policy = fluree_db_api::build_transact_policy_context(
+        &state.fluree,
+        &snap.snapshot,
+        snap.novelty.as_ref(),
+        Some(snap.novelty.as_ref()),
+        snap.t,
+        governance,
+    )
+    .await
+    .map_err(ServerError::from)?;
+    drop(snap);
+    let opts = fluree_db_api::SyncGraphOpts {
+        dry_run: true,
+        allow_empty,
+        ..Default::default()
+    };
+    let report = state
+        .fluree
+        .sync_graph_with(ledger_id, graph, payload, opts, txn_opts, policy)
+        .await
+        .map_err(ServerError::from)?;
+    Ok(axum::Json(serde_json::json!({
+        "ledger": report.ledger_id,
+        "graph": report.graph_iri,
+        "asserted": report.asserted,
+        "retracted": report.retracted,
+        "committed": report.committed,
+        "dryRun": report.dry_run,
+        "t": report.t,
+    }))
+    .into_response())
+}
+
+/// Insert data with ledger in path
+///
+/// POST /:ledger/insert
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn insert_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    insert_ledger_local(state, ledger, bearer, request)
+        .await
+        .into_response()
+}
+
+/// Insert data with ledger as greedy tail segment.
+///
+/// POST /fluree/insert/<ledger...>
+pub async fn insert_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    insert_ledger(State(state), Path(ledger), MaybeDataBearer(bearer), request).await
+}
+
+/// Local implementation of insert_ledger
+async fn insert_ledger_local(
+    state: Arc<AppState>,
+    ledger: String,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
+
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "insert",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        Some(&ledger),
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a Turtle or TriG request
+        if credential.is_turtle_or_trig() {
+            let format = if credential.is_trig() {
+                "trig"
+            } else {
+                "turtle"
+            };
+            tracing::info!(
+                status = "start",
+                format = format,
+                "ledger insert transaction requested"
+            );
+
+            let turtle = match credential.body_string() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!(error = %e, "invalid UTF-8 in Turtle/TriG body");
+                    return Err(e);
+                }
+            };
+
+            enforce_write_access(&state, &ledger, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            return execute_turtle_transaction(
+                &state,
+                &ledger,
+                TurtleOp::Insert,
+                &turtle,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
+
+        tracing::info!(status = "start", "ledger insert transaction requested");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in insert request body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(Some(&ledger), &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "ledger ID mismatch");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Insert,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Upsert data with ledger in path
+///
+/// POST /:ledger/upsert
+/// Supports signed requests (JWS/VC format).
+/// In peer mode, forwards the request to the transaction server.
+pub async fn upsert_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    // In peer mode, forward to transaction server
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    upsert_ledger_local(state, ledger, bearer, request)
+        .await
+        .into_response()
+}
+
+/// Upsert data with ledger as greedy tail segment.
+///
+/// POST /fluree/upsert/<ledger...>
+pub async fn upsert_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    upsert_ledger(State(state), Path(ledger), MaybeDataBearer(bearer), request).await
+}
+
+/// Local implementation of upsert_ledger
+async fn upsert_ledger_local(
+    state: Arc<AppState>,
+    ledger: String,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+) -> Result<Response> {
+    // Extract query params before consuming the request
+    let query_params = extract_query_params(&request)?;
+    query_params.using.reject_outside_sparql()?;
+
+    let headers_result = FlureeHeaders::from_headers(request.headers());
+    let headers = match headers_result {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        credential.did(),
+    )?;
+
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let input_format = if credential.is_trig() {
+        "trig"
+    } else if credential.is_turtle_or_trig() {
+        "turtle"
+    } else {
+        "json-ld"
+    };
+
+    let span = create_request_span(
+        "upsert",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        Some(&ledger),
+        None,
+        Some(input_format),
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Check if this is a Turtle or TriG request
+        if credential.is_turtle_or_trig() {
+            let format = if credential.is_trig() {
+                "trig"
+            } else {
+                "turtle"
+            };
+            tracing::info!(
+                status = "start",
+                format = format,
+                "ledger upsert transaction requested"
+            );
+
+            let turtle = match credential.body_string() {
+                Ok(s) => s,
+                Err(e) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    tracing::warn!(error = %e, "invalid UTF-8 in Turtle/TriG body");
+                    return Err(e);
+                }
+            };
+
+            enforce_write_access(&state, &ledger, bearer.as_ref(), &credential)?;
+            let author = effective_author(&credential, bearer.as_ref());
+            return execute_turtle_transaction(
+                &state,
+                &ledger,
+                TurtleOp::Upsert,
+                &turtle,
+                &credential,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+        }
+
+        tracing::info!(status = "start", "ledger upsert transaction requested");
+
+        let body_json = match credential.body_json() {
+            Ok(json) => json,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid JSON in upsert request body");
+                return Err(e);
+            }
+        };
+
+        let ledger_id = match get_ledger_id(Some(&ledger), &query_params, &headers, &body_json) {
+            Ok(id) => {
+                span.record("ledger_id", id.as_str());
+                id
+            }
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "ledger ID mismatch");
+                return Err(e);
+            }
+        };
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Upsert,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Execute a transaction with the given type.
+///
+/// When tracking headers are present (fluree-track-fuel, fluree-max-fuel, etc.),
+/// tracking options are injected into the transaction body and the response
+/// includes x-fdb-fuel / x-fdb-time headers.
+/// A body shaped like the Cypher HTTP envelope (`{"cypher": "...", "params": {...}}`)
+/// that carries none of the JSON-LD transaction keys was almost certainly meant
+/// for the `application/cypher` path.
+fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    obj.get("cypher").is_some_and(JsonValue::is_string)
+        && ["insert", "delete", "where", "@graph", "@id"]
+            .iter()
+            .all(|k| !obj.contains_key(*k))
+}
+
+/// Derive the `TxnOpts` the HTTP layer surfaces from a JSON-LD body's
+/// `opts` block (`shapes`, `uniqueProperties`). Shared by the consensus
+/// submission path and the sync dry-run path so both stage under the same
+/// inline constraints.
+///
+/// Inline governance (`opts.shapes`, `opts.uniqueProperties`) is refused in a
+/// request carrying policy inputs (identity, policy class, inline policy or
+/// policy values): support in policy-scoped requests is a follow-up.
+fn txn_opts_from_body(
+    body: &JsonValue,
+    governance: &GovernanceOptions,
+    span: &tracing::Span,
+) -> Result<TxnOpts> {
+    // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
+    // so inline SHACL shapes and unique-property constraints reach the
+    // staging path. Other `TxnOpts` fields are not yet surfaced over
+    // HTTP (branch/context/etc. come from headers or query params);
+    // add them here if a use case lands.
+    let mut txn_opts = TxnOpts::default();
+    if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
+        // Validate at the boundary: `shapes` must be a JSON-LD
+        // document (object) or an array of JSON-LD documents.
+        // Letting scalars / nulls fall through to
+        // `fluree_graph_json_ld::expand` surfaces as a fuzzy
+        // internal parse error rather than the precise 400
+        // the caller deserves.
+        match shapes {
+            JsonValue::Object(_) => {}
+            JsonValue::Array(arr) => {
+                for (idx, item) in arr.iter().enumerate() {
+                    if !item.is_object() {
+                        set_span_error_code(span, "error:BadRequest");
+                        return Err(ServerError::bad_request(format!(
+                            "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.shapes must be a JSON-LD object or array of objects",
+                ));
+            }
+        }
+        if governance.has_any_policy_inputs() {
+            set_span_error_code(span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "inline request shapes are not supported in a policy-scoped request",
+            ));
+        }
+        txn_opts.shapes = Some(shapes.clone());
+    }
+    if let Some(unique_props_raw) = body.get("opts").and_then(|o| o.get("uniqueProperties")) {
+        // Must be a JSON array. A scalar (or null) is a type
+        // error, not "empty list".
+        let Some(arr) = unique_props_raw.as_array() else {
+            set_span_error_code(span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "opts.uniqueProperties must be an array of property IRI strings",
+            ));
+        };
+        // Every element must be a string. `filter_map` would
+        // silently drop integers/bools/etc. — that's the silent-
+        // weakening pattern we deliberately don't want here.
+        let mut iris: Vec<String> = Vec::with_capacity(arr.len());
+        for (idx, v) in arr.iter().enumerate() {
+            let Some(s) = v.as_str() else {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(format!(
+                    "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
+                )));
+            };
+            iris.push(s.to_string());
+        }
+        // Empty array is intentionally treated as "no inline
+        // constraints" rather than an error — operators may build
+        // the array dynamically and end up with zero entries.
+        if !iris.is_empty() {
+            if governance.has_any_policy_inputs() {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "inline uniqueness constraints (opts.uniqueProperties) are not supported in \
+                     a policy-scoped request",
+                ));
+            }
+            txn_opts.unique_properties = Some(iris);
+        }
+    }
+    Ok(txn_opts)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_transaction(
+    state: &AppState,
+    ledger_id: &str,
+    txn_type: TxnType,
+    graph_op: Option<(&GraphSel, GraphWrite)>,
+    body: JsonValue,
+    credential: &MaybeCredential,
+    author: Option<&str>,
+    headers: &FlureeHeaders,
+) -> Result<Response> {
+    // A Cypher envelope posted with a JSON Content-Type parses as valid JSON
+    // but contains no JSON-LD transaction clauses; without this check it
+    // reaches the transaction parser and fails with a message that never
+    // mentions the actual mistake (the Content-Type header).
+    if is_misrouted_cypher_envelope(&body) {
+        return Err(ServerError::bad_request(
+            "request body is a Cypher envelope ({\"cypher\": ...}) but was sent with a JSON \
+             Content-Type and interpreted as JSON-LD; resend with Content-Type: application/cypher",
+        ));
+    }
+    let idempotency_key = extract_idempotency_key(&credential.headers)?;
+    let prepared_transaction = prepare_transaction_body(body, headers)?;
+
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        let tx_id = compute_tx_id(&prepared_transaction.body);
+        tracing::debug!(tx_id = %tx_id, "computed transaction ID");
+
+        // Resolve the ledger handle up front so a missing ledger surfaces as
+        // a 404 here, before submission. The handle is also the source of the
+        // canonical ledger ID used to scope the raw-txn content store.
+        let handle = match state.fluree.ledger_cached(ledger_id).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:NotFound");
+                tracing::error!(error = %server_error, "ledger not found");
+                return Err(server_error);
+            }
+        };
+
+        let did = effective_did(&prepared_transaction.governance, author);
+        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+
+        if let Some(event_time_raw) = prepared_transaction
+            .body
+            .get("opts")
+            .and_then(|o| o.get("eventTime"))
+        {
+            let Some(event_time) = event_time_raw.as_str() else {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.eventTime must be an RFC 3339 timestamp string",
+                ));
+            };
+            commit_opts = with_event_time(commit_opts, event_time, "opts.eventTime")
+                .inspect_err(|_| set_span_error_code(&span, "error:BadRequest"))?;
+        }
+
+        let txn_opts = txn_opts_from_body(
+            &prepared_transaction.body,
+            &prepared_transaction.governance,
+            &span,
+        )?;
+
+        // Every JSON-LD transaction goes through consensus. Policy context,
+        // tracking, and execution are all handled by the submission layer;
+        // policy is built there from the ledger state the transaction
+        // actually stages against.
+        let body = match graph_op {
+            Some((graph, GraphWrite::Sync)) => TransactionBody::JsonLdGraphSync {
+                graph_iri: graph_iri(graph),
+                body: prepared_transaction.body,
+            },
+            Some((graph, GraphWrite::Insert)) => TransactionBody::GraphInsert {
+                graph_iri: graph_iri(graph),
+                payload: GraphBody::JsonLd(prepared_transaction.body),
+            },
+            None => match txn_type {
+                TxnType::Insert => TransactionBody::JsonLdInsert(prepared_transaction.body),
+                TxnType::Upsert => TransactionBody::JsonLdUpsert(prepared_transaction.body),
+                TxnType::Update => TransactionBody::JsonLdUpdate(prepared_transaction.body),
+            },
+        };
+        let request = TransactionRequest {
+            idempotency_key,
+            ledger_id: ledger_id.to_string(),
+            body,
+            txn_opts,
+            commit_opts,
+            tracking: prepared_transaction.tracking,
+            governance: prepared_transaction.governance,
+        };
+        transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+    }
+    .instrument(span)
+    .await
+}
+
+// ===== Turtle/TriG execution =====
+
+/// Compute transaction ID from Turtle/TriG string
+fn compute_tx_id_turtle(turtle: &str) -> String {
+    let hash = Sha256::digest(turtle.as_bytes());
+    format!("fluree:tx:sha256:{}", hex::encode(hash))
+}
+
+/// Operation kind for the Turtle/TriG transaction path.
+///
+/// Narrower than [`TxnType`] — Turtle bodies cannot represent an update
+/// (SPARQL UPDATE is the update path for RDF text), so the variant is
+/// excluded at the type level rather than checked at runtime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TurtleOp<'a> {
+    Insert,
+    Upsert,
+    /// A write scoped to one graph. `allow_empty` confirms that an empty
+    /// body clears the graph (sync only).
+    Graph {
+        graph: &'a GraphSel,
+        write: GraphWrite,
+        allow_empty: bool,
+    },
+}
+
+/// A graph target as the consensus bodies carry it: `None` is the default
+/// graph.
+fn graph_iri(graph: &GraphSel) -> Option<String> {
+    match graph {
+        GraphSel::Graph(iri) => Some(iri.clone()),
+        GraphSel::Default => None,
+    }
+}
+
+/// Execute a Turtle/TriG transaction
+///
+/// This function handles both:
+/// - text/turtle: Standard Turtle format (insert, upsert or sync)
+/// - application/trig: TriG format with GRAPH blocks for named graphs (insert, upsert or sync)
+///
+/// # Insert vs Upsert Semantics
+///
+/// - **Insert with Turtle/TriG** (`/insert`): Pure insert. Turtle parses directly to flakes;
+///   a TriG body (detected by the API, under either content type) lands its GRAPH blocks in
+///   their named graphs. Both travel as `TransactionBody::TurtleInsert`.
+/// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
+///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
+///   are retracted before new values are asserted.
+/// - **Graph writes with Turtle/TriG** (`/sync`, Graph Store `PUT`/`POST`): the body replaces
+///   or adds to one graph's contents (see `fluree_db_api::GraphPayload::Rdf`).
+pub(crate) async fn execute_turtle_transaction(
+    state: &AppState,
+    ledger_id: &str,
+    op: TurtleOp<'_>,
+    turtle: &str,
+    credential: &MaybeCredential,
+    headers: &FlureeHeaders,
+    _author: Option<&str>,
+) -> Result<Response> {
+    let is_trig = credential.is_trig();
+
+    // Create execution span
+    let format = if is_trig { "trig" } else { "turtle" };
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        op = ?op,
+        format = format,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        // Compute tx-id from Turtle string
+        let tx_id = compute_tx_id_turtle(turtle);
+
+        tracing::debug!(tx_id = %tx_id, "computed transaction ID");
+
+        // Get cached ledger handle (loads if not cached)
+        let handle = match state.fluree.ledger_cached(ledger_id).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:NotFound");
+                tracing::error!(error = %server_error, "ledger not found");
+                return Err(server_error);
+            }
+        };
+
+        // Turtle/TriG bodies carry no `opts`, so all policy inputs come from
+        // the fluree-identity / fluree-policy / fluree-policy-class /
+        // fluree-policy-values / fluree-default-allow headers — the same
+        // header-only path the SPARQL UPDATE route uses. The consensus layer
+        // builds the PolicyContext from this governance against the staged
+        // ledger state and enforces f:modify on the write.
+        let effective_identity = headers.identity.clone();
+
+        let governance =
+            crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
+
+        let commit_opts = build_commit_opts(
+            effective_identity.as_deref(),
+            credential,
+            &state.fluree,
+            &handle,
+        );
+
+        // Tracking is header-driven and applies to every format.
+        let tracking = tracking_from_headers(headers);
+        // Sync, insert and upsert all read GRAPH blocks from either content
+        // type.
+        let body = match op {
+            TurtleOp::Graph {
+                graph,
+                write: GraphWrite::Sync,
+                allow_empty,
+            } => TransactionBody::RdfGraphSync {
+                graph_iri: graph_iri(graph),
+                text: turtle.to_string(),
+                allow_empty,
+            },
+            TurtleOp::Graph {
+                graph,
+                write: GraphWrite::Insert,
+                ..
+            } => TransactionBody::GraphInsert {
+                graph_iri: graph_iri(graph),
+                payload: GraphBody::Rdf(turtle.to_string()),
+            },
+            TurtleOp::Upsert if is_trig => TransactionBody::TrigUpsert(turtle.to_string()),
+            TurtleOp::Upsert => TransactionBody::TurtleUpsert(turtle.to_string()),
+            TurtleOp::Insert => TransactionBody::TurtleInsert(turtle.to_string()),
+        };
+        let request = TransactionRequest {
+            idempotency_key: extract_idempotency_key(&credential.headers)?,
+            ledger_id: ledger_id.to_string(),
+            body,
+            txn_opts: TxnOpts::default(),
+            commit_opts,
+            tracking,
+            governance,
+        };
+        transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+    }
+    .instrument(span)
+    .await
+}
+
+// ===== Cypher / SPARQL UPDATE execution =====
+
+/// Execute a Cypher write statement (CREATE, SET, REMOVE) against a ledger.
+///
+/// Goes through the same cached-handle commit path as SPARQL UPDATE
+/// (`ledger_cached` plus `stage(&handle)`) so the in-memory ledger cache stays
+/// current, meaning a subsequent read in the same process sees the write. The
+/// Cypher AST is lowered to a `Txn` via the shared `lower_cypher_to_txn`, which
+/// threads the ledger's default context. v1 does a single attempt with no
+/// reconcile/retry loop, so a concurrent-writer conflict surfaces as an error.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cypher_transact(
+    state: &AppState,
+    ledger_id: &str,
+    body: &str,
+    headers: &FlureeHeaders,
+    bearer: Option<&crate::extract::DataPrincipal>,
+    credential: &MaybeCredential,
+    span: &tracing::Span,
+) -> Result<Response> {
+    enforce_write_access(state, ledger_id, bearer, credential)?;
+
+    // Hash the full request body (statement + any params envelope) so two
+    // requests with the same statement but different params get distinct
+    // tx-ids.
+    let tx_id = compute_tx_id_sparql(body);
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(body);
+
+    // Use the verified effective identity and build policy
+    // options from headers, same as the SPARQL UPDATE path.
+    let effective_identity = headers.identity.clone();
+    let qc_opts =
+        crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
+
+    // Submit through consensus, exactly like SPARQL UPDATE: the Cypher statement
+    // is lowered to a `Txn` inside the consensus layer under the ledger write
+    // lock — including conditional `MERGE … ON MATCH/ON CREATE` branch
+    // resolution against a policy-wrapped probe — so a retried submission is
+    // deduplicated by `Idempotency-Key` and there is no pre-lock TOCTOU on the
+    // branch choice. `build_commit_opts` is built from the cached handle for
+    // raw-txn provenance / identity, identical to the SPARQL path.
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    let commit_opts = build_commit_opts(
+        effective_identity.as_deref(),
+        credential,
+        &state.fluree,
+        &handle,
+    );
+    let tracking = tracking_from_headers(headers);
+
+    // A multi-clause statement runs through the sequential write driver
+    // inside the consensus layer; its trailing RETURN is answered from the
+    // driver's final row table and travels back on the receipt (local
+    // consensus only — the Raft receipt path has no channel for it, so
+    // reject RETURN there pre-submission rather than after committing).
+    let (is_sequential, sequential_has_return) =
+        fluree_db_api::cypher_seq::classify_sequential_source(&cypher, params.as_ref());
+    if is_sequential
+        && sequential_has_return
+        && !crate::routes::import::source_import_supported(state)
+    {
+        set_span_error_code(span, "error:BadRequest");
+        return Err(ServerError::Api(fluree_db_api::ApiError::cypher(
+            "a trailing RETURN on a multi-clause Cypher write is not supported under Raft \
+             consensus — drop the RETURN or use a Bolt session"
+                .to_string(),
+            Vec::new(),
+        )));
+    }
+
+    // A trailing RETURN on a single-clause write ships a skolemization id
+    // with the request so the created-entity rows are reconstructible
+    // post-commit (see `fluree_db_api::cypher_write`). Validation errors
+    // surface here, pre-submission; parse errors fall through to the
+    // consensus path's full-diagnostic error.
+    let return_plan = if is_sequential {
+        None
+    } else {
+        fluree_db_api::cypher_write::plan_write_return_source(&cypher, params.as_ref())
+            .map_err(ServerError::Api)
+            .inspect_err(|_| {
+                set_span_error_code(span, "error:BadRequest");
+            })?
+    };
+    let skolem_txn_id = return_plan
+        .as_ref()
+        .map(|_| fluree_db_api::cypher_write::fresh_skolem_txn_id());
+    let txn_opts = TxnOpts {
+        skolem_txn_id: skolem_txn_id.clone(),
+        ..TxnOpts::default()
+    };
+
+    let request = TransactionRequest {
+        idempotency_key: extract_idempotency_key(&credential.headers)?,
+        ledger_id: ledger_id.to_string(),
+        body: TransactionBody::Cypher {
+            query: cypher,
+            params,
+        },
+        txn_opts,
+        commit_opts,
+        tracking,
+        governance: qc_opts,
+    };
+
+    if is_sequential && sequential_has_return {
+        // Sequential write with RETURN: the receipt carries the envelope.
+        let receipt = submit_via_consensus(state, request, &credential.headers).await?;
+        let envelope = receipt
+            .cypher_return
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"results": [{"columns": [], "data": []}]}));
+        let mut response_headers = HeaderMap::new();
+        if let Some(key) = &receipt.idempotency_key {
+            if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+                response_headers.insert("Idempotency-Key", value);
+            }
+        }
+        if let Some(tally) = &receipt.tally {
+            response_headers.extend(tracking_headers(tally));
+        }
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.fluree.cypher+json; charset=utf-8"),
+        );
+        return Ok((response_headers, envelope.to_string()).into_response());
+    }
+
+    let (Some(plan), Some(skolem_id)) = (return_plan, skolem_txn_id) else {
+        return transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await;
+    };
+
+    // Write with RETURN: commit, then answer the RETURN as a Cypher-JSON
+    // envelope (matching the read path's tabular format).
+    let receipt = submit_via_consensus(state, request, &credential.headers).await?;
+    let ledger_state =
+        wait_for_committed_state(state, ledger_id, receipt.commit.t, &receipt).await?;
+    let envelope = fluree_db_api::cypher_write::write_return_rows(&plan, &skolem_id, &ledger_state)
+        .await
+        .map_err(ServerError::Api)?;
+
+    let mut response_headers = HeaderMap::new();
+    if let Some(key) = &receipt.idempotency_key {
+        if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+            response_headers.insert("Idempotency-Key", value);
+        }
+    }
+    if let Some(tally) = &receipt.tally {
+        response_headers.extend(tracking_headers(tally));
+    }
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.fluree.cypher+json; charset=utf-8"),
+    );
+    Ok((response_headers, envelope.to_string()).into_response())
+}
+
+/// Wait (briefly) until the cached ledger state includes commit `t`. Local
+/// consensus updates the cache before the receipt returns, so this passes
+/// immediately; a Raft follower may lag until the commit event applies.
+pub(crate) async fn wait_for_committed_state(
+    state: &AppState,
+    ledger_id: &str,
+    commit_t: i64,
+    receipt: &fluree_db_consensus::TransactionReceipt,
+) -> Result<fluree_db_api::LedgerState> {
+    for _ in 0..40 {
+        let handle = state
+            .fluree
+            .ledger_cached(ledger_id)
+            .await
+            .map_err(ServerError::Api)?;
+        let view = handle.snapshot().await;
+        if view.t >= commit_t {
+            return Ok(view.to_ledger_state());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    Err(ServerError::Api(fluree_db_api::ApiError::internal(
+        format!(
+            "commit {} (t={commit_t}) is not yet visible in the local ledger state; \
+         the write succeeded but its RETURN rows could not be produced",
+            receipt.commit.commit_id
+        ),
+    )))
+}
+
+/// Execute a SPARQL UPDATE request
+///
+/// This function:
+/// 1. Parses the SPARQL UPDATE string
+/// 2. Extracts the UpdateOperation from the AST
+/// 3. Lowers to Txn IR using lower_sparql_update
+/// 4. Executes via the stage/commit pipeline
+async fn execute_sparql_update_request(
+    state: &AppState,
+    path_ledger: Option<&str>,
+    query_params: &TransactQueryParams,
+    headers: &FlureeHeaders,
+    credential: &MaybeCredential,
+    parent_span: &tracing::Span,
+    bearer: Option<&crate::extract::DataPrincipal>,
+) -> Result<Response> {
+    // Extract SPARQL string from body
+    let sparql = match credential.body_string() {
+        Ok(s) => s,
+        Err(e) => {
+            set_span_error_code(parent_span, "error:BadRequest");
+            tracing::warn!(error = %e, "invalid SPARQL UPDATE body");
+            return Err(e);
+        }
+    };
+
+    // SPARQL Protocol `using-graph-uri` / `using-named-graph-uri` become the
+    // operations' USING / USING NAMED before the text is logged or lowered.
+    let sparql = query_params.using.apply(sparql).inspect_err(|e| {
+        set_span_error_code(parent_span, "error:BadRequest");
+        tracing::warn!(error = %e, "invalid SPARQL Protocol USING parameters");
+    })?;
+
+    // Get ledger id from path, query param, or header (SPARQL UPDATE body doesn't contain ledger)
+    let ledger_id = match path_ledger {
+        Some(ledger) => ledger.to_string(),
+        None => match query_params.ledger.as_ref().or(headers.ledger.as_ref()) {
+            Some(ledger) => ledger.clone(),
+            None => {
+                set_span_error_code(parent_span, "error:BadRequest");
+                tracing::warn!("missing ledger ID for SPARQL UPDATE");
+                return Err(ServerError::MissingLedger);
+            }
+        },
+    };
+
+    parent_span.record("ledger_id", ledger_id.as_str());
+
+    // Enforce write access for unsigned requests when bearer is present/required
+    enforce_write_access(state, &ledger_id, bearer, credential)?;
+
+    submit_sparql_update(state, &ledger_id, sparql, headers, credential, parent_span).await
+}
+
+/// Submit a SPARQL UPDATE through consensus, once the ledger and write access
+/// are settled. The text is parsed and lowered inside the consensus layer.
+pub(crate) async fn submit_sparql_update(
+    state: &AppState,
+    ledger_id: &str,
+    sparql: String,
+    headers: &FlureeHeaders,
+    credential: &MaybeCredential,
+    parent_span: &tracing::Span,
+) -> Result<Response> {
+    let tx_id = compute_tx_id_sparql(&sparql);
+
+    // `# PRAGMA` options merge with the headers as `with_sparql_pragmas`
+    // describes. The transaction-level ones (`validation-mode`,
+    // `unique-properties`) ride the text itself and are applied where it is
+    // lowered.
+    let pragmas = fluree_db_sparql::request_pragmas(&sparql).map_err(|e| {
+        set_span_error_code(parent_span, "error:BadRequest");
+        ServerError::bad_request(e)
+    })?;
+    let headers = &headers.clone().with_sparql_pragmas(&pragmas)?;
+
+    // Resolve the ledger handle up front: a missing ledger surfaces as a 404
+    // here, and the handle provides the canonical ledger ID for commit_opts.
+    let handle = match state.fluree.ledger_cached(ledger_id).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            let server_error = ServerError::Api(e);
+            set_span_error_code(parent_span, "error:NotFound");
+            tracing::error!(error = %server_error, "ledger not found");
+            return Err(server_error);
+        }
+    };
+
+    // Policy headers have already been bound to verified authorization.
+    let effective_identity = headers.identity.clone();
+
+    let governance =
+        crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
+
+    let mut commit_opts = build_commit_opts(
+        effective_identity.as_deref(),
+        credential,
+        &state.fluree,
+        &handle,
+    );
+    if let Some(event_time) = &pragmas.event_time {
+        commit_opts = with_event_time(commit_opts, event_time, "pragma `event-time`")
+            .inspect_err(|_| set_span_error_code(parent_span, "error:BadRequest"))?;
+    }
+
+    // The query is parsed and lowered inside the consensus layer, under the
+    // ledger write lock — so namespace allocation shares the staging
+    // registry and the namespace-conflict retry that pre-lowering required
+    // is gone. Tracking is header-driven for SPARQL.
+    let tracking = tracking_from_headers(headers);
+    let request = TransactionRequest {
+        idempotency_key: extract_idempotency_key(&credential.headers)?,
+        ledger_id: ledger_id.to_string(),
+        body: TransactionBody::Sparql(sparql),
+        txn_opts: TxnOpts::default(),
+        commit_opts,
+        tracking,
+        governance,
+    };
+    transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+}
+
+// ===== Peer mode forwarding =====
+
+/// Forward a transaction request to the transaction server (peer mode)
+pub(crate) async fn forward_write_request(state: &AppState, request: Request) -> Response {
+    let client = match state.forwarding_client.as_ref() {
+        Some(c) => c,
+        None => {
+            return ServerError::internal("Forwarding client not configured").into_response();
+        }
+    };
+
+    tracing::debug!("Forwarding transaction request to transaction server");
+
+    // Forward the request and return the response directly
+    // This preserves the upstream status codes (including 502/504 for errors)
+    match client.forward(request).await {
+        Ok(response) => response,
+        Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn misrouted_cypher_envelope_detection() {
+        assert!(is_misrouted_cypher_envelope(&json!({
+            "cypher": "MERGE (n:Person {name: 'Alice'})",
+            "params": {"name": "Alice"}
+        })));
+        // Any JSON-LD transaction key means the body was not a Cypher envelope.
+        assert!(!is_misrouted_cypher_envelope(&json!({
+            "cypher": "not really",
+            "insert": {"@id": "ex:a", "ex:p": 1}
+        })));
+        // A "cypher" property on a data node (non-string or alongside @id) is data.
+        assert!(!is_misrouted_cypher_envelope(&json!({
+            "@id": "ex:doc",
+            "cypher": "MATCH (n) RETURN n"
+        })));
+        assert!(!is_misrouted_cypher_envelope(&json!({"cypher": 42})));
+        assert!(!is_misrouted_cypher_envelope(&json!("MATCH (n) RETURN n")));
+    }
+
+    /// Exhaustive classification of every [`SubmissionError`] variant at the
+    /// consensus→HTTP flattening point. `Retry-After` attaches to every 503
+    /// unconditionally, so each variant's mapping is a retryability decision;
+    /// the `match` below has no wildcard arm, so adding a `SubmissionError`
+    /// variant refuses to compile until it is consciously classified here
+    /// (and, if it maps to 503, in `RETRYABLE_503_TYPES` in `error.rs`).
+    #[test]
+    fn submission_error_variants_are_exhaustively_classified() {
+        use fluree_vocab::errors;
+
+        let variants = [
+            SubmissionError::KeyCollision,
+            SubmissionError::AlreadyInFlight,
+            SubmissionError::Overloaded,
+            SubmissionError::Execution {
+                status: 422,
+                message: "invalid transaction".into(),
+            },
+            SubmissionError::NoveltyBackpressure {
+                message: "Novelty at maximum size, reindexing required".into(),
+            },
+            SubmissionError::NoveltyDeltaTooLarge {
+                message: "Transaction would exceed novelty limit".into(),
+            },
+            SubmissionError::DatatypeLimitExceeded {
+                message: "datatype limit exceeded".into(),
+            },
+            SubmissionError::CommitNotFound {
+                message: "No commit found with prefix: ffffffff".into(),
+            },
+            SubmissionError::ConfigUnavailable {
+                message: "Ledger config unavailable: storage read failed".into(),
+            },
+            SubmissionError::CommitContention {
+                message: "Commit contention: 16 commit attempts lost".into(),
+            },
+            SubmissionError::IndexNotLoaded {
+                message: "Index not loaded: the ledger's index (t=1) is not loaded".into(),
+            },
+        ];
+        for variant in variants {
+            // (status, @type) each variant must surface as. No wildcard:
+            // this match is the classification record.
+            let (expected_status, expected_type) = match &variant {
+                SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => {
+                    (409, errors::COMMIT_CONFLICT)
+                }
+                // Retryable capacity (in-flight cap) — one of the allowlisted
+                // 503 sources; its @type is the Http-passthrough catch-all.
+                SubmissionError::Overloaded => (503, errors::INTERNAL),
+                SubmissionError::Execution { .. } => (422, errors::INVALID_TRANSACTION),
+                SubmissionError::NoveltyBackpressure { .. } => (503, errors::NOVELTY_AT_MAX),
+                SubmissionError::NoveltyDeltaTooLarge { .. } => {
+                    (413, errors::NOVELTY_DELTA_TOO_LARGE)
+                }
+                SubmissionError::DatatypeLimitExceeded { .. } => {
+                    (422, errors::DATATYPE_LIMIT_EXCEEDED)
+                }
+                SubmissionError::CommitNotFound { .. } => (404, errors::COMMIT_NOT_FOUND),
+                SubmissionError::ConfigUnavailable { .. } => (500, errors::STORAGE_READ),
+                SubmissionError::CommitContention { .. } => (503, errors::COMMIT_CONTENTION),
+                SubmissionError::IndexNotLoaded { .. } => (503, errors::INDEX_NOT_LOADED),
+            };
+            let se = submission_error_to_server_error(variant);
+            assert_eq!(se.status_code().as_u16(), expected_status, "{se}");
+            assert_eq!(se.error_type(), expected_type, "{se}");
+            let is_503 = expected_status == 503;
+            let resp = axum::response::IntoResponse::into_response(se);
+            assert_eq!(
+                resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+                is_503,
+                "Retry-After must attach to every 503 and only to 503s"
+            );
+        }
+    }
+}
