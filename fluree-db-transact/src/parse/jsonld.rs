@@ -104,6 +104,21 @@ fn parse_rooted(
             .and_then(|o| o.get("lpgEdgeLifecycle"))
             .and_then(Value::as_bool);
     }
+    if let Some(options) = json.get("opts") {
+        if let Some(value) = options.get("expectedT") {
+            let expected = value.as_i64().filter(|t| *t >= 0)
+                .ok_or_else(|| TransactError::Parse("opts.expectedT must be a nonnegative integer".into()))?;
+            if opts.expected_t.is_some_and(|t| t != expected) {
+                return Err(TransactError::Parse("Conflicting expectedT values".into()));
+            }
+            opts.expected_t = Some(expected);
+        }
+        if let Some(value) = options.get("requireChange") {
+            let required = value.as_bool()
+                .ok_or_else(|| TransactError::Parse("opts.requireChange must be boolean".into()))?;
+            opts.require_change = Some(opts.require_change.unwrap_or(false) || required);
+        }
+    }
     let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
 
     // Requested SHACL validation mode ("warn" / "reject"), same JSON-over-

@@ -859,6 +859,14 @@ pub struct RelationshipDelete {
 /// Transaction options
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TxnOpts {
+    /// Reject staging against a different ledger revision, including on consensus retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_t: Option<i64>,
+
+    /// Reject a guarded transaction whose templates produce no changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_change: Option<bool>,
+
     /// Branch to commit to (defaults to main branch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,

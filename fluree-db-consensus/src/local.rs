@@ -605,6 +605,9 @@ mod tests {
         assert!(!is_retryable_txn_conflict(&ApiError::Transact(
             TransactError::EmptyTransaction,
         )));
+        assert!(!is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::PreconditionFailed("stale signed revision".into())
+        )));
         // CommitIdMismatch indicates the head was rewritten under us in
         // a way refresh can't reconcile (snapshot taken at the wrong
         // moment); a retry would hit the same mismatch.

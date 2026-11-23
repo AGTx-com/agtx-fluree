@@ -754,6 +754,7 @@ impl ApiError {
 
             ApiError::Transact(
                 TE::CommitConflict { .. }
+                | TE::PreconditionFailed(_)
                 | TE::CommitIdMismatch { .. }
                 | TE::PublishLostRace { .. }
                 | TE::NamespaceConflict(_),
@@ -949,6 +950,7 @@ impl ApiError {
             )) => errors::ACCESS_DENIED,
             ApiError::Transact(
                 TE::CommitConflict { .. }
+                | TE::PreconditionFailed(_)
                 | TE::CommitIdMismatch { .. }
                 | TE::PublishLostRace { .. }
                 | TE::NamespaceConflict(_),
