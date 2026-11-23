@@ -400,6 +400,8 @@ pub struct ExecutionContext<'a> {
     /// `false`. Surfaced through `opts.includeSystemFacts: true` on
     /// JSON-LD queries.
     pub include_system_facts: bool,
+    /// Only trusted policy execution may explicitly address native commit metadata.
+    pub(crate) policy_commit_metadata: bool,
     /// `@vocab` prefix a Cypher query was lowered against (from
     /// `Query::cypher_vocab`). Used by `labels()`/`type()`/`keys()`
     /// evaluation to compact IRIs the way `db.labels()` does: strip the
@@ -669,6 +671,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -738,6 +741,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -811,6 +815,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -873,6 +878,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -934,6 +940,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -997,6 +1004,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
+            policy_commit_metadata: false,
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
@@ -1402,6 +1410,13 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// Attach a dataset to this execution context for multi-graph queries
+    /// Keep ordinary GRAPH routing/edge resolution intact; do not turn the whole policy into a dataset query.
+    /// This is never a request option and does not enumerate system graphs.
+    pub(crate) fn with_policy_commit_metadata(mut self) -> Self {
+        self.policy_commit_metadata = true;
+        self
+    }
+
     pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
         self.multi_ledger = Self::compute_multi_ledger(Some(dataset), &self.active_graph);
         self.dataset = Some(dataset);
@@ -1838,6 +1853,11 @@ impl<'a> ExecutionContext<'a> {
     /// A graph dropped as of `to_t` names no graph here either, as one that
     /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        if self.policy_commit_metadata
+            && iri == fluree_db_core::txn_meta_graph_iri(&self.active_snapshot.ledger_id)
+        {
+            return Some(fluree_db_core::graph_registry::TXN_META_GRAPH_ID);
+        }
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
                 if g_id >= FIRST_USER_GRAPH_ID
@@ -1946,6 +1966,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            policy_commit_metadata: self.policy_commit_metadata,
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
@@ -2018,6 +2039,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            policy_commit_metadata: self.policy_commit_metadata,
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
@@ -2091,6 +2113,7 @@ impl<'a> ExecutionContext<'a> {
             vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            policy_commit_metadata: self.policy_commit_metadata,
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
