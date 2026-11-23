@@ -173,6 +173,22 @@ fn dropped_schema_source(iri: &str, floor: i64, to_t: i64) -> ApiError {
     crate::policy_builder::dropped_source("schema source", iri, floor, to_t)
 }
 
+/// Materialize the configured local ontology for query and enforcement consumers.
+/// Only the selected schema/import closure is projected; instance data stays in place.
+pub(crate) async fn resolve_local_schema_flakes(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    reasoning: &ReasoningDefaults,
+) -> Result<Option<Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>> {
+    let Some(bundle) = resolve_schema_bundle(snapshot, overlay, to_t, reasoning).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        get_or_build_schema_bundle_flakes(snapshot, overlay, &bundle).await?,
+    ))
+}
+
 /// Resolve a `GraphSourceRef` to a local `GraphId` in the current ledger.
 ///
 /// Central chokepoint for the three invariants applied to every
