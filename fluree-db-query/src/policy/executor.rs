@@ -547,6 +547,10 @@ impl QueryPolicyExecutor<'_> {
             ExecutionContext::with_time(snapshot, vars, to_t, None).with_graph_id(self.g_id)
         };
 
+        // Native metadata is explicitly addressable in this trusted root context only.
+        // Ordinary query contexts never enable it, and graph enumeration stays unchanged.
+        let mut ctx = ctx.with_policy_commit_metadata();
+
         // Build the where clause operators (VALUES is now part of the patterns).
         //
         // Root: policy queries always evaluate at the selected state's t for
