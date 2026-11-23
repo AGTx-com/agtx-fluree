@@ -46,6 +46,8 @@ pub mod lists;
 pub mod lower_cypher_update;
 pub mod lower_sparql_update;
 pub mod namespace;
+pub mod metadata_bindings;
+pub use metadata_bindings::TransactionMetadataBindings;
 pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;

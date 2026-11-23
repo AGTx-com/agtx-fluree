@@ -601,8 +601,18 @@ async fn build_direct_fluree(
     }
 
     let fluree = match nameservice {
-        Some(ns) => Arc::new(builder.build_client_with_nameservice(ns).await?),
-        None => Arc::new(builder.build_client().await?),
+        Some(ns) => Arc::new(
+            builder
+                .build_client_with_nameservice(ns)
+                .await?
+                .with_transaction_metadata_bindings(config.transaction_metadata_bindings.clone()),
+        ),
+        None => Arc::new(
+            builder
+                .build_client()
+                .await?
+                .with_transaction_metadata_bindings(config.transaction_metadata_bindings.clone()),
+        ),
     };
 
     tracing::info!(

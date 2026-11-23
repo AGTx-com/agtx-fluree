@@ -206,6 +206,11 @@ impl PolicyContext {
         self
     }
 
+    /// Preserve native graph selection when trusted transaction bindings are attached.
+    pub fn graph_overrides(&self) -> impl Iterator<Item = (&String, &PolicyContext)> {
+        self.graph_overrides.iter()
+    }
+
     /// Select by the actual destination, never a value supplied in the request.
     pub fn for_graph(&self, graph: Option<&str>) -> &Self {
         let key = graph.unwrap_or(fluree_vocab::config_iris::DEFAULT_GRAPH);

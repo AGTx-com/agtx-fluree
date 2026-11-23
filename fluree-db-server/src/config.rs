@@ -393,6 +393,9 @@ impl AdminAuthConfig {
 #[command(name = "fluree-server")]
 #[command(about = "Fluree DB HTTP REST API Server")]
 pub struct ServerConfig {
+    /// Trusted startup-only metadata dictionary, not a request option.
+    #[arg(skip)]
+    pub transaction_metadata_bindings: fluree_db_api::TransactionMetadataBindings,
     /// Path to configuration file (default: walks up from cwd looking for .fluree/config.toml)
     #[arg(long, env = "FLUREE_CONFIG")]
     pub config_file: Option<PathBuf>,
@@ -949,6 +952,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            transaction_metadata_bindings: Default::default(),
             config_file: None,
             profile: None,
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),

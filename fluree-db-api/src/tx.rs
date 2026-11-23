@@ -3098,6 +3098,10 @@ impl crate::Fluree {
         txn_context: Option<&JsonValue>,
         request: Option<&RequestGovernance>,
     ) -> std::result::Result<CheckedStage, fluree_db_transact::TransactError> {
+        let options = StageOptions {
+            transaction_metadata_bindings: Some(&self.transaction_metadata_bindings),
+            ..options
+        };
         // Without SHACL support inline shapes cannot be applied, and a request
         // that carries them expects its data checked: refuse rather than
         // commit unchecked.
@@ -4502,7 +4506,10 @@ impl crate::Fluree {
         // Carries f:modify policy for the parsed flakes. Without it a Turtle
         // write would skip transaction-time enforcement entirely (the JSON/IR
         // path applies it via StageOptions; the direct flake path must too).
-        let options = stage_options(index_config, policy, tracker);
+        let options = StageOptions {
+            transaction_metadata_bindings: Some(&self.transaction_metadata_bindings),
+            ..stage_options(index_config, policy, tracker)
+        };
         let mut view = match stage_flakes(ledger, flakes, options).await {
             Ok(view) => view,
             Err(e) => {

@@ -3473,6 +3473,7 @@ impl FlureeBuilder {
         }
 
         Fluree {
+            transaction_metadata_bindings: Default::default(),
             config,
             backend,
             nameservice_mode: nameservice,
@@ -3813,6 +3814,7 @@ impl FlureeBuilder {
 /// re-opening storage.
 #[derive(Clone)]
 pub struct Fluree {
+    transaction_metadata_bindings: fluree_db_transact::TransactionMetadataBindings,
     /// Connection configuration
     config: ConnectionConfig,
     /// Storage backend (managed or permanent).
@@ -3881,6 +3883,15 @@ struct RootHold {
 }
 
 impl Fluree {
+    /// Set trusted metadata bindings before sharing this instance with write handlers.
+    pub fn with_transaction_metadata_bindings(
+        mut self,
+        bindings: fluree_db_transact::TransactionMetadataBindings,
+    ) -> Self {
+        self.transaction_metadata_bindings = bindings;
+        self
+    }
+
     /// Create a new Fluree instance with custom components
     ///
     /// Most users should use `FlureeBuilder` instead.
@@ -3907,6 +3918,7 @@ impl Fluree {
             config.cache.query_result_mb(),
         ));
         Self {
+            transaction_metadata_bindings: Default::default(),
             config,
             backend,
             nameservice_mode: nameservice,
@@ -3939,6 +3951,7 @@ impl Fluree {
             config.cache.query_result_mb(),
         ));
         Self {
+            transaction_metadata_bindings: Default::default(),
             config,
             backend: StorageBackend::Managed(Arc::new(storage)),
             nameservice_mode: nameservice,
@@ -6709,3 +6722,5 @@ mod storage_lock_tests {
         });
     }
 }
+
+pub use fluree_db_transact::TransactionMetadataBindings;
