@@ -460,8 +460,10 @@ impl Fluree {
             let policy_ctx =
                 build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
                     .await?;
-            if !c.commit.graph_drops.is_empty()
-                && policy_ctx.as_ref().is_some_and(|p| !p.wrapper().is_root())
+            // `is_root` covers native graph overrides too, as a local DROP's
+            // check in staging does: a root ledger default does not make an
+            // identity a restrictive graph override governs unrestricted.
+            if !c.commit.graph_drops.is_empty() && policy_ctx.as_ref().is_some_and(|p| !p.is_root())
             {
                 return Err(push_error_for_stage(
                     fluree_db_transact::drop_needs_unrestricted_identity(&format!(

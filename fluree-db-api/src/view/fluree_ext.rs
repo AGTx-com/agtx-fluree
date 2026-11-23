@@ -1098,6 +1098,44 @@ impl Fluree {
         // Such a view must not bypass ledger override controls just because
         // config has not been attached yet (for example GraphQL read-back).
         let view = self.resolve_and_attach_config(view).await?;
+        // A GRAPH query may scan more than the view's initial graph. Use the
+        // same committed native GraphConfig selection as writes, and let the
+        // enforcer select by the actual fact's graph. Request overrides still
+        // go through merge_policy_opts for every configured destination.
+        let config = crate::policy_view::resolve_ledger_config_cached(
+            self,
+            &view.snapshot,
+            view.overlay.as_ref(),
+            view.novelty_for_stats(),
+            view.t,
+        )
+        .await?;
+        if config
+            .as_ref()
+            .is_some_and(|c| !c.graph_overrides.is_empty())
+        {
+            let ledger_id = view.snapshot.ledger_id.clone();
+            let mut resolution = crate::cross_ledger::ResolveCtx::with_resolved_heads(
+                &ledger_id,
+                self,
+                (**view.cross_ledger_resolved_heads()).clone(),
+            );
+            if let Some(context) = crate::policy_view::build_graph_policy_contexts(
+                self,
+                &view.snapshot,
+                view.overlay.as_ref(),
+                view.novelty_for_stats(),
+                view.t,
+                opts,
+                &mut resolution,
+            )
+            .await?
+            {
+                return Ok(view
+                    .with_policy(Arc::new(context))
+                    .with_cross_ledger_resolved_heads(Arc::new(resolution.resolved_heads)));
+            }
+        }
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
             config_resolver::merge_policy_opts(resolved, opts)
         } else {

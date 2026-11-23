@@ -1015,7 +1015,7 @@ pub async fn stage_with_graph_delta(
         // Under a policy, the stored facts the write restates as they are
         // (retracted and asserted again, so they cancel) go to the modify
         // check below. Without one, cancellation keeps nothing.
-        let restricted = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
+        let restricted = options.policy_ctx.is_some_and(|p| !p.is_root());
         let mut restated: Vec<(Flake, Flake)> = Vec::new();
         let mut flakes = if pure_retract {
             let _span =
@@ -1171,7 +1171,7 @@ pub async fn stage_with_graph_delta(
         // both sides when the identity cannot view it, so whether restating
         // a value it cannot see succeeds does not depend on what is stored.
         if let Some(policy) = options.policy_ctx {
-            if !policy.wrapper().is_root() {
+            if !policy.is_root() {
                 let hidden =
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
@@ -1689,7 +1689,7 @@ async fn stage_graph_mgmt(
         // Under a non-root policy, a re-homed fact the destination already
         // holds stages nothing but is judged as a restatement, as in `stage`
         // (`hidden_restatements`): (the stored fact's retraction, the assertion).
-        let policed = options.policy_ctx.is_some_and(|p| !p.wrapper().is_root());
+        let policed = options.policy_ctx.is_some_and(|p| !p.is_root());
         let mut restated: Vec<(Flake, Flake)> = Vec::new();
         // The graphs the operation drops (DROP, and MOVE's source): recorded
         // on the commit, which retracts nothing of them.
@@ -2179,7 +2179,7 @@ async fn stage_graph_mgmt(
         // whether a transfer into a graph the identity cannot view succeeds
         // does not depend on what that graph already holds.
         if let Some(policy) = options.policy_ctx {
-            if !policy.wrapper().is_root() {
+            if !policy.is_root() {
                 let hidden =
                     hidden_restatements(&ledger, policy, restated, &reverse_graph, options.tracker)
                         .await?;
@@ -2628,7 +2628,7 @@ pub async fn stage_flakes(
 
         // 5. Policy enforcement
         if let Some(policy) = options.policy_ctx {
-            if !policy.wrapper().is_root() {
+            if !policy.is_root() {
                 tracing::debug!("enforcing modify policies on pre-built flakes");
                 enforce_modify_policies(
                     &flakes,
@@ -2706,7 +2706,7 @@ async fn hidden_restatements(
     let mut hidden = Vec::new();
     for (g_id, pairs) in by_graph {
         let db = ledger.as_graph_db_ref(g_id);
-        if policy.wrapper().has_class_policies() {
+        if policy.contexts().any(|p| p.wrapper().has_class_policies()) {
             let mut subjects: Vec<Sid> = pairs.iter().map(|(r, _)| r.s.clone()).collect();
             subjects.sort();
             subjects.dedup();
@@ -2838,8 +2838,10 @@ async fn enforce_modify_policies(
         std::borrow::Cow::Owned(staged.iter().cloned().chain(owner_checks).collect())
     };
     let flakes: &[Flake] = &flakes;
-    let needs_classes = policy.wrapper().has_class_policies();
-    let needs_lifecycle = policy.wrapper().has_write_verb_policies();
+    let needs_classes = policy.contexts().any(|p| p.wrapper().has_class_policies());
+    let needs_lifecycle = policy
+        .contexts()
+        .any(|p| p.wrapper().has_write_verb_policies());
 
     let mut states: HashMap<(GraphId, Sid), SubjectWriteState> = HashMap::new();
     if needs_classes || needs_lifecycle {
@@ -2916,7 +2918,10 @@ async fn enforce_modify_policies(
     // f:queryState f:postState conditions read committed + staged state; the
     // StagedLedger overlay (the same view SHACL validates against) provides
     // it. Built only when such a condition is loaded.
-    let staged_view = if policy.wrapper().has_post_state_conditions() {
+    let staged_view = if policy
+        .contexts()
+        .any(|p| p.wrapper().has_post_state_conditions())
+    {
         // Post-state GRAPH queries must discover graphs first introduced by
         // this staged write, not just the committed registry. Extend only the
         // isolated post-state snapshot; pre-state authority/config selection
@@ -3060,8 +3065,19 @@ async fn enforce_modify_policy_per_flake(
     let empty_classes: Vec<Sid> = Vec::new();
 
     for flake in flakes {
-        // Resolve the graph for this flake and get/create a cached executor.
+        // Resolve policy selection and query execution from the same actual graph.
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+        let graph_iri = flake
+            .g
+            .as_ref()
+            .and_then(|sid| ledger.snapshot.decode_sid(sid));
+        // A configured target was already interned by the committed config.
+        // A newly introduced IRI cannot match it; use the ledger fallback.
+        let policy = match (&flake.g, graph_iri.as_deref()) {
+            (None, _) => policy.for_graph(None),
+            (Some(_), Some(iri)) => policy.for_graph(Some(iri)),
+            (Some(_), None) => policy,
+        };
         let executor = executors.entry(g_id).or_insert_with(|| {
             // Modify policy queries see the state *before* this transaction
             // by default; f:postState conditions read through the staged
@@ -3407,7 +3423,7 @@ async fn stream_where_into_accumulator(
     // exactly what a plain query would (same enforcer, same default_allow). Pure
     // inserts have no WHERE and so are unaffected. Root policies skip filtering.
     let view_enforcer: Option<Arc<QueryPolicyEnforcer>> = view_policy
-        .filter(|p| !p.wrapper().is_root())
+        .filter(|p| !p.is_root())
         .map(|p| Arc::new(QueryPolicyEnforcer::new(Arc::new(p.clone()))));
 
     let make_graph_ref = |g_id: GraphId| -> fluree_db_query::GraphRef {
@@ -3660,7 +3676,7 @@ async fn stream_where_into_accumulator(
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
-    let collect_unmatched = view_policy.is_some_and(|p| !p.wrapper().is_root());
+    let collect_unmatched = view_policy.is_some_and(|p| !p.is_root());
     let mut unmatched_intents: Vec<Flake> = Vec::new();
     generator.set_graph_aliases(graph_aliases);
 

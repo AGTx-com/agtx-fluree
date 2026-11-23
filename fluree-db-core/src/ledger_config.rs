@@ -74,7 +74,7 @@ pub struct ResolvedConfig {
 // ============================================================================
 
 /// Policy defaults from the config graph (`f:policyDefaults`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyDefaults {
     /// `f:defaultAllow` — whether to permit access when no policy rule
     /// matches. `None` means unconfigured, in which case the request's own
@@ -112,7 +112,7 @@ pub struct ShaclDefaults {
 }
 
 /// Reasoning defaults from the config graph (`f:reasoningDefaults`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReasoningDefaults {
     /// `f:reasoningModes` — e.g., `["rdfs"]`, `["owl2rl"]`.
     pub modes: Option<Vec<String>>,
@@ -150,7 +150,7 @@ pub struct ReasoningDefaults {
 ///
 /// Binds an external ontology IRI (as it appears in `owl:imports`) to the
 /// local graph that provides that ontology's triples.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OntologyImportBinding {
     /// `f:ontologyIri` — the IRI that appears in `owl:imports` statements.
     pub ontology_iri: String,
@@ -386,7 +386,7 @@ pub struct GraphConfig {
 /// Permissiveness ordering: `None` < `IdentityRestricted` < `AllowAll`.
 ///
 /// Default is `AllowAll` (existing query behavior is unrestricted).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OverrideControl {
     /// No overrides permitted, regardless of identity.
     None,
@@ -471,7 +471,7 @@ impl OverrideControl {
 /// internal `GraphRef` enum used for fragment parsing in `fluree_ext.rs`.
 ///
 /// Corresponds to `f:GraphRef` in the config graph schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphSourceRef {
     /// Ledger identifier (e.g., `"mydb:main"`). `None` = same ledger.
     pub ledger: Option<String>,
@@ -486,7 +486,7 @@ pub struct GraphSourceRef {
 }
 
 /// Trust verification model for a [`GraphSourceRef`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustPolicy {
     /// How to validate the referenced graph.
     pub trust_mode: TrustMode,
@@ -496,7 +496,7 @@ pub struct TrustPolicy {
 ///
 /// Corresponds to `f:RollbackGuard` in the config graph schema.
 /// Prevents accepting stale or rolled-back heads from a nameservice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackGuard {
     /// Reject any resolved head where `head_t < min_t`.
     pub min_t: Option<i64>,

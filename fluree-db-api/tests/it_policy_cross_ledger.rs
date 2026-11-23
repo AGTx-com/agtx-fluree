@@ -24,6 +24,15 @@ fn config_graph_iri(ledger_id: &str) -> String {
 /// govern D without any policy IRIs ever being written into D.
 #[tokio::test]
 async fn data_ledger_query_enforces_model_ledger_deny_policy() {
+    data_ledger_deny_policy(false).await;
+}
+
+#[tokio::test]
+async fn native_graph_selection_preserves_remote_governance_snapshot() {
+    data_ledger_deny_policy(true).await;
+}
+
+async fn data_ledger_deny_policy(native_graph_selection: bool) {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // --- model ledger M: holds a deny-on-class policy in a named graph
@@ -96,6 +105,9 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
         }}
     "
     );
+    let d_config = if native_graph_selection {
+        format!("{d_config}\n GRAPH <{config_iri}> {{ <urn:cfg:main> <https://ns.flur.ee/db#graphOverrides> <urn:cfg:default-graph> . <urn:cfg:default-graph> a <https://ns.flur.ee/db#GraphConfig> ; <https://ns.flur.ee/db#targetGraph> <https://ns.flur.ee/db#defaultGraph> ; <https://ns.flur.ee/db#policyDefaults> <urn:cfg:policy> . }}")
+    } else { d_config };
     fluree
         .stage_owned(data)
         .upsert_turtle(&d_config)
@@ -109,6 +121,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
         .db_with_policy(data_id, &opts)
         .await
         .expect("db_with_policy must route cross-ledger config through M");
+    assert!(!wrapped.cross_ledger_resolved_heads().is_empty(), "policy resolution must retain the model head for subsequent query stages");
 
     // Query 1: target the denied class (ex:User). M's deny rule must
     // apply against D's data — alice is filtered out.

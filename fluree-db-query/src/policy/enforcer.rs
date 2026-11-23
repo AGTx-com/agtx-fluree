@@ -67,7 +67,18 @@ impl QueryPolicyEnforcer {
 
     /// Check if this is a root policy (bypasses all checks)
     pub fn is_root(&self) -> bool {
-        self.policy.wrapper().is_root()
+        self.policy.is_root()
+    }
+
+    fn graph_policy<'a>(&'a self, snapshot: &LedgerSnapshot, g_id: GraphId) -> &'a PolicyContext {
+        if g_id == 0 {
+            return self.policy.for_graph(None);
+        }
+        snapshot
+            .graph_registry
+            .iri_for_graph_id(g_id)
+            .map(|iri| self.policy.for_graph(Some(iri)))
+            .unwrap_or(&self.policy)
     }
 
     /// Classify a single statically-known scanned predicate against the *view*
@@ -79,6 +90,10 @@ impl QueryPolicyEnforcer {
     /// before reaching here, so the root arm is only a defensive fallback (it
     /// forces the filtered path, which is correct — just slower — for root).
     pub fn classify_view_predicate(&self, predicate: &Sid) -> PredicateCoverage {
+        // Without a graph argument a cached verdict cannot represent overrides.
+        if self.policy.has_graph_overrides() {
+            return PredicateCoverage::Covered;
+        }
         let wrapper = self.policy.wrapper();
         if wrapper.is_root() {
             return PredicateCoverage::Covered;
@@ -120,15 +135,17 @@ impl QueryPolicyEnforcer {
         tracker: &Tracker,
         flakes: Vec<Flake>,
     ) -> Result<Vec<Flake>> {
+        let policy = self.graph_policy(snapshot, g_id);
         // Root policy bypasses all checks
-        if self.policy.wrapper().is_root() {
+        if policy.wrapper().is_root() {
             return Ok(flakes);
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
-        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        let executor =
+            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
         let classes = self
-            .subject_classes(snapshot, g_id, overlay, to_t, &flakes)
+            .subject_classes(policy, snapshot, g_id, overlay, to_t, &flakes)
             .await?;
 
         let mut result = Vec::with_capacity(flakes.len());
@@ -140,11 +157,10 @@ impl QueryPolicyEnforcer {
                 continue;
             }
 
-            let subject_classes = classes.of(&self.policy, &flake.s);
+            let subject_classes = classes.of(policy, &flake.s);
 
             // Async policy check with f:query support
-            match self
-                .policy
+            match policy
                 .allow_view_flake_async(
                     &flake.s,
                     &flake.p,
@@ -181,8 +197,9 @@ impl QueryPolicyEnforcer {
         tracker: &Tracker,
         flake: &Flake,
     ) -> Result<bool> {
+        let policy = self.graph_policy(snapshot, g_id);
         // Root policy bypasses all checks
-        if self.policy.wrapper().is_root() {
+        if policy.wrapper().is_root() {
             return Ok(true);
         }
 
@@ -192,14 +209,22 @@ impl QueryPolicyEnforcer {
         }
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
-        let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
+        let executor =
+            QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t).with_graph_id(g_id);
         let subject_classes = self
-            .subject_classes(snapshot, g_id, overlay, to_t, std::slice::from_ref(flake))
+            .subject_classes(
+                policy,
+                snapshot,
+                g_id,
+                overlay,
+                to_t,
+                std::slice::from_ref(flake),
+            )
             .await?
-            .of(&self.policy, &flake.s);
+            .of(policy, &flake.s);
 
         // Async policy check
-        self.policy
+        policy
             .allow_view_flake_async(
                 &flake.s,
                 &flake.p,
@@ -219,15 +244,20 @@ impl QueryPolicyEnforcer {
     /// An overlay with no content version shares its lookups with nothing, so
     /// they stay in a map of this call's own: in the context's cache they
     /// would be entries no later check reads, kept for the context's life.
+    ///
+    /// `policy` is the context that judges the graph (its native graph
+    /// override, else this enforcer's own): its class policies decide whether
+    /// classes are needed, and its cache holds them.
     async fn subject_classes(
         &self,
+        policy: &PolicyContext,
         snapshot: &LedgerSnapshot,
         g_id: GraphId,
         overlay: &dyn OverlayProvider,
         to_t: i64,
         flakes: &[Flake],
     ) -> Result<SubjectClasses> {
-        if !self.policy.wrapper().has_class_policies() {
+        if !policy.wrapper().has_class_policies() {
             return Ok(SubjectClasses::Local(HashMap::new()));
         }
         let mut subjects: Vec<Sid> = flakes
@@ -240,7 +270,7 @@ impl QueryPolicyEnforcer {
         let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
         let state = ClassState::new(g_id, overlay, to_t);
         if state.is_shared() {
-            fluree_db_policy::populate_class_cache_in(state, &subjects, db, &self.policy)
+            fluree_db_policy::populate_class_cache_in(state, &subjects, db, policy)
                 .await
                 .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
             Ok(SubjectClasses::Shared(state))
@@ -263,9 +293,13 @@ impl QueryPolicyEnforcer {
         db: fluree_db_core::GraphDbRef<'_>,
         subjects: &[fluree_db_core::Sid],
     ) -> Result<()> {
-        fluree_db_policy::populate_class_cache(subjects, db, &self.policy)
-            .await
-            .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
+        fluree_db_policy::populate_class_cache(
+            subjects,
+            db,
+            self.graph_policy(db.snapshot, db.g_id),
+        )
+        .await
+        .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
         Ok(())
     }
 }
@@ -443,5 +477,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, vec![name("bob")]);
+    }
+
+    /// A native graph override's class policy reads the classes of the
+    /// subjects its graph's facts have, even when the ledger default it
+    /// overrides has no class policy of its own.
+    #[tokio::test]
+    async fn a_graph_override_class_policy_reads_subject_classes() {
+        let graph = "http://example.org/restricted";
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        for (code, iri) in [
+            (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+            (100, "http://example.org/"),
+        ] {
+            let _ = snapshot.insert_namespace_code(code, iri.to_string());
+        }
+        snapshot.graph_registry.apply_delta([graph]);
+        let g_id = snapshot.graph_registry.assigned_graph_id(graph).unwrap();
+        let name = |s: &str| {
+            Flake::new(
+                ex(s),
+                ex("name"),
+                FlakeValue::String(s.into()),
+                Sid::new(2, "string"),
+                1,
+                true,
+                None,
+            )
+        };
+        let secret_type = Flake::new(
+            ex("alice"),
+            Sid::new(3, "type"),
+            FlakeValue::Ref(ex("Secret")),
+            Sid::new(1, "id"),
+            1,
+            true,
+            None,
+        );
+        let overlay = Unversioned::new(vec![secret_type, name("alice"), name("bob")]);
+
+        let deny = PolicyRestriction {
+            id: "secret".into(),
+            target_mode: TargetMode::OnClass,
+            targets: HashSet::new(),
+            action: PolicyAction::View,
+            verbs: None,
+            value: PolicyValue::Deny,
+            required: false,
+            message: None,
+            class_policy: true,
+            for_classes: [ex("Secret")].into_iter().collect(),
+            class_check_needed: true,
+        };
+        let view = build_policy_set(vec![deny], None, PolicyAction::View, None)
+            .selecting_classes_by_subject()
+            .expect("a class policy");
+        let restricted = PolicyContext::new(
+            PolicyWrapper::new(view, PolicySet::default(), false, true, HashMap::new()),
+            None,
+        );
+        let ledger_default = PolicyContext::new(
+            PolicyWrapper::new(
+                PolicySet::default(),
+                PolicySet::default(),
+                false,
+                true,
+                HashMap::new(),
+            ),
+            None,
+        )
+        .with_graph_overrides(HashMap::from([(graph.to_string(), restricted)]));
+        let enforcer = QueryPolicyEnforcer::new(Arc::new(ledger_default));
+
+        let kept = enforcer
+            .filter_flakes_for_graph(
+                &snapshot,
+                g_id,
+                &overlay,
+                1,
+                &Tracker::disabled(),
+                vec![name("alice"), name("bob")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept, vec![name("bob")]);
+        assert!(!enforcer
+            .allow_flake_for_graph(
+                &snapshot,
+                g_id,
+                &overlay,
+                1,
+                &Tracker::disabled(),
+                &name("alice"),
+            )
+            .await
+            .unwrap());
+        // The ledger default, which has no class policy, governs the default graph.
+        let kept = enforcer
+            .filter_flakes_for_graph(
+                &snapshot,
+                0,
+                &overlay,
+                1,
+                &Tracker::disabled(),
+                vec![name("alice"), name("bob")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept, vec![name("alice"), name("bob")]);
     }
 }
