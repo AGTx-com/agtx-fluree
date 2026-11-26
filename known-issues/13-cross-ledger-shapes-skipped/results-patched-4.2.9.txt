@@ -1,0 +1,8 @@
+fluree 4.2.9
+control: shapes in co:main itself                | no commodity reject  | coffee       pass    | unobtainium  reject 
+cross-ledger, fresh co:main                      | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
+cross-ledger, co:main knows the data IRIs        | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
+cross-ledger, + an unrelated urn:shape: IRI      | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
+cross-ledger, + both shape node IRIs             | no commodity reject  | coffee       pass    | unobtainium  reject 
+cross-ledger, blank property shape, + node IRI   | no commodity reject  | coffee       pass    | unobtainium  reject 
+wrong outcomes: 6
