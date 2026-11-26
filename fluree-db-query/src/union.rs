@@ -23,6 +23,20 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    /// Test probe: every UNION's `branch_execs` on this thread, summed, for
+    /// tests that cannot reach the operator, such as one a policy check plans
+    /// and drops inside its own evaluation.
+    static THREAD_BRANCH_EXECS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test probe: the UNION branches built on this thread so far.
+#[cfg(test)]
+pub(crate) fn thread_branch_execs() -> usize {
+    THREAD_BRANCH_EXECS.with(std::cell::Cell::get)
+}
+
 /// UNION operator - executes branches for each input row (correlated).
 pub struct UnionOperator {
     /// Child operator providing input solutions
@@ -323,6 +337,8 @@ impl Operator for UnionOperator {
 
             for branch_patterns in &self.branches {
                 self.branch_execs += 1;
+                #[cfg(test)]
+                THREAD_BRANCH_EXECS.with(|n| n.set(n.get() + 1));
                 let seed = SeedOperator::from_batch_row(&input_batch, row_idx);
                 let mut branch_op = build_where_operators_seeded(
                     Some(Box::new(seed)),
@@ -868,5 +884,34 @@ mod tests {
         let (branch_execs, total) = run_union(op, &ctx).await;
         assert_eq!(branch_execs, 2, "without a budget both branches always run");
         assert_eq!(total, 3);
+    }
+
+    // ---- Policy existence check: the lever with a one-row budget ----
+    //
+    // A policy condition holds when its query has one solution, so the policy
+    // check reads with the one-row limit an `ASK` carries. That budget trips
+    // the lever above as soon as one branch has a row.
+
+    #[tokio::test]
+    async fn policy_check_builds_no_branch_after_one_with_a_row() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // The policy's VALUES row, then `{ branch-1 } UNION { branch-2 }`,
+        // where branch-1 matches.
+        let mut op = UnionOperator::new(
+            unit_seed_child(),
+            two_values_branches(&[10], &[30]),
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        let found = crate::policy::first_solution_exists(&mut op, &ctx)
+            .await
+            .unwrap();
+        assert!(found);
+        assert_eq!(
+            op.branch_execs, 1,
+            "a policy check must not build branch-2 once branch-1 has a row"
+        );
     }
 }

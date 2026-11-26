@@ -6,6 +6,7 @@ use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
+use crate::operator::Operator;
 use crate::var_registry::VarRegistry;
 use fluree_db_core::{
     DatatypeConstraint, FlakeValue, GraphId, LedgerSnapshot, OverlayProvider, Sid,
@@ -564,39 +565,56 @@ impl QueryPolicyExecutor<'_> {
             message: e.to_string(),
         })?;
 
-        // Execute and check if there's at least one result (existence check)
-        operator
-            .open(&ctx)
+        first_solution_exists(operator.as_mut(), &ctx)
             .await
             .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
                 message: e.to_string(),
-            })?;
-
-        // A graph/union branch may yield an empty batch before a later branch matches.
-        // ASK is true if any batch has a solution, not only if the first batch does.
-        let has_results = loop {
-            match operator.next_batch(&ctx).await {
-                Ok(Some(batch)) if !batch.is_empty() => break true,
-                Ok(Some(_)) => continue,
-                Ok(None) => break false,
-                Err(e) => {
-                    operator.close();
-                    return Err(fluree_db_policy::PolicyError::QueryExecution {
-                        message: e.to_string(),
-                    });
-                }
-            }
-        };
-
-        operator.close();
-
-        Ok(has_results)
+            })
     }
+}
+
+/// The rows a policy check needs. A condition holds when its query has a
+/// solution, so one is enough: the `LIMIT 1` an `ASK` is planned with, and
+/// the `"limit": 1` the JSON-LD path sets. Lowering a condition to bare WHERE
+/// patterns drops that limit, so the check restores it as a row budget.
+const POLICY_CHECK_ROW_BUDGET: usize = 1;
+
+/// Run a policy condition's operator tree and report whether it has a
+/// solution.
+///
+/// The tree reads under a one-row budget, as an ordinary query under
+/// `LIMIT 1` does (see [`Operator::set_row_budget`]): operators that honor
+/// it stop early, and a `UNION` builds no branch after one that has produced
+/// a row. The budget never ends the read itself. A false condition still
+/// reads every batch to the end.
+pub(crate) async fn first_solution_exists(
+    operator: &mut (dyn Operator + Send + Sync),
+    ctx: &ExecutionContext<'_>,
+) -> crate::error::Result<bool> {
+    operator.set_row_budget(POLICY_CHECK_ROW_BUDGET);
+    operator.open(ctx).await?;
+
+    // A graph/union branch may yield an empty batch before a later branch matches.
+    // ASK is true if any batch has a solution, not only if the first batch does.
+    let found = loop {
+        match operator.next_batch(ctx).await {
+            Ok(Some(batch)) if !batch.is_empty() => break Ok(true),
+            Ok(Some(_)) => continue,
+            Ok(None) => break Ok(false),
+            Err(e) => break Err(e),
+        }
+    };
+
+    operator.close();
+
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binding::Batch;
+    use crate::var_registry::VarId;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -652,5 +670,126 @@ mod tests {
         // A regular ref seeds itself.
         let real = FlakeValue::Ref(Sid::new(XSD, "someSubject"));
         assert!(matches!(binding_for_value(&real), Binding::Sid { .. }));
+    }
+
+    /// Evaluate a JSON-LD condition for one fact, returning the decision and
+    /// the UNION branches the evaluation built.
+    async fn evaluate_jsonld_counting_branches(condition: serde_json::Value) -> (bool, usize) {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let executor = QueryPolicyExecutor::new(&snapshot);
+        let query = PolicyQuery {
+            source: condition.to_string(),
+            language: PolicyQueryLanguage::JsonLd,
+            state: ConditionState::Pre,
+        };
+        let bindings = HashMap::from([(
+            "?$this".to_string(),
+            FlakeValue::Ref(Sid::new(EMPTY, "urn:test:fact")),
+        )]);
+        let before = crate::union::thread_branch_execs();
+        let allowed = executor
+            .evaluate_policy_query(&query, &bindings)
+            .await
+            .expect("condition evaluates");
+        (allowed, crate::union::thread_branch_execs() - before)
+    }
+
+    /// The JSON-LD path forces `"limit": 1` onto every condition. The check
+    /// must keep that limit, so a `union` whose first branch has a row builds
+    /// no later branch.
+    #[tokio::test]
+    async fn jsonld_condition_keeps_its_one_row_limit() {
+        let (allowed, branches) = evaluate_jsonld_counting_branches(serde_json::json!({
+            "where": [["union",
+                [["values", ["?b", [1]]]],
+                [["values", ["?b", [2]]]]]]
+        }))
+        .await;
+        assert!(allowed);
+        assert_eq!(branches, 1, "the second branch must not be built");
+    }
+
+    /// Yields scripted batches, counting each call for one.
+    struct ScriptedBatches {
+        schema: Arc<[VarId]>,
+        batches: std::collections::VecDeque<Batch>,
+        reads: usize,
+    }
+
+    impl ScriptedBatches {
+        /// Empty batches, then (when `then_a_row`) one batch with a row.
+        fn new(empty_batches: usize, then_a_row: bool) -> Self {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+            let mut batches: std::collections::VecDeque<Batch> = (0..empty_batches)
+                .map(|_| Batch::empty(schema.clone()).unwrap())
+                .collect();
+            if then_a_row {
+                let row = Binding::lit(FlakeValue::Long(1), Sid::new(XSD, xsd_names::LONG));
+                batches.push_back(Batch::new(schema.clone(), vec![vec![row]]).unwrap());
+            }
+            Self {
+                schema,
+                batches,
+                reads: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Operator for ScriptedBatches {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn next_batch(
+            &mut self,
+            _ctx: &ExecutionContext<'_>,
+        ) -> crate::error::Result<Option<Batch>> {
+            self.reads += 1;
+            Ok(self.batches.pop_front())
+        }
+        fn close(&mut self) {}
+    }
+
+    /// Fix 6 with the one-row limit: an empty batch never ends the check, so
+    /// a condition that has no row so far reads on, to a later row or to the
+    /// end; and every UNION branch runs until one has a row.
+    #[tokio::test]
+    async fn a_false_condition_still_reads_every_batch() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // The row comes after two empty batches.
+        let mut late_row = ScriptedBatches::new(2, true);
+        assert!(first_solution_exists(&mut late_row, &ctx).await.unwrap());
+        assert_eq!(late_row.reads, 3);
+
+        // No row at all: every batch is read, and the end.
+        let mut no_row = ScriptedBatches::new(2, false);
+        assert!(!first_solution_exists(&mut no_row, &ctx).await.unwrap());
+        assert_eq!(no_row.reads, 3);
+
+        // A first branch with no row runs the second, which decides.
+        let (allowed, branches) = evaluate_jsonld_counting_branches(serde_json::json!({
+            "where": [["union",
+                [["values", ["?b", [1]]], ["filter", "(= ?b 2)"]],
+                [["values", ["?b", [2]]]]]]
+        }))
+        .await;
+        assert!(allowed);
+        assert_eq!(branches, 2);
+
+        // No branch has a row: both run and the fact is denied.
+        let (allowed, branches) = evaluate_jsonld_counting_branches(serde_json::json!({
+            "where": [["union",
+                [["values", ["?b", [1]]], ["filter", "(= ?b 2)"]],
+                [["values", ["?b", [3]]], ["filter", "(= ?b 2)"]]]]
+        }))
+        .await;
+        assert!(!allowed);
+        assert_eq!(branches, 2);
     }
 }

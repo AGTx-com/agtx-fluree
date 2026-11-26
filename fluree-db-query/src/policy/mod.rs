@@ -29,4 +29,6 @@ mod enforcer;
 mod executor;
 
 pub use enforcer::{PredicateCoverage, QueryPolicyEnforcer};
+#[cfg(test)]
+pub(crate) use executor::first_solution_exists;
 pub use executor::QueryPolicyExecutor;
