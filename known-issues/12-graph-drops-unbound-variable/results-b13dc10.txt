@@ -1,0 +1,17 @@
+# binary: fluree-4.2.9-fixes-bug11-b13dc1035ee4
+fluree 4.2.9
+novelty  OPTIONAL found nothing, then GRAPH <iri>                       expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+novelty  BIND errors, then GRAPH <iri>                                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+novelty  BIND errors, then GRAPH ?g                                     expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+novelty  BIND errors, then a UNION with a GRAPH branch                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+novelty  OPTIONAL found nothing, then a default-graph triple (control)  expected=[u:1 r:1; u:2 r:2] got=[u:1 r:1; u:2 r:2] 
+novelty  BIND errors, then a default-graph triple (control)             expected=[u:1 r:1; u:2 r:2] got=[u:1 r:1; u:2 r:2] 
+novelty  BIND binds ?reader, then GRAPH <iri> (control)                 expected=[u:1 p:1] got=[u:1 p:1] 
+indexed  OPTIONAL found nothing, then GRAPH <iri>                       expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+indexed  BIND errors, then GRAPH <iri>                                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+indexed  BIND errors, then GRAPH ?g                                     expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+indexed  BIND errors, then a UNION with a GRAPH branch                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
+indexed  OPTIONAL found nothing, then a default-graph triple (control)  expected=[u:1 r:1; u:2 r:2] got=[u:1 r:1; u:2 r:2] 
+indexed  BIND errors, then a default-graph triple (control)             expected=[u:1 r:1; u:2 r:2] got=[u:1 r:1; u:2 r:2] 
+indexed  BIND binds ?reader, then GRAPH <iri> (control)                 expected=[u:1 p:1] got=[u:1 p:1] 
+exit 1
