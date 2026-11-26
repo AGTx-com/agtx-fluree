@@ -1,0 +1,16 @@
+# binary: fluree-4.2.9-agtx-64f56de8389c
+fluree 4.2.9
+BIND computes the GRAPH name (the defect shape)                        novelty  bob expected=['doc1'] saw=[] WRONG; alice expected=['doc2'] saw=[] WRONG; dana expected=[] saw=[]
+BIND computes the GRAPH name (the defect shape)                        indexed  bob expected=['doc1'] saw=[] WRONG; alice expected=['doc2'] saw=[] WRONG; dana expected=[] saw=[]
+BIND computes the expected name, compared after GRAPH ?g (control)     novelty  bob expected=['doc1'] saw=['doc1']; alice expected=['doc2'] saw=['doc2']; dana expected=[] saw=[]
+BIND computes the expected name, compared after GRAPH ?g (control)     indexed  bob expected=['doc1'] saw=['doc1']; alice expected=['doc2'] saw=['doc2']; dana expected=[] saw=[]
+BIND computes the GRAPH name, no FILTER EXISTS wrapper                 novelty  bob expected=['doc1'] saw=['doc1']; alice expected=['doc2'] saw=['doc2']; dana expected=[] saw=[]
+BIND computes the GRAPH name, no FILTER EXISTS wrapper                 indexed  bob expected=['doc1'] saw=['doc1']; alice expected=['doc2'] saw=['doc2']; dana expected=[] saw=[]
+membership in any graph (control)                                      novelty  bob expected=['doc1'] saw=['doc1']; alice expected=['doc1', 'doc2'] saw=['doc1', 'doc2']; dana expected=[] saw=[]
+membership in any graph (control)                                      indexed  bob expected=['doc1'] saw=['doc1']; alice expected=['doc1', 'doc2'] saw=['doc1', 'doc2']; dana expected=[] saw=[]
+NOT EXISTS, BIND computes the GRAPH name (hide from members)           novelty  bob expected=['doc2'] saw=['doc1', 'doc2'] WRONG; alice expected=['doc1'] saw=['doc1', 'doc2'] WRONG; dana expected=['doc1', 'doc2'] saw=['doc1', 'doc2']
+NOT EXISTS, BIND computes the GRAPH name (hide from members)           indexed  bob expected=['doc2'] saw=['doc1', 'doc2'] WRONG; alice expected=['doc1'] saw=['doc1', 'doc2'] WRONG; dana expected=['doc1', 'doc2'] saw=['doc1', 'doc2']
+NOT EXISTS, expected name compared after GRAPH ?g (control)            novelty  bob expected=['doc2'] saw=['doc2']; alice expected=['doc1'] saw=['doc1']; dana expected=['doc1', 'doc2'] saw=['doc1', 'doc2']
+NOT EXISTS, expected name compared after GRAPH ?g (control)            indexed  bob expected=['doc2'] saw=['doc2']; alice expected=['doc1'] saw=['doc1']; dana expected=['doc1', 'doc2'] saw=['doc1', 'doc2']
+reader decisions that contradict the ordinary query: 8
+exit 1
