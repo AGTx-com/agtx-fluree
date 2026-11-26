@@ -1,6 +1,6 @@
-"""Bug 13: shapes taken from another ledger are skipped when the data ledger has not registered their IRIs.
+"""Bug 13, diagnostics: the cases of shapes_repro.py, plus ledger info for the fresh cross-ledger ledger.
 
-Usage: python3 -I shapes_repro.py <fluree-binary>
+Usage: python3 -I info_probe.py <fluree-binary>
 
 One local server (in memory), two ledgers per case. ref:main holds a node shape for urn:x:Listing whose property
 shape requires one urn:x:commodity that is an instance of urn:x:Commodity, plus the value set (coffee and cocoa are
@@ -78,7 +78,9 @@ for name, shapes_ledger, shape, seed in CASES:
             assert s == 200, t
         if name.startswith('cross-ledger, fresh'):
             s_i, t_i = req('GET', '/v1/fluree/info/co:main')
-            import json as _j; _d=_j.loads(t_i); print('   ledger info HTTP %s; top-level keys: %s; configDiagnostics: %s' % (s_i, sorted(_d.keys())[:25], _d.get('configDiagnostics', _d.get('config_diagnostics', 'absent'))))
+            import json as _j
+            _d = _j.loads(t_i)
+            print('   ledger info HTTP %s; configDiagnostics: %s' % (s_i, _d.get('configDiagnostics', 'absent')))
         line = '%-48s' % name
         for label, expect, body in WRITES:
             s, t = update('co:main', 'INSERT DATA { %s }' % body)
