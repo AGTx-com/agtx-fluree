@@ -914,4 +914,72 @@ mod tests {
             "a policy check must not build branch-2 once branch-1 has a row"
         );
     }
+
+    /// The known difference the one-row budget brings (the feature
+    /// proposal's R5, case a0): an error in a branch the check no longer runs
+    /// no longer surfaces. It only ever skips work after a real solution, so
+    /// when the decision needs the failing branch the error still fails the
+    /// check. The outcome depends on branch order.
+    #[tokio::test]
+    async fn policy_check_skips_an_erroring_branch_after_a_matching_one() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let matching = || {
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::Long(10),
+                    Sid::new(2, "long"),
+                )]],
+            }]
+        };
+        let missing = || {
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![],
+            }]
+        };
+        // Fails at run time, for every input row: external SERVICE
+        // endpoints are not supported.
+        let failing = || {
+            vec![Pattern::Service(crate::ir::ServicePattern::new(
+                false,
+                crate::ir::ServiceEndpoint::Iri(Arc::from("http://example.org/sparql")),
+                vec![],
+            ))]
+        };
+        let check = |branches: Vec<Vec<Pattern>>| {
+            UnionOperator::new(
+                unit_seed_child(),
+                branches,
+                None,
+                crate::temporal_mode::PlanningContext::current(),
+            )
+        };
+
+        // (a) The first branch matches: the failing branch never runs.
+        let mut op = check(vec![matching(), failing()]);
+        let found = crate::policy::first_solution_exists(&mut op, &ctx).await;
+        assert!(
+            matches!(found, Ok(true)),
+            "a match before the failing branch decides: {found:?}"
+        );
+        assert_eq!(op.branch_execs, 1);
+
+        // (b) The same branches, failing one first: the error surfaces.
+        let mut op = check(vec![failing(), matching()]);
+        let err = crate::policy::first_solution_exists(&mut op, &ctx)
+            .await
+            .expect_err("the failing branch runs first");
+        assert!(err.to_string().contains("External SERVICE"), "{err}");
+
+        // (c) The first branch misses: the failing branch runs and fails.
+        let mut op = check(vec![missing(), failing()]);
+        let err = crate::policy::first_solution_exists(&mut op, &ctx)
+            .await
+            .expect_err("the decision needs the failing branch");
+        assert!(err.to_string().contains("External SERVICE"), "{err}");
+        assert_eq!(op.branch_execs, 2);
+    }
 }
