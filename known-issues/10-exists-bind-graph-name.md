@@ -4,6 +4,8 @@ Found on 26 November 2026, during the policy-reuse engine work on the `policy-re
 
 **Severity: report privately.** The `NOT EXISTS` form makes a policy allow what it should refuse, as bugs 1 to 4 do. Keep this record internal until Fluree gives a private channel.
 
+**Cause in brief.** Fluree evaluates this kind of check once for all rows instead of once per row. It has a guard that forces per-row evaluation for a related case, a graph name that comes from outside the check, but the guard doesn't cover a graph name computed inside the check. Fluree's code points to its own issue #1443 for that related case. The fix is to extend the guard to this shape. Details under [Cause](#cause) and [Proposed fix](#proposed-fix).
+
 ## What goes wrong
 
 The trigger is a `FILTER EXISTS` or `FILTER NOT EXISTS` whose inner patterns do two things:
@@ -55,7 +57,9 @@ Each case ran on the stock v4.2.9 release (`fluree 4.2.9`, the official binary) 
 
 ## Cause
 
-The cause is in planning. `choose_exists_strategy` (`fluree-db-query/src/execute/where_plan.rs:547–592` on `main`) picks a semijoin for this `EXISTS`:
+**In plain terms:** Fluree evaluates this kind of check once for all rows instead of once per row. It has a guard that forces per-row evaluation for a related case, a graph name that comes from outside the check, but the guard doesn't cover a graph name computed inside the check. Fluree's code points to its own issue #1443 for that related case. The fix is to extend the guard to this shape.
+
+**In the source:** the cause is in planning. `choose_exists_strategy` (`fluree-db-query/src/execute/where_plan.rs:547–592` on `main`) picks a semijoin for this `EXISTS`:
 - The inner patterns produce `?u` and `?w` through the `GRAPH` triple.
 - They read no outer value they don't produce. So the strategy keys a semijoin on `(?u, ?w)` (`:590`). The semijoin evaluates the inner patterns once, without the outer row, builds the set of keys and probes each row against it.
 
