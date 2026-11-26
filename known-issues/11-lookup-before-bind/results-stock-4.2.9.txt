@@ -1,0 +1,5 @@
+# binary: fluree-4.2.9-stock-3b8d19e649a6 (official v4.2.9 release)
+fluree 4.2.9
+N=  1000 | lifted  median      30 ms rows=2 | control median      17 ms rows=2
+N= 10000 | lifted  median     150 ms rows=2 | control median      19 ms rows=2
+N= 40000 | lifted  median     642 ms rows=2 | control median      21 ms rows=2
