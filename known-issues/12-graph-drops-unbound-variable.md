@@ -25,7 +25,7 @@ Two ways the row gets there:
 
 ## Scope, measured
 
-Each case ran on the three builds above, before and after `fluree reindex`. All builds gave identical results. Full output: [stock](12-graph-drops-unbound-variable/results-stock-4.2.9.txt), [pinned AGTx build](12-graph-drops-unbound-variable/results-patched-4.2.9.txt), [`b13dc10`](12-graph-drops-unbound-variable/results-b13dc10.txt).
+Each case ran on the three builds above, before and after `fluree reindex`. All builds gave identical results. Full output: [stock](12-graph-drops-unbound-variable/results-stock-4.2.9.txt), [pinned AGTx build](12-graph-drops-unbound-variable/results-patched-4.2.9.txt), [`b13dc10`](12-graph-drops-unbound-variable/results-b13dc10.txt). The reworked bug 11 fix, `738a4cc`, also leaves it unchanged: [`738a4cc`](12-graph-drops-unbound-variable/results-738a4cc.txt).
 
 | Case | Expected | Got |
 |---|---|---|

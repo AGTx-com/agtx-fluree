@@ -42,10 +42,41 @@ So the check is by namespace: `urn:shape:Unrelated` registers `urn:shape:` but n
 
 `ShapesArtifactWire::translate_to_schema_bundle_flakes` (`fluree-db-api/src/cross_ledger/types.rs`) encodes each wire triple with `NamespaceRegistry::lookup_sid_for_iri`, lookup only, and `continue`s past any triple whose subject, predicate or IRI object is not registered on the data ledger. Its doc comment gives the reason: an IRI the data ledger has never seen "couldn't apply to data D doesn't have anyway", and allocating codes for model-only IRIs would churn D's namespaces. That holds for target classes and values. It does not hold for the shape's own node IRIs, which are model-only by design, so dropping their triples removes the shape. `docs/security/cross-ledger-policy.md` documents the silent drop but not this consequence.
 
-## Possible fixes, not chosen
+## What the standards say
 
-- Translate shape-internal subjects (node shapes, named property shapes, list cells) into a namespace space of their own, so they never depend on D's registry.
-- Allocate namespace codes for model-only IRIs that appear only as shape subjects.
-- At minimum, fail closed: report a configuration error, or log and refuse, when a shape from `f:shapesSource` loses its node triples, instead of validating with fewer shapes.
+- **SHACL Core.** `sh:minCount 1` on a property the focus node has no value for is a violation, whatever the data graph has seen before. `sh:class` reports a value that is not an instance of the class. Neither depends on whether the data graph has ever used the shape's IRIs.
+- **Fluree's own docs.** `docs/security/cross-ledger-policy.md` says M's shapes are compiled against D and accept or reject D's transactions accordingly. It also says IRIs D has never seen are dropped silently, because "the shape couldn't apply to data D doesn't have". That reasoning holds for target classes and values. It fails for the shape's own node IRIs, and for a `sh:path` D has never used, where `sh:minCount` is exactly the case that must fire.
+- **No warning.** Ledger info reports `configDiagnostics` for other config states that don't do what they appear to, such as shapes that no config enables. In the fresh cross-ledger case, ledger info carries no `configDiagnostics` at all ([`info_probe.py`](13-cross-ledger-shapes-skipped/info_probe.py), stock).
 
-A deployment-side workaround, until a fix: when a data ledger is created, write one triple that registers every namespace the model's shapes use, and re-run it on each standards release.
+## Proposed fix
+
+Encode every IRI in the pulled shapes into a validation-local overlay, instead of dropping triples whose IRIs the data ledger lacks. The overlay lives only for that validation, so D's persistent namespace registry stays untouched, which is the churn the current code avoids. An IRI D has never used then simply matches none of D's data. That gives SHACL's answers: a required property is missing, and a value is not an instance of an unseen class.
+
+Short of that, fail closed. Refuse the transaction, or reject the config at write time, when translating a shape from `f:shapesSource` would drop any of its triples, instead of validating with fewer shapes than the model holds.
+
+Other options considered:
+- Allocate permanent namespace codes in D for model-only IRIs. This works, but it is the churn the doc comment rejects.
+- Translate only shape-internal subjects (node shapes, named property shapes, list cells) into their own namespace space. This misses a `sh:path` D has never used.
+
+## Workaround
+
+- Keep shapes in the data ledger itself (same-ledger `f:shapesSource`). Nothing is dropped then, as the control case shows.
+- Or, when a data ledger is created and on every model release, write one transaction into the data ledger that registers every namespace the model's shapes use, including the namespaces of the shape node IRIs and every `sh:path` and `sh:class` IRI. Then prove it with a probe write the shapes must reject. The AGTx multi-ledger design records this as a setup step until a fix lands.
+
+## Downstream check
+
+- **AGTx today: not exposed.** GTX-Spring's ledger config (`deployment/fluree/native-graphs.template.trig`) sets `f:shapesSource cfg:core`, a graph in the same ledger, with no `f:ledger`.
+- **AGTx target: exposed.** The multi-ledger target design (gtp-trade `docs/superpowers/specs/2026-11-26-multi-ledger-platform-design.md`) takes every ledger's shapes from one standards ledger. It needs the fix or the workaround before it relies on shared shapes.
+
+## Related
+
+- Bug 1 (graph IDs after an index install) also lets SHACL accept invalid data, in its window.
+- Probes from the design work: gtp-trade `docs/research/sources/fluree-multi-ledger-2026-11-26/` (`xledger_valueset_*`, `cross-ledger-shacl-results.txt`).
+
+## Reproduction
+
+```bash
+python3 -I known-issues/13-cross-ledger-shapes-skipped/shapes_repro.py <fluree-binary>
+```
+
+It starts one in-memory server per case and prints each case's three outcomes. It exits 1 while any outcome is wrong. On stock and on the pinned build it reports 6 wrong outcomes, in the three cross-ledger cases without the shape IRIs registered; the control and the two registered cases are correct. [`info_probe.py`](13-cross-ledger-shapes-skipped/info_probe.py) runs the same cases and also prints ledger info for the fresh cross-ledger ledger.
