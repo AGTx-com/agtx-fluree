@@ -1151,7 +1151,7 @@ mod tests {
             r#"
             [transaction_metadata_bindings]
             txnActor = "urn:example:actor"
-            sampleTarget = "urn:example:subject"
+            txnTarget = "urn:example:subject"
         "#,
         )
         .unwrap();
