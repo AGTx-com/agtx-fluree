@@ -1,0 +1,88 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "steps": [
+  {
+   "step": "0",
+   "what": "insert and re-send at once, nothing indexed in between",
+   "history": [
+    [
+     "t1",
+     "assert"
+    ]
+   ],
+   "commitT": 2,
+   "indexT": 0
+  },
+  {
+   "step": "1",
+   "what": "insert, then full reindex",
+   "history": [
+    [
+     "t3",
+     "assert"
+    ]
+   ],
+   "commitT": 3,
+   "indexT": 3
+  },
+  {
+   "step": "2",
+   "what": "re-send unchanged; the copy is only in memory",
+   "history": [
+    [
+     "t3",
+     "assert"
+    ],
+    [
+     "t4",
+     "assert"
+    ]
+   ],
+   "commitT": 4,
+   "indexT": 3,
+   "resendCommit": {
+    "assertions": 0,
+    "retractions": 0
+   }
+  },
+  {
+   "step": "3",
+   "what": "after the incremental index build absorbed the copy",
+   "history": [
+    [
+     "t3",
+     "assert"
+    ],
+    [
+     "t4",
+     "retract"
+    ],
+    [
+     "t4",
+     "assert"
+    ]
+   ],
+   "commitT": 4,
+   "indexT": 4
+  },
+  {
+   "step": "4",
+   "what": "after a full reindex",
+   "history": [
+    [
+     "t3",
+     "assert"
+    ]
+   ],
+   "commitT": 4,
+   "indexT": 4
+  }
+ ],
+ "graph": "urn:g",
+ "resendCommit": {
+  "assertions": 0,
+  "retractions": 0
+ },
+ "sameAnswerInEveryIndexState": false
+}

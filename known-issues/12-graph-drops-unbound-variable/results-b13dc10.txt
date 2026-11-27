@@ -1,4 +1,4 @@
-# binary: fluree-4.2.9-fixes-bug11-b13dc1035ee4
+# build: a build of this fork's `fix/bug-11-bind-order` at `b13dc10`
 fluree 4.2.9
 novelty  OPTIONAL found nothing, then GRAPH <iri>                       expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
 novelty  BIND errors, then GRAPH <iri>                                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG

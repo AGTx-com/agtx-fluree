@@ -1,0 +1,11 @@
+# Recorded output, 23 November 2026. Build: the fork's full-patch build (fixes 1 to 7 plus the fork's own features).
+build:   fluree 4.2.9
+server:  server run --memory --listen-addr 127.0.0.1:18714
+shape:   first commit 200000 filler triples; 5 small commits; tail commit 60000 filler triples; 4 readers
+round 1  ledger repro-1:main  reads 7842  wrong during 0  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+round 2  ledger repro-2:main  reads 9574  wrong during 0  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+round 3  ledger repro-3:main  reads 9375  wrong during 0  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+RESULT: no wrong reads in 26791 reads

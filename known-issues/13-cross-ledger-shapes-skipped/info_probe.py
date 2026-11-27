@@ -2,10 +2,10 @@
 
 Usage: python3 -I info_probe.py <fluree-binary>
 
-One local server (in memory), two ledgers per case. ref:main holds a node shape for urn:x:Listing whose property
-shape requires one urn:x:commodity that is an instance of urn:x:Commodity, plus the value set (coffee and cocoa are
-commodities) in the same shapes graph. co:main enables SHACL and takes its shapes from ref:main with
-f:shapesSource + f:ledger. Three writes follow: no commodity (must be rejected), coffee (must pass) and unobtainium
+One local server (in memory), two ledgers per case. ref:main holds a node shape for urn:x:Order whose property
+shape requires one urn:x:product that is an instance of urn:x:Product, plus the value set (widget and gadget are
+products) in the same shapes graph. co:main enables SHACL and takes its shapes from ref:main with
+f:shapesSource + f:ledger. Three writes follow: no product (must be rejected), widget (must pass) and unobtainium
 (must be rejected). Cases differ only in which IRIs co:main has registered beforehand.
 """
 import http.client, json, os, subprocess, sys, tempfile, time
@@ -29,23 +29,23 @@ def update(ledger, sparql):
     return req('POST', '/v1/fluree/update?ledger=' + ledger, sparql, 'application/sparql-update')
 
 
-NAMED = ('<urn:shape:Listing> a <{sh}NodeShape> ; <{sh}targetClass> <urn:x:Listing> ; <{sh}property> <urn:shape:Listing:commodity> . '
-         '<urn:shape:Listing:commodity> <{sh}path> <urn:x:commodity> ; <{sh}minCount> 1 ; <{sh}class> <urn:x:Commodity> .')
-BLANK = ('<urn:shape:Listing> a <{sh}NodeShape> ; <{sh}targetClass> <urn:x:Listing> ; '
-         '<{sh}property> [ <{sh}path> <urn:x:commodity> ; <{sh}minCount> 1 ; <{sh}class> <urn:x:Commodity> ] .')
-DATA_IRIS = '<urn:seed> <urn:x:commodity> <urn:x:coffee> ; <urn:x:kind> <urn:x:Commodity> ; <urn:x:also> <urn:x:Listing>'
+NAMED = ('<urn:shape:Order> a <{sh}NodeShape> ; <{sh}targetClass> <urn:x:Order> ; <{sh}property> <urn:shape:Order:product> . '
+         '<urn:shape:Order:product> <{sh}path> <urn:x:product> ; <{sh}minCount> 1 ; <{sh}class> <urn:x:Product> .')
+BLANK = ('<urn:shape:Order> a <{sh}NodeShape> ; <{sh}targetClass> <urn:x:Order> ; '
+         '<{sh}property> [ <{sh}path> <urn:x:product> ; <{sh}minCount> 1 ; <{sh}class> <urn:x:Product> ] .')
+DATA_IRIS = '<urn:seed> <urn:x:product> <urn:x:widget> ; <urn:x:kind> <urn:x:Product> ; <urn:x:also> <urn:x:Order>'
 CASES = [
     # name, where the shapes live, shape form, extra IRIs seeded into co:main
     ('control: shapes in co:main itself', 'co:main', NAMED, ''),
     ('cross-ledger, fresh co:main', 'ref:main', NAMED, None),
     ('cross-ledger, co:main knows the data IRIs', 'ref:main', NAMED, DATA_IRIS + ' .'),
     ('cross-ledger, + an unrelated urn:shape: IRI', 'ref:main', NAMED, DATA_IRIS + ' , <urn:shape:Unrelated> .'),
-    ('cross-ledger, + both shape node IRIs', 'ref:main', NAMED, DATA_IRIS + ' , <urn:shape:Listing> , <urn:shape:Listing:commodity> .'),
-    ('cross-ledger, blank property shape, + node IRI', 'ref:main', BLANK, DATA_IRIS + ' , <urn:shape:Listing> .'),
+    ('cross-ledger, + both shape node IRIs', 'ref:main', NAMED, DATA_IRIS + ' , <urn:shape:Order> , <urn:shape:Order:product> .'),
+    ('cross-ledger, blank property shape, + node IRI', 'ref:main', BLANK, DATA_IRIS + ' , <urn:shape:Order> .'),
 ]
-WRITES = [('no commodity', 'reject', '<urn:l:0> a <urn:x:Listing> .'),
-          ('coffee', 'pass', '<urn:l:1> a <urn:x:Listing> ; <urn:x:commodity> <urn:x:coffee> .'),
-          ('unobtainium', 'reject', '<urn:l:2> a <urn:x:Listing> ; <urn:x:commodity> <urn:x:unobtainium> .')]
+WRITES = [('no product', 'reject', '<urn:o:0> a <urn:x:Order> .'),
+          ('widget', 'pass', '<urn:o:1> a <urn:x:Order> ; <urn:x:product> <urn:x:widget> .'),
+          ('unobtainium', 'reject', '<urn:o:2> a <urn:x:Order> ; <urn:x:product> <urn:x:unobtainium> .')]
 
 print(subprocess.run([BIN, '--version'], capture_output=True, text=True).stdout.strip())
 wrong = 0
@@ -63,8 +63,8 @@ for name, shapes_ledger, shape, seed in CASES:
                 time.sleep(0.02)
         for L in ('ref:main', 'co:main'):
             assert req('POST', '/v1/fluree/create', json.dumps({'ledger': L}))[0] in (200, 201)
-        s, t = update(shapes_ledger, 'INSERT DATA { GRAPH <urn:g:shapes> { %s <urn:x:coffee> a <urn:x:Commodity> . '
-                                     '<urn:x:cocoa> a <urn:x:Commodity> . } }' % shape.format(sh=SH))
+        s, t = update(shapes_ledger, 'INSERT DATA { GRAPH <urn:g:shapes> { %s <urn:x:widget> a <urn:x:Product> . '
+                                     '<urn:x:gadget> a <urn:x:Product> . } }' % shape.format(sh=SH))
         assert s == 200, t
         source = '<{f}ledger> <ref:main> ; '.format(f=F) if shapes_ledger == 'ref:main' else ''
         s, t = update('co:main', ('INSERT DATA {{ GRAPH <urn:fluree:co:main#config> {{ '

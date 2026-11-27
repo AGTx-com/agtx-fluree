@@ -1,4 +1,4 @@
-# binary: fluree-4.2.9-agtx-64f56de8389c
+# build: the fork's full-patch build
 fluree 4.2.9
 BIND computes the GRAPH name (the defect shape)                        novelty  bob expected=['doc1'] saw=[] WRONG; alice expected=['doc2'] saw=[] WRONG; dana expected=[] saw=[]
 BIND computes the GRAPH name (the defect shape)                        indexed  bob expected=['doc1'] saw=[] WRONG; alice expected=['doc2'] saw=[] WRONG; dana expected=[] saw=[]

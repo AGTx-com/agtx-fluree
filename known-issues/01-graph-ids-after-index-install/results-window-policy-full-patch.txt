@@ -1,0 +1,10 @@
+# Recorded output, 23 November 2026. Build: the fork's full-patch build (fixes 1 to 7 plus the fork's own features).
+fluree 4.2.9
+window: index t=2 installed with later commits unindexed; next install 3651 ms later
+  urn:x:eve read       in window: right  refused (rows []; must be refused)                   inside=True | after settling: right  refused (rows []; must be refused)
+  urn:x:eve write      in window: right  refused (HTTP 403; must be refused)                  inside=True | after settling: right  refused (HTTP 403; must be refused)
+  urn:x:rob read       in window: right  refused (rows []; must be refused)                   inside=True | after settling: right  refused (rows []; must be refused)
+  urn:x:rob write      in window: right  refused (HTTP 403; must be refused)                  inside=True | after settling: right  refused (HTTP 403; must be refused)
+  urn:x:sam read       in window: right  allowed (rows ['item']; must be allowed)             inside=True | after settling: right  allowed (rows ['item']; must be allowed)
+  urn:x:sam write      in window: right  allowed (HTTP 200; must be allowed)                  inside=True | after settling: right  allowed (HTTP 200; must be allowed)
+RESULT wrong in-window decisions with a right control: 0

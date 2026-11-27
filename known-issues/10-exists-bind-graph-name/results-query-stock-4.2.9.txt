@@ -1,4 +1,4 @@
-# binary: fluree-4.2.9-stock-3b8d19e649a6
+# build: the stock v4.2.9 release (`3b8d19e649a6`)
 fluree 4.2.9
 novelty  EXISTS, BIND computes the GRAPH name       expected=[alice doc2; bob doc1] got=[] WRONG
 novelty  NOT EXISTS, BIND computes the GRAPH name   expected=[alice doc1; bob doc2] got=[alice doc1; alice doc2; bob doc1; bob doc2] WRONG

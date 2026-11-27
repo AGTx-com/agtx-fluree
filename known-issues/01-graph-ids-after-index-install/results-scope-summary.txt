@@ -1,0 +1,443 @@
+# Recorded output, 23 November 2026, summarised from scope_graph_id_swap.py runs. "stock": the stock v4.2.9 release (3b8d19e649a6); "patched": the fork's full-patch build (fixes 1 to 7 plus the fork's own features).
+====================================================================================================
+case file-storage
+  stock: 3 runs; runs with any wrong read/state: 3; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [170, 170, 175]
+    enum [inside window]                             reads    853 wrong    853 (rounds with wrong: 3)
+    enum [after restart]                             reads      6 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    893 wrong    893 (rounds with wrong: 3)
+    from urn:g:a [after restart]                     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    858 wrong    858 (rounds with wrong: 3)
+    from urn:g:z [after restart]                     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    867 wrong    867 (rounds with wrong: 3)
+    graph urn:g:a [after restart]                    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    882 wrong    882 (rounds with wrong: 3)
+    graph urn:g:z [after restart]                    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+  patched: 3 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [157, 160, 163]
+    enum [inside window]                             reads    787 wrong      0 (rounds with wrong: 0)
+    enum [after restart]                             reads      6 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    804 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after restart]                     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    795 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after restart]                     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    808 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after restart]                    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    812 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after restart]                    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case long-window
+  stock: 3 runs; runs with any wrong read/state: 3; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [3612, 3626, 3643]
+    default [inside window]                          reads   9026 wrong      0 (rounds with wrong: 0)
+    default [settled]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [inside window]                             reads   8915 wrong   8915 (rounds with wrong: 3)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads   8995 wrong   8995 (rounds with wrong: 3)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads   9088 wrong   9088 (rounds with wrong: 3)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads   8922 wrong   8922 (rounds with wrong: 3)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads   8879 wrong   8879 (rounds with wrong: 3)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    history [inside window]                          reads   7777 wrong      0 (rounds with wrong: 0)
+    history [settled]                                reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [inside window]                 reads   8184 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [inside window]                 reads   8090 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [inside window]                 reads   7826 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [inside window]                 reads   8974 wrong   8974 (rounds with wrong: 3)
+    pinned urn:g:a 7 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [inside window]                 reads   8131 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [inside window]                 reads   8041 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [inside window]                 reads   7880 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [inside window]                 reads   9078 wrong   9078 (rounds with wrong: 3)
+    pinned urn:g:z 7 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+  patched: 3 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [3378, 3413, 3487]
+    default [inside window]                          reads   8715 wrong      0 (rounds with wrong: 0)
+    default [settled]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [inside window]                             reads   8307 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads   8557 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads   8582 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads   8441 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads   8488 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    history [inside window]                          reads   7177 wrong      0 (rounds with wrong: 0)
+    history [settled]                                reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [inside window]                 reads   7498 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [inside window]                 reads   7362 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [inside window]                 reads   7113 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [inside window]                 reads   8402 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [inside window]                 reads   7557 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [inside window]                 reads   7320 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [inside window]                 reads   7178 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [inside window]                 reads   8474 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [settled]                       reads      3 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case one-per-commit
+  stock: 5 runs; runs with any wrong read/state: 5; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [93, 96, 96, 96, 98]
+    enum [inside window]                             reads    821 wrong    821 (rounds with wrong: 5)
+    enum [settled+3s]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    831 wrong    831 (rounds with wrong: 5)
+    from urn:g:a [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    832 wrong    832 (rounds with wrong: 5)
+    from urn:g:z [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    818 wrong    818 (rounds with wrong: 5)
+    graph urn:g:a [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    839 wrong    839 (rounds with wrong: 5)
+    graph urn:g:z [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+  patched: 5 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [73, 75, 76, 78, 82]
+    enum [inside window]                             reads    574 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    614 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    597 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    609 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    607 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case one-per-commit-alpha
+  stock: 3 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [95, 96, 97]
+    enum [inside window]                             reads    501 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    529 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    509 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    525 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    514 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+  patched: 3 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [113, 120, 127]
+    enum [inside window]                             reads    607 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      3 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    596 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    604 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    622 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    632 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case reads
+  stock: 5 runs; runs with any wrong read/state: 5; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [150, 165, 243, 356, 478]
+    default [inside window]                          reads    567 wrong      0 (rounds with wrong: 0)
+    default [settled+3s]                             reads      5 wrong      0 (rounds with wrong: 0)
+    default [settled]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [inside window]                             reads    542 wrong    542 (rounds with wrong: 5)
+    enum [settled+3s]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    530 wrong    530 (rounds with wrong: 5)
+    from urn:g:a [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    560 wrong    560 (rounds with wrong: 5)
+    from urn:g:z [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    550 wrong    550 (rounds with wrong: 5)
+    graph urn:g:a [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    565 wrong    565 (rounds with wrong: 5)
+    graph urn:g:z [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    history [inside window]                          reads      2 wrong      0 (rounds with wrong: 0)
+    history [settled+3s]                             reads      5 wrong      0 (rounds with wrong: 0)
+    history [settled]                                reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [inside window]                 reads      7 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [inside window]                 reads     24 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [inside window]                 reads    427 wrong    427 (rounds with wrong: 5)
+    pinned urn:g:a 7 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [inside window]                 reads      4 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [inside window]                 reads     33 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [inside window]                 reads    370 wrong    370 (rounds with wrong: 5)
+    pinned urn:g:z 7 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+  patched: 5 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [144, 151, 173, 256, 272]
+    default [inside window]                          reads    293 wrong      0 (rounds with wrong: 0)
+    default [settled+3s]                             reads      5 wrong      0 (rounds with wrong: 0)
+    default [settled]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [inside window]                             reads    305 wrong      0 (rounds with wrong: 0)
+    enum [settled+3s]                                reads      5 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    318 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    328 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled+3s]                        reads      5 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    317 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    310 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled+3s]                       reads      5 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      5 wrong      0 (rounds with wrong: 0)
+    history [settled+3s]                             reads      5 wrong      0 (rounds with wrong: 0)
+    history [settled]                                reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 1 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 3 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [inside window]                 reads      7 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 6 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [inside window]                 reads    311 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:a 7 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 1 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [inside window]                 reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 3 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [inside window]                 reads     20 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 6 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [inside window]                 reads    312 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [settled+3s]                    reads      5 wrong      0 (rounds with wrong: 0)
+    pinned urn:g:z 7 [settled]                       reads      5 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case restart-long
+  stock: 1 runs; runs with any wrong read/state: 1; errors: 0
+    samples: {'reads': 4646, 'wrong': 4640, 'first_wrong_s': 1.82, 'last_wrong_s': 599.97, 'settled_s': 600.2258610725403}
+    windows (ms between an install that left unindexed commits and the next install): [598392]
+    from urn:g:a [inside window]                     reads   2320 wrong   2320 (rounds with wrong: 1)
+    from urn:g:a [settled]                           reads      1 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads   2320 wrong   2320 (rounds with wrong: 1)
+    from urn:g:z [first read after restart]          reads      1 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      1 wrong      0 (rounds with wrong: 0)
+  patched: 1 runs; runs with any wrong read/state: 0; errors: 0
+    samples: {'reads': 4646, 'wrong': 0, 'first_wrong_s': None, 'last_wrong_s': None, 'settled_s': 600.0538423061371}
+    windows (ms between an install that left unindexed commits and the next install): [598799]
+    from urn:g:a [inside window]                     reads   2319 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      1 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads   2319 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [first read after restart]          reads      1 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      1 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case restart-unindexed
+  stock: 3 runs; runs with any wrong read/state: 3; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [155, 160, 164]
+    enum [inside window]                             reads    743 wrong    743 (rounds with wrong: 3)
+    enum [after second restart, settled]             reads      6 wrong      0 (rounds with wrong: 0)
+    enum [after second restart]                      reads      6 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    800 wrong    800 (rounds with wrong: 3)
+    from urn:g:a [after second restart, settled]     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart]              reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    804 wrong    804 (rounds with wrong: 3)
+    from urn:g:z [after second restart, settled]     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart]              reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [first read after restart]          reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    767 wrong    767 (rounds with wrong: 3)
+    graph urn:g:a [after second restart, settled]    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart]             reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    778 wrong    778 (rounds with wrong: 3)
+    graph urn:g:z [after second restart, settled]    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart]             reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+  patched: 3 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): [165, 167, 170]
+    enum [inside window]                             reads    793 wrong      0 (rounds with wrong: 0)
+    enum [after second restart, settled]             reads      6 wrong      0 (rounds with wrong: 0)
+    enum [after second restart]                      reads      6 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [inside window]                     reads    808 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart, settled]     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart]              reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [inside window]                     reads    833 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart, settled]     reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart]              reads      6 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [first read after restart]          reads      3 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [inside window]                    reads    835 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart, settled]    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart]             reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [inside window]                    reads    857 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart, settled]    reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart]             reads      6 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      3 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case restart-unindexed-off
+  stock: 2 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): []
+    enum [after second restart, settled]             reads      4 wrong      0 (rounds with wrong: 0)
+    enum [after second restart]                      reads      4 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart, settled]     reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart]              reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart, settled]     reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart]              reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [first read after restart]          reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      2 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart, settled]    reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart]             reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      2 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart, settled]    reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart]             reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      2 wrong      0 (rounds with wrong: 0)
+  patched: 2 runs; runs with any wrong read/state: 0; errors: 0
+    windows (ms between an install that left unindexed commits and the next install): []
+    enum [after second restart, settled]             reads      4 wrong      0 (rounds with wrong: 0)
+    enum [after second restart]                      reads      4 wrong      0 (rounds with wrong: 0)
+    enum [settled]                                   reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart, settled]     reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [after second restart]              reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:a [settled]                           reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart, settled]     reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [after second restart]              reads      4 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [first read after restart]          reads      2 wrong      0 (rounds with wrong: 0)
+    from urn:g:z [settled]                           reads      2 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart, settled]    reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [after second restart]             reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:a [settled]                          reads      2 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart, settled]    reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [after second restart]             reads      4 wrong      0 (rounds with wrong: 0)
+    graph urn:g:z [settled]                          reads      2 wrong      0 (rounds with wrong: 0)
+====================================================================================================
+case writes
+  stock: 3 runs; runs with any wrong read/state: 3; errors: 0
+    copy-where   control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"], "z": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    copy-where   in window runs 3  wrong after settling 3  wrong after restart 3  window reads [n, wrong] [2195, 2195]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": ["a-2", "a-3", "a-4", "a-5", "a-6", "z-1"], "z": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    delete-data  control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    delete-data  in window runs 3  wrong after settling 3  wrong after restart 3  window reads [n, wrong] [2310, 2310]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    delete-where control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": []}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    delete-where in window runs 3  wrong after settling 3  wrong after restart 3  window reads [n, wrong] [2133, 2133]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    edit-where   control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1-edited", "z-2-edited", "z-3-edited", "z-4-edited", "z-5-edited", "z-6-edited"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    edit-where   in window runs 3  wrong after settling 3  wrong after restart 3  window reads [n, wrong] [2292, 2292]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["a-2-edited", "a-3-edited", "a-4-edited", "a-5-edited", "a-6-edited", "z-1-edited", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    upsert       control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-3-new", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    upsert       in window runs 3  wrong after settling 3  wrong after restart 3  window reads [n, wrong] [2266, 2266]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-3", "z-3-new", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+  patched: 3 runs; runs with any wrong read/state: 0; errors: 0
+    copy-where   control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"], "z": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    copy-where   in window runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [2017, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"], "z": ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    delete-data  control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    delete-data  in window runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [2201, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    delete-where control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": []}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    delete-where in window runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [2158, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": []}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    edit-where   control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1-edited", "z-2-edited", "z-3-edited", "z-4-edited", "z-5-edited", "z-6-edited"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    edit-where   in window runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [2222, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1-edited", "z-2-edited", "z-3-edited", "z-4-edited", "z-5-edited", "z-6-edited"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8
+    upsert       control   runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [0, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-3-new", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7] answered t=7
+    upsert       in window runs 3  wrong after settling 0  wrong after restart 0  window reads [n, wrong] [2187, 0]
+        final state seen: {"a": ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"], "copy": [], "z": ["z-1", "z-2", "z-3-new", "z-4", "z-5", "z-6"]}
+        commits in log: [1, 2, 3, 4, 5, 6, 7, 8] answered t=8

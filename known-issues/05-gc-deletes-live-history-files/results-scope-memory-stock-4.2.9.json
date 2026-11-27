@@ -1,0 +1,207 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "storage": "memory",
+ "steps": [
+  {
+   "step": "before the additive commits (t=3)",
+   "reads": [
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:1"
+     ],
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after the failure (t=14)",
+   "reads": [
+    {
+     "ok": false,
+     "error": "error: server error: Query error: Internal error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "error: server error: Query error: Internal error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after a full reindex",
+   "reads": [
+    {
+     "ok": false,
+     "error": "error: server error: Query error: Internal error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "error: server error: Query error: Internal error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  }
+ ],
+ "firstFailureAfterAdditiveCommit": 11,
+ "fullReindex": {
+  "status": 200,
+  "body": "{\"ledger_id\":\"repro:main\",\"index_t\":14,\"root_id\":\"baghybqabciqdjmxprxkxpj2blz7m2hsvabgldnym3dl6cns4rdv6d7vg5dwm66a\",\"stats\":{\"flake_count\":1,\"leaf_count\":12,\"branch_count\":4,\"total_bytes\":6118},\"fuel\":69.0}"
+ },
+ "reindexRestoredTheRead": false,
+ "failsAgainAfterFurtherAdditiveCommits": 1,
+ "gcPassesThatReleased": 5
+}

@@ -57,7 +57,7 @@ CONDITIONS = [
 READERS = ['bob', 'alice', 'dana']
 DOCS = {'doc1': 'ws1', 'doc2': 'ws2'}
 
-record = {'binary': cli, 'version': subprocess.run([cli, '--version'], capture_output=True, text=True).stdout.strip(),
+record = {'version': subprocess.run([cli, '--version'], capture_output=True, text=True).stdout.strip(),
           'cases': []}
 
 

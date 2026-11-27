@@ -1,0 +1,19 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "version": "fluree 4.2.9",
+ "setups": {
+  "permission only in X": {
+   "read X": false,
+   "read Y": false,
+   "write X": true,
+   "write Y": false
+  },
+  "permission in X and default": {
+   "read X": true,
+   "read Y": true,
+   "write X": true,
+   "write Y": false
+  }
+ },
+ "readsAndWritesAgree": false
+}

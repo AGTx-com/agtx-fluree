@@ -1,14 +1,14 @@
 # 13. Shapes taken from another ledger are skipped until the data ledger has registered their IRIs
 
-Found on 26 November 2026 while checking a multi-ledger design. Confirmed the same day on the stock v4.2.9 release (`3b8d19e649a6`) and on the pinned AGTx build (`64f56de8389c`), with identical results. **Not fixed.** Not reported to Fluree.
+Found on 26 November 2026 while checking a design in which many data ledgers take their SHACL shapes from one shared ledger. Confirmed the same day on the stock v4.2.9 release (`3b8d19e649a6`) and on the fork's full-patch build, with identical results. **Not fixed.** Not reported to Fluree.
 
-**Severity:** validation silently off. A ledger that takes its SHACL shapes from another ledger accepts data the shapes forbid, with no error or warning, until its own namespace registry happens to contain the shapes' IRIs. Nothing we deploy today takes shapes from another ledger: the current build keeps its shapes in its own ledger.
+**Severity:** validation silently off. A ledger that takes its SHACL shapes from another ledger accepts data the shapes forbid, with no error or warning, until its own namespace registry happens to contain the shapes' IRIs.
 
-**Cause in brief.** Before validating, Fluree translates the shapes it pulls from the model ledger into the data ledger's terms, and drops every shape triple whose subject, predicate or object IRI the data ledger has not registered. A shape's own node IRIs (`urn:shape:Listing`, a named property shape) exist only in the model ledger, so on a ledger that has never used their namespaces every triple of the shape is dropped and the shape does not apply.
+**Cause in brief.** Before validating, Fluree translates the shapes it pulls from the model ledger into the data ledger's terms, and drops every shape triple whose subject, predicate or object IRI the data ledger has not registered. A shape's own node IRIs (`urn:shape:Order`, a named property shape) exist only in the model ledger, so on a ledger that has never used their namespaces every triple of the shape is dropped and the shape does not apply.
 
 ## What goes wrong
 
-`ref:main` holds, in graph `<urn:g:shapes>`, a node shape for `urn:x:Listing` whose property shape requires one `urn:x:commodity` that is a `urn:x:Commodity`, and the value set (`urn:x:coffee` and `urn:x:cocoa` are commodities) beside it, as Fluree's [shared value-sets pattern](../docs/guides/cookbook-shacl.md#shared-value-sets-with-shclass) describes. `co:main` enables SHACL and takes its shapes from `ref:main`:
+`ref:main` holds, in graph `<urn:g:shapes>`, a node shape for `urn:x:Order` whose property shape requires one `urn:x:product` that is a `urn:x:Product`, and the value set (`urn:x:widget` and `urn:x:gadget` are products) beside it, as Fluree's [shared value-sets pattern](../docs/guides/cookbook-shacl.md#shared-value-sets-with-shclass) describes. `co:main` enables SHACL and takes its shapes from `ref:main`:
 
 ```trig
 GRAPH <urn:fluree:co:main#config> {
@@ -19,22 +19,22 @@ GRAPH <urn:fluree:co:main#config> {
 }
 ```
 
-A listing with no commodity, and one naming `urn:x:unobtainium`, should both be rejected. On a fresh `co:main` both commit.
+An order with no product, and one naming `urn:x:unobtainium`, should both be rejected. On a fresh `co:main` both commit.
 
 ## Scope, measured
 
-[`shapes_repro.py`](13-cross-ledger-shapes-skipped/shapes_repro.py), one in-memory server per case. Full output: [stock](13-cross-ledger-shapes-skipped/results-stock-4.2.9.txt), [pinned AGTx build](13-cross-ledger-shapes-skipped/results-patched-4.2.9.txt).
+[`shapes_repro.py`](13-cross-ledger-shapes-skipped/shapes_repro.py), one in-memory server per case. Full output: [stock](13-cross-ledger-shapes-skipped/results-stock-4.2.9.txt), [full-patch build](13-cross-ledger-shapes-skipped/results-patched-4.2.9.txt).
 
-| Case | No commodity (reject) | Coffee (pass) | Unobtainium (reject) |
+| Case | No product (reject) | Widget (pass) | Unobtainium (reject) |
 |---|---|---|---|
 | Control: the same shapes in `co:main` itself | rejected | passes | rejected |
 | Cross-ledger, fresh `co:main` | **passes** | passes | **passes** |
-| Cross-ledger, `co:main` has used the data IRIs (`urn:x:commodity`, `urn:x:Commodity`, `urn:x:Listing`, `urn:x:coffee`) | **passes** | passes | **passes** |
+| Cross-ledger, `co:main` has used the data IRIs (`urn:x:product`, `urn:x:Product`, `urn:x:Order`, `urn:x:widget`) | **passes** | passes | **passes** |
 | Same, plus an unrelated `urn:shape:Unrelated` | **passes** | passes | **passes** |
 | Same, plus both shape node IRIs | rejected | passes | rejected |
 | Blank-node property shape, plus the node shape's IRI | rejected | passes | rejected |
 
-So the check is by namespace: `urn:shape:Unrelated` registers `urn:shape:` but not `urn:shape:Listing:`, the namespace of the named property shape. Blank-node property shapes survive once the node shape's namespace is known. Once the IRIs are registered, the cross-ledger value set works: `sh:class` sees the commodities declared in the model ledger's shapes graph.
+So the check is by namespace: `urn:shape:Unrelated` registers `urn:shape:` but not `urn:shape:Order:`, the namespace of the named property shape. Blank-node property shapes survive once the node shape's namespace is known. Once the IRIs are registered, the cross-ledger value set works: `sh:class` sees the products declared in the model ledger's shapes graph.
 
 **Not run:** JSON-LD spellings; `sh:sparql` constraints; a model ledger that changes after the data ledger first validated; whether the ledger-info diagnostics report anything.
 
@@ -61,17 +61,21 @@ Other options considered:
 ## Workaround
 
 - Keep shapes in the data ledger itself (same-ledger `f:shapesSource`). Nothing is dropped then, as the control case shows.
-- Or, when a data ledger is created and on every model release, write one transaction into the data ledger that registers every namespace the model's shapes use, including the namespaces of the shape node IRIs and every `sh:path` and `sh:class` IRI. Then prove it with a probe write the shapes must reject. The AGTx multi-ledger design records this as a setup step until a fix lands.
+- Or, when a data ledger is created and on every model release, write one transaction into the data ledger that registers every namespace the model's shapes use, including the namespaces of the shape node IRIs and every `sh:path` and `sh:class` IRI. Then prove it with a probe write the shapes must reject.
 
-## Downstream check
+## Who is affected
 
-- **AGTx today: not exposed.** GTX-Spring's ledger config (`deployment/fluree/native-graphs.template.trig`) sets `f:shapesSource cfg:core`, a graph in the same ledger, with no `f:ledger`.
-- **AGTx target: exposed.** The multi-ledger target design (gtp-trade `docs/superpowers/specs/2026-11-26-multi-ledger-platform-design.md`) takes every ledger's shapes from one standards ledger. It needs the fix or the workaround before it relies on shared shapes.
+- **Affected:** any ledger whose `f:shapesSource` names a graph in another ledger (an `f:GraphRef` whose source has `f:ledger`), until the data ledger has registered the namespaces of every IRI in the shapes, the shape node IRIs included.
+- **Not affected:** a `f:shapesSource` that names a graph in the same ledger, with no `f:ledger`.
+
+## History
+
+- **26 November 2026:** found while checking a shared-shapes design, and confirmed the same day on stock and on the full-patch build. Recorded on `main` as `c50d754`; completed, with the ledger-info probe, in `a82e1bb`, and its usage line corrected in `e23c063`. Not fixed.
 
 ## Related
 
-- Bug 1 (graph IDs after an index install) also lets SHACL accept invalid data, in its window.
-- Probes from the design work: gtp-trade `docs/research/sources/fluree-multi-ledger-2026-11-26/` (`xledger_valueset_*`, `cross-ledger-shacl-results.txt`).
+- [Bug 1](01-graph-ids-after-index-install.md) (graph IDs after an index install) also lets SHACL accept invalid data, in its window.
+- The design work's own probes are not in this repository; [`shapes_repro.py`](13-cross-ledger-shapes-skipped/shapes_repro.py) reproduces their result.
 
 ## Reproduction
 
@@ -79,4 +83,4 @@ Other options considered:
 python3 -I known-issues/13-cross-ledger-shapes-skipped/shapes_repro.py <fluree-binary>
 ```
 
-It starts one in-memory server per case and prints each case's three outcomes. It exits 1 while any outcome is wrong. On stock and on the pinned build it reports 6 wrong outcomes, in the three cross-ledger cases without the shape IRIs registered; the control and the two registered cases are correct. [`info_probe.py`](13-cross-ledger-shapes-skipped/info_probe.py) runs the same cases and also prints ledger info for the fresh cross-ledger ledger.
+It starts one in-memory server per case and prints each case's three outcomes. It exits 1 while any outcome is wrong. On stock and on the full-patch build it reports 6 wrong outcomes, in the three cross-ledger cases without the shape IRIs registered; the control and the two registered cases are correct. [`info_probe.py`](13-cross-ledger-shapes-skipped/info_probe.py) runs the same cases and also prints ledger info for the fresh cross-ledger ledger.

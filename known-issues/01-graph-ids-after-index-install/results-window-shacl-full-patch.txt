@@ -1,0 +1,11 @@
+# Recorded output, 23 November 2026. Build: the fork's full-patch build (fixes 1 to 7 plus the fork's own features).
+fluree 4.2.9
+window: index t=2 installed with later commits unindexed; next install 3451 ms later
+  k1 second value  in window: right  rejected (HTTP 400: Transaction error: SHACL validation failed with 1 violation(s): 1. Exp; must be rejected) inside=True
+                   no race:   right  rejected (HTTP 400: Transaction error: SHACL validation failed with 1 violation(s): 1. Exp; must be rejected)
+  k2 one value     in window: right  accepted (HTTP 200; must be accepted)                      inside=True
+                   no race:   right  accepted (HTTP 200; must be accepted)
+stored in z after settling: ['k1=first', 'k2=z-only']; validate z: conforms=True violations=0 focus=[]
+stored in z after restart:  ['k1=first', 'k2=z-only']; validate z: conforms=True violations=0 focus=[]
+control ledger in z:        ['k1=first', 'k2=z-only']; validate z: conforms=True violations=0 focus=[]
+RESULT wrong in-window decisions with a right control: 0

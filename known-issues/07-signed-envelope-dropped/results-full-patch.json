@@ -1,0 +1,28 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "commits": {
+  "A unsigned": {
+   "t": 2,
+   "rawTransactionBlobs": 0,
+   "missing": [],
+   "holdsExactJws": false,
+   "blobSha256": []
+  },
+  "B signed JWS": {
+   "t": 3,
+   "rawTransactionBlobs": 1,
+   "missing": [],
+   "holdsExactJws": true,
+   "blobSha256": [
+    "4f9339ef0b91daedadb31f6e6b13c3e81873204f1ba822ce0ed755678b1c4eef"
+   ]
+  }
+ },
+ "signedInsert": {
+  "status": 200,
+  "t": 3
+ },
+ "signedJwsSha256": "4f9339ef0b91daedadb31f6e6b13c3e81873204f1ba822ce0ed755678b1c4eef",
+ "signedEnvelopeKept": true
+}

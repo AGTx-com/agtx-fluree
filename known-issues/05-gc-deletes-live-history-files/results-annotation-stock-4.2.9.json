@@ -1,0 +1,50 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "firstProblems": {
+  "named graph, annotation at t=2": {
+   "afterAdditiveCommit": 11,
+   "t": 17,
+   "got": "ERROR al error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/70e5578304daa96ae30714ffa0aa6b24679b03c2b89aac552b7fba5269bd785e.fhs1",
+   "baseline": [
+    "first"
+   ]
+  },
+  "named graph, annotation at t=5": {
+   "afterAdditiveCommit": 11,
+   "t": 17,
+   "got": "ERROR al error: V3 cursor: Not found: fluree:memory://repro/main/index/objects/history/70e5578304daa96ae30714ffa0aa6b24679b03c2b89aac552b7fba5269bd785e.fhs1",
+   "baseline": [
+    "first",
+    "second"
+   ]
+  }
+ },
+ "baseline": {
+  "default graph, annotation now": [
+   "second"
+  ],
+  "default graph, annotation at t=1": [
+   "first"
+  ],
+  "default graph, annotation at t=3": [
+   "first",
+   "second"
+  ],
+  "named graph, annotation now": [
+   "second"
+  ],
+  "named graph, annotation at t=2": [
+   "first"
+  ],
+  "named graph, annotation at t=5": [
+   "first",
+   "second"
+  ],
+  "default graph, annotation history": [
+   "first",
+   "first",
+   "second"
+  ]
+ },
+ "gcPassesThatReleased": 36
+}

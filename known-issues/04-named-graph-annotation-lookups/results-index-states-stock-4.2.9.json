@@ -1,0 +1,393 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "version": "fluree 4.2.9",
+ "cases": [
+  {
+   "rule": "presence",
+   "mode": "direct-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "presence",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": false,
+   "errorAfter": "error: Transaction error: Policy enforcement prevents modification.",
+   "correct": false
+  },
+  {
+   "rule": "presence",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "presence",
+   "mode": "server-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "presence",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": false
+  },
+  {
+   "rule": "presence",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "presence",
+   "mode": "server-background",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "presence",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": false
+  },
+  {
+   "rule": "presence",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "direct-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-background",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": true
+  },
+  {
+   "rule": "absence",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: access denied (403): Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "direct-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild",
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "direct-reindex",
+   "indexStep": "fluree reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": false,
+   "allowedAfter": false,
+   "errorAfter": "error: Transaction error: Policy enforcement prevents modification.",
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "server-reindex",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "server-reindex",
+   "indexStep": "POST /reindex",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": false
+  },
+  {
+   "rule": "optional",
+   "mode": "server-background",
+   "adminQueriesBefore": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "adminQueriesAfter": {
+    "GRAPH": [
+     "active"
+    ],
+    "FROM": [
+     "active"
+    ]
+   },
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": true
+  },
+  {
+   "rule": "optional",
+   "mode": "server-background",
+   "indexStep": "background incremental index",
+   "member": "erin",
+   "expectedAllowed": false,
+   "allowedBefore": true,
+   "allowedAfter": true,
+   "errorAfter": "",
+   "correct": false
+  }
+ ]
+}

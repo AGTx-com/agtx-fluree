@@ -1,8 +1,8 @@
 # 10. An EXISTS whose BIND computes its GRAPH name never matches
 
-Found on 26 November 2026, during the policy-reuse engine work on the `policy-reuse/engine` branch. Confirmed the same day on the stock v4.2.9 release and on the full-patch build. **Not fixed.** Not reported to Fluree.
+Found on 26 November 2026, during policy-evaluation work on this fork's `policy-reuse/engine` branch. Confirmed the same day on the stock v4.2.9 release (`3b8d19e649a6`) and on the fork's full-patch build. **Not fixed.** Not reported to Fluree.
 
-**Severity: report privately.** The `NOT EXISTS` form makes a policy allow what it should refuse, as bugs 1 to 4 do. Keep this record internal until Fluree gives a private channel.
+**Severity: report privately.** The `NOT EXISTS` form makes a policy allow what it should refuse, as bugs [1](01-graph-ids-after-index-install.md) to [4](04-named-graph-annotation-lookups.md) do. Keep this record internal until Fluree gives a private channel.
 
 **Cause in brief.** Fluree evaluates this kind of check once for all rows instead of once per row. It has a guard that forces per-row evaluation for a related case, a graph name that comes from outside the check, but the guard doesn't cover a graph name computed inside the check. Fluree's code points to its own issue #1443 for that related case. The fix is to extend the guard to this shape. Details under [Cause](#cause) and [Proposed fix](#proposed-fix).
 
@@ -32,7 +32,7 @@ The same happens in a policy's `f:query`, where `$value` takes the place of `?w`
 
 ## Scope, measured
 
-Each case ran on the stock v4.2.9 release (`fluree 4.2.9`, the official binary) and on our full-patch build, both before and after `fluree reindex`. The two builds gave identical results. Data:
+Each case ran on the stock v4.2.9 release (`3b8d19e649a6`) and on the fork's full-patch build, both before and after `fluree reindex`. The two builds gave identical results. Data:
 - `ex:doc1` belongs to `ex:ws1`, and `ex:doc2` to `ex:ws2`;
 - bob's ws1 membership is in graph `members/ws1`;
 - alice's ws2 membership is in `members/ws2`;
@@ -90,9 +90,13 @@ Either of these decides correctly on both builds:
 - compute the expected name, then compare it after `GRAPH ?g`: `FILTER(STR(?g) = ?expected)`;
 - bind the `BIND`'s input from an earlier pattern before computing the name.
 
-## Downstream check
+## Who is affected
 
-On 26 November, none of the policies we deploy used this shape. Every policy that computes a graph name does it outside the `EXISTS`, or from a value an earlier pattern binds.
+Any query or policy whose `FILTER EXISTS` or `FILTER NOT EXISTS` computes a graph IRI with a `BIND` inside the check and names a `GRAPH` block with it that matches the value the IRI was computed from. A `NOT EXISTS` policy of this shape allows every identity; an `EXISTS` policy refuses every identity. A query or policy that computes the graph name outside the `EXISTS`, or from a value an earlier pattern binds, is not affected.
+
+## History
+
+- **26 November 2026:** found during policy-evaluation work on the `policy-reuse/engine` branch, whose work counters showed the check building no key. Confirmed the same day on the stock v4.2.9 release and on the fork's full-patch build, before and after `fluree reindex`, in ordinary queries and in policies. Recorded on `main` as `3455416`; the plain-terms statement of the cause added in `7b95064`. Not fixed.
 
 ## Related
 
@@ -104,4 +108,4 @@ Each script needs no server and runs `python3 -I <script> <fluree-binary>` on fr
 - [`policy_repro.py`](10-exists-bind-graph-name/policy_repro.py): the policy cases;
 - [`query_repro.py`](10-exists-bind-graph-name/query_repro.py): the ordinary-query cases.
 
-Each exits non-zero while the bug is present. Saved outputs: [policy, stock](10-exists-bind-graph-name/results-policy-stock-4.2.9.txt), [policy, patched](10-exists-bind-graph-name/results-policy-patched-4.2.9.txt), [query, stock](10-exists-bind-graph-name/results-query-stock-4.2.9.txt), [query, patched](10-exists-bind-graph-name/results-query-patched-4.2.9.txt).
+Each exits non-zero while the bug is present. Saved outputs, 26 November 2026: [policy, stock](10-exists-bind-graph-name/results-policy-stock-4.2.9.txt), [policy, full-patch build](10-exists-bind-graph-name/results-policy-patched-4.2.9.txt), [query, stock](10-exists-bind-graph-name/results-query-stock-4.2.9.txt), [query, full-patch build](10-exists-bind-graph-name/results-query-patched-4.2.9.txt).

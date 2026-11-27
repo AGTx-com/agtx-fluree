@@ -1,0 +1,215 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "version": "fluree 4.2.9",
+ "queries": [
+  {
+   "query": "GRAPH pattern, constant edge, variable annotation",
+   "sparql": "SELECT ?v WHERE { GRAPH <urn:g:data> { <urn:x:alice> <urn:x:memberOf> <urn:x:ws> ~ ?a {| <urn:x:status> ?v |} } }",
+   "expected": [
+    "active"
+   ],
+   "beforeIndex": [
+    "active"
+   ],
+   "afterIndex": [
+    "active"
+   ],
+   "correct": true
+  },
+  {
+   "query": "GRAPH pattern, constant edge, anonymous annotation",
+   "sparql": "SELECT ?v WHERE { GRAPH <urn:g:data> { <urn:x:alice> <urn:x:memberOf> <urn:x:ws> {| <urn:x:status> ?v |} } }",
+   "expected": [
+    "active"
+   ],
+   "beforeIndex": [
+    "active"
+   ],
+   "afterIndex": [
+    "active"
+   ],
+   "correct": true
+  },
+  {
+   "query": "GRAPH pattern, variable subject",
+   "sparql": "SELECT ?v WHERE { GRAPH <urn:g:data> { ?s <urn:x:memberOf> <urn:x:ws> {| <urn:x:status> ?v |} } } ORDER BY ?v",
+   "expected": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "beforeIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "afterIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "correct": true
+  },
+  {
+   "query": "GRAPH pattern, rdf:reifies form",
+   "sparql": "SELECT ?v WHERE { GRAPH <urn:g:data> { ?a <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <urn:x:memberOf> ?o )>> ; <urn:x:status> ?v } } ORDER BY ?v",
+   "expected": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "beforeIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "afterIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "correct": true
+  },
+  {
+   "query": "FROM <ledger#graph>, constant edge, variable annotation",
+   "sparql": "SELECT ?v FROM <repro:main#urn:g:data> WHERE { <urn:x:alice> <urn:x:memberOf> <urn:x:ws> ~ ?a {| <urn:x:status> ?v |} }",
+   "expected": [
+    "active"
+   ],
+   "beforeIndex": [
+    "active"
+   ],
+   "afterIndex": [
+    "active"
+   ],
+   "correct": true
+  },
+  {
+   "query": "FROM <ledger#graph>, constant edge, anonymous annotation",
+   "sparql": "SELECT ?v FROM <repro:main#urn:g:data> WHERE { <urn:x:alice> <urn:x:memberOf> <urn:x:ws> {| <urn:x:status> ?v |} }",
+   "expected": [
+    "active"
+   ],
+   "beforeIndex": [
+    "active"
+   ],
+   "afterIndex": [
+    "active"
+   ],
+   "correct": true
+  },
+  {
+   "query": "FROM <ledger#graph>, variable subject",
+   "sparql": "SELECT ?v FROM <repro:main#urn:g:data> WHERE { ?s <urn:x:memberOf> <urn:x:ws> {| <urn:x:status> ?v |} } ORDER BY ?v",
+   "expected": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "beforeIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "afterIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "correct": true
+  },
+  {
+   "query": "FROM <ledger#graph>, variable subject and annotation value filter",
+   "sparql": "SELECT ?s FROM <repro:main#urn:g:data> WHERE { ?s <urn:x:memberOf> ?o {| <urn:x:status> \"active\" |} }",
+   "expected": [
+    "urn:x:alice",
+    "urn:x:dave"
+   ],
+   "beforeIndex": [
+    "urn:x:alice",
+    "urn:x:dave"
+   ],
+   "afterIndex": [
+    "urn:x:alice",
+    "urn:x:dave"
+   ],
+   "correct": true
+  },
+  {
+   "query": "FROM <ledger#graph>, rdf:reifies form",
+   "sparql": "SELECT ?v FROM <repro:main#urn:g:data> WHERE { ?a <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( ?s <urn:x:memberOf> ?o )>> ; <urn:x:status> ?v } ORDER BY ?v",
+   "expected": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "beforeIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "afterIndex": [
+    "active",
+    "active",
+    "inactive",
+    "inactive"
+   ],
+   "correct": true
+  },
+  {
+   "query": "default graph, constant edge (control)",
+   "sparql": "SELECT ?v WHERE { <urn:x:alice> <urn:x:memberOf> <urn:x:ws> {| <urn:x:status> ?v |} }",
+   "expected": [
+    "default-graph"
+   ],
+   "beforeIndex": [
+    "default-graph"
+   ],
+   "afterIndex": [
+    "default-graph"
+   ],
+   "correct": true
+  }
+ ],
+ "policy": [
+  {
+   "member": "alice",
+   "expectedAllowed": true,
+   "allowedBeforeIndex": true,
+   "allowedAfterIndex": false,
+   "correct": false
+  },
+  {
+   "member": "bob",
+   "expectedAllowed": false,
+   "allowedBeforeIndex": false,
+   "allowedAfterIndex": false,
+   "correct": true
+  },
+  {
+   "member": "carol",
+   "expectedAllowed": false,
+   "allowedBeforeIndex": false,
+   "allowedAfterIndex": false,
+   "correct": true
+  },
+  {
+   "member": "dave",
+   "expectedAllowed": true,
+   "allowedBeforeIndex": true,
+   "allowedAfterIndex": false,
+   "correct": false
+  }
+ ]
+}

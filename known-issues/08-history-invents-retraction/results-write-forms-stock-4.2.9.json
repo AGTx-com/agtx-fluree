@@ -1,0 +1,257 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "version": "fluree 4.2.9",
+ "cases": [
+  {
+   "mode": "novelty",
+   "form": "JSON-LD insert (unguarded)",
+   "subject": "urn:x:s1",
+   "insertT": 1,
+   "indexTBeforeResend": null,
+   "resendT": 2,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s1",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "1",
+     "true"
+    ]
+   ],
+   "indexTAfter": 2,
+   "historyAfterReindex": [
+    [
+     "1",
+     "true"
+    ]
+   ]
+  },
+  {
+   "mode": "novelty",
+   "form": "JSON-LD update guarded by the edge",
+   "subject": "urn:x:s2",
+   "insertT": 3,
+   "indexTBeforeResend": null,
+   "resendT": 4,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s2",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "3",
+     "true"
+    ],
+    [
+     "4",
+     "false"
+    ],
+    [
+     "4",
+     "true"
+    ]
+   ],
+   "indexTAfter": 4,
+   "historyAfterReindex": [
+    [
+     "3",
+     "true"
+    ]
+   ]
+  },
+  {
+   "mode": "novelty",
+   "form": "SPARQL INSERT DATA",
+   "subject": "urn:x:s3",
+   "insertT": 5,
+   "indexTBeforeResend": null,
+   "resendT": 6,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s3",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "5",
+     "true"
+    ],
+    [
+     "6",
+     "false"
+    ],
+    [
+     "6",
+     "true"
+    ]
+   ],
+   "indexTAfter": 6,
+   "historyAfterReindex": [
+    [
+     "5",
+     "true"
+    ]
+   ]
+  },
+  {
+   "mode": "indexed",
+   "form": "JSON-LD insert (unguarded)",
+   "subject": "urn:x:s4",
+   "insertT": 7,
+   "indexTBeforeResend": 7,
+   "resendT": 8,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s4",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "7",
+     "true"
+    ],
+    [
+     "8",
+     "false"
+    ],
+    [
+     "8",
+     "true"
+    ]
+   ],
+   "indexTAfter": 8,
+   "historyAfterReindex": [
+    [
+     "7",
+     "true"
+    ]
+   ]
+  },
+  {
+   "mode": "indexed",
+   "form": "JSON-LD update guarded by the edge",
+   "subject": "urn:x:s5",
+   "insertT": 9,
+   "indexTBeforeResend": 9,
+   "resendT": 10,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s5",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "9",
+     "true"
+    ],
+    [
+     "10",
+     "false"
+    ],
+    [
+     "10",
+     "true"
+    ]
+   ],
+   "indexTAfter": 10,
+   "historyAfterReindex": [
+    [
+     "9",
+     "true"
+    ]
+   ]
+  },
+  {
+   "mode": "indexed",
+   "form": "SPARQL INSERT DATA",
+   "subject": "urn:x:s6",
+   "insertT": 11,
+   "indexTBeforeResend": 11,
+   "resendT": 12,
+   "resendCommit": {
+    "status": 200,
+    "asserts": 1,
+    "retracts": 0,
+    "flakes": [
+     [
+      "urn:x:s6",
+      "urn:x:link",
+      "urn:x:b",
+      "@id",
+      true
+     ]
+    ]
+   },
+   "historyAfterResend": [
+    [
+     "11",
+     "true"
+    ],
+    [
+     "12",
+     "false"
+    ],
+    [
+     "12",
+     "true"
+    ]
+   ],
+   "indexTAfter": 12,
+   "historyAfterReindex": [
+    [
+     "11",
+     "true"
+    ]
+   ]
+  }
+ ],
+ "serverLog": "<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g0/psot \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160194Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"psot\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160217Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g0/post \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160418Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160438Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g0/opst \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160650Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.160654Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::rebuild\u001b[0m\u001b[2m:\u001b[0m Phase D-V3: graph indexes built \u001b[3mg_id\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3morders\u001b[0m\u001b[2m=\u001b[0m4 \u001b[3mremap_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mbuild_ms\u001b[0m\u001b[2m=\u001b[0m1 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161279Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m building secondary orders \u001b[3mbuildable_orders\u001b[0m\u001b[2m=\u001b[0m[\"spot\", \"psot\", \"post\", \"opst\"] \u001b[3mconcurrency\u001b[0m\u001b[2m=\u001b[0m1 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161308Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"spot\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g1/spot \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161619Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"spot\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m83 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161650Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"psot\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g1/psot \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161900Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"psot\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m83 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.161926Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g1/post \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162179Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m83 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162207Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g1/opst \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162470Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m83 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162474Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::rebuild\u001b[0m\u001b[2m:\u001b[0m Phase D-V3: graph indexes built \u001b[3mg_id\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m83 \u001b[3morders\u001b[0m\u001b[2m=\u001b[0m4 \u001b[3mremap_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mbuild_ms\u001b[0m\u001b[2m=\u001b[0m1 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162730Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m building secondary orders \u001b[3mbuildable_orders\u001b[0m\u001b[2m=\u001b[0m[\"spot\", \"psot\", \"post\", \"opst\"] \u001b[3mconcurrency\u001b[0m\u001b[2m=\u001b[0m1 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162756Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"spot\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g2/spot \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162783Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"spot\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162813Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"psot\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g2/psot \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162840Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"psot\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162864Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g2/post \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162888Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"post\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162912Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m starting order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mrun_count\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mrun_dir\u001b[0m\u001b[2m=\u001b[<tmp>/repro/main/tmp_import/4c5b65f4-05fe-4093-ab4c-1604d222ed17/v3_runs_g2/opst \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162936Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::index_build\u001b[0m\u001b[2m:\u001b[0m completed order index build \u001b[3morder\u001b[0m\u001b[2m=\u001b[0m\"opst\" \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3melapsed_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162939Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::rebuild\u001b[0m\u001b[2m:\u001b[0m Phase D-V3: graph indexes built \u001b[3mg_id\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3morders\u001b[0m\u001b[2m=\u001b[0m4 \u001b[3mremap_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mbuild_ms\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162942Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::rebuild\u001b[0m\u001b[2m:\u001b[0m Phase D-V3 complete: all graph indexes built \u001b[3mtotal_rows\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m3 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.162999Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::build_from_commits\u001b[0m\u001b[2m:\u001b[0m class bitset table built \u001b[3mclasses\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mgraphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mtotal_subjects\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163036Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::run_index::build::build_from_commits\u001b[0m\u001b[2m:\u001b[0m SPOT class stats collector finished \u001b[3mclass_count_entries\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mclass_prop_dt_classes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mclass_prop_lang_classes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mclass_prop_ref_classes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mref_leaf_entries\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mref_truncated\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163068Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::rebuild\u001b[0m\u001b[2m:\u001b[0m Phase D-V3 stats: collected \u001b[3mtotal_flakes\u001b[0m\u001b[2m=\u001b[0m89 \u001b[3mproperty_count\u001b[0m\u001b[2m=\u001b[0m8 \u001b[3mgraph_count\u001b[0m\u001b[2m=\u001b[0m2 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163424Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m reading small dictionaries for v4 root (graphs, datatypes, languages) \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163487Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m dict upload: start (subject/string trees, numbig, vectors) \u001b[3mstreaming\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mrss_mib\u001b[0m\u001b[2m=\u001b[0m60 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163542Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m subject dict files loaded \u001b[3msubjects\u001b[0m\u001b[2m=\u001b[0m19 \u001b[3mfwd_bytes\u001b[0m\u001b[2m=\u001b[0m1075 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163551Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m building subject reverse tree (fallback index-sort) \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163560Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m subject dict artifacts uploaded \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163606Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m string dict files loaded \u001b[3mstrings\u001b[0m\u001b[2m=\u001b[0m12 \u001b[3mfwd_bytes\u001b[0m\u001b[2m=\u001b[0m768 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163613Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m building string reverse tree (fallback index-sort) \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163620Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m string dict artifacts uploaded \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163672Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::upload_dicts\u001b[0m\u001b[2m:\u001b[0m dict upload: done (dictionary trees built and uploaded to CAS) \u001b[3msubjects\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mstrings\u001b[0m\u001b[2m=\u001b[0m12 \u001b[3mnumbig_graphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mvector_graphs\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3msubject_id_encoding\u001b[0m\u001b[2m=\u001b[0mNarrow \u001b[3mwatermarks\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mstring_watermark\u001b[0m\u001b[2m=\u001b[0m11 \u001b[3mrss_mib\u001b[0m\u001b[2m=\u001b[0m60 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163714Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::root_assembly\u001b[0m\u001b[2m:\u001b[0m GC chain: garbage record written \u001b[3mgarbage_count\u001b[0m\u001b[2m=\u001b[0m13 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163719Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::root_assembly\u001b[0m\u001b[2m:\u001b[0m encoding and writing FIR6 root to CAS \u001b[3mindex_t\u001b[0m\u001b[2m=\u001b[0m12 \u001b[3mo_type_entries\u001b[0m\u001b[2m=\u001b[0m45 \u001b[3mdefault_orders\u001b[0m\u001b[2m=\u001b[0m4 \u001b[3mnamed_graphs\u001b[0m\u001b[2m=\u001b[0m1 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.163736Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_indexer::build::root_assembly\u001b[0m\u001b[2m:\u001b[0m FIR6 index root published \u001b[3mroot_id\u001b[0m\u001b[2m=\u001b[0mbaghybqabciqghcctd6du3gln2ww56poqa3shi3dqxm6tdp7o6bfrcoqymwmm7bi \u001b[3mindex_t\u001b[0m\u001b[2m=\u001b[0m12 \u001b[3mroot_bytes\u001b[0m\u001b[2m=\u001b[0m5408 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.166399Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_api::admin\u001b[0m\u001b[2m:\u001b[0m Binary index build complete \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0mrepro:main \u001b[3mindex_t\u001b[0m\u001b[2m=\u001b[0m12 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.166413Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_api::admin\u001b[0m\u001b[2m:\u001b[0m Reindex completed \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0mrepro:main \u001b[3mindex_t\u001b[0m\u001b[2m=\u001b[0m12 \u001b[3mroot_id\u001b[0m\u001b[2m=\u001b[0mbaghybqabciqghcctd6du3gln2ww56poqa3shi3dqxm6tdp7o6bfrcoqymwmm7bi \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.166424Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_server::routes::ledger\u001b[0m\u001b[2m:\u001b[0m ledger reindex complete \u001b[3mstatus\u001b[0m\u001b[2m=\u001b[0m\"success\" \u001b[3mindex_t\u001b[0m\u001b[2m=\u001b[0m12 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mledger:reindex \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"ledger:reindex\" \u001b[3mledger_id\u001b[0m\u001b[2m=\u001b[0m\"repro:main\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.166634Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfluree_db_indexer::gc::collector\u001b[0m\u001b[2m:\u001b[0m Garbage collection complete \u001b[3mindexes_cleaned\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mnodes_deleted\u001b[0m\u001b[2m=\u001b[0m10 \u001b[3mshared_released\u001b[0m\u001b[2m=\u001b[0m6 \u001b[3mshared_deferred\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mresurrected\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3munnameable_indexes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mage_guard_overridden\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mretained\u001b[0m\u001b[2m=\u001b[0m11 \u001b[3mretention_target\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mpast_target\u001b[0m\u001b[2m=\u001b[0m10 \u001b[3mstopped_by\u001b[0m\u001b[2m=\u001b[0m\"age_guard\"\n\u001b[2m2026-11-23T15:18:41.166734Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_server::routes::query\u001b[0m\u001b[2m:\u001b[0m query request received \u001b[3mstatus\u001b[0m\u001b[2m=\u001b[0m\"start\" \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mquery:sparql \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"query\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.166955Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1mrequest\u001b[0m: \u001b[2mfluree_db_server::routes::query\u001b[0m\u001b[2m:\u001b[0m \u001b[3mstatus\u001b[0m\u001b[2m=\u001b[0m\"success\" \u001b[3mquery_kind\u001b[0m\u001b[2m=\u001b[0m\"sparql\" \u001b[3mresult_count\u001b[0m\u001b[2m=\u001b[0m0 \u001b[2m\u001b[3motel.name\u001b[0m\u001b[2m=\u001b[0mquery:sparql \u001b[3moperation\u001b[0m\u001b[2m=\u001b[0m\"query\"\u001b[0m\n\u001b[2m2026-11-23T15:18:41.167110Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mfluree_db_server\u001b[0m\u001b[2m:\u001b[0m shutdown signal received; draining\n"
+}

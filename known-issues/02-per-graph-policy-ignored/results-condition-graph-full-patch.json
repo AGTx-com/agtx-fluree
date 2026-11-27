@@ -1,0 +1,19 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "setups": {
+  "permission only in X": {
+   "read X": true,
+   "read Y": false,
+   "write X": true,
+   "write Y": false
+  },
+  "permission in X and default": {
+   "read X": true,
+   "read Y": false,
+   "write X": true,
+   "write Y": false
+  }
+ },
+ "readsAndWritesAgree": true
+}

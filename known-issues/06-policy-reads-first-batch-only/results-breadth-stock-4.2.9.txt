@@ -1,0 +1,507 @@
+# Recorded output, 23 November 2026. Build: the stock v4.2.9 release (3b8d19e649a6).
+fluree 4.2.9
+Part A: small data (rob)
+unindexed    A1       view   query=True  policy=refused INCONSISTENT
+unindexed    A1       modify query=True  policy=refused INCONSISTENT
+unindexed    A2       view   query=True  policy=refused INCONSISTENT
+unindexed    A2       modify query=True  policy=refused INCONSISTENT
+unindexed    A3       view   query=True  policy=refused INCONSISTENT
+unindexed    A3       modify query=True  policy=refused INCONSISTENT
+unindexed    A4       view   query=True  policy=refused INCONSISTENT
+unindexed    A4       modify query=True  policy=refused INCONSISTENT
+unindexed    A5       view   query=True  policy=allowed 
+unindexed    A5       modify query=True  policy=allowed 
+unindexed    A6       view   query=True  policy=allowed 
+unindexed    A6       modify query=True  policy=allowed 
+unindexed    A7       view   query=True  policy=allowed 
+unindexed    A7       modify query=True  policy=allowed 
+unindexed    A8       view   query=True  policy=allowed 
+unindexed    A8       modify query=True  policy=allowed 
+unindexed    A9       view   query=True  policy=allowed 
+unindexed    A9       modify query=True  policy=allowed 
+unindexed    A10      view   query=True  policy=allowed 
+unindexed    A10      modify query=True  policy=allowed 
+unindexed    A11      view   query=True  policy=allowed 
+unindexed    A11      modify query=True  policy=allowed 
+unindexed    A1-json  view   query=True  policy=refused INCONSISTENT
+unindexed    A1-json  modify query=True  policy=refused INCONSISTENT
+unindexed    A2-json  view   query=True  policy=refused INCONSISTENT
+unindexed    A2-json  modify query=True  policy=refused INCONSISTENT
+unindexed    A3-json  view   query=True  policy=refused INCONSISTENT
+unindexed    A3-json  modify query=True  policy=refused INCONSISTENT
+index        A1       view   query=True  policy=refused INCONSISTENT
+index        A1       modify query=True  policy=refused INCONSISTENT
+index        A2       view   query=True  policy=refused INCONSISTENT
+index        A2       modify query=True  policy=refused INCONSISTENT
+index        A3       view   query=True  policy=refused INCONSISTENT
+index        A3       modify query=True  policy=refused INCONSISTENT
+index        A4       view   query=True  policy=refused INCONSISTENT
+index        A4       modify query=True  policy=refused INCONSISTENT
+index        A5       view   query=True  policy=allowed 
+index        A5       modify query=True  policy=allowed 
+index        A6       view   query=True  policy=allowed 
+index        A6       modify query=True  policy=allowed 
+index        A7       view   query=True  policy=allowed 
+index        A7       modify query=True  policy=allowed 
+index        A8       view   query=True  policy=allowed 
+index        A8       modify query=True  policy=allowed 
+index        A9       view   query=True  policy=allowed 
+index        A9       modify query=True  policy=allowed 
+index        A10      view   query=True  policy=allowed 
+index        A10      modify query=True  policy=allowed 
+index        A11      view   query=True  policy=allowed 
+index        A11      modify query=True  policy=allowed 
+index        A1-json  view   query=True  policy=refused INCONSISTENT
+index        A1-json  modify query=True  policy=refused INCONSISTENT
+index        A2-json  view   query=True  policy=refused INCONSISTENT
+index        A2-json  modify query=True  policy=refused INCONSISTENT
+index        A3-json  view   query=True  policy=refused INCONSISTENT
+index        A3-json  modify query=True  policy=refused INCONSISTENT
+reindex      A1       view   query=True  policy=refused INCONSISTENT
+reindex      A1       modify query=True  policy=refused INCONSISTENT
+reindex      A2       view   query=True  policy=refused INCONSISTENT
+reindex      A2       modify query=True  policy=refused INCONSISTENT
+reindex      A3       view   query=True  policy=refused INCONSISTENT
+reindex      A3       modify query=True  policy=refused INCONSISTENT
+reindex      A4       view   query=True  policy=refused INCONSISTENT
+reindex      A4       modify query=True  policy=refused INCONSISTENT
+reindex      A5       view   query=True  policy=allowed 
+reindex      A5       modify query=True  policy=allowed 
+reindex      A6       view   query=True  policy=allowed 
+reindex      A6       modify query=True  policy=allowed 
+reindex      A7       view   query=True  policy=allowed 
+reindex      A7       modify query=True  policy=allowed 
+reindex      A8       view   query=True  policy=allowed 
+reindex      A8       modify query=True  policy=allowed 
+reindex      A9       view   query=True  policy=allowed 
+reindex      A9       modify query=True  policy=allowed 
+reindex      A10      view   query=True  policy=allowed 
+reindex      A10      modify query=True  policy=allowed 
+reindex      A11      view   query=True  policy=allowed 
+reindex      A11      modify query=True  policy=allowed 
+reindex      A1-json  view   query=True  policy=refused INCONSISTENT
+reindex      A1-json  modify query=True  policy=refused INCONSISTENT
+reindex      A2-json  view   query=True  policy=refused INCONSISTENT
+reindex      A2-json  modify query=True  policy=refused INCONSISTENT
+reindex      A3-json  view   query=True  policy=refused INCONSISTENT
+reindex      A3-json  modify query=True  policy=refused INCONSISTENT
+index+newer  A1       view   query=True  policy=refused INCONSISTENT
+index+newer  A1       modify query=True  policy=refused INCONSISTENT
+index+newer  A2       view   query=True  policy=refused INCONSISTENT
+index+newer  A2       modify query=True  policy=refused INCONSISTENT
+index+newer  A3       view   query=True  policy=refused INCONSISTENT
+index+newer  A3       modify query=True  policy=refused INCONSISTENT
+index+newer  A4       view   query=True  policy=refused INCONSISTENT
+index+newer  A4       modify query=True  policy=refused INCONSISTENT
+index+newer  A5       view   query=True  policy=allowed 
+index+newer  A5       modify query=True  policy=allowed 
+index+newer  A6       view   query=True  policy=allowed 
+index+newer  A6       modify query=True  policy=allowed 
+index+newer  A7       view   query=True  policy=allowed 
+index+newer  A7       modify query=True  policy=allowed 
+index+newer  A8       view   query=True  policy=allowed 
+index+newer  A8       modify query=True  policy=allowed 
+index+newer  A9       view   query=True  policy=allowed 
+index+newer  A9       modify query=True  policy=allowed 
+index+newer  A10      view   query=True  policy=allowed 
+index+newer  A10      modify query=True  policy=allowed 
+index+newer  A11      view   query=True  policy=allowed 
+index+newer  A11      modify query=True  policy=allowed 
+index+newer  A1-json  view   query=True  policy=refused INCONSISTENT
+index+newer  A1-json  modify query=True  policy=refused INCONSISTENT
+index+newer  A2-json  view   query=True  policy=refused INCONSISTENT
+index+newer  A2-json  modify query=True  policy=refused INCONSISTENT
+index+newer  A3-json  view   query=True  policy=refused INCONSISTENT
+index+newer  A3-json  modify query=True  policy=refused INCONSISTENT
+Part B: 3000 users and 3000 documents
+unindexed    B1       pos=0     view   query=True  policy=allowed 
+unindexed    B1       pos=0     modify query=True  policy=allowed 
+unindexed    B1       pos=999   view   query=True  policy=allowed 
+unindexed    B1       pos=999   modify query=True  policy=allowed 
+unindexed    B1       pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B1       pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B1       pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B1       pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B1-json  pos=0     view   query=True  policy=allowed 
+unindexed    B1-json  pos=0     modify query=True  policy=allowed 
+unindexed    B1-json  pos=999   view   query=True  policy=allowed 
+unindexed    B1-json  pos=999   modify query=True  policy=allowed 
+unindexed    B1-json  pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B1-json  pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B1-json  pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B1-json  pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B2       pos=0     view   query=True  policy=allowed 
+unindexed    B2       pos=0     modify query=True  policy=allowed 
+unindexed    B2       pos=999   view   query=True  policy=allowed 
+unindexed    B2       pos=999   modify query=True  policy=allowed 
+unindexed    B2       pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B2       pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B2       pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B2       pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B3       pos=0     view   query=True  policy=allowed 
+unindexed    B3       pos=0     modify query=True  policy=allowed 
+unindexed    B3       pos=999   view   query=True  policy=allowed 
+unindexed    B3       pos=999   modify query=True  policy=allowed 
+unindexed    B3       pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B3       pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B3       pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B3       pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B4       pos=0     view   query=True  policy=allowed 
+unindexed    B4       pos=0     modify query=True  policy=allowed 
+unindexed    B4       pos=999   view   query=True  policy=allowed 
+unindexed    B4       pos=999   modify query=True  policy=allowed 
+unindexed    B4       pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B4       pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B4       pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B4       pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B10      pos=0     view   query=True  policy=allowed 
+unindexed    B10      pos=0     modify query=True  policy=allowed 
+unindexed    B10      pos=999   view   query=True  policy=allowed 
+unindexed    B10      pos=999   modify query=True  policy=allowed 
+unindexed    B10      pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B10      pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B10      pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B10      pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B11      pos=0     view   query=True  policy=allowed 
+unindexed    B11      pos=0     modify query=True  policy=allowed 
+unindexed    B11      pos=999   view   query=True  policy=allowed 
+unindexed    B11      pos=999   modify query=True  policy=allowed 
+unindexed    B11      pos=1000  view   query=True  policy=refused INCONSISTENT
+unindexed    B11      pos=1000  modify query=True  policy=refused INCONSISTENT
+unindexed    B11      pos=2999  view   query=True  policy=refused INCONSISTENT
+unindexed    B11      pos=2999  modify query=True  policy=refused INCONSISTENT
+unindexed    B5       pos=0     view   query=True  policy=allowed 
+unindexed    B5       pos=0     modify query=True  policy=allowed 
+unindexed    B5       pos=999   view   query=True  policy=allowed 
+unindexed    B5       pos=999   modify query=True  policy=allowed 
+unindexed    B5       pos=1000  view   query=True  policy=allowed 
+unindexed    B5       pos=1000  modify query=True  policy=allowed 
+unindexed    B5       pos=2999  view   query=True  policy=allowed 
+unindexed    B5       pos=2999  modify query=True  policy=allowed 
+unindexed    B6       pos=0     view   query=True  policy=allowed 
+unindexed    B6       pos=0     modify query=True  policy=allowed 
+unindexed    B6       pos=999   view   query=True  policy=allowed 
+unindexed    B6       pos=999   modify query=True  policy=allowed 
+unindexed    B6       pos=1000  view   query=True  policy=allowed 
+unindexed    B6       pos=1000  modify query=True  policy=allowed 
+unindexed    B6       pos=2999  view   query=True  policy=allowed 
+unindexed    B6       pos=2999  modify query=True  policy=allowed 
+unindexed    B7       pos=0     view   query=True  policy=allowed 
+unindexed    B7       pos=0     modify query=True  policy=allowed 
+unindexed    B7       pos=999   view   query=True  policy=allowed 
+unindexed    B7       pos=999   modify query=True  policy=allowed 
+unindexed    B7       pos=1000  view   query=True  policy=allowed 
+unindexed    B7       pos=1000  modify query=True  policy=allowed 
+unindexed    B7       pos=2999  view   query=True  policy=allowed 
+unindexed    B7       pos=2999  modify query=True  policy=allowed 
+unindexed    B8       pos=0     view   query=True  policy=allowed 
+unindexed    B8       pos=0     modify query=True  policy=allowed 
+unindexed    B8       pos=999   view   query=True  policy=allowed 
+unindexed    B8       pos=999   modify query=True  policy=allowed 
+unindexed    B8       pos=1000  view   query=True  policy=allowed 
+unindexed    B8       pos=1000  modify query=True  policy=allowed 
+unindexed    B8       pos=2999  view   query=True  policy=allowed 
+unindexed    B8       pos=2999  modify query=True  policy=allowed 
+unindexed    B9       pos=0     view   query=True  policy=allowed 
+unindexed    B9       pos=0     modify query=True  policy=allowed 
+unindexed    B9       pos=999   view   query=True  policy=allowed 
+unindexed    B9       pos=999   modify query=True  policy=allowed 
+unindexed    B9       pos=1000  view   query=True  policy=allowed 
+unindexed    B9       pos=1000  modify query=True  policy=allowed 
+unindexed    B9       pos=2999  view   query=True  policy=allowed 
+unindexed    B9       pos=2999  modify query=True  policy=allowed 
+unindexed    B2       all documents: 1000 of 3000 tiers visible INCONSISTENT
+index        B1       pos=0     view   query=True  policy=allowed 
+index        B1       pos=0     modify query=True  policy=allowed 
+index        B1       pos=999   view   query=True  policy=allowed 
+index        B1       pos=999   modify query=True  policy=allowed 
+index        B1       pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B1       pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B1       pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B1       pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B1-json  pos=0     view   query=True  policy=allowed 
+index        B1-json  pos=0     modify query=True  policy=allowed 
+index        B1-json  pos=999   view   query=True  policy=allowed 
+index        B1-json  pos=999   modify query=True  policy=allowed 
+index        B1-json  pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B1-json  pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B1-json  pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B1-json  pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B2       pos=0     view   query=True  policy=allowed 
+index        B2       pos=0     modify query=True  policy=allowed 
+index        B2       pos=999   view   query=True  policy=allowed 
+index        B2       pos=999   modify query=True  policy=allowed 
+index        B2       pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B2       pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B2       pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B2       pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B3       pos=0     view   query=True  policy=allowed 
+index        B3       pos=0     modify query=True  policy=allowed 
+index        B3       pos=999   view   query=True  policy=allowed 
+index        B3       pos=999   modify query=True  policy=allowed 
+index        B3       pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B3       pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B3       pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B3       pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B4       pos=0     view   query=True  policy=allowed 
+index        B4       pos=0     modify query=True  policy=allowed 
+index        B4       pos=999   view   query=True  policy=allowed 
+index        B4       pos=999   modify query=True  policy=allowed 
+index        B4       pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B4       pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B4       pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B4       pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B10      pos=0     view   query=True  policy=allowed 
+index        B10      pos=0     modify query=True  policy=allowed 
+index        B10      pos=999   view   query=True  policy=allowed 
+index        B10      pos=999   modify query=True  policy=allowed 
+index        B10      pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B10      pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B10      pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B10      pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B11      pos=0     view   query=True  policy=allowed 
+index        B11      pos=0     modify query=True  policy=allowed 
+index        B11      pos=999   view   query=True  policy=allowed 
+index        B11      pos=999   modify query=True  policy=allowed 
+index        B11      pos=1000  view   query=True  policy=refused INCONSISTENT
+index        B11      pos=1000  modify query=True  policy=refused INCONSISTENT
+index        B11      pos=2999  view   query=True  policy=refused INCONSISTENT
+index        B11      pos=2999  modify query=True  policy=refused INCONSISTENT
+index        B5       pos=0     view   query=True  policy=allowed 
+index        B5       pos=0     modify query=True  policy=allowed 
+index        B5       pos=999   view   query=True  policy=allowed 
+index        B5       pos=999   modify query=True  policy=allowed 
+index        B5       pos=1000  view   query=True  policy=allowed 
+index        B5       pos=1000  modify query=True  policy=allowed 
+index        B5       pos=2999  view   query=True  policy=allowed 
+index        B5       pos=2999  modify query=True  policy=allowed 
+index        B6       pos=0     view   query=True  policy=allowed 
+index        B6       pos=0     modify query=True  policy=allowed 
+index        B6       pos=999   view   query=True  policy=allowed 
+index        B6       pos=999   modify query=True  policy=allowed 
+index        B6       pos=1000  view   query=True  policy=allowed 
+index        B6       pos=1000  modify query=True  policy=allowed 
+index        B6       pos=2999  view   query=True  policy=allowed 
+index        B6       pos=2999  modify query=True  policy=allowed 
+index        B7       pos=0     view   query=True  policy=allowed 
+index        B7       pos=0     modify query=True  policy=allowed 
+index        B7       pos=999   view   query=True  policy=allowed 
+index        B7       pos=999   modify query=True  policy=allowed 
+index        B7       pos=1000  view   query=True  policy=allowed 
+index        B7       pos=1000  modify query=True  policy=allowed 
+index        B7       pos=2999  view   query=True  policy=allowed 
+index        B7       pos=2999  modify query=True  policy=allowed 
+index        B8       pos=0     view   query=True  policy=allowed 
+index        B8       pos=0     modify query=True  policy=allowed 
+index        B8       pos=999   view   query=True  policy=allowed 
+index        B8       pos=999   modify query=True  policy=allowed 
+index        B8       pos=1000  view   query=True  policy=allowed 
+index        B8       pos=1000  modify query=True  policy=allowed 
+index        B8       pos=2999  view   query=True  policy=allowed 
+index        B8       pos=2999  modify query=True  policy=allowed 
+index        B9       pos=0     view   query=True  policy=allowed 
+index        B9       pos=0     modify query=True  policy=allowed 
+index        B9       pos=999   view   query=True  policy=allowed 
+index        B9       pos=999   modify query=True  policy=allowed 
+index        B9       pos=1000  view   query=True  policy=allowed 
+index        B9       pos=1000  modify query=True  policy=allowed 
+index        B9       pos=2999  view   query=True  policy=allowed 
+index        B9       pos=2999  modify query=True  policy=allowed 
+reindex      B1       pos=0     view   query=True  policy=allowed 
+reindex      B1       pos=0     modify query=True  policy=allowed 
+reindex      B1       pos=999   view   query=True  policy=allowed 
+reindex      B1       pos=999   modify query=True  policy=allowed 
+reindex      B1       pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B1       pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B1       pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B1       pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B1-json  pos=0     view   query=True  policy=allowed 
+reindex      B1-json  pos=0     modify query=True  policy=allowed 
+reindex      B1-json  pos=999   view   query=True  policy=allowed 
+reindex      B1-json  pos=999   modify query=True  policy=allowed 
+reindex      B1-json  pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B1-json  pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B1-json  pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B1-json  pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B2       pos=0     view   query=True  policy=allowed 
+reindex      B2       pos=0     modify query=True  policy=allowed 
+reindex      B2       pos=999   view   query=True  policy=allowed 
+reindex      B2       pos=999   modify query=True  policy=allowed 
+reindex      B2       pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B2       pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B2       pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B2       pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B3       pos=0     view   query=True  policy=allowed 
+reindex      B3       pos=0     modify query=True  policy=allowed 
+reindex      B3       pos=999   view   query=True  policy=allowed 
+reindex      B3       pos=999   modify query=True  policy=allowed 
+reindex      B3       pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B3       pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B3       pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B3       pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B4       pos=0     view   query=True  policy=allowed 
+reindex      B4       pos=0     modify query=True  policy=allowed 
+reindex      B4       pos=999   view   query=True  policy=allowed 
+reindex      B4       pos=999   modify query=True  policy=allowed 
+reindex      B4       pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B4       pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B4       pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B4       pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B10      pos=0     view   query=True  policy=allowed 
+reindex      B10      pos=0     modify query=True  policy=allowed 
+reindex      B10      pos=999   view   query=True  policy=allowed 
+reindex      B10      pos=999   modify query=True  policy=allowed 
+reindex      B10      pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B10      pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B10      pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B10      pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B11      pos=0     view   query=True  policy=allowed 
+reindex      B11      pos=0     modify query=True  policy=allowed 
+reindex      B11      pos=999   view   query=True  policy=allowed 
+reindex      B11      pos=999   modify query=True  policy=allowed 
+reindex      B11      pos=1000  view   query=True  policy=refused INCONSISTENT
+reindex      B11      pos=1000  modify query=True  policy=refused INCONSISTENT
+reindex      B11      pos=2999  view   query=True  policy=refused INCONSISTENT
+reindex      B11      pos=2999  modify query=True  policy=refused INCONSISTENT
+reindex      B5       pos=0     view   query=True  policy=allowed 
+reindex      B5       pos=0     modify query=True  policy=allowed 
+reindex      B5       pos=999   view   query=True  policy=allowed 
+reindex      B5       pos=999   modify query=True  policy=allowed 
+reindex      B5       pos=1000  view   query=True  policy=allowed 
+reindex      B5       pos=1000  modify query=True  policy=allowed 
+reindex      B5       pos=2999  view   query=True  policy=allowed 
+reindex      B5       pos=2999  modify query=True  policy=allowed 
+reindex      B6       pos=0     view   query=True  policy=allowed 
+reindex      B6       pos=0     modify query=True  policy=allowed 
+reindex      B6       pos=999   view   query=True  policy=allowed 
+reindex      B6       pos=999   modify query=True  policy=allowed 
+reindex      B6       pos=1000  view   query=True  policy=allowed 
+reindex      B6       pos=1000  modify query=True  policy=allowed 
+reindex      B6       pos=2999  view   query=True  policy=allowed 
+reindex      B6       pos=2999  modify query=True  policy=allowed 
+reindex      B7       pos=0     view   query=True  policy=allowed 
+reindex      B7       pos=0     modify query=True  policy=allowed 
+reindex      B7       pos=999   view   query=True  policy=allowed 
+reindex      B7       pos=999   modify query=True  policy=allowed 
+reindex      B7       pos=1000  view   query=True  policy=allowed 
+reindex      B7       pos=1000  modify query=True  policy=allowed 
+reindex      B7       pos=2999  view   query=True  policy=allowed 
+reindex      B7       pos=2999  modify query=True  policy=allowed 
+reindex      B8       pos=0     view   query=True  policy=allowed 
+reindex      B8       pos=0     modify query=True  policy=allowed 
+reindex      B8       pos=999   view   query=True  policy=allowed 
+reindex      B8       pos=999   modify query=True  policy=allowed 
+reindex      B8       pos=1000  view   query=True  policy=allowed 
+reindex      B8       pos=1000  modify query=True  policy=allowed 
+reindex      B8       pos=2999  view   query=True  policy=allowed 
+reindex      B8       pos=2999  modify query=True  policy=allowed 
+reindex      B9       pos=0     view   query=True  policy=allowed 
+reindex      B9       pos=0     modify query=True  policy=allowed 
+reindex      B9       pos=999   view   query=True  policy=allowed 
+reindex      B9       pos=999   modify query=True  policy=allowed 
+reindex      B9       pos=1000  view   query=True  policy=allowed 
+reindex      B9       pos=1000  modify query=True  policy=allowed 
+reindex      B9       pos=2999  view   query=True  policy=allowed 
+reindex      B9       pos=2999  modify query=True  policy=allowed 
+reindex      B2       all documents: 1000 of 3000 tiers visible INCONSISTENT
+index+newer  B1       pos=0     view   query=True  policy=allowed 
+index+newer  B1       pos=0     modify query=True  policy=allowed 
+index+newer  B1       pos=999   view   query=True  policy=allowed 
+index+newer  B1       pos=999   modify query=True  policy=allowed 
+index+newer  B1       pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B1       pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B1       pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B1       pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B1-json  pos=0     view   query=True  policy=allowed 
+index+newer  B1-json  pos=0     modify query=True  policy=allowed 
+index+newer  B1-json  pos=999   view   query=True  policy=allowed 
+index+newer  B1-json  pos=999   modify query=True  policy=allowed 
+index+newer  B1-json  pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B1-json  pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B1-json  pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B1-json  pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B2       pos=0     view   query=True  policy=allowed 
+index+newer  B2       pos=0     modify query=True  policy=allowed 
+index+newer  B2       pos=999   view   query=True  policy=allowed 
+index+newer  B2       pos=999   modify query=True  policy=allowed 
+index+newer  B2       pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B2       pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B2       pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B2       pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B3       pos=0     view   query=True  policy=allowed 
+index+newer  B3       pos=0     modify query=True  policy=allowed 
+index+newer  B3       pos=999   view   query=True  policy=allowed 
+index+newer  B3       pos=999   modify query=True  policy=allowed 
+index+newer  B3       pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B3       pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B3       pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B3       pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B4       pos=0     view   query=True  policy=allowed 
+index+newer  B4       pos=0     modify query=True  policy=allowed 
+index+newer  B4       pos=999   view   query=True  policy=allowed 
+index+newer  B4       pos=999   modify query=True  policy=allowed 
+index+newer  B4       pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B4       pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B4       pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B4       pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B10      pos=0     view   query=True  policy=allowed 
+index+newer  B10      pos=0     modify query=True  policy=allowed 
+index+newer  B10      pos=999   view   query=True  policy=allowed 
+index+newer  B10      pos=999   modify query=True  policy=allowed 
+index+newer  B10      pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B10      pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B10      pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B10      pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B11      pos=0     view   query=True  policy=allowed 
+index+newer  B11      pos=0     modify query=True  policy=allowed 
+index+newer  B11      pos=999   view   query=True  policy=allowed 
+index+newer  B11      pos=999   modify query=True  policy=allowed 
+index+newer  B11      pos=1000  view   query=True  policy=refused INCONSISTENT
+index+newer  B11      pos=1000  modify query=True  policy=refused INCONSISTENT
+index+newer  B11      pos=2999  view   query=True  policy=refused INCONSISTENT
+index+newer  B11      pos=2999  modify query=True  policy=refused INCONSISTENT
+index+newer  B5       pos=0     view   query=True  policy=allowed 
+index+newer  B5       pos=0     modify query=True  policy=allowed 
+index+newer  B5       pos=999   view   query=True  policy=allowed 
+index+newer  B5       pos=999   modify query=True  policy=allowed 
+index+newer  B5       pos=1000  view   query=True  policy=allowed 
+index+newer  B5       pos=1000  modify query=True  policy=allowed 
+index+newer  B5       pos=2999  view   query=True  policy=allowed 
+index+newer  B5       pos=2999  modify query=True  policy=allowed 
+index+newer  B6       pos=0     view   query=True  policy=allowed 
+index+newer  B6       pos=0     modify query=True  policy=allowed 
+index+newer  B6       pos=999   view   query=True  policy=allowed 
+index+newer  B6       pos=999   modify query=True  policy=allowed 
+index+newer  B6       pos=1000  view   query=True  policy=allowed 
+index+newer  B6       pos=1000  modify query=True  policy=allowed 
+index+newer  B6       pos=2999  view   query=True  policy=allowed 
+index+newer  B6       pos=2999  modify query=True  policy=allowed 
+index+newer  B7       pos=0     view   query=True  policy=allowed 
+index+newer  B7       pos=0     modify query=True  policy=allowed 
+index+newer  B7       pos=999   view   query=True  policy=allowed 
+index+newer  B7       pos=999   modify query=True  policy=allowed 
+index+newer  B7       pos=1000  view   query=True  policy=allowed 
+index+newer  B7       pos=1000  modify query=True  policy=allowed 
+index+newer  B7       pos=2999  view   query=True  policy=allowed 
+index+newer  B7       pos=2999  modify query=True  policy=allowed 
+index+newer  B8       pos=0     view   query=True  policy=allowed 
+index+newer  B8       pos=0     modify query=True  policy=allowed 
+index+newer  B8       pos=999   view   query=True  policy=allowed 
+index+newer  B8       pos=999   modify query=True  policy=allowed 
+index+newer  B8       pos=1000  view   query=True  policy=allowed 
+index+newer  B8       pos=1000  modify query=True  policy=allowed 
+index+newer  B8       pos=2999  view   query=True  policy=allowed 
+index+newer  B8       pos=2999  modify query=True  policy=allowed 
+index+newer  B9       pos=0     view   query=True  policy=allowed 
+index+newer  B9       pos=0     modify query=True  policy=allowed 
+index+newer  B9       pos=999   view   query=True  policy=allowed 
+index+newer  B9       pos=999   modify query=True  policy=allowed 
+index+newer  B9       pos=1000  view   query=True  policy=allowed 
+index+newer  B9       pos=1000  modify query=True  policy=allowed 
+index+newer  B9       pos=2999  view   query=True  policy=allowed 
+index+newer  B9       pos=2999  modify query=True  policy=allowed 
+Part C: a wrongly refused view policy and the reader's own FILTER NOT EXISTS
+unindexed    condition answer=True; hold flags rob sees=[]; his "documents without a hold" query returns ['urn:doc:held', 'urn:doc:open'] WRONG (held document listed)
+reindex      condition answer=True; hold flags rob sees=[]; his "documents without a hold" query returns ['urn:doc:held', 'urn:doc:open'] WRONG (held document listed)
+cases where the policy decision contradicts the query answer: 172
+exit status 1

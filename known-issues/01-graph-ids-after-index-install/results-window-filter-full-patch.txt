@@ -1,0 +1,79 @@
+# Recorded output, 23 November 2026. Build: the fork's full-patch build (fixes 1 to 7 plus the fork's own features).
+fluree 4.2.9 | case policy-filter | scale 2.0 | runs 3 | long window True
+  run 1: installs (ms, index_t, unindexed flakes left) [(-3.3, 1, 0), (4618.6, 2, 54), (8051.7, 7, 0)]; window [4618.6, 8051.7] ms; trigger seen at 4618.8 ms; tail fact t=3
+    in_window    probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [4619.4..4623.1 ms, inside=True]
+    in_window    probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [4619.7..4623.2 ms, inside=True]
+    in_window    decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [4623.4..4626.5 ms, inside=True]
+    in_window    decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [4623.4..4628.1 ms, inside=True]
+    in_window    decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [4623.5..4630.0 ms, inside=True]
+    in_window    enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [4623.6..4625.5 ms, inside=True]
+    after_settle probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 2.5 ms]
+    after_settle probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 3.1 ms]
+    after_settle decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 2.3 ms]
+    after_settle decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.9 ms]
+    after_settle decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 2.2 ms]
+    after_settle enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.3 ms]
+    no_race      probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 1.2 ms]
+    no_race      probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 1.0 ms]
+    no_race      decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 1.9 ms]
+    no_race      decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.5 ms]
+    no_race      decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 1.3 ms]
+    no_race      enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.0 ms]
+  run 2: installs (ms, index_t, unindexed flakes left) [(-50.7, 1, 0), (4668.1, 2, 54), (8032.9, 7, 0)]; window [4668.1, 8032.9] ms; trigger seen at 4668.2 ms; tail fact t=3
+    in_window    probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [4668.5..4670.3 ms, inside=True]
+    in_window    probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [4668.6..4670.4 ms, inside=True]
+    in_window    decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [4670.6..4673.1 ms, inside=True]
+    in_window    decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [4670.6..4673.0 ms, inside=True]
+    in_window    decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [4670.8..4672.8 ms, inside=True]
+    in_window    enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [4670.9..4673.2 ms, inside=True]
+    after_settle probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 1.1 ms]
+    after_settle probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 11.6 ms]
+    after_settle decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 1.4 ms]
+    after_settle decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.0 ms]
+    after_settle decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 1.2 ms]
+    after_settle enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.0 ms]
+    no_race      probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 2.2 ms]
+    no_race      probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 1.2 ms]
+    no_race      decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 1.5 ms]
+    no_race      decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.8 ms]
+    no_race      decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 1.0 ms]
+    no_race      enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.1 ms]
+  run 3: installs (ms, index_t, unindexed flakes left) [(-12.2, 1, 0), (6585.5, 2, 54), (10027.3, 7, 0)]; window [6585.5, 10027.3] ms; trigger seen at 6585.6 ms; tail fact t=3
+    in_window    probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [6585.8..6587.1 ms, inside=True]
+    in_window    probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [6586.0..6587.2 ms, inside=True]
+    in_window    decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [6587.3..6589.4 ms, inside=True]
+    in_window    decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [6587.4..6589.2 ms, inside=True]
+    in_window    decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [6587.4..6589.3 ms, inside=True]
+    in_window    enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [6587.5..6589.5 ms, inside=True]
+    after_settle probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 1.8 ms]
+    after_settle probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 1.2 ms]
+    after_settle decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 2.1 ms]
+    after_settle decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.5 ms]
+    after_settle decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 1.6 ms]
+    after_settle enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.4 ms]
+    no_race      probe       admin marker read of z                     RIGHT got=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] expected=["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"] [took 1.5 ms]
+    no_race      probe       admin read of z public marks               RIGHT got=["urn:x:doc-0", "urn:x:doc-2"] expected=["urn:x:doc-0", "urn:x:doc-2"] [took 1.1 ms]
+    no_race      decision    rob read of titles (default graph)         RIGHT got=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] expected=["title-0 urn:x:doc-0", "title-2 urn:x:doc-2"] [took 2.1 ms]
+    no_race      decision    rob read of all of z                       RIGHT got=["z-1 urn:p:m", "z-2 urn:p:m", "z-3 urn:p:m", "z-4 urn:p:m", "z-5 urn:p:m", "z-6 urn:p:m"] expected=["z", ["z-1", "z-2", "z-3", "z-4", "z-5", "z-6"]] [took 1.6 ms]
+    no_race      decision    rob read of all of a                       RIGHT got=["a-1 urn:p:m", "a-2 urn:p:m", "a-3 urn:p:m", "a-4 urn:p:m", "a-5 urn:p:m", "a-6 urn:p:m"] expected=["a", ["a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]] [took 1.6 ms]
+    no_race      enforcement rob read of secrets (enforcement)          RIGHT got=[] expected=[] [took 1.2 ms]
+  stored policy-filter-1:main               settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored policy-filter-1-norace:main        settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored policy-filter-2:main               settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored policy-filter-2-norace:main        settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored policy-filter-3:main               settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored policy-filter-3-norace:main        settled {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+  stored                                    restart {"z public": ["urn:x:doc-0", "urn:x:doc-2"]}
+SUMMARY (right / counted; in-window counts only requests that started and finished inside the window)
+  probe | admin marker read of z                             in_window 3/3  after_settle 3/3  no_race 3/3
+  probe | admin read of z public marks                       in_window 3/3  after_settle 3/3  no_race 3/3
+  decision | rob read of titles (default graph)              in_window 3/3  after_settle 3/3  no_race 3/3
+  decision | rob read of all of z                            in_window 3/3  after_settle 3/3  no_race 3/3
+  decision | rob read of all of a                            in_window 3/3  after_settle 3/3  no_race 3/3
+  enforcement | rob read of secrets (enforcement)            in_window 3/3  after_settle 3/3  no_race 3/3
+RESULT case=policy-filter wrong_in_window=0 runs_with_wrong_controls=0 decisions_outside_window=0

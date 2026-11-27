@@ -1,8 +1,9 @@
+# build: the stock v4.2.9 release (`3b8d19e649a6`)
 fluree 4.2.9
-control: shapes in co:main itself                | no commodity reject  | coffee       pass    | unobtainium  reject 
-cross-ledger, fresh co:main                      | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
-cross-ledger, co:main knows the data IRIs        | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
-cross-ledger, + an unrelated urn:shape: IRI      | no commodity pass    WRONG | coffee       pass    | unobtainium  pass    WRONG
-cross-ledger, + both shape node IRIs             | no commodity reject  | coffee       pass    | unobtainium  reject 
-cross-ledger, blank property shape, + node IRI   | no commodity reject  | coffee       pass    | unobtainium  reject 
+control: shapes in co:main itself                | no product   reject  | widget       pass    | unobtainium  reject 
+cross-ledger, fresh co:main                      | no product   pass    WRONG | widget       pass    | unobtainium  pass    WRONG
+cross-ledger, co:main knows the data IRIs        | no product   pass    WRONG | widget       pass    | unobtainium  pass    WRONG
+cross-ledger, + an unrelated urn:shape: IRI      | no product   pass    WRONG | widget       pass    | unobtainium  pass    WRONG
+cross-ledger, + both shape node IRIs             | no product   reject  | widget       pass    | unobtainium  reject 
+cross-ledger, blank property shape, + node IRI   | no product   reject  | widget       pass    | unobtainium  reject 
 wrong outcomes: 6

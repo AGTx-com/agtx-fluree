@@ -1,8 +1,8 @@
 # 12. A GRAPH block drops a variable the row before it left unbound
 
-Found on 26 November 2026 while fixing bug 11 (`b13dc10`). Confirmed the same day on the stock v4.2.9 release (`3b8d19e649a6`), on the pinned AGTx build (`64f56de8389c`) and on a build of `b13dc10`, which does not change it. **Not fixed.** Not reported to Fluree.
+Found on 26 November 2026 while fixing bug 11 (`b13dc10`). Confirmed the same day on the stock v4.2.9 release (`3b8d19e649a6`), on the fork's full-patch build and on a build of `b13dc10`, which does not change it. **Not fixed.** Not reported to Fluree.
 
-**Severity:** wrong answers. A solution loses a binding it should have. No policy we deploy reaches this path (see [Downstream check](#downstream-check)). A policy that later reads the dropped variable would see it unbound.
+**Severity:** wrong answers. A solution loses a binding it should have. A policy that reads the dropped variable after the block sees it unbound (see [Who is affected](#who-is-affected)).
 
 **Cause in brief.** A `GRAPH` block runs once per incoming row and joins its own solutions to that row. When the row already has a column for one of the block's variables, Fluree copies the row's value into the result, even when that value is unbound and the block bound the variable. SPARQL's join keeps the block's value: an unbound variable is compatible with any value.
 
@@ -25,7 +25,7 @@ Two ways the row gets there:
 
 ## Scope, measured
 
-Each case ran on the three builds above, before and after `fluree reindex`. All builds gave identical results. Full output: [stock](12-graph-drops-unbound-variable/results-stock-4.2.9.txt), [pinned AGTx build](12-graph-drops-unbound-variable/results-patched-4.2.9.txt), [`b13dc10`](12-graph-drops-unbound-variable/results-b13dc10.txt). The reworked bug 11 fix, `738a4cc`, also leaves it unchanged: [`738a4cc`](12-graph-drops-unbound-variable/results-738a4cc.txt).
+Each case ran on the three builds above, before and after `fluree reindex`. All builds gave identical results. Full output: [stock](12-graph-drops-unbound-variable/results-stock-4.2.9.txt), [full-patch build](12-graph-drops-unbound-variable/results-patched-4.2.9.txt), [`b13dc10`](12-graph-drops-unbound-variable/results-b13dc10.txt). The reworked bug 11 fix, `738a4cc`, also leaves it unchanged: [`738a4cc`](12-graph-drops-unbound-variable/results-738a4cc.txt).
 
 | Case | Expected | Got |
 |---|---|---|
@@ -67,17 +67,21 @@ Tests, written first:
 - the controls;
 - a bound parent value (the inner value must equal it, so nothing changes).
 
-## Downstream check
+## Workaround
 
-On 26 November, by inspection of the 24 OPTIONALs in the GTO policies (`gto/core/identity-access`, `gto/core/verification-authority`, GTX-Spring `e7bb7a35`), no `GRAPH` block reads a variable an earlier OPTIONAL or BIND can leave unbound:
-- the GRAPH blocks after the signer OPTIONAL read `?readerAccount`, which `COALESCE(?keyAccount, $identity)` always binds;
-- the others read variables a default-graph triple binds first.
+Make the variable bound on every row before the block, for example `BIND(COALESCE(?keyAccount, $identity) AS ?reader)`; or bind a fresh variable inside the block and test compatibility yourself: `GRAPH <g> { ?r <urn:x:person> ?person } FILTER(!BOUND(?reader) || ?r = ?reader)`. The second form was not run.
 
-This was not exhaustive, and nothing was run.
+## Who is affected
+
+A query or policy condition in which a `GRAPH <iri>` or `GRAPH ?g` block binds a variable that an earlier `OPTIONAL` (written before the block and sharing the variable) or an erroring `BIND` can leave unbound, and that reads the variable afterwards, in the projection or in a later pattern or `FILTER`. Not affected: a `GRAPH` block whose variables are bound on every incoming row (for example by `COALESCE` with a constant or `$identity` fallback), and default-graph triples.
+
+## History
+
+- **26 November 2026:** found while writing bug 11's first fix (`b13dc10`), whose hold could route a plan through this path. Confirmed the same day on stock, on the full-patch build and on `b13dc10`. Recorded as `21ba453` on `fix/bug-11-bind-order` and as `562a685` on `main`; the run on `738a4cc` and the completed record added in `a82e1bb`. Not fixed.
 
 ## Related
 
-Bug 11's fix (`b13dc10`) avoids sending new plans through this path. A lookup with a GRAPH block waits for its BIND only when every pattern that could run before it binds its variables on every row.
+[Bug 11](11-lookup-before-bind.md)'s fix (`5b5f18d` on `main`, first written as `b13dc10`) avoids sending new plans through this path: a lookup with a `GRAPH` block waits for its `BIND` only when every pattern that could run before it binds its variables on every row.
 
 ## Reproduction
 

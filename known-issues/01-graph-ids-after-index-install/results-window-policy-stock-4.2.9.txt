@@ -1,0 +1,10 @@
+# Recorded output, 23 November 2026. Build: the stock v4.2.9 release (3b8d19e649a6).
+fluree 4.2.9
+window: index t=2 installed with later commits unindexed; next install 3821 ms later
+  urn:x:eve read       in window: right  refused (rows []; must be refused)                   inside=True | after settling: right  refused (rows []; must be refused)
+  urn:x:eve write      in window: right  refused (HTTP 403; must be refused)                  inside=True | after settling: right  refused (HTTP 403; must be refused)
+  urn:x:rob read       in window: WRONG  allowed (rows ['item']; must be refused)             inside=True | after settling: right  refused (rows []; must be refused)   <- wrong decision
+  urn:x:rob write      in window: WRONG  allowed (HTTP 200; must be refused)                  inside=True | after settling: right  refused (HTTP 403; must be refused)   <- wrong decision
+  urn:x:sam read       in window: WRONG  refused (rows []; must be allowed)                   inside=True | after settling: right  allowed (rows ['item']; must be allowed)   <- wrong decision
+  urn:x:sam write      in window: WRONG  refused (HTTP 403; must be allowed)                  inside=True | after settling: right  allowed (HTTP 200; must be allowed)   <- wrong decision
+RESULT wrong in-window decisions with a right control: 4

@@ -1,0 +1,73 @@
+# Recorded output, 23 November 2026. Build: the stock v4.2.9 release (3b8d19e649a6).
+fluree 4.2.9 | case writes | scale 2.0
+  delete-where in window write answered t=8; commits in server log: t=[1, 2, 3, 4, 5, 6, 7, 8]
+      sent 1919.4 ms, answered 1928.5 ms after the first commit; installs (ms, index_t, unindexed flakes left) [(1919.1, 1, 120063), (2082.3, 7, 14), (2105.2, 8, 0)];
+      window reads [reads, wrong]: z after the first install and before the write, a between the first two installs: {'from urn:g:a': [719, 719]}
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-2", "urn:p:m", "a-2", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-3", "urn:p:m", "a-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-4", "urn:p:m", "a-4", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-5", "urn:p:m", "a-5", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-6", "urn:p:m", "a-6", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}]]
+      settled       ok=False z=['z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=[] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=False z=['z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=[] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  delete-where control   write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-2", "urn:p:m", "z-2", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-3", "urn:p:m", "z-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-4", "urn:p:m", "z-4", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-5", "urn:p:m", "z-5", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-6", "urn:p:m", "z-6", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}]]
+      settled       ok=True z=[] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=True z=[] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  copy-where   in window write answered t=8; commits in server log: t=[1, 2, 3, 4, 5, 6, 7, 8]
+      sent 1850.6 ms, answered 1858.8 ms after the first commit; installs (ms, index_t, unindexed flakes left) [(1849.1, 1, 120063), (2008.0, 7, 14), (2033.2, 8, 0)];
+      window reads [reads, wrong]: z after the first install and before the write, a between the first two installs: {'from urn:g:a': [670, 670]}
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:2-2", "urn:p:m", "a-2", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:2-3", "urn:p:m", "a-3", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:2-4", "urn:p:m", "a-4", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:2-5", "urn:p:m", "a-5", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:2-6", "urn:p:m", "a-6", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}]]
+      settled       ok=False z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']
+                    expected z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+      after restart ok=False z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']
+                    expected z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+  copy-where   control   write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:1-2", "urn:p:m", "z-2", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:1-3", "urn:p:m", "z-3", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:1-4", "urn:p:m", "z-4", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:1-5", "urn:p:m", "z-5", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}], ["urn:s:1-6", "urn:p:m", "z-6", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:copy"}]]
+      settled       ok=True z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+      after restart ok=True z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+  edit-where   in window write answered t=8; commits in server log: t=[1, 2, 3, 4, 5, 6, 7, 8]
+      sent 1860.0 ms, answered 1872.2 ms after the first commit; installs (ms, index_t, unindexed flakes left) [(1858.4, 1, 120063), (2024.7, 7, 20), (2049.6, 8, 0)];
+      window reads [reads, wrong]: z after the first install and before the write, a between the first two installs: {'from urn:g:a': [760, 760]}
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-1", "urn:p:m", "z-1-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:2-2", "urn:p:m", "a-2", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-2", "urn:p:m", "a-2-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:2-3", "urn:p:m", "a-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-3", "urn:p:m", "a-3-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:2-4", "urn:p:m", "a-4", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:2-4", "urn:p:m", "a-4-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:2-5", "urn:p:m", "a-5", "ht
+      settled       ok=False z=['a-2-edited', 'a-3-edited', 'a-4-edited', 'a-5-edited', 'a-6-edited', 'z-1-edited', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1-edited', 'z-2-edited', 'z-3-edited', 'z-4-edited', 'z-5-edited', 'z-6-edited'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=False z=['a-2-edited', 'a-3-edited', 'a-4-edited', 'a-5-edited', 'a-6-edited', 'z-1-edited', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1-edited', 'z-2-edited', 'z-3-edited', 'z-4-edited', 'z-5-edited', 'z-6-edited'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  edit-where   control   write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-1", "urn:p:m", "z-1", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-1", "urn:p:m", "z-1-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:1-2", "urn:p:m", "z-2", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-2", "urn:p:m", "z-2-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:1-3", "urn:p:m", "z-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-3", "urn:p:m", "z-3-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:1-4", "urn:p:m", "z-4", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-4", "urn:p:m", "z-4-edited", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}], ["urn:s:1-5", "urn:p:m", "z-5", "ht
+      settled       ok=True z=['z-1-edited', 'z-2-edited', 'z-3-edited', 'z-4-edited', 'z-5-edited', 'z-6-edited'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=True z=['z-1-edited', 'z-2-edited', 'z-3-edited', 'z-4-edited', 'z-5-edited', 'z-6-edited'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  delete-data  in window write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      sent 1864.0 ms, answered 1864.9 ms after the first commit; installs (ms, index_t, unindexed flakes left) [(1862.6, 1, 120063), (2021.2, 7, 0)];
+      window reads [reads, wrong]: z after the first install and before the write, a between the first two installs: {'from urn:g:a': [833, 833]}
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): []
+      settled       ok=False z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1', 'z-2', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=False z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1', 'z-2', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  delete-data  control   write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-3", "urn:p:m", "z-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}]]
+      settled       ok=True z=['z-1', 'z-2', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=True z=['z-1', 'z-2', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  upsert       in window write answered t=8; commits in server log: t=[1, 2, 3, 4, 5, 6, 7, 8]
+      sent 1858.5 ms, answered 1868.6 ms after the first commit; installs (ms, index_t, unindexed flakes left) [(1857.6, 1, 120063), (2021.1, 7, 9), (2047.6, 8, 0)];
+      window reads [reads, wrong]: z after the first install and before the write, a between the first two installs: {'from urn:g:a': [799, 799]}
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-3", "urn:p:m", "z-3-new", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}]]
+      settled       ok=False z=['z-1', 'z-2', 'z-3', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1', 'z-2', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=False z=['z-1', 'z-2', 'z-3', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+                    expected z=['z-1', 'z-2', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+  upsert       control   write answered t=7; commits in server log: t=[1, 2, 3, 4, 5, 6, 7]
+      before:   z=['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+      committed (urn:p:m flakes): [["urn:s:1-3", "urn:p:m", "z-3", "http://www.w3.org/2001/XMLSchema#string", false, {"graph": "urn:g:z"}], ["urn:s:1-3", "urn:p:m", "z-3-new", "http://www.w3.org/2001/XMLSchema#string", true, {"graph": "urn:g:z"}]]
+      settled       ok=True z=['z-1', 'z-2', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+      after restart ok=True z=['z-1', 'z-2', 'z-3-new', 'z-4', 'z-5', 'z-6'] a=['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6'] copy=[]
+RESULT case=writes wrong=10

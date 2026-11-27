@@ -1,0 +1,404 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "storage": "file",
+ "steps": [
+  {
+   "step": "before the additive commits (t=3)",
+   "reads": [
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:1"
+     ],
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after the failure (t=14)",
+   "reads": [
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after a server restart, same storage",
+   "reads": [
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after a full reindex",
+   "reads": [
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "another build started on the same storage: the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+   "reads": [
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": false,
+     "error": "48c1150e46d67649db87400bf0b16938.fhs1: <tmp>/data/repro/main/index/objects/history/4652e53af6c584e1161929f83b28dfb048c1150e46d67649db87400bf0b16938.fhs1",
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": false
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  },
+  {
+   "step": "after that build's full reindex",
+   "reads": [
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:1"
+     ],
+     "read": "named graph at t=1 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:1#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph at t=2 (time-pinned)",
+     "query": "SELECT ?rev FROM <repro:main@t:2#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (GRAPH pattern)",
+     "query": "SELECT ?rev WHERE { GRAPH <urn:g> { <urn:s> <urn:sel> ?rev } }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "urn:rev:2"
+     ],
+     "read": "named graph, current state (FROM <ledger#graph>)",
+     "query": "SELECT ?rev FROM <repro:main#urn:g> WHERE { <urn:s> <urn:sel> ?rev }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2"
+     ],
+     "read": "default graph, current state",
+     "query": "SELECT ?v WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [],
+     "read": "default graph at t=1 (time-pinned)",
+     "query": "SELECT ?v FROM <repro:main@t:1> WHERE { <urn:d> <urn:val> ?v }",
+     "correct": true
+    },
+    {
+     "ok": true,
+     "rows": [
+      "2",
+      "3",
+      "3"
+     ],
+     "read": "default graph history of <urn:d>",
+     "query": "PREFIX f: <https://ns.flur.ee/db#> SELECT ?t FROM <repro:main@t:1> TO <repro:main@t:latest> WHERE { << <urn:d> <urn:val> ?v >> f:t ?t ; f:op ?op } ORDER BY ?t"
+    }
+   ]
+  }
+ ],
+ "firstFailureAfterAdditiveCommit": 11,
+ "fullReindex": {
+  "status": 200,
+  "body": "{\"ledger_id\":\"repro:main\",\"index_t\":14,\"root_id\":\"baghybqabciqpt3twfbhfyeyzjzvyrddxuxosgnrnfqrecd4grjgugenupb54lca\",\"stats\":{\"flake_count\":1,\"leaf_count\":12,\"branch_count\":4,\"total_bytes\":6118},\"fuel\":69.0}"
+ },
+ "reindexRestoredTheRead": false,
+ "failsAgainAfterFurtherAdditiveCommits": 1,
+ "recoveryBuild": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "recoveryBuildReadsBeforeItsReindex": false,
+ "recoveryBuildReadsAfterItsReindex": true,
+ "recoveryBuildFailsAfterFurtherCommits": null,
+ "gcPassesThatReleased": 36
+}

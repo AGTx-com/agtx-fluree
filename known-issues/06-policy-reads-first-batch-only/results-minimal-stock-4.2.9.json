@@ -1,0 +1,35 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6)",
+ "version": "fluree 4.2.9",
+ "users": 1200,
+ "checks": [
+  {
+   "user": 0,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  },
+  {
+   "user": 999,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  },
+  {
+   "user": 1000,
+   "queryAnswer": true,
+   "writeAllowed": false,
+   "canRead": false,
+   "consistent": false
+  },
+  {
+   "user": 1199,
+   "queryAnswer": true,
+   "writeAllowed": false,
+   "canRead": false,
+   "consistent": false
+  }
+ ]
+}

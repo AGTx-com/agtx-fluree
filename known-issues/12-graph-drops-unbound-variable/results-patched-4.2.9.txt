@@ -1,4 +1,4 @@
-# binary: fluree-4.2.9-agtx-64f56de8389c
+# build: the fork's full-patch build
 fluree 4.2.9
 novelty  OPTIONAL found nothing, then GRAPH <iri>                       expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG
 novelty  BIND errors, then GRAPH <iri>                                  expected=[u:1 p:1; u:2 p:2] got=[- p:1; - p:2] WRONG

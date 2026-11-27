@@ -1,0 +1,426 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "cases": [
+  {
+   "case": "graph exists already; rob writes an item he owns (control)",
+   "graphExistsBefore": true,
+   "ask": "ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> } }",
+   "expectedAllowed": true,
+   "allowed": true,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "seed the graph",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:earlier> <urn:x:owner> <urn:x:someone> } }"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 1 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=2, 6 flakes",
+     "stderr": "warning: novelty is 2KB (2 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> } }"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=3, 1 flakes",
+     "stderr": "warning: novelty is 3KB (3 commits ahead of index); run `fluree index` to rebuild"
+    }
+   ]
+  },
+  {
+   "case": "graph exists already; rob writes an item someone else owns (control)",
+   "graphExistsBefore": true,
+   "ask": "ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:mallory> } }",
+   "expectedAllowed": false,
+   "allowed": false,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "seed the graph",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:earlier> <urn:x:owner> <urn:x:someone> } }"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 1 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=2, 6 flakes",
+     "stderr": "warning: novelty is 2KB (2 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:mallory> } }"
+     ],
+     "exitCode": 1,
+     "stdout": "",
+     "stderr": "error: Transaction error: Policy enforcement prevents modification."
+    }
+   ]
+  },
+  {
+   "case": "graph is created by this write; rob writes an item he owns",
+   "graphExistsBefore": false,
+   "ask": "ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> } }",
+   "expectedAllowed": true,
+   "allowed": true,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 6 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> } }"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=2, 1 flakes",
+     "stderr": "warning: novelty is 2KB (2 commits ahead of index); run `fluree index` to rebuild"
+    }
+   ]
+  },
+  {
+   "case": "graph is created by this write; rob writes an item someone else owns",
+   "graphExistsBefore": false,
+   "ask": "ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:mallory> } }",
+   "expectedAllowed": false,
+   "allowed": false,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { GRAPH <urn:g:items> { $this <urn:x:owner> $identity } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 6 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:mallory> } }"
+     ],
+     "exitCode": 1,
+     "stdout": "",
+     "stderr": "error: Transaction error: Policy enforcement prevents modification."
+    }
+   ]
+  },
+  {
+   "case": "absence rule, graph exists already; rob writes a blocked item (control)",
+   "graphExistsBefore": true,
+   "ask": "ASK { $this <urn:x:owner> ?anyone . FILTER NOT EXISTS { GRAPH <urn:g:items> { $this <urn:x:flag> \"blocked\" } } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> ; <urn:x:flag> \"blocked\" } }",
+   "expectedAllowed": false,
+   "allowed": false,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "seed the graph",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:earlier> <urn:x:owner> <urn:x:someone> } }"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 1 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { $this <urn:x:owner> ?anyone . FILTER NOT EXISTS { GRAPH <urn:g:items> { $this <urn:x:flag> \\\"blocked\\\" } } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=2, 6 flakes",
+     "stderr": "warning: novelty is 2KB (2 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> ; <urn:x:flag> \"blocked\" } }"
+     ],
+     "exitCode": 1,
+     "stdout": "",
+     "stderr": "error: Transaction error: Policy enforcement prevents modification."
+    }
+   ]
+  },
+  {
+   "case": "absence rule, graph is created by this write; rob writes a blocked item",
+   "graphExistsBefore": false,
+   "ask": "ASK { $this <urn:x:owner> ?anyone . FILTER NOT EXISTS { GRAPH <urn:g:items> { $this <urn:x:flag> \"blocked\" } } }",
+   "write": "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> ; <urn:x:flag> \"blocked\" } }",
+   "expectedAllowed": false,
+   "allowed": false,
+   "asDocumented": true,
+   "steps": [
+    {
+     "step": "init",
+     "args": [
+      "init"
+     ],
+     "exitCode": 0,
+     "stdout": "Initialized Fluree in <tmp>/.fluree",
+     "stderr": ""
+    },
+    {
+     "step": "create",
+     "args": [
+      "create",
+      "repro:main"
+     ],
+     "exitCode": 0,
+     "stdout": "Created ledger 'repro:main'",
+     "stderr": ""
+    },
+    {
+     "step": "policy",
+     "args": [
+      "insert",
+      "--direct",
+      "-l",
+      "repro:main",
+      "-e",
+      "{\"@context\": {\"f\": \"https://ns.flur.ee/db#\"}, \"@graph\": [{\"@id\": \"urn:x:rule\", \"@type\": [\"f:AccessPolicy\", \"urn:x:Policies\"], \"f:action\": [{\"@id\": \"f:modify\"}], \"f:queryState\": {\"@id\": \"f:postState\"}, \"f:query\": {\"@type\": \"https://ns.flur.ee/db#sparql\", \"@value\": \"ASK { $this <urn:x:owner> ?anyone . FILTER NOT EXISTS { GRAPH <urn:g:items> { $this <urn:x:flag> \\\"blocked\\\" } } }\"}}, {\"@id\": \"urn:x:rob\", \"f:policyClass\": [{\"@id\": \"urn:x:Policies\"}]}]}"
+     ],
+     "exitCode": 0,
+     "stdout": "Committed t=1, 6 flakes",
+     "stderr": "warning: novelty is 1KB (1 commits ahead of index); run `fluree index` to rebuild"
+    },
+    {
+     "step": "write as rob",
+     "args": [
+      "update",
+      "--direct",
+      "-l",
+      "repro:main",
+      "--format",
+      "sparql",
+      "--as",
+      "urn:x:rob",
+      "-e",
+      "INSERT DATA { GRAPH <urn:g:items> { <urn:x:item> <urn:x:owner> <urn:x:rob> ; <urn:x:flag> \"blocked\" } }"
+     ],
+     "exitCode": 1,
+     "stdout": "",
+     "stderr": "error: Transaction error: Policy enforcement prevents modification."
+    }
+   ]
+  }
+ ]
+}

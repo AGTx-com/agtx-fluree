@@ -1,0 +1,26 @@
+{
+ "build": "the stock v4.2.9 release (3b8d19e649a6), SHA-256 3b8d19e649a695dc29c4a040f3df59ec5bca5efc0a614c6de7e07b358601716a",
+ "version": "fluree 4.2.9",
+ "commits": {
+  "A unsigned": {
+   "t": 2,
+   "rawTransactionBlobs": 0,
+   "missing": [],
+   "holdsExactJws": false,
+   "blobSha256": []
+  },
+  "B signed JWS": {
+   "t": 3,
+   "rawTransactionBlobs": 0,
+   "missing": [],
+   "holdsExactJws": false,
+   "blobSha256": []
+  }
+ },
+ "signedInsert": {
+  "status": 200,
+  "t": 3
+ },
+ "signedJwsSha256": "6a3dd7303d4a34fd3541af341b0a12ace6e242bf6745266f0a2f2bd9f4d7d794",
+ "signedEnvelopeKept": false
+}

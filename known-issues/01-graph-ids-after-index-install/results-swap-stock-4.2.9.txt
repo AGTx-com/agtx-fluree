@@ -1,0 +1,23 @@
+# Recorded output, 23 November 2026. Build: the stock v4.2.9 release (3b8d19e649a6).
+build:   fluree 4.2.9
+server:  server run --memory --listen-addr 127.0.0.1:18714
+shape:   first commit 200000 filler triples; 5 small commits; tail commit 60000 filler triples; 4 readers
+round 1  ledger repro-1:main  reads 7820  wrong during 459  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+         wrong reads seen from 1010.6 ms to 1096.9 ms after the first commit was sent
+         WRONG during  FROM  urn:g:z got ['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']; acknowledged before the read: ['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+         WRONG during  FROM  urn:g:z got ['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']; acknowledged before the read: ['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+         WRONG during  GRAPH urn:g:z got ['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']; acknowledged before the read: ['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+round 2  ledger repro-2:main  reads 7336  wrong during 404  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+         wrong reads seen from 1052.9 ms to 1173.0 ms after the first commit was sent
+         WRONG during  GRAPH urn:g:a got ['a-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']; acknowledged before the read: ['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+         WRONG during  FROM  urn:g:a got ['a-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']; acknowledged before the read: ['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+         WRONG during  FROM  urn:g:z got ['a-2', 'a-3', 'a-4', 'a-5', 'a-6', 'z-1']; acknowledged before the read: ['z-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']
+round 3  ledger repro-3:main  reads 7416  wrong during 452  wrong after settling 0  final (index_t, commit_t, ids) (7, 7, {'urn:g:z': 3, 'urn:g:a': 4})
+         index installs (index_t, unindexed flakes left): (1, 60058), (7, 0)
+         wrong reads seen from 1051.3 ms to 1137.5 ms after the first commit was sent
+         WRONG during  FROM  urn:g:a got ['a-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']; acknowledged before the read: ['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+         WRONG during  GRAPH urn:g:a got ['a-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']; acknowledged before the read: ['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+         WRONG during  FROM  urn:g:a got ['a-1', 'z-2', 'z-3', 'z-4', 'z-5', 'z-6']; acknowledged before the read: ['a-1', 'a-2', 'a-3', 'a-4', 'a-5', 'a-6']
+RESULT: WRONG READS: 1315 of 22572 reads returned another graph's facts or missed their own

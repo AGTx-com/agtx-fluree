@@ -1,0 +1,35 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "users": 1200,
+ "checks": [
+  {
+   "user": 0,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  },
+  {
+   "user": 999,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  },
+  {
+   "user": 1000,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  },
+  {
+   "user": 1199,
+   "queryAnswer": true,
+   "writeAllowed": true,
+   "canRead": true,
+   "consistent": true
+  }
+ ]
+}

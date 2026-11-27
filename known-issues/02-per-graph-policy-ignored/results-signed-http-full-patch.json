@@ -1,0 +1,48 @@
+{
+ "build": "the fork's full-patch build (fixes 1 to 7 plus the fork's own features)",
+ "version": "fluree 4.2.9",
+ "cases": {
+  "ledger-locked": {
+   "requests": [
+    {
+     "step": "signed write -> open graph",
+     "status": 403,
+     "allowed": false,
+     "expectedAllowed": false,
+     "asDocumented": true,
+     "message": "{\"error\":\"Transaction error: Policy enforcement prevents modification.\",\"status\":403,\"@type\":\"err:policy/AccessDenied\"}"
+    },
+    {
+     "step": "signed write -> sensitive graph",
+     "status": 403,
+     "allowed": false,
+     "expectedAllowed": false,
+     "asDocumented": true,
+     "message": "{\"error\":\"Transaction error: Policy enforcement prevents modification.\",\"status\":403,\"@type\":\"err:policy/AccessDenied\"}"
+    }
+   ],
+   "sensitiveGraphAfterwards": []
+  },
+  "readme": {
+   "requests": [
+    {
+     "step": "signed write -> open graph",
+     "status": 200,
+     "allowed": true,
+     "expectedAllowed": true,
+     "asDocumented": true,
+     "message": ""
+    },
+    {
+     "step": "signed write -> sensitive graph",
+     "status": 403,
+     "allowed": false,
+     "expectedAllowed": false,
+     "asDocumented": true,
+     "message": "{\"error\":\"Transaction error: Policy enforcement prevents modification.\",\"status\":403,\"@type\":\"err:policy/AccessDenied\"}"
+    }
+   ],
+   "sensitiveGraphAfterwards": []
+  }
+ }
+}
