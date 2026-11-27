@@ -2,6 +2,12 @@
 
 Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
+## This fork: engine bug fixes and features
+
+This branch, `full-patch`, is the Fluree DB v4.2.9 release plus this fork's engine bug fixes and its own features. Every feature is generic and documented beside its code; every bug, fixed or not, has a full record on `main`.
+
+**[Features: built and planned →](features/README.md)** · **[Engine bug records, on `main` →](https://github.com/AGTx-com/agtx-fluree/blob/main/known-issues/README.md)**
+
 RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
 
 Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean — and on Wikidata-truthy (8.19B triples) the next fastest engine is 10.4x slower. Reproducible head-to-head benchmarks against QLever, Virtuoso, MillenniumDB, Memgraph, Neo4j, FalkorDB and others: **[fluree/benchmark-db](https://github.com/fluree/benchmark-db)**. Why it's fast: **[Performance architecture](docs/design/performance.md)**.
