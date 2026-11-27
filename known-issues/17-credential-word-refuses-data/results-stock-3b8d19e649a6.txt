@@ -1,0 +1,10 @@
+fluree 4.2.9
+case 1 schema.org Credential class    HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case 2 same, in @graph                HTTP 200 t=1
+case 3 ex:Credentialing               HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case 4 type array                     HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case 5 "type" alias                   HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case 6 a property named jws           HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case 7 ex:Certificate (control)       HTTP 200 t=2
+case 8 ex:Thing (control)             HTTP 200 t=3
+subjects written: ['http://example.org/cert', 'http://example.org/diploma2', 'http://example.org/thing']

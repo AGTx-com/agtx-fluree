@@ -1,0 +1,40 @@
+fluree 4.2.9
+signer: did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+t=1 setup (unsigned): HTTP 200
+write: signed, with an f:author claim       HTTP 200 t=2
+write: signed, no claim                     HTTP 200 t=3
+write: unsigned, with an f:author claim     HTTP 200 t=4
+write: unsigned, opts.identity = the DID    HTTP 200 t=5
+--- before reindex
+docs "Query provenance", verbatim (default graph): []
+docs "Query provenance", against #txn-meta: []
+docs audit query (f:assert), against #txn-meta: []
+    t=1  time  1795804405733
+    t=2  author  alice-claim
+    t=2  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=2  time  1795804405735
+    t=2  txn  bagbibqabciqfgl37c342fslqehd2ryindvmgzxfioyriyyy5a7ifrrvzuxwqzgi
+    t=3  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=3  time  1795804405735
+    t=3  txn  bagbibqabciqcvdwacqkx4jxh2bgulxr6t6j6nsiaftv7btgudaiz6lfmqrgj4vq
+    t=4  author  bob-claim
+    t=4  time  1795804405736
+    t=5  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=5  time  1795804405737
+reindex: HTTP 200 {"ledger_id": "prov:main", "index_t": 5, "root_id": "baghybqabciqljhbmuqbxalsst2j53gt3wnjcegyce4vaw4s5lepd5yea6qjz47q", "stats": {"flake_count": 10, "leaf_count
+--- after reindex
+docs "Query provenance", verbatim (default graph): []
+docs "Query provenance", against #txn-meta: []
+docs audit query (f:assert), against #txn-meta: []
+    t=1  time  1795804405733
+    t=2  author  alice-claim
+    t=2  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=2  time  1795804405735
+    t=2  txn  bagbibqabciqfgl37c342fslqehd2ryindvmgzxfioyriyyy5a7ifrrvzuxwqzgi
+    t=3  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=3  time  1795804405735
+    t=3  txn  bagbibqabciqcvdwacqkx4jxh2bgulxr6t6j6nsiaftv7btgudaiz6lfmqrgj4vq
+    t=4  author  bob-claim
+    t=4  time  1795804405736
+    t=5  identity  did:key:z6MkgZ87bxgJW1WZucFnrC39EG1bJ6cGJFskTBF6jmjrPJcb
+    t=5  time  1795804405737

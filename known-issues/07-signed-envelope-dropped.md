@@ -71,7 +71,8 @@ Keep the signed request outside the ledger, for example in the client's own stor
 
 ## Related
 
-None of the other records; this is the only signing defect found.
+- [Bug 16](16-signed-write-provenance.md): with this fix, a signed write's `f:txn` names its stored request, the only metadata that tells a signed write from one that only named an identity.
+- [Bug 15](15-credential-transactions-documented-not-built.md) and [bug 17](17-credential-word-refuses-data.md), the other signing defects: credential transactions documented but always refused, and ordinary data mistaken for a credential.
 
 ## Reproduction
 

@@ -1,0 +1,9 @@
+fluree 4.2.9
+signer: did:key:z6MkqNUkcQVy62CqXNqC58TNjwLx1CuHSizXre8WskG7MpZ9
+setup (unsigned): HTTP 200
+case A docs VC, vc+ld+json          HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case B docs VC, json                HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case C docs VC, garbage proof       HTTP 401 {"error": "Credential error: VerifiableCredential verification not enabled (requires 'vc' feature)", "status": 401, "@type": "err:policy/InvalidCredential"}
+case D ES256 JWS                    HTTP 401 {"error": "Credential error: Unsupported algorithm: ES256. Expected EdDSA", "status": 401, "@type": "err:policy/InvalidCredential"}
+case E EdDSA JWS (control)          HTTP 200 t=2
+subjects written: ['did:key:z6MkqNUkcQVy62CqXNqC58TNjwLx1CuHSizXre8WskG7MpZ9', 'urn:ex:allowAll', 'http://example.org/ns/eddsa']

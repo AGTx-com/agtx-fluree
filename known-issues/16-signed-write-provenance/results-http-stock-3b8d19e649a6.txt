@@ -1,0 +1,36 @@
+fluree 4.2.9
+signer: did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+t=1 setup (unsigned): HTTP 200
+write: signed, with an f:author claim       HTTP 200 t=2
+write: signed, no claim                     HTTP 200 t=3
+write: unsigned, with an f:author claim     HTTP 200 t=4
+write: unsigned, opts.identity = the DID    HTTP 200 t=5
+--- before reindex
+docs "Query provenance", verbatim (default graph): []
+docs "Query provenance", against #txn-meta: []
+docs audit query (f:assert), against #txn-meta: []
+    t=1  time  1795804404863
+    t=2  author  alice-claim
+    t=2  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=2  time  1795804404865
+    t=3  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=3  time  1795804404866
+    t=4  author  bob-claim
+    t=4  time  1795804404866
+    t=5  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=5  time  1795804404867
+reindex: HTTP 200 {"ledger_id": "prov:main", "index_t": 5, "root_id": "baghybqabciqhnfr3u2oddsdonhhto3x6cxs6o6kleyd6m7rv4s64hcgq7zarczi", "stats": {"flake_count": 10, "leaf_count
+--- after reindex
+docs "Query provenance", verbatim (default graph): []
+docs "Query provenance", against #txn-meta: []
+docs audit query (f:assert), against #txn-meta: []
+    t=1  time  1795804404863
+    t=2  author  alice-claim
+    t=2  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=2  time  1795804404865
+    t=3  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=3  time  1795804404866
+    t=4  author  bob-claim
+    t=4  time  1795804404866
+    t=5  identity  did:key:z6MkwbbknQX8CQ96oa15CtpF9ZVnzXQd1SNXPq7h2vyQUdhN
+    t=5  time  1795804404867

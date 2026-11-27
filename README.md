@@ -6,7 +6,7 @@ Temporal, verifiable, standards-compliant, git-like branching and merging, and [
 
 This repository is the Fluree DB v4.2.9 release plus fixes for engine bugs confirmed on it, one commit per bug on `main`. Every bug, fixed or not, has a full record of its scope, cause, fix and reproduction.
 
-**[Engine bug records: bugs 1 to 14 →](known-issues/README.md)**
+**[Engine bug records: bugs 1 to 17 →](known-issues/README.md)**
 
 This fork's own features, built and planned, are on the `full-patch` branch, documented beside their code.
 

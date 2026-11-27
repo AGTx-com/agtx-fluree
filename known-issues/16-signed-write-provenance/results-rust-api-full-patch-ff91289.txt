@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized] target(s) in 33.89s
+     Running tests/bug16_author_after_index.rs (target/debug/deps/bug16_author_after_index-951bf181573b971e)
+
+running 1 test
+signer: did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z
+signed update with an f:author claim: committed at t=3
+before index build:
+    t=2 f:identity "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    t=3 f:identity "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+after index build:
+    t=2 f:author "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    t=2 f:identity "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    t=3 f:author "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+    t=3 f:identity "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+test bug16_signed_write_provenance_before_and_after_index ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+[exited with code 0]
