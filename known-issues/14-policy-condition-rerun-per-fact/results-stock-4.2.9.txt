@@ -1,0 +1,8 @@
+fluree 4.2.9
+team of 5000 members; median of 3 runs per write
+refused control: carol writes 1 fact -> HTTP 403 (refused)
+    K | same inputs (alice)                | same subject (bob)                 | no policy   
+    1 |      13 ms executed=1 http=200     |       1 ms executed=1 http=200     |       0 ms http=200
+   10 |     115 ms executed=10 http=200    |       8 ms executed=10 http=200    |       0 ms http=200
+  100 |    1150 ms executed=100 http=200   |      78 ms executed=100 http=200   |       1 ms http=200
+ 1000 |   11727 ms executed=1000 http=200  |     914 ms executed=1000 http=200  |       4 ms http=200

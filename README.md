@@ -6,7 +6,7 @@ Temporal, verifiable, standards-compliant, git-like branching and merging, and [
 
 This repository is the Fluree DB v4.2.9 release plus fixes for engine bugs confirmed on it, one commit per bug on `main`. Every bug, fixed or not, has a full record of its scope, cause, fix and reproduction.
 
-**[Engine bug records: bugs 1 to 13 →](known-issues/README.md)**
+**[Engine bug records: bugs 1 to 14 →](known-issues/README.md)**
 
 RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
 
