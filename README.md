@@ -2,15 +2,11 @@
 
 Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
-## This fork: engine bug fixes
+## This fork: engine bug fixes and features
 
-This repository is the Fluree DB v4.2.9 release plus fixes for engine bugs confirmed on it, one commit per bug on `main`. Every bug, fixed or not, has a full record of its scope, cause, fix and reproduction.
+This branch, `full-patch`, is `main` plus this fork's own features: the Fluree DB v4.2.9 release, one commit per engine bug fix, then the features. Every bug, fixed or not, has a full record of its scope, cause, fix and reproduction; every feature is generic and documented beside its code.
 
-**[Engine bug records: bugs 1 to 17 →](known-issues/README.md)**
-
-This fork's own features, built and planned, are on the `full-patch` branch, documented beside their code.
-
-**[Features, on `full-patch` →](https://github.com/AGTx-com/agtx-fluree/blob/full-patch/features/README.md)**
+**[Engine bug records: bugs 1 to 17 →](known-issues/README.md)** · **[Features: built and planned →](features/README.md)**
 
 RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
 

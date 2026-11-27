@@ -1,0 +1,107 @@
+fluree 4.2.9
+signer: did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji
+setup (unsigned): HTTP 200 {"ledger_id": "vc:main", "t": 1, "tx-id": "fluree:tx:sha256:c90ca51734551beae5048b47a42f914c2e042c3bc171824a120eb1c7fe1d8a80", "commit": {"hash": "bagaybqabciqi
+case 1 control insert           HTTP 200 {"ledger_id": "vc:main", "t": 2, "tx-id": "fluree:tx:sha256:770b351b2d9be4321172cc400e21584a83ea0bdd8858b13c1a0bea0dd5cdc474", "commit": {"hash": "bagaybqabciqhlkbfte4vt4tjhrxjhw7i3thinb7dpgnjab7nui6myojefuc2b6a"}}
+case 2 VC, remote v2 context    HTTP 200 {"ledger_id": "vc:main", "t": 3, "tx-id": "fluree:tx:sha256:dcb07ed560cfa551d7e25039e585e4a0e9d1fa7addc999e5ce0c2441af3bd977", "commit": {"hash": "bagaybqabciqgbfkbj4xrqwv6nszcbvjz4iudt7rps7bzxs3tcq62ziungxfpgnq"}}
+case 3 VC, inline context       HTTP 200 {"ledger_id": "vc:main", "t": 4, "tx-id": "fluree:tx:sha256:521fc8733fb8e9239db86638b8ee81c03f57e65ceccd8aa9a078f93c3a78c41e", "commit": {"hash": "bagaybqabciqc5ivbh6qiemeawsjm5i6zwf57r2aef6ha2braxxtjtxza6uw5fcq"}}
+case 4 VC, inline, as vc+jwt    HTTP 200 {"ledger_id": "vc:main", "t": 5, "tx-id": "fluree:tx:sha256:c8ea4b5f16a95e72bb8a440e76e1c85acda589225db72cde490240a1eb529a54", "commit": {"hash": "bagaybqabciqbpgmiusquyozww3tpjkeue6xnnv5xu2kvbew6ejniw47gblsxkpq"}}
+case 6 VC, standard + subset    HTTP 200 {"ledger_id": "vc:main", "t": 6, "tx-id": "fluree:tx:sha256:5e3d08a0116734648a3bb79b7019786883d8f5889072ee99cc74f71529584250", "commit": {"hash": "bagaybqabciqnjduf6ehdcrpt6n5efpqvqqdix2diqat2u2nnrx6qopgpzqqslna"}}
+case 5 VC, payload swapped      HTTP 401 {"error": "Credential error: Invalid signature: signature error: Verification equation was not satisfied", "status": 401, "@type": "err:policy/InvalidCredential"}
+facts: HTTP 200
+     did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji  https://ns.flur.ee/db#policyClass  urn:ex:AllowAll
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/credentialSubject  fdb-18ebf6ea206d9010-0-b1
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/id  'urn:uuid:acceptance-2'
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/issuer  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/type  'VerifiableCredential'
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/type  'ex:AcceptanceCredential'
+     fdb-18ebf6ea206d9010-0-b0  https://www.w3.org/ns/credentials/v2/validFrom  '2026-11-27T12:00:00Z'
+     fdb-18ebf6ea206d9010-0-b1  urn:ex:acceptedBy  fdb-18ebf6ea206d9010-0-b2
+     fdb-18ebf6ea206d9010-0-b1  urn:ex:pinnedCommit  'fluree:commit:sha256:abc2'
+     fdb-18ebf6ea206d9010-0-b1  https://www.w3.org/ns/credentials/v2/id  'urn:ex:agreement:a2'
+     fdb-18ebf6ea206d9010-0-b2  https://www.w3.org/ns/credentials/v2/id  'urn:ex:org:c'
+     urn:ex:allowAll  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  https://ns.flur.ee/db#AccessPolicy
+     urn:ex:allowAll  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  urn:ex:AllowAll
+     urn:ex:allowAll  https://ns.flur.ee/db#action  https://ns.flur.ee/db#modify
+     urn:ex:allowAll  https://ns.flur.ee/db#action  https://ns.flur.ee/db#view
+     urn:ex:allowAll  https://ns.flur.ee/db#allow  'true'^^boolean
+     urn:ex:control  urn:ex:name  'control'
+     urn:uuid:acceptance-3  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  urn:ex:AcceptanceCredential
+     urn:uuid:acceptance-3  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  https://www.w3.org/2018/credentials#VerifiableCredential
+     urn:uuid:acceptance-3  https://www.w3.org/2018/credentials#credentialSubject  urn:ex:agreement:a3
+     urn:uuid:acceptance-3  https://www.w3.org/2018/credentials#issuer  did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji
+     urn:uuid:acceptance-3  https://www.w3.org/2018/credentials#validFrom  '2026-11-27T12:00:00Z'^^dateTime
+     urn:uuid:acceptance-4  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  urn:ex:AcceptanceCredential
+     urn:uuid:acceptance-4  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  https://www.w3.org/2018/credentials#VerifiableCredential
+     urn:uuid:acceptance-4  https://www.w3.org/2018/credentials#credentialSubject  urn:ex:agreement:a4
+     urn:uuid:acceptance-4  https://www.w3.org/2018/credentials#issuer  did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji
+     urn:uuid:acceptance-4  https://www.w3.org/2018/credentials#validFrom  '2026-11-27T12:00:00Z'^^dateTime
+     urn:uuid:acceptance-7  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  urn:ex:AcceptanceCredential
+     urn:uuid:acceptance-7  http://www.w3.org/1999/02/22-rdf-syntax-ns#type  https://www.w3.org/ns/credentials/v2/VerifiableCredential
+     urn:uuid:acceptance-7  https://www.w3.org/2018/credentials#credentialSubject  urn:ex:agreement:a7
+     urn:uuid:acceptance-7  https://www.w3.org/2018/credentials#issuer  did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji
+     urn:uuid:acceptance-7  https://www.w3.org/2018/credentials#validFrom  '2026-11-27T12:00:00Z'^^dateTime
+     urn:ex:agreement:a3  urn:ex:acceptedBy  urn:ex:org:c
+     urn:ex:agreement:a3  urn:ex:pinnedCommit  'fluree:commit:sha256:abc3'
+     urn:ex:agreement:a4  urn:ex:acceptedBy  urn:ex:org:c
+     urn:ex:agreement:a4  urn:ex:pinnedCommit  'fluree:commit:sha256:abc4'
+     urn:ex:agreement:a7  urn:ex:acceptedBy  urn:ex:org:c
+     urn:ex:agreement:a7  urn:ex:pinnedCommit  'fluree:commit:sha256:abc7'
+txn-meta: HTTP 200
+     t=1  https://ns.flur.ee/db#address  '8af96180861f73d5167dd699c7175165608b56854971720b47276689d7b94263'
+     t=1  https://ns.flur.ee/db#asserts  '6'^^integer
+     t=1  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=1  https://ns.flur.ee/db#size  '340'^^long
+     t=1  https://ns.flur.ee/db#t  '1'^^integer
+     t=1  https://ns.flur.ee/db#time  '1795800361844'^^long
+     t=2  https://ns.flur.ee/db#address  'bagaybqabciqhlkbfte4vt4tjhrxjhw7i3thinb7dpgnjab7nui6myojefuc2b6a'
+     t=2  https://ns.flur.ee/db#alias  'vc:main'
+     t=2  https://ns.flur.ee/db#asserts  '1'^^integer
+     t=2  https://ns.flur.ee/db#identity  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     t=2  https://ns.flur.ee/db#previous  fluree:commit:sha256:8af96180861f73d5167dd699c7175165608b56854971720b47276689d7b
+     t=2  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=2  https://ns.flur.ee/db#size  '81'^^long
+     t=2  https://ns.flur.ee/db#t  '2'^^integer
+     t=2  https://ns.flur.ee/db#time  '1795800361863'^^long
+     t=3  https://ns.flur.ee/db#address  'bagaybqabciqgbfkbj4xrqwv6nszcbvjz4iudt7rps7bzxs3tcq62ziungxfpgnq'
+     t=3  https://ns.flur.ee/db#alias  'vc:main'
+     t=3  https://ns.flur.ee/db#asserts  '10'^^integer
+     t=3  https://ns.flur.ee/db#identity  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     t=3  https://ns.flur.ee/db#previous  fluree:commit:sha256:75a825993959f2693c6e93dbe8dcce8687e3799a9007eda23ccc39242d0
+     t=3  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=3  https://ns.flur.ee/db#size  '1186'^^long
+     t=3  https://ns.flur.ee/db#t  '3'^^integer
+     t=3  https://ns.flur.ee/db#time  '1795800361864'^^long
+     t=4  https://ns.flur.ee/db#address  'bagaybqabciqc5ivbh6qiemeawsjm5i6zwf57r2aef6ha2braxxtjtxza6uw5fcq'
+     t=4  https://ns.flur.ee/db#alias  'vc:main'
+     t=4  https://ns.flur.ee/db#asserts  '7'^^integer
+     t=4  https://ns.flur.ee/db#identity  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     t=4  https://ns.flur.ee/db#previous  fluree:commit:sha256:6095414f2f185abe6cb220d539e22839fe2f97c39bcb73143daca28d35c
+     t=4  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=4  https://ns.flur.ee/db#size  '669'^^long
+     t=4  https://ns.flur.ee/db#t  '4'^^integer
+     t=4  https://ns.flur.ee/db#time  '1795800361865'^^long
+     t=5  https://ns.flur.ee/db#address  'bagaybqabciqbpgmiusquyozww3tpjkeue6xnnv5xu2kvbew6ejniw47gblsxkpq'
+     t=5  https://ns.flur.ee/db#alias  'vc:main'
+     t=5  https://ns.flur.ee/db#asserts  '7'^^integer
+     t=5  https://ns.flur.ee/db#identity  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     t=5  https://ns.flur.ee/db#previous  fluree:commit:sha256:2ea2a13fa0823080b492cea3d9b17bf8e8042f8e0d0620bde699df20f52
+     t=5  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=5  https://ns.flur.ee/db#size  '669'^^long
+     t=5  https://ns.flur.ee/db#t  '5'^^integer
+     t=5  https://ns.flur.ee/db#time  '1795800361866'^^long
+     t=6  https://ns.flur.ee/db#address  'bagaybqabciqnjduf6ehdcrpt6n5efpqvqqdix2diqat2u2nnrx6qopgpzqqslna'
+     t=6  https://ns.flur.ee/db#alias  'vc:main'
+     t=6  https://ns.flur.ee/db#asserts  '7'^^integer
+     t=6  https://ns.flur.ee/db#identity  'did:key:z6MkkA8SHSu423a3GMm3gyq3cBsXhMNn9RwrymVo8Eo7RLji'
+     t=6  https://ns.flur.ee/db#previous  fluree:commit:sha256:179988a4a14c3b36b6e6f4a89427aed6d7b7a6955092de225a8b73e60ae
+     t=6  https://ns.flur.ee/db#retracts  '0'^^integer
+     t=6  https://ns.flur.ee/db#size  '669'^^long
+     t=6  https://ns.flur.ee/db#t  '6'^^integer
+     t=6  https://ns.flur.ee/db#time  '1795800361867'^^long
+show t:1 HTTP 200 asserts=6 retracts=0
+show t:2 HTTP 200 asserts=1 retracts=0
+show t:3 HTTP 200 asserts=10 retracts=0
+show t:4 HTTP 200 asserts=7 retracts=0
+show t:5 HTTP 200 asserts=7 retracts=0
+show t:6 HTTP 200 asserts=7 retracts=0
+server log tail: 2026-11-27T17:26:01.899950Z  WARN fluree_db_query::binary_scan: failed to translate overlay flake to V3; keeping as raw error=string not found in dict: vc:main | 2026-11-27T17:26:01.900796Z  WARN fluree_db_query::binary_scan: failed to translate overlay flake to V3; keeping as raw error=string not found in dict: vc:main | 2026-11-27T17:26:01.900832Z  WARN fluree_db_query::binary_scan: failed to translate overlay flake to V3; keeping as raw error=string not found in dict: vc:main | 2026-11-27T17:26:01.900859Z  WARN fluree_db_query::binary_scan: failed to translate overlay flake to V3; keeping as raw error=string not found in dict: vc:main | 2026-11-27T17:26:01.901142Z  WARN fluree_db_query::binary_scan: failed to translate overlay flake to V3; keeping as raw error=string not found in dict: vc:main | 
