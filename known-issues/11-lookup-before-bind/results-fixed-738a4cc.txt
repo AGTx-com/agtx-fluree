@@ -1,0 +1,50 @@
+# binary: fluree-4.2.9-fixes-bug11-738bec316938 (fix/bug-11-bind-order 738a4cc), then the stock release and b13dc10 in the same sitting
+fluree 4.2.9
+N=  1000 | lifted  median      12 ms rows=2 | control median      11 ms rows=2
+N= 10000 | lifted  median      11 ms rows=2 | control median      11 ms rows=2
+N= 40000 | lifted  median      12 ms rows=2 | control median      12 ms rows=2
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=5 
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=5 
+I1 N=  1000 median    11 ms rows=1 
+I1 N= 10000 median    12 ms rows=1 
+review_repro exit 0
+
+# binary: fluree-4.2.9-stock-3b8d19e649a6
+fluree 4.2.9
+N=  1000 | lifted  median      15 ms rows=2 | control median       8 ms rows=2
+N= 10000 | lifted  median      69 ms rows=2 | control median       9 ms rows=2
+N= 40000 | lifted  median     253 ms rows=2 | control median      10 ms rows=2
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=5 
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=5 
+I1 N=  1000 median     9 ms rows=1 
+I1 N= 10000 median     8 ms rows=1 
+review_repro exit 0
+
+# binary: fluree-4.2.9-fixes-bug11-b13dc1035ee4
+fluree 4.2.9
+N=  1000 | lifted  median      10 ms rows=2 | control median       9 ms rows=2
+N= 10000 | lifted  median      10 ms rows=2 | control median      10 ms rows=2
+N= 40000 | lifted  median      11 ms rows=2 | control median      10 ms rows=2
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=0 WRONG
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=0 WRONG
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=0 WRONG
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=0 WRONG
+I1 N=  1000 median    18 ms rows=1 
+I1 N= 10000 median    88 ms rows=1 
+review_repro exit 1

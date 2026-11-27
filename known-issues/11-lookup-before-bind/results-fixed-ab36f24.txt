@@ -1,0 +1,98 @@
+# fix/bug-11-bind-order ab36f24: fluree-4.2.9-fixes-bug11-25a51c6e9a27, then the stock release and 738a4cc in the same sitting (opt-level-1 dev builds for the fixes)
+# binary: fluree-4.2.9-fixes-bug11-25a51c6e9a27
+fluree 4.2.9
+N=  1000 | lifted  median      10 ms rows=2 | control median      10 ms rows=2
+N= 10000 | lifted  median      10 ms rows=2 | control median      10 ms rows=2
+N= 40000 | lifted  median      11 ms rows=2 | control median      11 ms rows=2
+query_repro.py exit 0
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=5 
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=5 
+I1 N=  1000 median    11 ms rows=1 
+I1 N= 10000 median    10 ms rows=1 
+review_repro.py exit 0
+
+fluree 4.2.9
+I1b work STR N=1000                          median    10 ms got=['urn:doc:1'] 
+I1b work IRI N=1000                          median    10 ms got=['title-1'] 
+I1b work STR N=10000                         median    10 ms got=['urn:doc:1'] 
+I1b work IRI N=10000                         median    10 ms got=['title-1'] 
+I1b rows STRLEN novelty                       got=['urn:d:x', 'urn:doc:7'] 
+I1b rows STRLEN indexed                       got=['urn:d:x', 'urn:doc:7'] 
+N1 UNION N=1000                              median    10 ms got=[] 
+N1 UNION N=10000                             median     9 ms got=[] 
+N2 strict, fails on urn:u:2                   got=fails 
+N2 strict, fallback without a role            got=succeeds 
+N2 strict, nothing written                    got=[] 
+rereview_repro.py exit 0
+
+# binary: fluree-4.2.9-stock-3b8d19e649a6
+fluree 4.2.9
+N=  1000 | lifted  median      14 ms rows=2 | control median       8 ms rows=2
+N= 10000 | lifted  median      69 ms rows=2 | control median       8 ms rows=2
+N= 40000 | lifted  median     250 ms rows=2 | control median       9 ms rows=2
+query_repro.py exit 0
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=5 
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=5 
+I1 N=  1000 median     8 ms rows=1 
+I1 N= 10000 median     8 ms rows=1 
+review_repro.py exit 0
+
+fluree 4.2.9
+I1b work STR N=1000                          median     8 ms got=['urn:doc:1'] 
+I1b work IRI N=1000                          median     8 ms got=['title-1'] 
+I1b work STR N=10000                         median     8 ms got=['urn:doc:1'] 
+I1b work IRI N=10000                         median     8 ms got=['title-1'] 
+I1b rows STRLEN novelty                       got=['urn:d:x', 'urn:doc:7'] 
+I1b rows STRLEN indexed                       got=['urn:d:x', 'urn:doc:7'] 
+N1 UNION N=1000                              median     8 ms got=[] 
+N1 UNION N=10000                             median     8 ms got=[] 
+N2 strict, fails on urn:u:2                   got=fails 
+N2 strict, fallback without a role            got=succeeds 
+N2 strict, nothing written                    got=[] 
+rereview_repro.py exit 0
+
+# binary: fluree-4.2.9-fixes-bug11-738bec316938
+fluree 4.2.9
+N=  1000 | lifted  median      10 ms rows=2 | control median       9 ms rows=2
+N= 10000 | lifted  median      10 ms rows=2 | control median      10 ms rows=2
+N= 40000 | lifted  median      10 ms rows=2 | control median      11 ms rows=2
+query_repro.py exit 0
+
+fluree 4.2.9
+C1 novelty  no FILTER                      expected=5 got=5 
+C1 novelty  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 novelty  FILTER(BOUND(?reader))         expected=5 got=5 
+C1 indexed  no FILTER                      expected=5 got=5 
+C1 indexed  FILTER(?reader != <urn:u:1>)   expected=4 got=4 
+C1 indexed  FILTER(BOUND(?reader))         expected=5 got=5 
+I1 N=  1000 median     9 ms rows=1 
+I1 N= 10000 median    10 ms rows=1 
+review_repro.py exit 0
+
+fluree 4.2.9
+I1b work STR N=1000                          median    16 ms got=['urn:doc:1'] 
+I1b work IRI N=1000                          median    16 ms got=['title-1'] 
+I1b work STR N=10000                         median    76 ms got=['urn:doc:1'] 
+I1b work IRI N=10000                         median    78 ms got=['title-1'] 
+I1b rows STRLEN novelty                       got=['urn:doc:7'] WRONG (expected ['urn:d:x', 'urn:doc:7'])
+I1b rows STRLEN indexed                       got=['urn:doc:7'] WRONG (expected ['urn:d:x', 'urn:doc:7'])
+N1 UNION N=1000                              median    26 ms got=[] 
+N1 UNION N=10000                             median  1055 ms got=[] 
+N2 strict, fails on urn:u:2                   got=succeeds WRONG (expected fails)
+N2 strict, fallback without a role            got=fails: error: Transaction error: Query error: Arithmetic error: type mismatch: cannot perform arithmetic on these types
+ WRONG (expected succeeds)
+N2 strict, nothing written                    got=['0'] WRONG (expected [])
+rereview_repro.py exit 1
+
