@@ -413,7 +413,8 @@ pub async fn execute_where_streaming<'a>(
     // planning).
     let planning = temporal_mode::PlanningContext::current()
         .with_dataset_scope(dataset)
-        .with_unmatched_optional(unmatched_optional);
+        .with_unmatched_optional(unmatched_optional)
+        .with_strict_bind_errors(true);
     let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)
         .map_err(|e| e.name_variables(vars))?;
     operator

@@ -1582,8 +1582,10 @@ struct RankedPattern {
     orig_index: usize,
     pattern: Pattern,
     /// Original indices of patterns this one must not be placed before — the
-    /// left-join ordering barrier (see [`left_join_order_barriers`]). Empty
-    /// unless an OPTIONAL in the group shares a not-yet-certain variable with it.
+    /// left-join ordering barrier (see [`left_join_order_barriers`]), and the
+    /// BINDs whose variables it reads (see [`bind_consumer_wait`]). Empty
+    /// unless an OPTIONAL in the group shares a not-yet-certain variable with
+    /// it, or it waits for a BIND.
     after_indices: Vec<usize>,
 }
 
@@ -2044,6 +2046,462 @@ fn unpark(list: &mut Vec<RankedPattern>, parked: Vec<RankedPattern>) {
     list.sort_by_key(|rp| rp.orig_index);
 }
 
+/// The BINDs and UNWINDs of a group, by the variable each binds.
+fn computed_vars(patterns: &[Pattern]) -> HashMap<VarId, Vec<usize>> {
+    let mut computed: HashMap<VarId, Vec<usize>> = HashMap::new();
+    for (j, p) in patterns.iter().enumerate() {
+        if let Pattern::Bind { var, .. } | Pattern::Unwind { var, .. } = p {
+            computed.entry(*var).or_default().push(j);
+        }
+    }
+    computed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by tests to plan as before the BIND hold existed: the oracle the
+    /// hold's plans are checked against.
+    static BIND_HOLD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For each pattern of the group, the BINDs it must be placed after
+/// ([`bind_consumer_wait`]), or `None` to place it as before.
+///
+/// A held source leaves the race until its BIND is placed, so a source that
+/// would have joined it, through a shared variable or through a BIND or
+/// UNWIND that reads its variables, could go first, joined to nothing: a
+/// scan where today it is a probe, and work that grows with the data where
+/// today's plan does a constant amount. Through a BIND it can also change an
+/// answer: the BIND then compares its value with the scan's as terms, where
+/// a probe matches numbers across datatypes. So a source is held only when
+/// every other source that shares a variable with it (other than the
+/// seed's) is held too, applied until nothing changes. Its variables here
+/// include those of every BIND and UNWIND that reads them, directly or
+/// through another (but not the inputs of the BIND it waits for, which is
+/// what feeds it). A VALUES needs no anchor and does not count; an OPTIONAL,
+/// MINUS, FILTER, EXISTS, BIND or UNWIND is not a source.
+fn bind_consumer_holds(
+    patterns: &[Pattern],
+    seed: &SeedVars,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> Vec<Option<Vec<usize>>> {
+    let n = patterns.len();
+    #[cfg(test)]
+    if BIND_HOLD_OFF.with(std::cell::Cell::get) {
+        return vec![None; n];
+    }
+    let computed = computed_vars(patterns);
+    if computed.is_empty() {
+        return vec![None; n];
+    }
+    let mut holds: Vec<Option<Vec<usize>>> = (0..n)
+        .map(|i| bind_consumer_wait(patterns, i, &computed, seed, bound_vars, stats))
+        .collect();
+    if holds.iter().all(Option::is_none) {
+        return holds;
+    }
+    let vars: Vec<HashSet<VarId>> = patterns
+        .iter()
+        .map(|p| {
+            p.referenced_vars()
+                .into_iter()
+                .filter(|v| !seed.schema.contains(v))
+                .collect()
+        })
+        .collect();
+    // A held pattern's variables, with what BINDs and UNWINDs compute from
+    // them, until that stops growing.
+    let reach: Vec<HashSet<VarId>> = (0..n)
+        .map(|i| {
+            let mut reach = vars[i].clone();
+            if holds[i].is_none() {
+                return reach;
+            }
+            loop {
+                let before = reach.len();
+                for p in patterns {
+                    let (var, input) = match p {
+                        Pattern::Bind { var, expr } => (var, expr),
+                        Pattern::Unwind { var, list } => (var, list),
+                        _ => continue,
+                    };
+                    if !seed.schema.contains(var)
+                        && input.referenced_vars().iter().any(|v| reach.contains(v))
+                    {
+                        reach.insert(*var);
+                    }
+                }
+                if reach.len() == before {
+                    return reach;
+                }
+            }
+        })
+        .collect();
+    let source = |p: &Pattern| {
+        !matches!(
+            p,
+            Pattern::Filter(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
+                | Pattern::Optional(_)
+                | Pattern::Minus(_)
+                | Pattern::Exists(_)
+                | Pattern::NotExists(_)
+                | Pattern::Values { .. }
+        )
+    };
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if holds[i].is_some()
+                && (0..n).any(|j| {
+                    j != i
+                        && holds[j].is_none()
+                        && source(&patterns[j])
+                        && !reach[i].is_disjoint(&vars[j])
+                })
+            {
+                holds[i] = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            return holds;
+        }
+    }
+}
+
+/// Must the pattern at `i` wait for a BIND written before it, whose variable it
+/// reads? The BINDs it must follow, or `None` to place it as before.
+/// `computed` is [`computed_vars`] of `patterns`. [`bind_consumer_holds`]
+/// applies the rule's last condition, on the patterns around a held one.
+///
+/// SPARQL evaluates a BIND where it is written (`Extend`) and joins what
+/// follows on its variable. The source race can instead place a later pattern
+/// that reads the variable ahead of the BIND: it shares no variable with what
+/// is placed so far, and every source goes ahead of an OPTIONAL, so a BIND fed
+/// by an OPTIONAL comes after all of them. That pattern then scans with the
+/// variable unbound, and the BIND keeps the rows whose value matches, as a
+/// clobber check. The rows are the same, but the work grows with everything
+/// the pattern matches. Held out of the source race until the BIND is placed,
+/// a positional barrier like the left-join one, it then competes as before
+/// and scans with the BIND's value. A BIND placed first anyway (one with no
+/// inputs, or inputs from the seed) changes nothing. This is the BIND
+/// counterpart of the hold on a pattern that reads an uncorrelated
+/// sub-SELECT's output.
+///
+/// The patterns held ("consumers") are a triple, a `GRAPH <iri>` block of
+/// triples and such blocks, or a UNION whose every branch is that. A list may
+/// also hold FILTERs (without EXISTS) that read only what the list itself
+/// binds, or what the seed binds on every row, so they see the same values
+/// wherever the consumer runs.
+///
+/// Both orders give the same rows:
+/// - Every BIND of a variable the consumer reads binds it on every row
+///   ([`bind_always_binds`]). Today the consumer is the first to bind the
+///   variable, and every other pattern that reads it (a FILTER, BIND,
+///   EXISTS) runs after the consumer; held, those run after the BIND, before
+///   the consumer. With the BIND's value on every row they read that value
+///   either way, and a row whose consumer value differs is dropped by the
+///   clobber check today and never read held. A BIND that may leave the
+///   variable unbound would let them read it unbound, so it keeps today's
+///   order. (With strict BIND errors, an update's WHERE, nothing is held:
+///   see [`reorder_patterns_with_seed_for`].)
+/// - No MINUS written before the consumer reads a variable the consumer
+///   binds. A MINUS waits for what is written before it, not for its
+///   binders, so held it could run before the consumer and see it unbound.
+/// - The consumer reads the variable as a subject, or as an object when every
+///   BIND of it yields an IRI ([`yields_only_iris`]). Scanned with the value,
+///   it finds what the clobber check keeps: a literal is never a subject, and
+///   an IRI matches by identity. A probed literal object matches numerics
+///   across datatypes (`1` finds `"1"^^xsd:long`), where the check compares
+///   terms. So a BIND that may yield a literal object, an UNWIND, or the
+///   variable as a predicate leaves the consumer where it was.
+/// - A consumer with a GRAPH block waits only when every other pattern that
+///   binds one of its variables binds it on every row, and the seed binds
+///   every seed variable it reads on every row. A GRAPH block that runs after
+///   a row leaving one of its variables unbound drops the block's own
+///   binding of it (a separate engine bug), and held later the block could
+///   meet such rows where it does not today.
+/// - The BIND's inputs come from the seed or from patterns written before it,
+///   and no BIND, UNWIND or path search written before the consumer reads a
+///   variable that the consumer or a later pattern binds. Holding the
+///   consumer then holds nothing the BIND waits for, directly or through what
+///   feeds it. The BIND is placed when its inputs are, as before: it never
+///   moves.
+///
+/// Cost: a consumer that statistics price at one row or none keeps its place.
+/// Placed first it costs at most that row, and when it finds nothing the
+/// BIND's inputs are never read. Held, it would wait for them. A GRAPH block
+/// is priced from its body's statistics here, unlike in the race, which
+/// reads a block statistics call empty as unknown, and a UNION by its
+/// costliest branch ([`consumer_rows`]). Without statistics (policy
+/// conditions) no estimate is that small, so such a consumer waits.
+fn bind_consumer_wait(
+    patterns: &[Pattern],
+    i: usize,
+    computed: &HashMap<VarId, Vec<usize>>,
+    seed: &SeedVars,
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> Option<Vec<usize>> {
+    let consumer = &patterns[i];
+    let mut triples = Vec::new();
+    let mut filters = Vec::new();
+    let mut in_graph = false;
+    if !bind_consumer_parts(consumer, &mut triples, &mut filters, &mut in_graph) {
+        return None;
+    }
+    for (list, expr) in filters {
+        let local: HashSet<VarId> = list.iter().flat_map(Pattern::produced_vars).collect();
+        if !expr
+            .referenced_vars()
+            .iter()
+            .all(|v| local.contains(v) || seed.bound_in_every_row.contains(v))
+        {
+            return None;
+        }
+    }
+
+    let mut needs = HashSet::new();
+    let mut after = Vec::new();
+    for tp in &triples {
+        if tp.p.as_var().is_some_and(|v| computed.contains_key(&v)) {
+            return None;
+        }
+        let reads = [(tp.s.as_var(), false), (tp.o.as_var(), true)];
+        for (v, as_object) in reads.into_iter().filter_map(|(v, o)| v.map(|v| (v, o))) {
+            let Some(binders) = computed.get(&v) else {
+                continue;
+            };
+            let same_rows = binders.iter().all(|&j| match &patterns[j] {
+                Pattern::Bind { expr, .. } => {
+                    bind_always_binds(patterns, j, seed) && (!as_object || yields_only_iris(expr))
+                }
+                _ => false,
+            });
+            if !same_rows {
+                return None;
+            }
+            if seed.schema.contains(&v) {
+                continue;
+            }
+            for &j in binders.iter().filter(|&&j| j < i) {
+                if bind_inputs_written_before(patterns, j, seed) {
+                    needs.insert(v);
+                    if !after.contains(&j) {
+                        after.push(j);
+                    }
+                }
+            }
+        }
+    }
+    if needs.is_empty() {
+        return None;
+    }
+
+    let mut produced: Vec<VarId> = consumer.produced_vars();
+    produced.sort_unstable();
+    produced.dedup();
+    if patterns[..i].iter().any(|p| {
+        matches!(p, Pattern::Minus(_)) && p.referenced_vars().iter().any(|v| produced.contains(v))
+    }) {
+        return None;
+    }
+    if in_graph {
+        for &v in &produced {
+            if seed.schema.contains(&v) && !seed.bound_in_every_row.contains(&v) {
+                return None;
+            }
+            for (j, p) in patterns.iter().enumerate() {
+                if j == i || !p.produced_vars().contains(&v) {
+                    continue;
+                }
+                let every_row = match p {
+                    Pattern::Bind { .. } => bind_always_binds(patterns, j, seed),
+                    _ => must_bind_vars(p, BindTargets::MayBeUnbound).contains(&v),
+                };
+                if !every_row {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let bound_later: HashSet<VarId> = patterns[i..]
+        .iter()
+        .flat_map(Pattern::produced_vars)
+        .filter(|v| !needs.contains(v))
+        .collect();
+    if patterns[..i].iter().any(|p| {
+        matches!(
+            p,
+            Pattern::Bind { .. } | Pattern::Unwind { .. } | Pattern::ShortestPath(_)
+        ) && deferred_required_vars(p)
+            .iter()
+            .any(|v| bound_later.contains(v))
+    }) {
+        return None;
+    }
+
+    if consumer_rows(consumer, bound_vars, stats) <= HIGHLY_SELECTIVE {
+        return None;
+    }
+    Some(after)
+}
+
+/// The rows a consumer reads with its BIND variables free: the estimate the
+/// race uses, except that a GRAPH block is priced from its body's statistics
+/// (the race reads a block statistics call empty as unknown, since the graph
+/// may be another ledger's; here a low estimate only keeps today's order),
+/// and a UNION by its costliest branch. Each branch's estimate is at least
+/// one row, so a sum could never be one row; a UNION whose every branch
+/// reads one row or none reads no more than its branch count.
+fn consumer_rows(pattern: &Pattern, bound_vars: &HashSet<VarId>, stats: Option<&StatsView>) -> f64 {
+    fn list_triples(patterns: &[Pattern], out: &mut Vec<Pattern>) {
+        for p in patterns {
+            match p {
+                Pattern::Triple(_) => out.push(p.clone()),
+                Pattern::Graph { patterns, .. } => list_triples(patterns, out),
+                _ => {}
+            }
+        }
+    }
+    let list_rows = |list: &[Pattern]| {
+        let mut flat = Vec::new();
+        list_triples(list, &mut flat);
+        estimate_branch_cardinality_from(&flat, bound_vars, stats)
+    };
+    match pattern {
+        Pattern::Graph { patterns, .. } => list_rows(patterns),
+        Pattern::Union(branches) => branches.iter().map(|b| list_rows(b)).fold(0.0, f64::max),
+        other => estimate_pattern(other, bound_vars, stats).row_count(),
+    }
+}
+
+/// The triples and FILTERs of a pattern [`bind_consumer_wait`] may hold, each
+/// FILTER with the list it is written in, and whether it holds a GRAPH block;
+/// `false` for any other pattern.
+fn bind_consumer_parts<'p>(
+    pattern: &'p Pattern,
+    triples: &mut Vec<&'p TriplePattern>,
+    filters: &mut Vec<(&'p [Pattern], &'p Expression)>,
+    in_graph: &mut bool,
+) -> bool {
+    fn list<'p>(
+        patterns: &'p [Pattern],
+        triples: &mut Vec<&'p TriplePattern>,
+        filters: &mut Vec<(&'p [Pattern], &'p Expression)>,
+        in_graph: &mut bool,
+    ) -> bool {
+        patterns.iter().all(|p| match p {
+            Pattern::Triple(tp) => {
+                triples.push(tp);
+                true
+            }
+            Pattern::Graph {
+                name: crate::ir::GraphName::Iri(_),
+                patterns: inner,
+            } if !inner.is_empty() => {
+                *in_graph = true;
+                list(inner, triples, filters, in_graph)
+            }
+            Pattern::Filter(expr) if !crate::filter::contains_exists(expr) => {
+                filters.push((patterns, expr));
+                true
+            }
+            _ => false,
+        })
+    }
+    match pattern {
+        Pattern::Triple(tp) => {
+            triples.push(tp);
+            true
+        }
+        Pattern::Graph {
+            name: crate::ir::GraphName::Iri(_),
+            patterns,
+        } if !patterns.is_empty() => {
+            *in_graph = true;
+            list(patterns, triples, filters, in_graph)
+        }
+        Pattern::Union(branches) => branches.iter().all(|b| list(b, triples, filters, in_graph)),
+        _ => false,
+    }
+}
+
+/// Whether the BIND at `j` binds its variable on every row: its expression is
+/// a constant, a variable the seed or a VALUES written before it binds on
+/// every row, or a COALESCE with such an argument.
+fn bind_always_binds(patterns: &[Pattern], j: usize, seed: &SeedVars) -> bool {
+    fn has_value(expr: &Expression, every_row: &HashSet<VarId>) -> bool {
+        match expr {
+            Expression::Const(_) => true,
+            Expression::Var(v) => every_row.contains(v),
+            Expression::Call {
+                func: Function::Coalesce,
+                args,
+            } => args.iter().any(|a| has_value(a, every_row)),
+            other => other.is_constant_iri(),
+        }
+    }
+    let Pattern::Bind { expr, .. } = &patterns[j] else {
+        return false;
+    };
+    let every_row: HashSet<VarId> = patterns[..j]
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Values { vars, rows } => {
+                Some(crate::ir::pattern::values_bound_in_every_row(vars, rows).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .flatten()
+        .chain(seed.bound_in_every_row.iter().copied())
+        .collect();
+    has_value(expr, &every_row)
+}
+
+/// Whether the BIND at `j` reads only the seed and patterns written before it,
+/// and so can be placed without anything written after it.
+fn bind_inputs_written_before(patterns: &[Pattern], j: usize, seed: &SeedVars) -> bool {
+    let Pattern::Bind { expr, .. } = &patterns[j] else {
+        return false;
+    };
+    if expr.contains_bnode() {
+        return false;
+    }
+    let before: HashSet<VarId> = patterns[..j]
+        .iter()
+        .flat_map(Pattern::produced_vars)
+        .collect();
+    expr.referenced_vars()
+        .iter()
+        .all(|v| seed.schema.contains(v) || before.contains(v))
+}
+
+/// Whether `expr` yields an IRI or nothing (an error leaves the BIND unbound):
+/// `IRI(…)`, which constant IRIs lower to, or COALESCE or IF over such
+/// expressions.
+fn yields_only_iris(expr: &Expression) -> bool {
+    match expr {
+        Expression::Call {
+            func: Function::Iri,
+            ..
+        } => true,
+        Expression::Call {
+            func: Function::Coalesce,
+            args,
+        } => !args.is_empty() && args.iter().all(yields_only_iris),
+        Expression::Call {
+            func: Function::If,
+            args,
+        } => args.len() == 3 && yields_only_iris(&args[1]) && yields_only_iris(&args[2]),
+        _ => false,
+    }
+}
+
 /// Reorder all pattern types for optimal join order.
 ///
 /// Handles all pattern types including triples, compound patterns (UNION,
@@ -2094,6 +2552,21 @@ pub fn reorder_patterns_with_seed(
     patterns: &[Pattern],
     stats: Option<&StatsView>,
     seed: &SeedVars,
+) -> Vec<Pattern> {
+    reorder_patterns_with_seed_for(patterns, stats, seed, false)
+}
+
+/// [`reorder_patterns_with_seed`] for a group whose BIND errors fail the
+/// query when `strict_bind_errors` (an update's WHERE). Such a group holds no
+/// pattern behind a BIND ([`bind_consumer_holds`]): held, a BIND that reads
+/// the held pattern's variables would meet other rows than it meets
+/// otherwise, and could fail the update where it succeeds, or let it succeed
+/// where it fails. So it is planned as it was before the hold.
+pub fn reorder_patterns_with_seed_for(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    seed: &SeedVars,
+    strict_bind_errors: bool,
 ) -> Vec<Pattern> {
     if patterns.len() <= 1 {
         return patterns.to_vec();
@@ -2164,6 +2637,11 @@ pub fn reorder_patterns_with_seed(
     }
 
     let barriers = left_join_order_barriers(patterns, &seed.bound_in_every_row);
+    let holds = if strict_bind_errors {
+        vec![None; patterns.len()]
+    } else {
+        bind_consumer_holds(patterns, seed, &bound_vars, stats)
+    };
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
@@ -2313,11 +2791,21 @@ pub fn reorder_patterns_with_seed(
         }
 
         match estimate_pattern(pattern, &bound_vars, stats) {
-            PatternEstimate::Source { .. } => sources.push(RankedPattern {
-                orig_index: i,
-                pattern: pattern.clone(),
-                after_indices: barriers[i].clone(),
-            }),
+            PatternEstimate::Source { .. } => {
+                // A source that reads a variable an earlier-written BIND fills
+                // in stays out of the race until that BIND is placed, so it
+                // scans with the value instead of reading everything and
+                // leaving the BIND as a clobber check ([`bind_consumer_wait`]).
+                let mut after_indices = barriers[i].clone();
+                if let Some(binds) = &holds[i] {
+                    after_indices.extend(binds.iter().filter(|j| !barriers[i].contains(j)));
+                }
+                sources.push(RankedPattern {
+                    orig_index: i,
+                    pattern: pattern.clone(),
+                    after_indices,
+                });
+            }
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
@@ -3493,6 +3981,849 @@ mod tests {
                 "a permanently unbound input delayed the consumer: {ordered:?}",
             );
         }
+    }
+
+    // A pattern that reads a variable an earlier-written BIND fills in is
+    // planned after that BIND (see `bind_consumer_wait`). Variables of the
+    // shape below: key 0, key account 1, reader 2, person 3.
+
+    fn iri_const(value: &str) -> Expression {
+        Expression::call(
+            Function::Iri,
+            vec![Expression::Const(FlakeValue::String(value.to_string()))],
+        )
+    }
+
+    fn graph(name: &str, patterns: Vec<Pattern>) -> Pattern {
+        Pattern::Graph {
+            name: GraphName::Iri(Arc::from(name)),
+            patterns,
+        }
+    }
+
+    /// `OPTIONAL { GRAPH <urn:g:keys> { ?key <account> ?keyAccount } }`
+    fn key_lookup() -> Pattern {
+        Pattern::Optional(vec![graph(
+            "urn:g:keys",
+            vec![triple(VarId(0), "account", VarId(1))],
+        )])
+    }
+
+    /// `BIND(COALESCE(?keyAccount, <urn:u:target>) AS ?reader)`
+    fn fill_reader() -> Pattern {
+        Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(VarId(1)), iri_const("urn:u:target")],
+            ),
+        }
+    }
+
+    /// `GRAPH <urn:g:shared> { ?reader <person> ?person }`
+    fn reader_block() -> Pattern {
+        graph("urn:g:shared", vec![triple(VarId(2), "person", VarId(3))])
+    }
+
+    fn label(pattern: &Pattern) -> String {
+        match pattern {
+            Pattern::Triple(tp) => match &tp.p {
+                Ref::Sid(p) => format!("triple {}", p.name),
+                _ => "triple ?p".to_string(),
+            },
+            Pattern::Graph {
+                name: GraphName::Iri(g),
+                ..
+            } => format!("graph {g}"),
+            Pattern::Optional(_) => "optional".to_string(),
+            Pattern::Bind { var, .. } => format!("bind {}", var.0),
+            Pattern::Unwind { var, .. } => format!("unwind {}", var.0),
+            Pattern::Union(_) => "union".to_string(),
+            Pattern::Filter(_) => "filter".to_string(),
+            Pattern::Values { .. } => "values".to_string(),
+            Pattern::Minus(_) => "minus".to_string(),
+            Pattern::Exists(_) => "exists".to_string(),
+            Pattern::NotExists(_) => "not exists".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn labels(patterns: &[Pattern]) -> Vec<String> {
+        patterns.iter().map(label).collect()
+    }
+
+    /// The plan with the BIND hold, as labels.
+    fn plan_with(patterns: &[Pattern], stats: Option<&StatsView>, seed: &SeedVars) -> Vec<String> {
+        labels(&reorder_patterns_with_seed(patterns, stats, seed))
+    }
+
+    /// The plan the planner made before the BIND hold existed: the oracle a
+    /// plan that must not change is compared with.
+    fn todays_plan(
+        patterns: &[Pattern],
+        stats: Option<&StatsView>,
+        seed: &SeedVars,
+    ) -> Vec<String> {
+        BIND_HOLD_OFF.with(|off| off.set(true));
+        let plan = plan_with(patterns, stats, seed);
+        BIND_HOLD_OFF.with(|off| off.set(false));
+        plan
+    }
+
+    /// The hold leaves this group's plan as it is today.
+    #[track_caller]
+    fn assert_todays_plan(patterns: &[Pattern], stats: Option<&StatsView>, seed: &SeedVars) {
+        let today = todays_plan(patterns, stats, seed);
+        assert_eq!(plan_with(patterns, stats, seed), today, "today's plan");
+    }
+
+    /// `BIND(COALESCE(?keyAccount) AS ?reader)`: unbound when the key is not
+    /// found.
+    fn maybe_reader() -> Pattern {
+        Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(Function::Coalesce, vec![Expression::Var(VarId(1))]),
+        }
+    }
+
+    /// The bug-11 shape. The block shares no variable with the OPTIONAL, so
+    /// the source race used to place it first: it scanned every reader, and
+    /// the BIND then discarded all but one as a clobber check. It now waits
+    /// for the BIND and looks the reader up, with statistics or without.
+    #[test]
+    fn a_lookup_waits_for_the_bind_that_fills_in_its_key() {
+        let lots = stats_with(&[("person", 40_000, 40_000), ("account", 3, 3)]);
+        for consumer in [reader_block(), triple(VarId(2), "person", VarId(3))] {
+            for stats in [None, Some(&lots)] {
+                let ordered = reorder_patterns(
+                    &[key_lookup(), fill_reader(), consumer.clone()],
+                    stats,
+                    &HashSet::new(),
+                );
+                assert_eq!(
+                    labels(&ordered),
+                    [
+                        "optional".to_string(),
+                        "bind 2".to_string(),
+                        label(&consumer)
+                    ],
+                    "stats: {}",
+                    stats.is_some()
+                );
+            }
+        }
+    }
+
+    /// When the BIND's inputs are not available before it, nothing holds the
+    /// lookup back: it stays first, as before. An input written after the BIND
+    /// is one case; an input nothing binds is the other.
+    #[test]
+    fn a_lookup_keeps_its_place_when_the_bind_inputs_are_not_available() {
+        let later = reorder_patterns(
+            &[fill_reader(), key_lookup(), reader_block()],
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(labels(&later), ["graph urn:g:shared", "bind 2", "optional"]);
+
+        let unbound = Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(VarId(9)), iri_const("urn:u:target")],
+            ),
+        };
+        let never = reorder_patterns(
+            &[key_lookup(), unbound, reader_block()],
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(labels(&never), ["graph urn:g:shared", "optional", "bind 2"]);
+    }
+
+    /// A UNION waits too when every branch is triples, constant-graph blocks
+    /// and FILTERs that read only what their own list binds, or what the seed
+    /// binds on every row. A FILTER that reads anything else would see a
+    /// different value once the UNION runs later, so such a UNION keeps its
+    /// place, as does one with any other kind of pattern in a branch.
+    #[test]
+    fn a_plain_union_waits_for_the_bind() {
+        let local = Pattern::Filter(Expression::ne(
+            Expression::Var(VarId(3)),
+            iri_const("urn:p:x"),
+        ));
+        let other = vec![graph(
+            "urn:g:roles",
+            vec![triple(VarId(2), "role", VarId(4))],
+        )];
+        let union = |branch: Vec<Pattern>| Pattern::Union(vec![branch, other.clone()]);
+        let plan = |consumer: Pattern, seed: &SeedVars| {
+            labels(&reorder_patterns_with_seed(
+                &[key_lookup(), fill_reader(), consumer],
+                None,
+                seed,
+            ))
+        };
+        let no_seed = SeedVars::default();
+        let waits = ["optional", "bind 2", "union"];
+        let keeps = ["union", "optional", "bind 2"];
+
+        assert_eq!(
+            plan(union(vec![reader_block(), local.clone()]), &no_seed),
+            waits
+        );
+        assert_eq!(
+            plan(
+                union(vec![graph(
+                    "urn:g:shared",
+                    vec![triple(VarId(2), "person", VarId(3)), local]
+                )]),
+                &no_seed
+            ),
+            waits
+        );
+
+        // The seed binds ?9 on every row: the FILTER reads the same value
+        // wherever the UNION runs. Unbound on some rows, it does not.
+        let seeded = Pattern::Filter(Expression::eq(
+            Expression::Var(VarId(3)),
+            Expression::Var(VarId(9)),
+        ));
+        let every_row = SeedVars::all_bound(HashSet::from([VarId(9)]));
+        let some_rows = SeedVars {
+            schema: HashSet::from([VarId(9)]),
+            bound_in_every_row: HashSet::new(),
+        };
+        let seeded_union = union(vec![reader_block(), seeded]);
+        assert_eq!(plan(seeded_union.clone(), &every_row), waits);
+        assert_eq!(plan(seeded_union, &some_rows), keeps);
+
+        // This branch reads ?reader in a FILTER without binding it: unbound
+        // in an early UNION, bound in a late one. (A FILTER reading the
+        // OPTIONAL's ?keyAccount needs no rule: the left-join barrier already
+        // holds the UNION behind the OPTIONAL.)
+        let reads_reader = vec![
+            graph("urn:g:roles", vec![triple(VarId(7), "role", VarId(4))]),
+            Pattern::Filter(Expression::eq(
+                Expression::Var(VarId(7)),
+                Expression::Var(VarId(2)),
+            )),
+        ];
+        assert_eq!(
+            plan(
+                Pattern::Union(vec![vec![reader_block()], reads_reader]),
+                &no_seed
+            ),
+            keeps
+        );
+        assert_eq!(
+            plan(
+                union(vec![reader_block(), optional(VarId(3), "name", VarId(5))]),
+                &no_seed
+            ),
+            keeps
+        );
+    }
+
+    /// Two lookups wait for the same BIND. Once it is placed they rejoin the
+    /// source race and go in their order there, with the reader bound: the
+    /// triple, a one-subject probe, ahead of the UNION.
+    #[test]
+    fn held_lookups_rejoin_the_source_race() {
+        let union = Pattern::Union(vec![
+            vec![reader_block()],
+            vec![graph(
+                "urn:g:roles",
+                vec![triple(VarId(2), "role", VarId(4))],
+            )],
+        ]);
+        let ordered = reorder_patterns(
+            &[
+                key_lookup(),
+                fill_reader(),
+                union,
+                triple(VarId(2), "name", VarId(5)),
+            ],
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            labels(&ordered),
+            ["optional", "bind 2", "triple name", "union"]
+        );
+    }
+
+    /// A BIND with no inputs is placed before any source, so a lookup that
+    /// reads it already scans with the value, and its place in the race is
+    /// the one it had. Here the literal BIND stays a term check because the
+    /// race puts `?s <n> ?n` first; a lookup jumping that race would turn
+    /// it into a probe that matches every numerically equal object.
+    #[test]
+    fn a_lookup_whose_bind_comes_first_anyway_keeps_its_place_in_the_race() {
+        let (n, o, s) = (VarId(10), VarId(11), VarId(12));
+        let patterns = [
+            Pattern::Bind {
+                var: n,
+                expr: Expression::Const(FlakeValue::Long(1)),
+            },
+            Pattern::Bind {
+                var: o,
+                expr: iri_const("http://example.org/T1"),
+            },
+            triple(s, "about", o),
+            triple(s, "n", n),
+        ];
+        let stats = stats_with(&[("about", 5, 1), ("n", 5, 5)]);
+        assert_eq!(
+            labels(&reorder_patterns(&patterns, Some(&stats), &HashSet::new())),
+            ["bind 11", "bind 10", "triple n", "triple about"]
+        );
+    }
+
+    /// The hold moves the lookup and nothing else: with the lookup taken out,
+    /// the other patterns are in today's order (the planner with the hold
+    /// off, not the plan of a group without the lookup).
+    #[test]
+    fn the_other_patterns_keep_todays_order() {
+        let patterns = [
+            triple(VarId(7), "owner", VarId(8)),
+            key_lookup(),
+            fill_reader(),
+            reader_block(),
+            optional(VarId(7), "name", VarId(9)),
+        ];
+        let no_seed = SeedVars::default();
+        let with = plan_with(&patterns, None, &no_seed);
+        assert_eq!(
+            with,
+            [
+                "triple owner",
+                "optional",
+                "optional",
+                "bind 2",
+                "graph urn:g:shared"
+            ]
+        );
+        let without_lookup = |plan: Vec<String>| -> Vec<String> {
+            plan.into_iter()
+                .filter(|l| l != "graph urn:g:shared")
+                .collect()
+        };
+        assert_eq!(
+            without_lookup(with),
+            without_lookup(todays_plan(&patterns, None, &no_seed))
+        );
+    }
+
+    /// A lookup that reads the BIND's variable as an object waits only for a
+    /// BIND that yields an IRI on every row. A scan probed with a literal
+    /// matches numerics across datatypes (`1` finds `"1"^^xsd:long`), while
+    /// the clobber check compares terms, so a BIND that may yield a literal
+    /// keeps today's order there; so does one that may yield nothing.
+    #[test]
+    fn an_object_lookup_waits_only_for_a_bind_that_always_yields_an_iri() {
+        let owned = triple(VarId(4), "owner", VarId(2));
+        let group = |expr: Expression| {
+            vec![
+                key_lookup(),
+                Pattern::Bind {
+                    var: VarId(2),
+                    expr,
+                },
+                owned.clone(),
+            ]
+        };
+        let no_seed = SeedVars::default();
+        let iri_of_key = Expression::call(Function::Iri, vec![Expression::Var(VarId(1))]);
+        assert_eq!(
+            plan_with(
+                &group(Expression::call(
+                    Function::Coalesce,
+                    vec![iri_of_key.clone(), iri_const("urn:u:target")]
+                )),
+                None,
+                &no_seed
+            ),
+            ["optional", "bind 2", "triple owner"]
+        );
+        for keeps in [
+            // `IRI(?keyAccount)` is unbound when the key is not found.
+            iri_of_key.clone(),
+            // So is IF's when its condition errors.
+            Expression::if_then_else(
+                Expression::Var(VarId(1)),
+                iri_of_key,
+                iri_const("urn:u:target"),
+            ),
+            // `?keyAccount` may be a literal.
+            fill_reader_expr(),
+            Expression::add(
+                Expression::Var(VarId(1)),
+                Expression::Const(FlakeValue::Long(1)),
+            ),
+        ] {
+            assert_todays_plan(&group(keeps), None, &no_seed);
+        }
+    }
+
+    fn fill_reader_expr() -> Expression {
+        match fill_reader() {
+            Pattern::Bind { expr, .. } => expr,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Keeps today's order: a BIND variable read as a predicate (here beside
+    /// another read as the subject, so only the predicate guard keeps it), a
+    /// variable an UNWIND binds, and a variable the seed already carries.
+    #[test]
+    fn a_lookup_keeps_its_place_for_a_predicate_an_unwind_or_a_seed() {
+        let no_seed = SeedVars::default();
+        let fill_subject = Pattern::Bind {
+            var: VarId(6),
+            expr: Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(VarId(1)), iri_const("urn:u:other")],
+            ),
+        };
+        let as_predicate = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(6)),
+            Ref::Var(VarId(2)),
+            Term::Var(VarId(5)),
+        ));
+        let predicate_group = [key_lookup(), fill_reader(), fill_subject, as_predicate];
+        assert_eq!(plan_with(&predicate_group, None, &no_seed)[0], "triple ?p");
+        assert_todays_plan(&predicate_group, None, &no_seed);
+
+        let unwound = Pattern::Unwind {
+            var: VarId(5),
+            list: Expression::Var(VarId(1)),
+        };
+        assert_todays_plan(
+            &[
+                key_lookup(),
+                fill_reader(),
+                triple(VarId(2), "person", VarId(5)),
+                unwound,
+            ],
+            None,
+            &no_seed,
+        );
+
+        let seeded = SeedVars::all_bound(HashSet::from([VarId(2)]));
+        let group = [key_lookup(), fill_reader(), reader_block()];
+        assert_eq!(plan_with(&group, None, &seeded)[0], "graph urn:g:shared");
+        assert_todays_plan(&group, None, &seeded);
+    }
+
+    /// A BIND written before the lookup reads a variable only the lookup
+    /// binds. Holding the lookup would leave that BIND, and the one it feeds,
+    /// waiting for it, so the plan keeps today's order.
+    #[test]
+    fn a_lookup_a_feeding_bind_depends_on_keeps_its_place() {
+        let from_lookup = Pattern::Bind {
+            var: VarId(5),
+            expr: Expression::call(Function::Str, vec![Expression::Var(VarId(6))]),
+        };
+        let fill = Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(VarId(1)), Expression::Var(VarId(5))],
+            ),
+        };
+        let ordered = reorder_patterns(
+            &[
+                key_lookup(),
+                from_lookup,
+                fill,
+                triple(VarId(2), "person", VarId(6)),
+            ],
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            labels(&ordered),
+            ["triple person", "bind 5", "optional", "bind 2"]
+        );
+    }
+
+    /// A lookup waits only for a BIND that binds its variable on every row: a
+    /// constant, a variable the seed or an earlier VALUES binds on every row,
+    /// or a COALESCE with such an argument. Every other pattern that reads
+    /// the variable (a FILTER, BIND, EXISTS) runs after the first pattern
+    /// that binds it; held, that is the BIND, so a BIND that may leave it
+    /// unbound would show them unbound where today they see the lookup's
+    /// value.
+    #[test]
+    fn a_lookup_waits_only_for_a_bind_that_binds_on_every_row() {
+        let no_seed = SeedVars::default();
+        for lookup in [reader_block(), triple(VarId(2), "person", VarId(3))] {
+            assert_todays_plan(&[key_lookup(), maybe_reader(), lookup], None, &no_seed);
+        }
+
+        let or_nine = Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(VarId(1)), Expression::Var(VarId(9))],
+            ),
+        };
+        assert_eq!(
+            plan_with(
+                &[key_lookup(), or_nine.clone(), reader_block()],
+                None,
+                &SeedVars::all_bound(HashSet::from([VarId(9)]))
+            ),
+            ["optional", "bind 2", "graph urn:g:shared"]
+        );
+        let nine = Pattern::Values {
+            vars: vec![VarId(9)],
+            rows: vec![vec![crate::binding::Binding::lit(
+                FlakeValue::Long(1),
+                Sid::xsd_integer(),
+            )]],
+        };
+        assert_eq!(
+            plan_with(
+                &[nine, key_lookup(), or_nine.clone(), reader_block()],
+                None,
+                &no_seed
+            ),
+            ["values", "optional", "bind 2", "graph urn:g:shared"]
+        );
+        // ?9 bound by nothing: the fallback may be unbound too.
+        assert_todays_plan(&[key_lookup(), or_nine, reader_block()], None, &no_seed);
+    }
+
+    /// The review's shapes for a BIND that may be unbound, each with another
+    /// pattern reading the BIND's variable: they keep today's plan, in which
+    /// the reader runs after the lookup and sees its value.
+    #[test]
+    fn readers_of_a_bind_that_may_be_unbound_keep_todays_plan() {
+        let no_seed = SeedVars::default();
+        let lookup = triple(VarId(2), "role", VarId(3));
+        let not_user_one = Pattern::Filter(Expression::ne(
+            Expression::Var(VarId(2)),
+            iri_const("urn:u:1"),
+        ));
+        let bound = Pattern::Filter(Expression::call(
+            Function::Bound,
+            vec![Expression::Var(VarId(2))],
+        ));
+        let name = Pattern::Bind {
+            var: VarId(6),
+            expr: Expression::call(Function::Str, vec![Expression::Var(VarId(2))]),
+        };
+        let blocked = Pattern::NotExists(vec![triple(VarId(2), "blocked", VarId(7))]);
+        let erroring = Pattern::Bind {
+            var: VarId(2),
+            expr: Expression::call(
+                Function::Iri,
+                vec![Expression::add(
+                    Expression::Var(VarId(1)),
+                    Expression::Const(FlakeValue::String("x".into())),
+                )],
+            ),
+        };
+        let union = Pattern::Union(vec![
+            vec![triple(VarId(2), "role", VarId(3))],
+            vec![triple(VarId(2), "missing", VarId(3))],
+        ]);
+        for group in [
+            vec![
+                key_lookup(),
+                maybe_reader(),
+                lookup.clone(),
+                not_user_one.clone(),
+            ],
+            vec![key_lookup(), maybe_reader(), lookup.clone(), bound],
+            vec![key_lookup(), maybe_reader(), lookup.clone(), name],
+            vec![key_lookup(), maybe_reader(), blocked, lookup.clone()],
+            vec![key_lookup(), erroring, lookup.clone(), not_user_one.clone()],
+            vec![key_lookup(), maybe_reader(), union, not_user_one],
+        ] {
+            assert_todays_plan(&group, None, &no_seed);
+        }
+
+        // With the fallback, the FILTER reads the BIND's value either way, and
+        // the lookup waits.
+        let fallback = [
+            key_lookup(),
+            fill_reader(),
+            lookup,
+            Pattern::Filter(Expression::ne(
+                Expression::Var(VarId(2)),
+                iri_const("urn:u:1"),
+            )),
+        ];
+        let plan = plan_with(&fallback, None, &no_seed);
+        let at = |l: &str| plan.iter().position(|x| x == l).expect(l);
+        assert!(at("bind 2") < at("triple role"), "{plan:?}");
+    }
+
+    /// A MINUS waits for what is written before it, not for its binders. One
+    /// written before the lookup that reads a variable the lookup binds
+    /// would run before the held lookup, so the lookup keeps its place.
+    #[test]
+    fn a_lookup_a_minus_before_it_reads_keeps_its_place() {
+        let minus = Pattern::Minus(vec![triple(VarId(6), "role", VarId(3))]);
+        assert_todays_plan(
+            &[
+                key_lookup(),
+                fill_reader(),
+                minus,
+                triple(VarId(2), "role", VarId(3)),
+            ],
+            None,
+            &SeedVars::default(),
+        );
+    }
+
+    /// A selective lookup that anchors a chain: held, `?o <label> ?l` would
+    /// go first as a scan of every label, where today it probes the lookup's
+    /// three objects. A lookup is held only when every source sharing a
+    /// variable with it is held too.
+    #[test]
+    fn a_lookup_that_anchors_another_source_keeps_its_place() {
+        let chain = [
+            key_lookup(),
+            fill_reader(),
+            triple(VarId(2), "rare", VarId(4)),
+            triple(VarId(4), "label", VarId(5)),
+        ];
+        let stats = stats_with(&[("rare", 3, 3), ("label", 10_000, 10_000), ("account", 3, 3)]);
+        for stats in [None, Some(&stats)] {
+            assert_todays_plan(&chain, stats, &SeedVars::default());
+        }
+        // Through the BIND's own variable: the second triple reads ?reader as
+        // an object, which a COALESCE over ?keyAccount cannot make wait.
+        assert_todays_plan(
+            &[
+                key_lookup(),
+                fill_reader(),
+                triple(VarId(2), "rare", VarId(4)),
+                triple(VarId(8), "manager", VarId(2)),
+            ],
+            None,
+            &SeedVars::default(),
+        );
+    }
+
+    /// A GRAPH block that runs after a row leaving one of its variables
+    /// unbound drops its own binding of that variable (an engine bug of its
+    /// own). So a lookup with a GRAPH block waits only when nothing that could
+    /// run first leaves one of its variables unbound: no UNION binding one in
+    /// a branch only, and no seed variable it reads unbound on some rows.
+    #[test]
+    fn a_graph_lookup_waits_only_where_its_variables_are_bound_on_every_row() {
+        let one_branch = Pattern::Union(vec![
+            vec![triple(VarId(8), "a", VarId(3))],
+            vec![triple(VarId(8), "b", VarId(9))],
+        ]);
+        assert_todays_plan(
+            &[one_branch, key_lookup(), fill_reader(), reader_block()],
+            None,
+            &SeedVars::default(),
+        );
+        let some_rows = SeedVars {
+            schema: HashSet::from([VarId(9)]),
+            bound_in_every_row: HashSet::new(),
+        };
+        let seeded_block = graph("urn:g:shared", vec![triple(VarId(2), "person", VarId(9))]);
+        assert_todays_plan(
+            &[key_lookup(), fill_reader(), seeded_block.clone()],
+            None,
+            &some_rows,
+        );
+        assert_eq!(
+            plan_with(
+                &[key_lookup(), fill_reader(), seeded_block],
+                None,
+                &SeedVars::all_bound(HashSet::from([VarId(9)]))
+            ),
+            ["optional", "bind 2", "graph urn:g:shared"]
+        );
+    }
+
+    /// Cost guard: statistics that price the lookup at one row or none leave
+    /// it first, where it costs at most that row, rather than holding it
+    /// behind whatever the BIND's inputs cost.
+    #[test]
+    fn a_lookup_statistics_price_at_one_row_keeps_its_place() {
+        let consumer = triple(VarId(2), "person", VarId(3));
+        let plan = |stats: &StatsView| {
+            labels(&reorder_patterns(
+                &[key_lookup(), fill_reader(), consumer.clone()],
+                Some(stats),
+                &HashSet::new(),
+            ))
+        };
+        assert_eq!(
+            plan(&stats_with(&[("person", 1, 1), ("account", 3, 3)])),
+            ["triple person", "optional", "bind 2"]
+        );
+        assert_eq!(
+            plan(&stats_with(&[("other", 5, 5), ("account", 3, 3)])),
+            ["triple person", "optional", "bind 2"],
+            "an absent predicate prices at zero rows"
+        );
+        assert_eq!(
+            plan(&stats_with(&[("person", 2, 2), ("account", 3, 3)])),
+            ["optional", "bind 2", "triple person"]
+        );
+
+        // A GRAPH block is priced from its body's statistics: here it reads an
+        // absent predicate, and keeps its place.
+        assert_todays_plan(
+            &[
+                key_lookup(),
+                fill_reader(),
+                graph("urn:g:shared", vec![triple(VarId(2), "absent", VarId(3))]),
+            ],
+            Some(&stats_with(&[("person", 5, 5), ("account", 3, 3)])),
+            &SeedVars::default(),
+        );
+    }
+
+    /// Re-review N1: a UNION is priced by its costliest branch, so one whose
+    /// every branch statistics price at one row or none keeps its place, as
+    /// a triple does. (Each branch's estimate is floored at one row, so their
+    /// sum could never meet the guard.) One costly branch makes it wait.
+    #[test]
+    fn a_union_statistics_price_at_one_row_a_branch_keeps_its_place() {
+        let union = |a: &str, b: &str| {
+            Pattern::Union(vec![
+                vec![triple(VarId(2), a, VarId(3))],
+                vec![triple(VarId(2), b, VarId(3))],
+            ])
+        };
+        let stats = stats_with(&[("person", 5, 5), ("account", 3, 3)]);
+        assert_todays_plan(
+            &[key_lookup(), fill_reader(), union("absent", "missing")],
+            Some(&stats),
+            &SeedVars::default(),
+        );
+        assert_eq!(
+            plan_with(
+                &[key_lookup(), fill_reader(), union("absent", "person")],
+                Some(&stats),
+                &SeedVars::default()
+            ),
+            ["optional", "bind 2", "union"]
+        );
+    }
+
+    /// Re-review I1b: a source that joins the lookup through a BIND or UNWIND
+    /// that reads the lookup's variables, directly or through further BINDs,
+    /// anchors it as a source sharing a variable does: the lookup keeps its
+    /// place, so that source still probes its output. Here `?6` is computed
+    /// from the lookup's `?4`, or from the held `?2` itself, and read by
+    /// `?7 <label> ?6`.
+    #[test]
+    fn a_lookup_that_anchors_a_source_through_a_bind_keeps_its_place() {
+        let str_of = |v: u16| Expression::call(Function::Str, vec![Expression::Var(VarId(v))]);
+        let bind = |var: u16, expr: Expression| Pattern::Bind {
+            var: VarId(var),
+            expr,
+        };
+        let rare = triple(VarId(2), "rare", VarId(4));
+        let label = triple(VarId(7), "label", VarId(6));
+        let stats = stats_with(&[("rare", 3, 3), ("label", 10_000, 10_000), ("account", 3, 3)]);
+        let chains = [
+            vec![rare.clone(), bind(6, str_of(4)), label.clone()],
+            vec![rare.clone(), bind(6, str_of(2)), label.clone()],
+            vec![
+                rare.clone(),
+                bind(9, str_of(4)),
+                bind(
+                    6,
+                    Expression::call(
+                        Function::Concat,
+                        vec![
+                            Expression::Var(VarId(9)),
+                            Expression::Const(FlakeValue::String("x".into())),
+                        ],
+                    ),
+                ),
+                label.clone(),
+            ],
+            vec![
+                rare.clone(),
+                Pattern::Unwind {
+                    var: VarId(6),
+                    list: Expression::Var(VarId(4)),
+                },
+                label.clone(),
+            ],
+        ];
+        for chain in chains {
+            let mut patterns = vec![key_lookup(), fill_reader()];
+            patterns.extend(chain);
+            for stats in [None, Some(&stats)] {
+                assert_todays_plan(&patterns, stats, &SeedVars::default());
+            }
+        }
+
+        // A BIND that reads only what feeds the held BIND does not join the
+        // lookup to anything: the lookup still waits.
+        let patterns = [
+            key_lookup(),
+            fill_reader(),
+            rare.clone(),
+            bind(6, str_of(1)),
+            label,
+        ];
+        let plan = plan_with(&patterns, None, &SeedVars::default());
+        let at = |l: &str| plan.iter().position(|p| p == l).unwrap();
+        assert!(at("bind 2") < at("triple rare"), "{plan:?}");
+    }
+
+    /// Re-review N2: with strict BIND errors (an update's WHERE), a group is
+    /// planned exactly as before the hold. Held, a BIND that reads the
+    /// lookup's variables would run on other rows than today, and could fail
+    /// where today's plan succeeds, or succeed where it fails.
+    #[test]
+    fn a_group_with_strict_bind_errors_plans_as_before() {
+        let patterns = [key_lookup(), fill_reader(), reader_block()];
+        let strict = |stats: Option<&StatsView>| {
+            labels(&reorder_patterns_with_seed_for(
+                &patterns,
+                stats,
+                &SeedVars::default(),
+                true,
+            ))
+        };
+        let stats = stats_with(&[("person", 40_000, 40_000), ("account", 3, 3)]);
+        for stats in [None, Some(&stats)] {
+            let today = todays_plan(&patterns, stats, &SeedVars::default());
+            assert_eq!(strict(stats), today);
+            assert_ne!(plan_with(&patterns, stats, &SeedVars::default()), today);
+        }
+    }
+
+    /// Re-review N4: a pattern the planner defers as the pipeline consumer of
+    /// an uncorrelated sub-SELECT never uses its hold. It reads the
+    /// sub-SELECT's output, and the sub-SELECT is a source that is never
+    /// held, so the anchor rule releases it, and it in turn anchors the lookup
+    /// it shares `?2` with: the lookup keeps its place.
+    #[test]
+    fn a_pattern_deferred_for_a_subquery_output_anchors_a_lookup() {
+        let patterns = [
+            key_lookup(),
+            fill_reader(),
+            triple(VarId(2), "person", VarId(3)),
+            Pattern::Subquery(
+                SubqueryPattern::new(vec![VarId(5)], vec![triple(VarId(5), "fr", VarId(6))])
+                    .with_uncorrelated(),
+            ),
+            triple(VarId(2), "manager", VarId(5)),
+        ];
+        assert_eq!(
+            bind_consumer_holds(&patterns, &SeedVars::default(), &HashSet::new(), None),
+            vec![None; patterns.len()]
+        );
+        assert_todays_plan(&patterns, None, &SeedVars::default());
     }
 
     #[test]

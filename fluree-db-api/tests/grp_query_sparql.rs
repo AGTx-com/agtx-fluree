@@ -39,6 +39,8 @@ mod it_property_join_filters;
 mod it_query_ask;
 #[path = "it_query_bi_q4.rs"]
 mod it_query_bi_q4;
+#[path = "it_query_bind_order.rs"]
+mod it_query_bind_order;
 #[path = "it_query_collect.rs"]
 mod it_query_collect;
 #[path = "it_query_construct.rs"]

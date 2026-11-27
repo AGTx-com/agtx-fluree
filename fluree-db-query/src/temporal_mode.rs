@@ -111,6 +111,12 @@ pub struct PlanningContext {
     /// unless the query root has shown that no LIMIT or OFFSET anywhere in the
     /// query can observe scan order (see `build_operator_tree`).
     pub scan_order: crate::r2rml::ScanOrder,
+    /// Whether a BIND error fails the query (an update's WHERE; see
+    /// `ExecutionContext::strict_bind_errors`). The planner then keeps every
+    /// pattern in the order it would give it without the BIND hold (see
+    /// `planner::reorder_patterns_with_seed_for`), so each BIND meets the
+    /// rows it meets there, and the update fails or succeeds as there.
+    pub strict_bind_errors: bool,
 }
 
 impl PlanningContext {
@@ -126,6 +132,7 @@ impl PlanningContext {
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
             scan_order: crate::r2rml::ScanOrder::Deterministic,
+            strict_bind_errors: false,
         }
     }
 
@@ -141,7 +148,16 @@ impl PlanningContext {
             unmatched_optional: UnmatchedOptional::Unbound,
             row_goal: None,
             scan_order: crate::r2rml::ScanOrder::Deterministic,
+            strict_bind_errors: false,
         }
+    }
+
+    /// Plan for a query whose BIND errors fail it (see
+    /// [`Self::strict_bind_errors`]).
+    #[inline]
+    pub const fn with_strict_bind_errors(mut self, strict: bool) -> Self {
+        self.strict_bind_errors = strict;
+        self
     }
 
     /// Vouch (or not) that semantic stats-based rewrites are sound for this

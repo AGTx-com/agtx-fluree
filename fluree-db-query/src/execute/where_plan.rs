@@ -27,7 +27,7 @@ use crate::operator::inline::InlineOperator;
 use crate::operator::{BoxedOperator, Operator};
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
 use crate::planner::{
-    analyze_property_join, is_property_join, must_bind_vars, reorder_patterns_with_seed,
+    analyze_property_join, is_property_join, must_bind_vars, reorder_patterns_with_seed_for,
     BindTargets, SeedVars,
 };
 use crate::property_join::PropertyJoinOperator;
@@ -2764,7 +2764,12 @@ pub fn build_where_operators_seeded_with_needed(
     // using selectivity-based cost estimation. This subsumes the per-block
     // reorder_patterns_seeded calls that previously handled triple-only blocks.
     let seed_vars = seed.as_deref().map(|op| seed_vars(op)).unwrap_or_default();
-    let reordered_storage = reorder_patterns_with_seed(patterns, stats.as_deref(), &seed_vars);
+    let reordered_storage = reorder_patterns_with_seed_for(
+        patterns,
+        stats.as_deref(),
+        &seed_vars,
+        planning.strict_bind_errors,
+    );
     let patterns = &reordered_storage;
 
     // Compute variable stats for emission pruning and join heuristics.

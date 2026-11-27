@@ -1113,7 +1113,10 @@ pub async fn execute<'a>(
     // the dataset paths do, so the members' scans deduplicate on full rows.
     let mut prepare_config =
         PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
-    prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
+    prepare_config.planning = prepare_config
+        .planning
+        .with_dataset_scope(config.dataset)
+        .with_strict_bind_errors(config.strict_bind_errors);
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await
         .map_err(|e| e.name_variables(vars))?;
